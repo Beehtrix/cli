@@ -197,6 +197,62 @@ func TestBatchBytesWithPrivacyFilter_FailsClosedOnBatchError(t *testing.T) {
 	}
 }
 
+// shortReturnBatchRuntime returns FEWER span slices than inputs — a
+// runtime contract violation that, if silently accepted, would leave
+// the tail leaves un-redacted while the rewrite ships the commits
+// tagged Entire-OPF-Applied: true.
+type shortReturnBatchRuntime struct{ batchCalls int }
+
+func (r *shortReturnBatchRuntime) Redact(_ context.Context, _ string, _ []string) ([]Span, error) {
+	return nil, nil
+}
+
+func (r *shortReturnBatchRuntime) RedactBatch(_ context.Context, inputs []string, _ []string) ([][]Span, error) {
+	r.batchCalls++
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	// Return exactly ONE span slice regardless of input count — the
+	// violation we're testing for.
+	return [][]Span{nil}, nil
+}
+
+// TestBatchBytesWithPrivacyFilter_ShortReturnFailsClosed pins the
+// fail-closed contract for the runtime short-return case. Production
+// shell-outs always return len(inputs); this guards against any future
+// runtime (daemon, gRPC, mocked partial-failure scenario) producing
+// fewer slices and the caller silently treating the missing tail as
+// "no PII found." The fix trips the breaker AND returns an error so
+// the orchestrator's two-layer abort fires either way.
+func TestBatchBytesWithPrivacyFilter_ShortReturnFailsClosed(t *testing.T) {
+	fake := &shortReturnBatchRuntime{}
+	resetOPFConfig()
+	t.Cleanup(resetOPFConfig)
+	origStderr := opfStderr
+	opfStderr = io.Discard
+	t.Cleanup(func() { opfStderr = origStderr })
+	ConfigurePrivacyFilterWithRuntime(OPFConfig{
+		Enabled:    true,
+		Categories: map[string]bool{"private_person": true},
+	}, fake)
+
+	inputs := []NamedBlob{
+		{Name: "a.jsonl", Content: []byte(`{"text":"Alice met Bob"}`)},
+		{Name: "b.jsonl", Content: []byte(`{"text":"Charlie sat down"}`)},
+		{Name: "c.jsonl", Content: []byte(`{"text":"Eve walked home"}`)},
+	}
+	_, err := BatchBytesWithPrivacyFilter(context.Background(), inputs)
+	if err == nil {
+		t.Fatal("short return must produce a non-nil error, got nil")
+	}
+	if !strings.Contains(err.Error(), "short return") {
+		t.Errorf("want error mentioning 'short return', got %q", err.Error())
+	}
+	if !opfBreakerTripped.Load() {
+		t.Error("short return must trip the breaker so future calls in this process skip OPF")
+	}
+}
+
 // TestBatchBytesWithPrivacyFilter_OPFDisabledReturns7Layer covers the
 // "OPF turned off in settings" path: every blob gets regex-only
 // redaction, no shell-out happens, no error. Without this, a user with

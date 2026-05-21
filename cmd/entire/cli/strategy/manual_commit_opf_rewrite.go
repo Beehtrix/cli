@@ -155,6 +155,38 @@ func resolveBatchLimit() int {
 	return batchDefaultLimit
 }
 
+// OPFRawBytesTooLargeError: the cumulative raw blob bytes the
+// collection pass loaded into memory exceeded the safety ceiling.
+// Unlike the leaf-byte cap, this is about RAM headroom rather than
+// inference wall-clock — a 200 MiB push of mostly-structural JSON has
+// tiny leaf content but huge raw bytes, and would OOM the user's
+// shell before the leaf-byte cap got a chance to fire.
+//
+// The raw ceiling is derived from ENTIRE_OPF_BATCH_LIMIT (raw =
+// leaf × rawByteCapMultiplier) so a user bumping the leaf cap
+// proportionally bumps the raw ceiling and doesn't need a second
+// env var.
+type OPFRawBytesTooLargeError struct {
+	RawBytes int
+	Limit    int
+}
+
+func (e *OPFRawBytesTooLargeError) Error() string {
+	return fmt.Sprintf("OPF rewrite would buffer %d raw blob bytes across "+
+		"all unpushed commits (limit %d, ~%d× the prose-leaf cap as a RAM ceiling). "+
+		"Bump ENTIRE_OPF_BATCH_LIMIT (the raw ceiling scales with it) "+
+		"or push without OPF (ENTIRE_OPF=no git push) and let a smaller "+
+		"follow-up push run OPF",
+		e.RawBytes, e.Limit, rawByteCapMultiplier)
+}
+
+// rawByteCapMultiplier ties the raw-byte RAM ceiling to the leaf-byte
+// inference cap. 100× means: leaf cap 2 MiB → raw ceiling 200 MiB.
+// Picked to comfortably exceed any realistic JSON-scaffolding ratio
+// (a 10 MiB JSONL with 300 KB of leaves still fits) while preventing
+// pathological RAM blowups (a 5 GiB pasted dump aborts before loading).
+const rawByteCapMultiplier = 100
+
 // RewriteUnpushedV1WithOPF re-redacts unpushed entire/checkpoints/v1
 // commits with OPF, builds new commits carrying Entire-OPF-Applied:
 // true, and CAS-updates the local ref. Idempotent: already-applied
@@ -225,6 +257,12 @@ func RewriteUnpushedV1WithOPF(ctx context.Context, repo *git.Repository, target 
 	}
 	var globalBlobs []redact.NamedBlob
 	pendings := make([]pendingCommit, 0, len(unpushed))
+	// Bound raw-bytes-in-memory incrementally so a pathological push
+	// (e.g. 5 GiB of pasted dumps) aborts before exhausting the user's
+	// shell RAM. The leaf-byte cap downstream is about inference cost;
+	// this one is about memory ceiling and fires earlier.
+	rawCap := resolveBatchLimit() * rawByteCapMultiplier
+	var rawBytesSoFar int
 	for _, c := range unpushed {
 		pc := pendingCommit{commit: c}
 		if !trailers.HasOPFApplied(c.Message) {
@@ -236,6 +274,12 @@ func RewriteUnpushedV1WithOPF(ctx context.Context, repo *git.Repository, target 
 			pc.startIdx = len(globalBlobs)
 			if err := collectTreeBlobs(repo, tree, "", pc.shardPath, &pc.blobs, &pc.paths); err != nil {
 				return plumbing.ZeroHash, fmt.Errorf("collect blobs %s: %w", c.Hash.String()[:7], err)
+			}
+			for _, b := range pc.blobs {
+				rawBytesSoFar += len(b.Content)
+			}
+			if rawBytesSoFar > rawCap {
+				return plumbing.ZeroHash, &OPFRawBytesTooLargeError{RawBytes: rawBytesSoFar, Limit: rawCap}
 			}
 			globalBlobs = append(globalBlobs, pc.blobs...)
 		}

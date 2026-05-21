@@ -486,6 +486,37 @@ func TestOPFBatchTooLargeErrorMessage(t *testing.T) {
 	}
 }
 
+// TestRewriteUnpushedV1WithOPF_RawByteCap pins the RAM-ceiling check
+// that fires during the collect pass (before the leaf-byte inference
+// cap). A push of mostly-structural JSON has tiny prose-leaf content
+// but the loaded raw blob bytes can still OOM if cumulative size
+// blows up — without this cap, a 5 GiB paste would silently load
+// before the leaf-byte cap got a chance to fire.
+//
+// Setting ENTIRE_OPF_BATCH_LIMIT very low scales the raw ceiling
+// (raw = leaf × rawByteCapMultiplier) low enough that the standard
+// setupV1Repo fixture triggers it.
+func TestRewriteUnpushedV1WithOPF_RawByteCap(t *testing.T) {
+	configureFakeOPF(t, &fakeOPFForRewrite{})
+	// leaf cap = 1 → raw ceiling = 100 bytes; the setupV1Repo
+	// checkpoint writes far more than that across its shard blobs.
+	t.Setenv(batchEnvVar, "1")
+	repo, originalTip := setupV1Repo(t)
+
+	_, err := RewriteUnpushedV1WithOPF(context.Background(), repo, "origin")
+	var rawErr *OPFRawBytesTooLargeError
+	require.ErrorAs(t, err, &rawErr, "want OPFRawBytesTooLargeError, got %T: %v", err, err)
+	require.Greater(t, rawErr.RawBytes, rawErr.Limit,
+		"error should report raw byte count > limit")
+
+	// CAS must not advance on raw-byte rejection — same fail-closed
+	// shape as the leaf-byte cap.
+	ref, refErr := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
+	require.NoError(t, refErr)
+	require.Equal(t, originalTip, ref.Hash(),
+		"local v1 ref must not move when raw byte cap rejects the push")
+}
+
 // TestCollectTreeBlobs_RedactsAllFileTypesInsideShard pins the
 // fail-closed file-type policy after the rebase onto the batching
 // architecture. The collect-pass walker must include .md, no-extension,

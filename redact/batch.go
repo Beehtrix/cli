@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 )
@@ -85,17 +84,18 @@ func BatchBytesWithPrivacyFilter(ctx context.Context, inputs []NamedBlob) ([][]b
 		}
 		fmt.Fprintf(opfStderr, "✓ OpenAI Privacy Filter: done (%.1fs, %d blobs)\n",
 			time.Since(start).Seconds(), len(inputs))
-		if len(batched) < len(batchInputs) {
-			slog.Warn("OPF runtime returned fewer span slices than inputs",
-				slog.String("component", "redaction"),
-				slog.Int("inputs", len(batchInputs)),
-				slog.Int("returned", len(batched)),
-			)
+		// A short return means the runtime gave us fewer span slices than
+		// inputs — the tail leaves would receive zero OPF spans and the
+		// rewrite would proceed as if OPF found nothing in them. With the
+		// Entire-OPF-Applied trailer attached to the resulting commits,
+		// that's silent under-redaction. Fail-closed: trip the breaker
+		// and return an error so the orchestrator aborts before CAS.
+		if len(batched) != len(batchInputs) {
+			shortErr := fmt.Errorf("opf runtime returned %d span slices for %d inputs", len(batched), len(batchInputs))
+			handleOPFFailure(ctx, cfg, shortErr)
+			return nil, fmt.Errorf("opf batch short return: %w", shortErr)
 		}
 		for i, leaf := range batchInputs {
-			if i >= len(batched) {
-				break
-			}
 			spansByInput[leaf] = batched[i]
 		}
 	}
