@@ -104,7 +104,7 @@ func resolveBootstrapLimit() int {
 	case v == "":
 		return bootstrapDefaultLimit
 	case strings.EqualFold(v, "unlimited"):
-		return math.MaxInt32
+		return math.MaxInt
 	}
 	if n, err := strconv.Atoi(v); err == nil && n > 0 {
 		return n
@@ -126,7 +126,7 @@ type OPFBatchTooLargeError struct {
 }
 
 func (e *OPFBatchTooLargeError) Error() string {
-	return fmt.Sprintf("OPF batch would inference %d prose-leaf bytes "+
+	return fmt.Sprintf("OPF would run inference on %d prose-leaf bytes "+
 		"(limit %d). Set ENTIRE_OPF_BATCH_LIMIT=<bytes> or =unlimited to override, "+
 		"or push without OPF (ENTIRE_OPF=no git push) and let a smaller follow-up push run OPF",
 		e.LeafBytes, e.Limit)
@@ -147,12 +147,26 @@ func resolveBatchLimit() int {
 	case v == "":
 		return batchDefaultLimit
 	case strings.EqualFold(v, "unlimited"):
-		return math.MaxInt32
+		return math.MaxInt
 	}
 	if n, err := strconv.Atoi(v); err == nil && n > 0 {
 		return n
 	}
 	return batchDefaultLimit
+}
+
+// scaleBatchLimit multiplies a batch-limit value by mult, saturating
+// at math.MaxInt to avoid signed-overflow when the limit is "unlimited"
+// (math.MaxInt) or a very large explicit value. Returns 0 if either
+// operand is non-positive, so the caller can treat 0 as "no cap" too.
+func scaleBatchLimit(limit, mult int) int {
+	if limit <= 0 || mult <= 0 {
+		return 0
+	}
+	if limit > math.MaxInt/mult {
+		return math.MaxInt
+	}
+	return limit * mult
 }
 
 // OPFRawBytesTooLargeError: the cumulative raw blob bytes the
@@ -260,8 +274,11 @@ func RewriteUnpushedV1WithOPF(ctx context.Context, repo *git.Repository, target 
 	// Bound raw-bytes-in-memory incrementally so a pathological push
 	// (e.g. 5 GiB of pasted dumps) aborts before exhausting the user's
 	// shell RAM. The leaf-byte cap downstream is about inference cost;
-	// this one is about memory ceiling and fires earlier.
-	rawCap := resolveBatchLimit() * rawByteCapMultiplier
+	// this one is about memory ceiling and fires earlier. scaleBatchLimit
+	// saturates at math.MaxInt so "unlimited" actually means unlimited
+	// — without saturation, "unlimited" × 100 overflows int and the cap
+	// trips on every push.
+	rawCap := scaleBatchLimit(resolveBatchLimit(), rawByteCapMultiplier)
 	var rawBytesSoFar int
 	for _, c := range unpushed {
 		pc := pendingCommit{commit: c}
