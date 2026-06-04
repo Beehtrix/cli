@@ -2,6 +2,7 @@ package coreapi
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,6 +10,10 @@ import (
 	"testing"
 
 	"github.com/ogen-go/ogen/ogenerrors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/entireio/cli/cmd/entire/cli/auth"
 )
 
 func TestAPIError(t *testing.T) {
@@ -70,6 +75,87 @@ func TestAPIError(t *testing.T) {
 			}
 		})
 	}
+}
+
+// makeJWT builds a three-segment JWT-shaped string with a non-"none" alg
+// (so auth.CoreURLFromEnvToken's underlying ParseClaims accepts it) and the
+// given payload. The signature segment is arbitrary — claims are parsed
+// unverified. Mirrors cmd/entire/cli/auth.makeJWT; inlined because that
+// helper is package-private.
+func makeJWT(t *testing.T, payloadJSON string) string {
+	t.Helper()
+	enc := base64.RawURLEncoding
+	header := enc.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	payload := enc.EncodeToString([]byte(payloadJSON))
+	return header + "." + payload + "." + enc.EncodeToString([]byte("sig"))
+}
+
+// TestBearerAuth_EnvTokenBypass covers the CI / workload-identity path:
+// when ENTIRE_TOKEN holds a JWT whose aud matches the bearerSource's
+// resource origin, BearerAuth returns it verbatim without touching the
+// keyring or contexts.json. This is the runner-friendly mode that lets
+// `entire repo create` succeed on a host with no Secret Service /
+// dbus-launch and no prior `entire login`.
+//
+// Not parallel — t.Setenv panics under t.Parallel and ENTIRE_TOKEN is
+// process-global.
+func TestBearerAuth_EnvTokenBypass(t *testing.T) {
+	const coreOrigin = "https://core.us.entire.io"
+	token := makeJWT(t, fmt.Sprintf(`{"sub":"ci-runner","aud":%q}`, coreOrigin))
+	t.Setenv(auth.EnvTokenVar, token)
+
+	src := &bearerSource{resourceBaseURL: coreOrigin}
+	got, err := src.BearerAuth(context.Background(), "AnyOp")
+	require.NoError(t, err)
+	assert.Equal(t, token, got.Token, "BearerAuth must return ENTIRE_TOKEN verbatim when aud matches the control-plane origin")
+}
+
+// TestBearerAuth_EnvTokenAudMismatch verifies the trust gate. A JWT whose
+// aud names a different core must be rejected with a clear error — never
+// forwarded as a bearer to the wrong origin (the receiver would reject it,
+// but the leak path is the request being sent at all).
+func TestBearerAuth_EnvTokenAudMismatch(t *testing.T) {
+	token := makeJWT(t, `{"sub":"ci-runner","aud":"https://core.eu.entire.io"}`)
+	t.Setenv(auth.EnvTokenVar, token)
+
+	src := &bearerSource{resourceBaseURL: "https://core.us.entire.io"}
+	_, err := src.BearerAuth(context.Background(), "AnyOp")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), auth.EnvTokenVar)
+	assert.Contains(t, err.Error(), "does not match")
+}
+
+// TestBearerAuth_EnvTokenBlank exercises the fail-closed contract: a set-
+// but-empty (or whitespace-only) ENTIRE_TOKEN must error rather than fall
+// through to the keyring, which would mask a misconfigured runner that
+// thought it was setting the variable.
+func TestBearerAuth_EnvTokenBlank(t *testing.T) {
+	t.Setenv(auth.EnvTokenVar, "   \n")
+
+	src := &bearerSource{resourceBaseURL: "https://core.us.entire.io"}
+	_, err := src.BearerAuth(context.Background(), "AnyOp")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), auth.EnvTokenVar)
+	assert.Contains(t, err.Error(), "blank")
+}
+
+// TestBearerAuth_EnvTokenAudNormalised confirms that the aud / resource
+// comparison is canonicalised through api.NormalizeOriginURL on both sides,
+// so a token whose aud differs only in case or default port matches the
+// resource origin. Mirrors what api.AuthBaseURL does to the resource URL
+// before bearerSource sees it.
+func TestBearerAuth_EnvTokenAudNormalised(t *testing.T) {
+	// aud carries an uppercase host and a trailing slash; the bearerSource
+	// resource was already canonicalised (lowercase, no slash) by
+	// api.OriginOnly at construction time. Both ends must normalise to the
+	// same value for the gate to pass.
+	token := makeJWT(t, `{"sub":"ci-runner","aud":"https://CORE.us.entire.io/"}`)
+	t.Setenv(auth.EnvTokenVar, token)
+
+	src := &bearerSource{resourceBaseURL: "https://core.us.entire.io"}
+	got, err := src.BearerAuth(context.Background(), "AnyOp")
+	require.NoError(t, err)
+	assert.Equal(t, token, got.Token)
 }
 
 // bearerOnlySource mirrors the CLI's bearerSource contract: a fixed

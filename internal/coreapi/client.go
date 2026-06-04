@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/ogen-go/ogen/ogenerrors"
@@ -82,6 +83,39 @@ type bearerSource struct {
 }
 
 func (b *bearerSource) BearerAuth(ctx context.Context, _ OperationName) (BearerAuth, error) {
+	// ENTIRE_TOKEN bypass: CI / workload-identity runners inject a short-
+	// lived login or sa-session JWT and want control-plane commands to use
+	// it verbatim, with no keyring lookup (the runner has none) and no
+	// contexts.json (the runner never ran `entire login`). Mirrors the
+	// env-token path in cmd/git-remote-entire/main.go:resolveCreds.
+	//
+	// Fail-closed: when ENTIRE_TOKEN is set we commit to it; a blank,
+	// malformed, or aud-mismatched value is fatal rather than a silent
+	// fallback to the keyring, which would mask a misconfigured runner.
+	//
+	// Trust gate: the token's aud must match b.resourceBaseURL (the core
+	// origin this client dials). Without that gate a JWT minted for a
+	// different core would be sent to this one as a bearer.
+	if raw, ok := os.LookupEnv(auth.EnvTokenVar); ok {
+		envToken := strings.TrimSpace(raw)
+		if envToken == "" {
+			return BearerAuth{}, fmt.Errorf("%s is set but blank", auth.EnvTokenVar)
+		}
+		tokenAud, err := auth.CoreURLFromEnvToken(envToken)
+		if err != nil {
+			return BearerAuth{}, err //nolint:wrapcheck // CoreURLFromEnvToken already prefixes with EnvTokenVar
+		}
+		// Both sides through NormalizeOriginURL so case / default-port /
+		// trailing-slash differences don't trigger a spurious mismatch —
+		// matches how api.AuthBaseURL canonicalises before bearerSource
+		// sees the resource URL.
+		if api.NormalizeOriginURL(tokenAud) != b.resourceBaseURL {
+			return BearerAuth{}, fmt.Errorf("%s aud %q does not match control-plane origin %q",
+				auth.EnvTokenVar, tokenAud, b.resourceBaseURL)
+		}
+		return BearerAuth{Token: envToken}, nil
+	}
+
 	token, err := auth.TokenForResource(ctx, b.resourceBaseURL)
 	if err != nil {
 		// Only suggest login when the user genuinely isn't logged in.
