@@ -81,7 +81,7 @@ func handlePush(ctx context.Context, t Transport, firstLine string, opts *Option
 		return fmt.Errorf("starting send-pack: %w", err)
 	}
 
-	respCh := make(chan io.Reader, 1)
+	respCh := make(chan io.ReadCloser, 1)
 	feedErr := make(chan error, 1)
 	go func() {
 		defer spIn.Close()
@@ -98,6 +98,13 @@ func handlePush(ctx context.Context, t Transport, firstLine string, opts *Option
 			feedErr <- nil
 			return
 		}
+		// io.Copy may still be reading after send-pack has consumed the
+		// report-status — the HTTP chunked terminator hasn't necessarily
+		// arrived yet. If main closed resp during that read, the body's
+		// Read would fail with "use of closed network connection" and
+		// the helper would exit non-zero on a push that actually
+		// succeeded. Own the close here so it runs strictly after Copy.
+		defer resp.Close()
 		if _, err := io.Copy(spIn, resp); err != nil {
 			feedErr <- fmt.Errorf("piping receive-pack response to send-pack: %w", err)
 			return
@@ -135,18 +142,19 @@ func handlePush(ctx context.Context, t Transport, firstLine string, opts *Option
 	// Drain the trailing flush so git sees only the newline-delimited
 	// status lines that transport-helper.c:push_update_refs_status
 	// expects.
+	//
+	// resp is closed by the feeder goroutine (above), not here — closing
+	// while io.Copy is mid-read aborts the body Read with "use of closed
+	// network connection" and turns successful pushes into fatal errors.
 	flushBuf := make([]byte, 4)
 	if _, err := io.ReadFull(spOutReader, flushBuf); err != nil {
-		_ = resp.Close()
 		return fmt.Errorf("reading send-pack trailing flush: %w", err)
 	}
 	if string(flushBuf) != "0000" {
-		_ = resp.Close()
 		return fmt.Errorf("expected trailing flush from send-pack, got %q", flushBuf)
 	}
 
 	helperStatus, err := io.ReadAll(spOutReader)
-	_ = resp.Close()
 	if err != nil {
 		return fmt.Errorf("reading helper-status: %w", err)
 	}
