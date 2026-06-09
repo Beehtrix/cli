@@ -515,11 +515,9 @@ func collectCommitsSince(ctx context.Context, repo *git.Repository, repoPath str
 		return nil, fmt.Errorf("git rev-list failed: %w", err)
 	}
 
+	// No depth cap: a checkpoint branch may legitimately carry an unbounded
+	// number of local-only commits to replay onto the remote tip.
 	lines := strings.Fields(string(output))
-	if len(lines) > MaxCommitTraversalDepth {
-		return nil, fmt.Errorf("commit chain exceeded %d commits; aborting rebase", MaxCommitTraversalDepth)
-	}
-
 	commits := make([]*object.Commit, 0, len(lines))
 	for _, line := range lines {
 		hash := plumbing.NewHash(line)

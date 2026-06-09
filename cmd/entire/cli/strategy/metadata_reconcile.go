@@ -242,8 +242,11 @@ func collectCommitChain(repo *git.Repository, tip plumbing.Hash, shallow map[plu
 	var chain []*object.Commit
 	current := tip
 
-	reachedRoot := false
-	for range MaxCommitTraversalDepth {
+	// Walk first-parent history to the root with no depth cap: a checkpoint
+	// branch may legitimately carry an unbounded number of commits, and a git
+	// DAG is acyclic and finite, so the walk always terminates at a root or a
+	// shallow boundary (or errors on a missing object).
+	for {
 		commit, err := repo.CommitObject(current)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get commit %s: %w", current, err)
@@ -251,19 +254,13 @@ func collectCommitChain(repo *git.Repository, tip plumbing.Hash, shallow map[plu
 		chain = append(chain, commit)
 
 		if len(commit.ParentHashes) == 0 {
-			reachedRoot = true
 			break
 		}
 		if shallow[current] {
 			// Shallow boundary — treat as a root.
-			reachedRoot = true
 			break
 		}
 		current = commit.ParentHashes[0]
-	}
-
-	if !reachedRoot {
-		return nil, fmt.Errorf("commit chain exceeded %d commits without reaching root; aborting reconciliation", MaxCommitTraversalDepth)
 	}
 
 	// Reverse to oldest-first

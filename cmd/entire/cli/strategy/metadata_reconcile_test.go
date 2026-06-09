@@ -696,9 +696,10 @@ func TestReconcileDisconnected_ModifiedEntries(t *testing.T) {
 	}
 }
 
-// TestCollectCommitChain_DepthLimit verifies that collectCommitChain returns an error
-// when the commit chain exceeds MaxCommitTraversalDepth without reaching a root commit.
-func TestCollectCommitChain_DepthLimit(t *testing.T) {
+// TestCollectCommitChain_WalksBeyondLegacyDepthLimit verifies that collectCommitChain
+// walks the entire chain to its root even when it is longer than the legacy
+// MaxCommitTraversalDepth cap, returning every commit oldest-first.
+func TestCollectCommitChain_WalksBeyondLegacyDepthLimit(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -712,10 +713,12 @@ func TestCollectCommitChain_DepthLimit(t *testing.T) {
 	treeHash, err := repo.Storer.SetEncodedObject(treeObj)
 	require.NoError(t, err)
 
-	// Build a linear chain of MaxCommitTraversalDepth+1 commits (all have parents,
-	// so none is a root). collectCommitChain should bail out at the depth limit.
+	// Build a linear chain of MaxCommitTraversalDepth+1 commits. The first commit
+	// is a true root (no parent); the rest chain on top. The full walk is one
+	// commit deeper than the legacy cap, so it would have errored before.
+	const chainLen = MaxCommitTraversalDepth + 1
 	var tip plumbing.Hash
-	for i := range MaxCommitTraversalDepth + 1 {
+	for i := range chainLen {
 		c := &object.Commit{
 			TreeHash:  treeHash,
 			Author:    object.Signature{Name: "test", Email: "test@test.com", When: time.Now().Add(time.Duration(i) * time.Second)},
@@ -732,10 +735,11 @@ func TestCollectCommitChain_DepthLimit(t *testing.T) {
 		tip = h
 	}
 
-	_, err = collectCommitChain(repo, tip, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "exceeded")
-	assert.Contains(t, err.Error(), "without reaching root")
+	chain, err := collectCommitChain(repo, tip, nil)
+	require.NoError(t, err)
+	assert.Len(t, chain, chainLen)
+	assert.Empty(t, chain[0].ParentHashes, "first entry should be the root commit")
+	assert.Equal(t, tip, chain[len(chain)-1].Hash, "last entry should be the tip")
 }
 
 // TestCollectCommitChain_StopsAtShallowBoundary verifies that collectCommitChain
