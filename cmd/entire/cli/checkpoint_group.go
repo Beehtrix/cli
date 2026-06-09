@@ -19,12 +19,14 @@ func newCheckpointGroupCmd() *cobra.Command {
 Commands:
   list     List checkpoints on the current branch
   explain  Explain a checkpoint, commit, or session
+  tokens   Show token usage and optimization recommendations
   rewind   Browse and rewind to a checkpoint
   search   Search checkpoints (semantic + keyword)
 
 Examples:
   entire checkpoint list
   entire checkpoint explain <id|sha>
+  entire checkpoint tokens <id>
   entire checkpoint rewind --to <id>
   entire checkpoint search "fix login"`,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
@@ -37,6 +39,7 @@ Examples:
 
 	cmd.AddCommand(newCheckpointListCmd())
 	cmd.AddCommand(newExplainCmd())
+	cmd.AddCommand(newCheckpointTokensCmd())
 	cmd.AddCommand(newRewindCmd())
 	cmd.AddCommand(newCheckpointSearchCmd())
 

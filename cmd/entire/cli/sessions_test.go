@@ -12,17 +12,22 @@ import (
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
+	"github.com/entireio/cli/redact"
 )
 
 const (
-	testAgentClaude    = "Claude Code"
-	testAgentGemini    = "Gemini CLI"
-	testCheckpointID   = "a3b2c4d5e6f7"
-	testPromptFixLogin = "fix the login bug"
+	testAgentClaude       = "Claude Code"
+	testAgentGemini       = "Gemini CLI"
+	testCheckpointID      = "a3b2c4d5e6f7"
+	testModelClaudeOpus   = "claude-opus-4-6[1m]"
+	testOtherWorktreePath = "/other/worktree"
+	testPromptFixLogin    = "fix the login bug"
 )
 
 // setupStopTestRepo initializes a temporary git repo, changes to it, and clears
@@ -312,7 +317,7 @@ func TestStopCmd_AllFlag_IncludesAllWorktrees(t *testing.T) {
 	inScope.WorktreePath = worktreePath
 
 	outOfScope := makeSessionState("test-all-scope-out", session.PhaseIdle)
-	outOfScope.WorktreePath = "/other/worktree"
+	outOfScope.WorktreePath = testOtherWorktreePath
 
 	for _, s := range []*strategy.SessionState{inScope, outOfScope} {
 		if err := strategy.SaveSessionState(ctx, s); err != nil {
@@ -593,7 +598,7 @@ func TestStopCmd_NoFlags_CrossWorktreeSession(t *testing.T) {
 
 	// Session in a different worktree — should be stoppable via no-args path.
 	remote := makeSessionState("test-cross-wt-stop", session.PhaseIdle)
-	remote.WorktreePath = "/other/worktree"
+	remote.WorktreePath = testOtherWorktreePath
 	remote.WorktreeID = "other-wt"
 	remote.StepCount = 0
 
@@ -850,7 +855,7 @@ func TestInfoCmd_TextOutput(t *testing.T) {
 
 	state := makeSessionState("test-info-text", session.PhaseActive)
 	state.AgentType = testAgentClaude
-	state.ModelName = "claude-opus-4-6[1m]"
+	state.ModelName = testModelClaudeOpus
 	state.WorktreeID = "my-feature"
 	state.LastInteractionTime = &lastActive
 	state.SessionTurnCount = 3
@@ -911,7 +916,7 @@ func TestInfoCmd_JSONOutput(t *testing.T) {
 
 	state := makeSessionState("test-info-json", session.PhaseIdle)
 	state.AgentType = testAgentClaude
-	state.ModelName = "claude-opus-4-6[1m]"
+	state.ModelName = testModelClaudeOpus
 	state.WorktreeID = "my-feature"
 	state.StepCount = 2
 	state.LastCheckpointID = testCheckpointID
@@ -964,6 +969,503 @@ func TestInfoCmd_JSONOutput(t *testing.T) {
 	}
 	if total != 5600 {
 		t.Errorf("expected total tokens 5600, got: %v", total)
+	}
+}
+
+// --- session tokens tests ---
+
+func TestTokensCmd_TextOutputWithRecommendations(t *testing.T) {
+	setupStopTestRepo(t)
+
+	ctx := context.Background()
+	state := makeSessionState("test-tokens-text", session.PhaseActive)
+	state.AgentType = testAgentClaude
+	state.ModelName = testModelClaudeOpus
+	state.SessionTurnCount = 12
+	state.ContextTokens = 8500
+	state.ContextWindowSize = 10000
+	state.TokenUsage = &agent.TokenUsage{
+		InputTokens:         1000,
+		CacheReadTokens:     10000,
+		CacheCreationTokens: 500,
+		OutputTokens:        100,
+		APICallCount:        6,
+		SubagentTokens: &agent.TokenUsage{
+			InputTokens:  1000,
+			OutputTokens: 1000,
+			APICallCount: 2,
+		},
+	}
+
+	if err := strategy.SaveSessionState(ctx, state); err != nil {
+		t.Fatalf("SaveSessionState() error = %v", err)
+	}
+
+	cmd := newTokensCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"test-tokens-text"})
+
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	out := stdout.String()
+	checks := []string{
+		"Session tokens",
+		"Session: test-tokens-text",
+		"Agent:   Claude Code",
+		"Model:   claude-opus-4-6[1m]",
+		"Status:  active",
+		"Total:  13.6k tokens",
+		"Input: 1k",
+		"Cache read: 10k",
+		"Cache write: 500",
+		"Output: 100",
+		"API calls: 6",
+		"Subagents: 2k tokens",
+		"Context pressure: 85% of 10k tokens",
+		"Recommendations",
+		"Scope subagent tasks tightly",
+		"Context pressure is 85% of the window",
+		"Compact or restart after summarizing the useful findings",
+	}
+	for _, check := range checks {
+		if !strings.Contains(out, check) {
+			t.Errorf("expected %q in output, got:\n%s", check, out)
+		}
+	}
+
+	recommendationsIndex := strings.Index(out, "Recommendations")
+	tokenUsageIndex := strings.Index(out, "Token usage")
+	if recommendationsIndex == -1 || tokenUsageIndex == -1 {
+		t.Fatalf("expected recommendations and token usage sections, got:\n%s", out)
+	}
+	if tokenUsageIndex > recommendationsIndex {
+		t.Fatalf("expected token usage before recommendations, got:\n%s", out)
+	}
+}
+
+func TestTokensCmd_JSONOutputReportsLimitations(t *testing.T) {
+	setupStopTestRepo(t)
+
+	ctx := context.Background()
+	state := makeSessionState("test-tokens-json", session.PhaseIdle)
+	state.AgentType = testAgentGemini
+	state.ContextTokens = 9000
+	state.ContextWindowSize = 10000
+
+	if err := strategy.SaveSessionState(ctx, state); err != nil {
+		t.Fatalf("SaveSessionState() error = %v", err)
+	}
+
+	cmd := newTokensCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"test-tokens-json", "--json"})
+
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("expected valid JSON, got parse error: %v\noutput: %s", err, stdout.String())
+	}
+
+	if result["session_id"] != "test-tokens-json" {
+		t.Errorf("expected session_id 'test-tokens-json', got: %v", result["session_id"])
+	}
+	if result["agent"] != testAgentGemini {
+		t.Errorf("expected agent %q, got: %v", testAgentGemini, result["agent"])
+	}
+	if _, ok := result["tokens"]; ok {
+		t.Errorf("expected tokens to be omitted when no token data exists, got: %v", result["tokens"])
+	}
+
+	recs, ok := result["recommendations"].([]interface{})
+	if !ok || len(recs) == 0 {
+		t.Fatalf("expected recommendations array, got: %T %v", result["recommendations"], result["recommendations"])
+	}
+	var sawNoTokenData bool
+	var sawContextPressure bool
+	for _, raw := range recs {
+		rec, ok := raw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected recommendation object, got: %T", raw)
+		}
+		switch rec["id"] {
+		case "no-token-data":
+			sawNoTokenData = true
+		case "high-context-pressure":
+			sawContextPressure = true
+		}
+	}
+	if !sawNoTokenData {
+		t.Error("expected no-token-data recommendation")
+	}
+	if !sawContextPressure {
+		t.Error("expected high-context-pressure recommendation")
+	}
+
+	limitations, ok := result["limitations"].([]interface{})
+	if !ok || len(limitations) == 0 {
+		t.Fatalf("expected limitations array, got: %T %v", result["limitations"], result["limitations"])
+	}
+}
+
+func TestSessionsCmd_TokensSubcommand(t *testing.T) {
+	setupStopTestRepo(t)
+
+	ctx := context.Background()
+	state := makeSessionState("test-tokens-subcommand", session.PhaseActive)
+	state.TokenUsage = &agent.TokenUsage{InputTokens: 42}
+
+	if err := strategy.SaveSessionState(ctx, state); err != nil {
+		t.Fatalf("SaveSessionState() error = %v", err)
+	}
+
+	cmd := newSessionsCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"tokens", "test-tokens-subcommand", "--json"})
+
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	var result sessionTokensReport
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("expected valid JSON, got parse error: %v\noutput: %s", err, stdout.String())
+	}
+	if result.SessionID != "test-tokens-subcommand" {
+		t.Errorf("expected session_id 'test-tokens-subcommand', got: %q", result.SessionID)
+	}
+	if result.Tokens == nil || result.Tokens.Total != 42 {
+		t.Fatalf("expected token total 42, got: %+v", result.Tokens)
+	}
+}
+
+func TestSessionsCmd_HelpIncludesTokensSubcommand(t *testing.T) {
+	cmd := newSessionsCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--help"})
+
+	if err := cmd.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "tokens   Show token usage and optimization recommendations") {
+		t.Fatalf("expected tokens command in manual command list, got:\n%s", out)
+	}
+	if !strings.Contains(out, "entire session tokens <session-id>       Show token usage") {
+		t.Fatalf("expected tokens example in help, got:\n%s", out)
+	}
+}
+
+func TestTokensCmd_PrioritizesContextReplayHotspot(t *testing.T) {
+	setupStopTestRepo(t)
+
+	ctx := context.Background()
+	state := makeSessionState("test-tokens-hotspot", session.PhaseActive)
+	state.AgentType = testAgentClaude
+	state.SessionTurnCount = 4
+	state.TokenUsage = &agent.TokenUsage{
+		InputTokens:         94,
+		CacheCreationTokens: 122171,
+		CacheReadTokens:     6052424,
+		OutputTokens:        38956,
+		APICallCount:        70,
+	}
+
+	if err := strategy.SaveSessionState(ctx, state); err != nil {
+		t.Fatalf("SaveSessionState() error = %v", err)
+	}
+
+	cmd := newTokensCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"test-tokens-hotspot"})
+
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	out := stdout.String()
+	checks := []string{
+		"Recommendations",
+		"Cache/context replay is 97.4% of token volume",
+		"Large context was replayed across 70 API calls",
+		"Compact or restart after summarizing this investigation",
+		"Token usage",
+		"Total:  6213.6k tokens",
+		"Cache read: 6052.4k",
+	}
+	for _, check := range checks {
+		if !strings.Contains(out, check) {
+			t.Errorf("expected %q in output, got:\n%s", check, out)
+		}
+	}
+
+	recommendationsIndex := strings.Index(out, "Recommendations")
+	tokenUsageIndex := strings.Index(out, "Token usage")
+	if recommendationsIndex == -1 || tokenUsageIndex == -1 {
+		t.Fatalf("expected recommendations and token usage sections, got:\n%s", out)
+	}
+	if tokenUsageIndex > recommendationsIndex {
+		t.Fatalf("expected token usage before recommendations, got:\n%s", out)
+	}
+	if strings.Contains(out, "Start a fresh session after major task boundaries") {
+		t.Fatalf("expected no generic fresh-session recommendation, got:\n%s", out)
+	}
+}
+
+func TestTokensCmd_DefaultsToCurrentSession(t *testing.T) {
+	setupStopTestRepo(t)
+
+	ctx := context.Background()
+	repoRoot, err := paths.WorktreeRoot(ctx)
+	if err != nil {
+		t.Fatalf("WorktreeRoot() error = %v", err)
+	}
+	now := time.Now()
+
+	current := makeSessionState("test-tokens-current", session.PhaseActive)
+	current.WorktreePath = repoRoot
+	current.LastInteractionTime = &now
+	current.TokenUsage = &agent.TokenUsage{InputTokens: 1200}
+
+	otherTime := now.Add(5 * time.Minute)
+	other := makeSessionState("test-tokens-other", session.PhaseActive)
+	other.WorktreePath = testOtherWorktreePath
+	other.LastInteractionTime = &otherTime
+	other.TokenUsage = &agent.TokenUsage{InputTokens: 9999}
+
+	for _, s := range []*strategy.SessionState{current, other} {
+		if err := strategy.SaveSessionState(ctx, s); err != nil {
+			t.Fatalf("SaveSessionState() error = %v", err)
+		}
+	}
+
+	cmd := newTokensCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{})
+
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "Session: test-tokens-current") {
+		t.Fatalf("expected current worktree session, got:\n%s", out)
+	}
+	if strings.Contains(out, "test-tokens-other") {
+		t.Fatalf("expected other worktree session to be ignored, got:\n%s", out)
+	}
+}
+
+func TestTokensCmd_CurrentAndSessionIDAreMutuallyExclusive(t *testing.T) {
+	setupStopTestRepo(t)
+
+	cmd := newTokensCmd()
+	cmd.SetArgs([]string{"test-session", "--current"})
+
+	err := cmd.ExecuteContext(context.Background())
+	if err == nil {
+		t.Fatal("expected error for --current with session ID")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected mutually exclusive error, got: %v", err)
+	}
+}
+
+// --- checkpoint tokens tests ---
+
+func TestCheckpointTokensCmd_TextOutputWithRealCheckpointShape(t *testing.T) {
+	repo, _ := runExplainAutoTestRepo(t)
+	ctx := context.Background()
+	cpID := id.MustCheckpointID("beefbeefcafe")
+	if err := checkpoint.NewGitStore(repo).WriteCommitted(ctx, checkpoint.WriteCommittedOptions{
+		CheckpointID: cpID,
+		SessionID:    "checkpoint-token-session",
+		Strategy:     strategy.StrategyNameManualCommit,
+		Branch:       "e2e-triage-fix",
+		Agent:        testAgentClaude,
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"why is slack failing"}]}}` + "\n")),
+		AuthorName:   "Test",
+		AuthorEmail:  "test@example.com",
+		TokenUsage: &agent.TokenUsage{
+			InputTokens:         94,
+			CacheCreationTokens: 122171,
+			CacheReadTokens:     6052424,
+			OutputTokens:        38956,
+			APICallCount:        70,
+		},
+	}); err != nil {
+		t.Fatalf("WriteCommitted() error = %v", err)
+	}
+
+	cmd := newCheckpointGroupCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"tokens", "beefbeef"})
+
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	out := stdout.String()
+	checks := []string{
+		"Checkpoint tokens",
+		"Checkpoint: beefbeefcafe",
+		"Session:    checkpoint-token-session",
+		"Agent:      Claude Code",
+		"Branch:     e2e-triage-fix",
+		"Recommendations",
+		"Cache/context replay is 97.4% of token volume",
+		"Large context was replayed across 70 API calls",
+		"Token usage",
+		"Total:  6213.6k tokens",
+		"Cache read: 6052.4k",
+	}
+	for _, check := range checks {
+		if !strings.Contains(out, check) {
+			t.Errorf("expected %q in output, got:\n%s", check, out)
+		}
+	}
+
+	recommendationsIndex := strings.Index(out, "Recommendations")
+	tokenUsageIndex := strings.Index(out, "Token usage")
+	if recommendationsIndex == -1 || tokenUsageIndex == -1 {
+		t.Fatalf("expected recommendations and token usage sections, got:\n%s", out)
+	}
+	if tokenUsageIndex > recommendationsIndex {
+		t.Fatalf("expected token usage before recommendations, got:\n%s", out)
+	}
+}
+
+func TestCheckpointTokensCmd_TextOutputWithMultipleSessionsUsesAggregateScope(t *testing.T) {
+	repo, _ := runExplainAutoTestRepo(t)
+	ctx := context.Background()
+	store := checkpoint.NewGitStore(repo)
+	cpID := id.MustCheckpointID("feedfeedcafe")
+
+	if err := store.WriteCommitted(ctx, checkpoint.WriteCommittedOptions{
+		CheckpointID: cpID,
+		SessionID:    "checkpoint-token-session-one",
+		Strategy:     strategy.StrategyNameManualCommit,
+		Branch:       "multi-session-branch",
+		Agent:        testAgentClaude,
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"first session"}]}}` + "\n")),
+		AuthorName:   "Test",
+		AuthorEmail:  "test@example.com",
+		TokenUsage: &agent.TokenUsage{
+			InputTokens:  1000,
+			APICallCount: 1,
+			SubagentTokens: &agent.TokenUsage{
+				InputTokens:  2000,
+				OutputTokens: 500,
+				APICallCount: 2,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("WriteCommitted() first session error = %v", err)
+	}
+	if err := store.WriteCommitted(ctx, checkpoint.WriteCommittedOptions{
+		CheckpointID: cpID,
+		SessionID:    "checkpoint-token-session-two",
+		Strategy:     strategy.StrategyNameManualCommit,
+		Branch:       "multi-session-branch",
+		Agent:        testAgentGemini,
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"second session"}]}}` + "\n")),
+		AuthorName:   "Test",
+		AuthorEmail:  "test@example.com",
+		TokenUsage: &agent.TokenUsage{
+			InputTokens:  500,
+			OutputTokens: 500,
+			APICallCount: 2,
+		},
+	}); err != nil {
+		t.Fatalf("WriteCommitted() second session error = %v", err)
+	}
+
+	cmd := newCheckpointGroupCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"tokens", "feedfeed"})
+
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	out := stdout.String()
+	checks := []string{
+		"Checkpoint tokens",
+		"Checkpoint: feedfeedcafe",
+		"Sessions:   2",
+		"Agents:     Claude Code, Gemini CLI",
+		"Branch:     multi-session-branch",
+		"Total:  4.5k tokens",
+		"Input: 1.5k",
+		"Output: 500",
+		"API calls: 3",
+		"Subagents: 2.5k tokens",
+	}
+	for _, check := range checks {
+		if !strings.Contains(out, check) {
+			t.Errorf("expected %q in output, got:\n%s", check, out)
+		}
+	}
+	if strings.Contains(out, "Session:    checkpoint-token-session-two") {
+		t.Fatalf("expected aggregate checkpoint output, not latest-session attribution, got:\n%s", out)
+	}
+}
+
+func TestCheckpointTokensCmd_JSONOutput(t *testing.T) {
+	repo, _ := runExplainAutoTestRepo(t)
+	ctx := context.Background()
+	cpID := id.MustCheckpointID("cafe00001234")
+	if err := checkpoint.NewGitStore(repo).WriteCommitted(ctx, checkpoint.WriteCommittedOptions{
+		CheckpointID: cpID,
+		SessionID:    "checkpoint-token-json",
+		Strategy:     strategy.StrategyNameManualCommit,
+		Agent:        testAgentGemini,
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"token json"}]}}` + "\n")),
+		AuthorName:   "Test",
+		AuthorEmail:  "test@example.com",
+		TokenUsage: &agent.TokenUsage{
+			InputTokens:  120,
+			OutputTokens: 30,
+			APICallCount: 1,
+		},
+	}); err != nil {
+		t.Fatalf("WriteCommitted() error = %v", err)
+	}
+
+	cmd := newCheckpointGroupCmd()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"tokens", "cafe0000", "--json"})
+
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	var result checkpointTokensReport
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("expected valid JSON, got parse error: %v\noutput: %s", err, stdout.String())
+	}
+	if result.CheckpointID != "cafe00001234" {
+		t.Errorf("expected checkpoint_id 'cafe00001234', got: %q", result.CheckpointID)
+	}
+	if result.SessionID != "checkpoint-token-json" {
+		t.Errorf("expected session_id 'checkpoint-token-json', got: %q", result.SessionID)
+	}
+	if result.Tokens == nil || result.Tokens.Total != 150 {
+		t.Fatalf("expected token total 150, got: %+v", result.Tokens)
 	}
 }
 
