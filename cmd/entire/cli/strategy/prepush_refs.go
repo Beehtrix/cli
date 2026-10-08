@@ -6,6 +6,11 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/go-git/go-git/v6/plumbing"
+
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
 )
 
 // PrePushRef is one line of the ref list git writes to a pre-push hook's
@@ -17,22 +22,26 @@ type PrePushRef struct {
 	RemoteSHA string
 }
 
-// maxPrePushRefsInput bounds how much of the hook's stdin is read. A ref line
-// is under 300 bytes, so this covers tens of thousands of refs.
-const maxPrePushRefsInput = 16 << 20
-
 // ParsePrePushRefs reads the "<local ref> <local sha> <remote ref> <remote sha>"
-// lines git passes to a pre-push hook. Malformed lines are skipped.
+// lines git passes to a pre-push hook and keeps the ones that touch checkpoint
+// refs, the only ones Entire needs. It reads to the end with no size cap: a
+// `--mirror` of a repository with many tags can be large, and a truncated list
+// could hide a checkpoint ref line. Memory stays bounded because other lines
+// are dropped as they are read. Malformed lines are skipped; a line too long to
+// be a ref line is an error.
 func ParsePrePushRefs(r io.Reader) ([]PrePushRef, error) {
-	var refs []PrePushRef
-	scanner := bufio.NewScanner(io.LimitReader(r, maxPrePushRefsInput))
+	refs := []PrePushRef{}
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 4096), 64*1024)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) != 4 {
 			continue
 		}
-		refs = append(refs, PrePushRef{LocalRef: fields[0], LocalSHA: fields[1], RemoteRef: fields[2], RemoteSHA: fields[3]})
+		ref := PrePushRef{LocalRef: fields[0], LocalSHA: fields[1], RemoteRef: fields[2], RemoteSHA: fields[3]}
+		if isCheckpointRefName(ref.LocalRef) || isCheckpointRefName(ref.RemoteRef) {
+			refs = append(refs, ref)
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("read pre-push refs: %w", err)
@@ -50,4 +59,11 @@ func WithPrePushRefs(ctx context.Context, refs []PrePushRef) context.Context {
 		refs = []PrePushRef{} // known to be empty, unlike absent
 	}
 	return context.WithValue(ctx, prePushRefsKey{}, refs)
+}
+
+// isCheckpointRefName reports whether name holds checkpoint content: the v1
+// branch or a per-checkpoint ref.
+func isCheckpointRefName(name string) bool {
+	return name == plumbing.NewBranchReferenceName(paths.MetadataBranchName).String() ||
+		strings.HasPrefix(name, checkpoint.CheckpointRefPrefix)
 }
