@@ -14,6 +14,7 @@ type PrePushRef struct {
 	LocalRef  string
 	LocalSHA  string
 	RemoteRef string
+	RemoteSHA string
 }
 
 // maxPrePushRefsInput bounds how much of the hook's stdin is read. A ref line
@@ -31,7 +32,7 @@ func ParsePrePushRefs(r io.Reader) ([]PrePushRef, error) {
 		if len(fields) != 4 {
 			continue
 		}
-		refs = append(refs, PrePushRef{LocalRef: fields[0], LocalSHA: fields[1], RemoteRef: fields[2]})
+		refs = append(refs, PrePushRef{LocalRef: fields[0], LocalSHA: fields[1], RemoteRef: fields[2], RemoteSHA: fields[3]})
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("read pre-push refs: %w", err)

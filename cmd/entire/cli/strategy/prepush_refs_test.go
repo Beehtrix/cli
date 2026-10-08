@@ -22,7 +22,7 @@ func TestParsePrePushRefs(t *testing.T) {
 			"(delete) " + zeroSHA + " refs/heads/old " + testSHA2 + "\n"))
 	require.NoError(t, err)
 	require.Equal(t, []PrePushRef{
-		{LocalRef: "refs/heads/main", LocalSHA: testSHA1, RemoteRef: "refs/heads/main"},
-		{LocalRef: "(delete)", LocalSHA: zeroSHA, RemoteRef: "refs/heads/old"},
+		{LocalRef: "refs/heads/main", LocalSHA: testSHA1, RemoteRef: "refs/heads/main", RemoteSHA: testSHA2},
+		{LocalRef: "(delete)", LocalSHA: zeroSHA, RemoteRef: "refs/heads/old", RemoteSHA: testSHA2},
 	}, refs)
 }
