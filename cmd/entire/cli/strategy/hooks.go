@@ -530,6 +530,10 @@ func gitHookStateInHooksDir(hooksDir string) GitHookState {
 		if entireHookLineRunsFromWorkingTree(content) {
 			outdated = true
 		}
+		if hook == prePushHook && !strings.Contains(content, PrePushStdinRefsEnv+"=1") {
+			// Predates passing git's ref list to Entire.
+			outdated = true
+		}
 	}
 	if outdated {
 		return GitHooksOutdated
@@ -585,7 +589,7 @@ func buildHookSpecs(cmdPrefix string) []hookSpec {
 	// the user opted into by enabling OPF. Users hit by unrelated
 	// bugs can `ENTIRE_OPF=no git push` for a one-off bypass while
 	// the bug is fixed.
-	prePushCmd := gitHookCommand(cmdPrefix, `pre-push "$1"`, false)
+	prePushCmd := prePushHookLine(cmdPrefix)
 
 	return []hookSpec{
 		{
@@ -1068,6 +1072,31 @@ trap 'rm -f "$_entire_stdin"' EXIT
 	body = strings.Replace(body, original, replacement, 1)
 
 	return replayPrefix + body + "\n" + chainCall(postRewriteHook, ` < "$_entire_stdin"`)
+}
+
+// PrePushStdinRefsEnv, set to 1, tells `entire hooks git pre-push` to read the
+// refs being pushed from stdin. It is an environment variable rather than a
+// flag so that an older entire binary run by a newer script (a downgrade, or a
+// second install earlier on PATH) ignores it instead of failing every push.
+// prePushHookLine sets it; an installed script without it is outdated (see
+// gitHookStateInHooksDir).
+const PrePushStdinRefsEnv = "ENTIRE_PRE_PUSH_STDIN_REFS"
+
+// prePushHookLine is the pre-push invocation, as one line so a hook manager
+// such as Husky can paste it into a script with other commands. Entire reads
+// git's ref list from stdin (PrePushStdinRefsEnv), and so does whatever runs
+// after it, typically `git lfs pre-push`. The line therefore saves the list,
+// gives Entire the copy, and points the script's stdin back at the copy for
+// the commands after it. Entire's failure ends the script there: a later
+// command's exit status must not decide the push and lose an abort from Entire.
+func prePushHookLine(cmdPrefix string) string {
+	invocation := fmt.Sprintf(`%s=1 %s hooks git pre-push "$1"`, PrePushStdinRefsEnv, cmdPrefix)
+	// Without Entire installed the line does nothing, stdin included.
+	return fmt.Sprintf(`if %s; then `, gitHookCommandAvailableTest(cmdPrefix)) +
+		`_entire_refs="$(mktemp "${TMPDIR:-/tmp}/entire-pre-push.XXXXXX")" || exit 1; ` +
+		`cat > "$_entire_refs"; ` +
+		invocation + ` < "$_entire_refs" || { _entire_status=$?; rm -f "$_entire_refs"; exit "$_entire_status"; }; ` +
+		`exec < "$_entire_refs"; rm -f "$_entire_refs"; fi`
 }
 
 // hookCmdPrefix returns the command prefix for hook scripts and warning messages.
