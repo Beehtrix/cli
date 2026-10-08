@@ -161,7 +161,7 @@ func recoverCheckpointRef(
 	)
 	refSpec := fmt.Sprintf("+%s:%s", candidate.name, fetchedRefName)
 	_, fetchSpan := perf.Start(ctx, "git_fetch")
-	fetchOutput, fetchErr := remote.Fetch(ctx, remote.FetchOptions{
+	_, fetchErr := remote.Fetch(ctx, remote.FetchOptions{
 		Remote:   fetchTarget,
 		RefSpecs: []string{refSpec},
 		NoTags:   true,
@@ -169,7 +169,7 @@ func recoverCheckpointRef(
 	fetchSpan.RecordError(fetchErr)
 	fetchSpan.End()
 	if fetchErr != nil {
-		return checkpointRefPush{}, fmt.Errorf("fetch failed: %s", fetchOutput)
+		return checkpointRefPush{}, fmt.Errorf("fetch failed: %w", fetchErr)
 	}
 	defer func() {
 		_ = repo.Storer.RemoveReference(fetchedRefName) //nolint:errcheck // cleanup is best-effort
