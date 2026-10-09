@@ -1,6 +1,8 @@
 package strategy
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -45,4 +47,23 @@ func TestParsePrePushRefs_LongListKeepsTheLastLine(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, refs, 1)
 	require.Equal(t, testSHA2, refs[0].LocalSHA)
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errors.New("stdin went away") }
+
+// prePushRefsRecorded reports whether ctx carries a ref list, empty or not.
+func prePushRefsRecorded(ctx context.Context) bool {
+	_, ok := ctx.Value(prePushRefsKey{}).([]PrePushRef)
+	return ok
+}
+
+// A ref list that cannot be read leaves the refs unknown, as an old hook does,
+// rather than failing the user's push over it.
+func TestWithPrePushRefsFrom_UnreadableListIsUnknown(t *testing.T) {
+	t.Parallel()
+	require.False(t, prePushRefsRecorded(WithPrePushRefsFrom(context.Background(), failingReader{})))
+	require.True(t, prePushRefsRecorded(WithPrePushRefsFrom(context.Background(),
+		strings.NewReader("refs/heads/main "+testSHA1+" refs/heads/main "+testSHA2+"\n"))))
 }

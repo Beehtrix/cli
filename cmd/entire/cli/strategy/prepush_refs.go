@@ -5,11 +5,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 
 	"github.com/go-git/go-git/v6/plumbing"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
+	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 )
 
@@ -50,6 +52,19 @@ func ParsePrePushRefs(r io.Reader) ([]PrePushRef, error) {
 }
 
 type prePushRefsKey struct{}
+
+// WithPrePushRefsFrom parses git's pre-push ref list from r and records it. A
+// list that cannot be read leaves the refs unknown, as with an old hook, and
+// the user's push is not blocked over it.
+func WithPrePushRefsFrom(ctx context.Context, r io.Reader) context.Context {
+	refs, err := ParsePrePushRefs(r)
+	if err != nil {
+		logging.Warn(ctx, "pre-push: could not read the ref list; treating it as unknown",
+			slog.String("error", err.Error()))
+		return ctx
+	}
+	return WithPrePushRefs(ctx, refs)
+}
 
 // WithPrePushRefs records the refs the user's own push is about to update.
 // Without it (an old hook script, a hook manager line, or a caller that is not

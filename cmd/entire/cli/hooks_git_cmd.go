@@ -257,11 +257,7 @@ func newHooksGitPrePushCmd() *cobra.Command {
 			if os.Getenv(strategy.PrePushStdinRefsEnv) == "1" {
 				// The ref list git passes on stdin is what the user's own
 				// push sends, which Entire's own push cannot see otherwise.
-				refs, err := strategy.ParsePrePushRefs(cmd.InOrStdin())
-				if err != nil {
-					return fmt.Errorf("pre-push: %w", err)
-				}
-				ctx = strategy.WithPrePushRefs(ctx, refs)
+				ctx = strategy.WithPrePushRefsFrom(ctx, cmd.InOrStdin())
 			}
 
 			hookErr := g.strategy.PrePushFromGitHook(ctx, remote)
