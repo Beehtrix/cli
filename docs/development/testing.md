@@ -209,7 +209,12 @@ Tests that spawn the real `entire` or `git` binary need the child to be non-inte
    it withdraws prompts from the largest agent population at once, which is a
    product decision rather than a detection fix.
 4. `CI=<non-empty-non-false>` → false.
-5. Controlling-terminal probe — `/dev/tty` on Unix, `CONIN$` + `CONOUT$` on
+5. Windows console with no window → false. A desktop app (such as Claude Code or
+   Codex desktop) may start its shell headless: `CONIN$` opens in line mode, so the
+   probe below passes, yet nobody can see or answer a prompt there. Only a missing
+   window counts; pseudoconsole hosts report an invisible window for consoles in
+   real use. See `interactive/console_windows.go`.
+6. Controlling-terminal probe — `/dev/tty` on Unix, `CONIN$` + `CONOUT$` on
    Windows. A terminal held in raw mode (canonical/line input off) belongs to a
    full-screen TUI that spawned us, not to a shell we can prompt: TUI git clients
    (lazygit, gitui, tig) run `git commit` as a child while owning the screen, so
