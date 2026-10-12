@@ -86,8 +86,10 @@ uses the following routing shapes, mirroring the entire.io BFF:
   See [Project trails CLI](../architecture/project-trails-cli.md).
 - **User-scoped `/me` → home cell, never fan out**:
   `auth.NewEntireAPICellClient(ctx, insecure, nil)` routes by the
-  `home_jurisdiction` JWT claim; activity/recap use it with a data-API
-  fallback (`runAuthenticatedActivityAPI` in `entireapi_client.go`).
+  `home_jurisdiction` JWT claim. Activity and recap use it with no data-API
+  fallback (`runAuthenticatedActivityAPI` in `entireapi_client.go`,
+  `newRecapClient` in `recap.go`): the BFF serves `/me/*` by proxying to the
+  same home cell, so it cannot answer a caller the cell path cannot.
 - **Cloud dispatch → one jurisdiction's cell**: `entire dispatch` builds one
   `CellClientFactory` (`newDispatchCellClient` in `dispatch/mode_cloud.go`)
   and dials the `--jurisdiction` cell, else the home cell. It posts to
