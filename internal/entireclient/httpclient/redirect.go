@@ -2,31 +2,51 @@ package httpclient
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 )
 
-// CheckSecureRedirect is the shared redirect floor, independent of each
-// caller's host policy. An initial local-development HTTP request may upgrade,
-// but once HTTPS has been reached no later hop may leave it.
+const (
+	// SchemeHTTPS is the secure scheme required for production credential transport.
+	SchemeHTTPS = "https"
+	// SchemeHTTP is permitted only by callers' explicit insecure-origin policies.
+	SchemeHTTP   = "http"
+	maxRedirects = 10
+)
+
+var (
+	// ErrRedirectPolicy identifies a redirect rejected by the shared security policy.
+	ErrRedirectPolicy = errors.New("redirect refused")
+	// ErrInsecureRedirect identifies a redirect that would leave HTTPS.
+	ErrInsecureRedirect = fmt.Errorf("%w: refusing redirect from HTTPS to an insecure scheme", ErrRedirectPolicy)
+	// ErrTooManyRedirects identifies a redirect chain exceeding the hop limit.
+	ErrTooManyRedirects = fmt.Errorf("%w: stopped after %d redirects", ErrRedirectPolicy, maxRedirects)
+)
+
+// CheckSecureRedirect is a CheckRedirect policy that limits redirect chains and
+// refuses to leave HTTPS once reached. Host restrictions belong to the caller.
 func CheckSecureRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
+	if len(via) >= maxRedirects {
+		return ErrTooManyRedirects
 	}
-	if req.URL.Scheme != "https" {
+	if req.URL.Scheme != SchemeHTTPS {
 		for _, previous := range via {
-			if previous.URL.Scheme == "https" {
-				return errors.New("refusing redirect from HTTPS to an insecure scheme")
+			if previous.URL.Scheme == SchemeHTTPS {
+				return ErrInsecureRedirect
 			}
 		}
 	}
 	return nil
 }
 
-// WithSecureRedirects copies a client and enforces the mandatory TLS floor
-// before and after its existing redirect policy. Transport, timeout and jar are preserved; the
-// caller's client is not mutated. A nil policy retains Go's default host/header
-// handling and our usual ten-hop cap.
+// WithSecureRedirects returns a copy of client with the shared redirect policy
+// applied before and after its existing callback. A nil client uses
+// http.DefaultClient. Transport, timeout and jar are preserved; neither the
+// supplied client nor the default client is mutated.
 func WithSecureRedirects(client *http.Client) *http.Client {
+	if client == nil {
+		client = http.DefaultClient
+	}
 	guarded := *client
 	policy := client.CheckRedirect
 	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
@@ -38,8 +58,7 @@ func WithSecureRedirects(client *http.Client) *http.Client {
 				// net/http compares ErrUseLastResponse by identity; do not wrap.
 				return err
 			}
-			// A callback can rewrite the destination. Validate the URL that
-			// will actually be sent, not just the server's original Location.
+			// Validate callback rewrites, not just the server's original Location.
 			return CheckSecureRedirect(req, via)
 		}
 		return nil

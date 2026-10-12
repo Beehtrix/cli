@@ -38,7 +38,8 @@ func testProxy(server *httptest.Server) *Proxy {
 }
 
 func proxyWithClient(nodes []string, path, entryURL, clusterHost string, client *http.Client) *Proxy {
-	// HTTP fixtures explicitly opt into the loopback development entry.
+	// Test-only HTTP loopback compatibility: production replicas.Resolve
+	// always supplies HTTPS. These fixtures exercise failover without TLS.
 	if entryURL == "" && len(nodes) > 0 {
 		entryURL = nodes[0]
 	}
@@ -452,7 +453,7 @@ func TestFailoverAll5xx(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when all nodes return 5xx")
 	}
-	if !strings.Contains(err.Error(), "all 2 nodes failed") {
+	if !strings.Contains(err.Error(), "all 2 attempted nodes failed") {
 		t.Errorf("error = %v", err)
 	}
 }
@@ -993,7 +994,7 @@ func TestColdPathRedirectAllReplicasFail(t *testing.T) {
 
 	_, err := p.InfoRefs(context.Background(), "git-upload-pack")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "all 2 nodes failed")
+	assert.Contains(t, err.Error(), "all 2 attempted nodes failed")
 	assert.Contains(t, err.Error(), "after entry-domain redirect")
 }
 
@@ -1272,7 +1273,9 @@ func TestNoRedirectClientShareTransport(t *testing.T) {
 	if got.CheckRedirect == nil {
 		t.Fatal("NoRedirectClient must set CheckRedirect")
 	}
-	if err := got.CheckRedirect(nil, nil); !errors.Is(err, http.ErrUseLastResponse) {
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://cluster.example", nil)
+	require.NoError(t, err)
+	if err := got.CheckRedirect(req, nil); !errors.Is(err, http.ErrUseLastResponse) {
 		t.Errorf("CheckRedirect returned %v, want http.ErrUseLastResponse", err)
 	}
 }
@@ -1303,7 +1306,7 @@ func TestInfoRefsWarmAndColdBothFailSurfacesBoth(t *testing.T) {
 	require.Error(t, err)
 	msg := err.Error()
 	assert.Contains(t, msg, "cached replicas")
-	assert.Contains(t, msg, "all 2 nodes failed")
+	assert.Contains(t, msg, "all 2 attempted nodes failed")
 	assert.Contains(t, msg, "entry domain")
 }
 

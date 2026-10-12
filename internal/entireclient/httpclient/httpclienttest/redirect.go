@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-)
 
-const schemeHTTPS = "https"
+	"github.com/entireio/cli/internal/entireclient/httpclient"
+)
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
@@ -20,24 +20,10 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 // host guard hide a missing TLS guard. No real credentials or network are used.
 func CheckRejectsDowngrade(t *testing.T, run func(*testing.T, string, http.RoundTripper) error) {
 	t.Helper()
-	checkRejectsDowngrade(t, true, run)
-}
-
-// CheckRejectsDowngradeSerial runs the same matrix for callers that replace
-// process-global state. Neither the caller nor its ancestors may be parallel.
-func CheckRejectsDowngradeSerial(t *testing.T, run func(*testing.T, string, http.RoundTripper) error) {
-	t.Helper()
-	checkRejectsDowngrade(t, false, run)
-}
-
-func checkRejectsDowngrade(t *testing.T, parallel bool, run func(*testing.T, string, http.RoundTripper) error) {
-	t.Helper()
 	for _, status := range []int{301, 302, 303, 307, 308} {
 		for _, start := range []string{"https://service.example", "https://127.0.0.1", "http://127.0.0.1"} {
 			t.Run(fmt.Sprintf("%d/%s", status, start), func(t *testing.T) {
-				if parallel {
-					t.Parallel()
-				}
+				t.Parallel()
 				calls, leaks := 0, 0
 				secure := false
 				rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -47,16 +33,16 @@ func checkRejectsDowngrade(t *testing.T, parallel bool, run func(*testing.T, str
 					}
 					code := status
 					header := make(http.Header)
-					if secure && r.URL.Scheme != schemeHTTPS {
+					if secure && r.URL.Scheme != httpclient.SchemeHTTPS {
 						leaks++
 						code = http.StatusOK
 					} else {
 						target := *r.URL
-						if r.URL.Scheme == schemeHTTPS {
+						if r.URL.Scheme == httpclient.SchemeHTTPS {
 							secure = true
 							target.Scheme = "http"
 						} else {
-							target.Scheme = schemeHTTPS
+							target.Scheme = httpclient.SchemeHTTPS
 						}
 						header.Set("Location", target.String())
 					}

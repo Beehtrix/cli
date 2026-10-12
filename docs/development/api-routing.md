@@ -6,35 +6,35 @@ Repository paths in code spans are relative to the repository root unless stated
 
 ### Credential-bearing redirects and replicas
 
-The API client, control-plane client, cloud dispatch client, cell catalog
-resolver, and git remote helper apply `internal/entireclient/httpclient.CheckSecureRedirect`: redirects
-must never leave HTTPS once reached, including HTTP → HTTPS → HTTP chains and
-HTTPS → loopback HTTP. This floor supplements, rather than replaces, each
-client's host policy. `WithSecureRedirects` copies injected clients and preserves
-their transport, timeout, cookie jar, and stricter redirect callbacks. The floor
-runs both before a callback and after it returns nil, because callbacks can
-rewrite the destination. Callback errors are returned unchanged, including
-`http.ErrUseLastResponse`.
+- **Construct clients with `httpclient.New`**
+  (`internal/entireclient/httpclient`). It limits redirect chains and refuses
+  HTTPS → HTTP, including HTTPS → loopback and HTTP → HTTPS → HTTP. A source
+  guard rejects bare production `http.Client` allocations outside that constructor.
+- **Preserve stricter policies.** The API client (also used by cloud dispatch)
+  refuses cross-host redirects and insecure absolute endpoints. The remote-helper
+  proxy restricts bearer forwarding to its cluster. Well-known discovery refuses
+  **all** redirects at the fetch boundary; its response is a trust root.
+  Auth-go separately protects OAuth exchanges and 421 routing, not the outer
+  control-plane client's ordinary HTTP redirects.
+- **Wrap injected clients with `WithSecureRedirects`.** It copies the supplied
+  client (nil means `http.DefaultClient`) and validates before and after a
+  successful custom callback. Callback errors, including `http.ErrUseLastResponse`,
+  remain unchanged. Inject a transport via `api.NewClientWithTransport` in tests,
+  not by replacing `http.DefaultTransport`.
+- **Do not classify policy rejections as node failures.** Shared redirect errors
+  match `httpclient.ErrRedirectPolicy` with `errors.Is`; downgrades additionally
+  match `ErrInsecureRedirect`. The proxy returns these without invalidating the
+  replica cache or trying an entry-domain/Location fallback. Skipped, ineligible
+  replicas do not replace a real server error such as HTTP 507.
+- **Require HTTPS for production replicas.** Validate cache entries, headers,
+  Location targets, response-URL fallback, and requests before attaching auth.
+  `replicas.Resolve` always creates an HTTPS entry; `SkipTLS` does not authorize
+  plaintext. Directly constructed loopback-HTTP proxies are a **test-only**
+  compatibility mode, disabled once that proxy attempts HTTPS.
 
-Cloud dispatch uses the shared API client and inherits its redirect policy;
-it no longer constructs a separate HTTP client.
-
-The API client's bearer transport reattaches Authorization on each hop, so its
-cross-host guard must remain. Absolute API paths cannot downgrade an HTTPS base
-either. OAuth request protection lives separately in auth-go; using that library
-for token exchange does not protect these CLI-owned HTTP clients. In particular,
-auth-go's 421 routing and exchange URL checks do not cover ordinary HTTP 3xx
-redirects followed by the outer control-plane client.
-
-Remote-helper replica URLs are validated at cache/header/Location ingress and
-again before requests: HTTPS plus the existing cluster trust boundary. HTTP is
-allowed only for loopback replicas of an explicitly HTTP loopback entry, and
-never after that proxy reaches HTTPS, even during manual failover. `SkipTLS`
-does not authorize plaintext transport.
-
-Flow-level downgrade tests use recording transports with identical hosts and
-ports (only the scheme changes), asserting the rejected destination receives no
-request. Keep these tests at the client wiring boundaries when refactoring.
+Keep flow-level regression tests at client wiring boundaries. Recording
+transports must keep host and port identical when testing a scheme change,
+and assert that a rejected destination receives no request.
 
 ### Control-Plane Core Resolution (which core am I talking to?)
 

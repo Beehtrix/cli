@@ -7,12 +7,12 @@ import (
 	"github.com/entireio/cli/internal/entireclient/httpclient/httpclienttest"
 )
 
-func TestRequireSameHost_RejectsInsecureAbsoluteEndpoint(t *testing.T) {
+func TestRequireSameOrigin_RejectsInsecureAbsoluteEndpoint(t *testing.T) {
 	t.Parallel()
-	if err := requireSameHost("https://api.example", "http://api.example/test"); err == nil {
+	if err := requireSameOrigin("https://api.example", "http://api.example/test"); err == nil {
 		t.Fatal("absolute endpoint downgraded HTTPS base")
 	}
-	if err := requireSameHost("http://127.0.0.1", "http://127.0.0.1/test"); err != nil {
+	if err := requireSameOrigin("http://127.0.0.1", "http://127.0.0.1/test"); err != nil {
 		t.Fatalf("explicit local HTTP base must still work: %v", err)
 	}
 }

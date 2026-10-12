@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/entireio/cli/internal/entireclient/discovery"
+	"github.com/entireio/cli/internal/entireclient/httpclient"
 	"github.com/entireio/cli/internal/remotehelper/debuglog"
 )
 
@@ -59,7 +60,7 @@ func (p *Proxy) infoRefs(ctx context.Context, label, suffix string, setHeaders f
 		if err == nil {
 			return p.handleInfoRefsResponse(resp)
 		}
-		if p.entryURL == "" {
+		if p.entryURL == "" || errors.Is(err, httpclient.ErrRedirectPolicy) {
 			return nil, fmt.Errorf("fetching %s: %w", label, err)
 		}
 		warmErr = err
@@ -120,7 +121,7 @@ func (p *Proxy) coldInfoRefs(ctx context.Context, suffix string, setHeaders func
 		return p.handleInfoRefsResponse(viaReplicas)
 	}
 
-	if location == "" {
+	if location == "" || errors.Is(err, httpclient.ErrRedirectPolicy) {
 		return nil, fmt.Errorf("fetching info/refs after entry-domain redirect: %w", err)
 	}
 	// The Location target is server-controlled. Salvaging the request means

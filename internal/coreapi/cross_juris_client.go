@@ -33,7 +33,7 @@ func newCrossJurisHTTPClient(coreURL string) (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &http.Client{Transport: rt, CheckRedirect: httpclient.CheckSecureRedirect}, nil
+	return httpclient.New(httpclient.Options{Transport: rt}), nil
 }
 
 // newCrossJurisRoundTripper stacks the coreapi transport chain over base:

@@ -342,13 +342,13 @@ func resolveEnvTokenCellSubject(raw string, insecureHTTP bool) (cellSubject, err
 func cellExchangeHTTPClient(origin string) *http.Client {
 	switch {
 	case cellExchangeTransportForTest != nil:
-		return &http.Client{Timeout: cellDataAPITimeout, Transport: versioninfo.WrapTransport(cellExchangeTransportForTest)}
+		return httpclient.New(httpclient.Options{Timeout: cellDataAPITimeout, Transport: versioninfo.WrapTransport(cellExchangeTransportForTest)})
 	case shouldUsePlainHTTPDiscovery(origin):
 		c := dataAPIDiscoveryClient(origin)
 		c.Timeout = cellDataAPITimeout
 		return c
 	default:
-		return &http.Client{Timeout: cellDataAPITimeout, Transport: versioninfo.WrapTransport(nil)}
+		return httpclient.New(httpclient.Options{Timeout: cellDataAPITimeout, Transport: versioninfo.WrapTransport(nil)})
 	}
 }
 

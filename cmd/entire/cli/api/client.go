@@ -47,7 +47,7 @@ func (c *Client) WithAuthSessionsPath(path string) *Client {
 // NewClientWithBaseURL creates a new authenticated API client targeting an
 // explicit base URL.
 //
-// This is the only constructor on purpose. Its predecessor, NewClient(token),
+// Both constructors require the base URL. Their predecessor, NewClient(token),
 // defaulted the host to BaseURL() — ENTIRE_API_BASE_URL or the production apex —
 // which is exactly the ambient default the data plane no longer has: the host
 // belongs to the acting login and comes from auth.ResolveDataAPI /
@@ -56,17 +56,27 @@ func (c *Client) WithAuthSessionsPath(path string) *Client {
 // entire.io, so the base URL is a required argument and every caller has to say
 // where it got it.
 func NewClientWithBaseURL(token, baseURL string) *Client {
+	return NewClientWithTransport(token, baseURL, nil)
+}
+
+// NewClientWithTransport creates an API client using an injected network
+// transport, retaining the standard bearer and redirect policies. A nil
+// transport uses http.DefaultTransport.
+func NewClientWithTransport(token, baseURL string, transport http.RoundTripper) *Client {
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
 	return &Client{
-		httpClient: &http.Client{
+		httpClient: httpclient.New(httpclient.Options{
 			Transport: &bearerTransport{
 				token: token,
-				base:  http.DefaultTransport,
+				base:  transport,
 			},
 			// A cross-host redirect must never carry the Entire bearer to
 			// another origin; refuse it rather than follow it. Same-origin
 			// requests are guaranteed by the base-host check in do().
 			CheckRedirect: rejectCrossHostRedirect,
-		},
+		}),
 		baseURL: baseURL,
 	}
 }
@@ -84,10 +94,11 @@ func rejectCrossHostRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// requireSameHost rejects off-host endpoints and downgrades from an HTTPS base.
+// requireSameOrigin rejects off-host endpoints and downgrades from an HTTPS base.
+// Explicit HTTP bases may upgrade to HTTPS on the same host.
 // It guards direct absolute paths as well as relative paths; redirects
 // are handled by rejectCrossHostRedirect.
-func requireSameHost(baseURL, endpoint string) error {
+func requireSameOrigin(baseURL, endpoint string) error {
 	b, err := url.Parse(baseURL)
 	if err != nil {
 		return fmt.Errorf("parse base URL: %w", err)
@@ -237,7 +248,7 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, he
 	// The bearer is only ever sent to the API's own host. A path that resolves
 	// to another host (absolute or scheme-relative URL) would otherwise redirect
 	// the Authorization header off-origin.
-	if err := requireSameHost(c.baseURL, endpoint); err != nil {
+	if err := requireSameOrigin(c.baseURL, endpoint); err != nil {
 		return nil, err
 	}
 
