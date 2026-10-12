@@ -233,6 +233,15 @@ var agentHelpGuidance = map[string]string{
 		"did, read \"tasks\" in --json, then stream one subagent's transcript with\n" +
 		"--transcript --task <tool_use_id>.",
 
+	// Agent sandboxes commonly block both, and the failure reads like an auth
+	// wall to an agent that does not know what the command needs.
+	"trail": "Trail commands talk to entire.io and read the saved login from the OS\n" +
+		"keyring (the Keychain on macOS), so they need network and keyring access.\n" +
+		"If you run commands in a sandbox, request unsandboxed execution for\n" +
+		"`entire trail` up front. An error saying the Keychain is not accessible or\n" +
+		"the network is not allowed means the sandbox blocked it, not that the user\n" +
+		"is logged out: ask to re-run it unsandboxed, and do not run `entire login`.",
+
 	"checkpoint delete": "Destructive and irreversible on the remote. Never run this unless the user\n" +
 		"explicitly asks to delete that checkpoint; do not pass --force on your own.",
 }
