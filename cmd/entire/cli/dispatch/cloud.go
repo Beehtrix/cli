@@ -118,6 +118,9 @@ func (e *RepoNotFoundError) FailedJurisdiction() string {
 
 const repoNotFoundPrefix = "repository not found"
 
+// noCheckpointsMessage is the cell's 404 for a window with no checkpoints.
+const noCheckpointsMessage = "no checkpoints in window"
+
 func (e *RepoNotFoundError) Error() string {
 	scope := "your home jurisdiction"
 	if j := strings.TrimSpace(e.Jurisdiction); j != "" {
@@ -169,6 +172,11 @@ func (c *CloudClient) CreateDispatch(ctx context.Context, reqBody CreateDispatch
 				Cause:        err,
 			}
 		}
+		// The cell has no error code for an empty window, only this message.
+		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound &&
+			strings.HasPrefix(strings.ToLower(httpErr.Message), noCheckpointsMessage) {
+			return nil, fmt.Errorf("no checkpoints for %s between %s and %s", strings.Join(reqBody.Repos, ", "), reqBody.Since, reqBody.Until)
+		}
 		return nil, err
 	}
 	return c.waitForDispatch(ctx, &run)
@@ -196,7 +204,11 @@ func (c *CloudClient) waitForDispatch(ctx context.Context, run *APIRun) (*APIRun
 			if ctx.Err() != nil {
 				return nil, stillGeneratingError(ctx, run.ID)
 			}
-			return nil, err
+			if pollIsTransient(err) {
+				logging.Debug(ctx, "dispatch poll failed; retrying", "dispatch_id", run.ID, "error", err)
+				continue
+			}
+			return nil, fmt.Errorf("dispatch %s: %w", run.ID, err)
 		}
 		run = &next
 	}
@@ -211,6 +223,18 @@ func (c *CloudClient) waitForDispatch(ctx context.Context, run *APIRun) (*APIRun
 	default:
 		return nil, fmt.Errorf("dispatch service returned unknown status %s", strconv.Quote(run.Status))
 	}
+}
+
+// pollIsTransient reports whether a failed status poll is worth repeating: the
+// run already exists and keeps generating on the cell, so a 5xx, a 429, or a
+// dropped connection must not abandon it.
+func pollIsTransient(err error) bool {
+	var httpErr *api.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode >= http.StatusInternalServerError || httpErr.StatusCode == http.StatusTooManyRequests
+	}
+	var urlErr *url.Error
+	return errors.As(err, &urlErr)
 }
 
 func stillGeneratingError(ctx context.Context, id string) error {

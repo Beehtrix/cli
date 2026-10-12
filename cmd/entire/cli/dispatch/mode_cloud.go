@@ -32,6 +32,9 @@ func defaultNewDispatchCellClient(ctx context.Context, insecureHTTP bool, jurisd
 	if err != nil {
 		return nil, "", err //nolint:wrapcheck // runServer wraps
 	}
+	if target != nil {
+		return client, "", nil // home only labels a not-found error with no selector
+	}
 	home, _ := factory.HomeJurisdiction() //nolint:errcheck // best-effort label for a repo-not-found error
 	return client, home, nil
 }

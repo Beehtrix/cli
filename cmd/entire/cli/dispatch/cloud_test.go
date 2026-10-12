@@ -197,6 +197,79 @@ func TestCloudClient_CreateDispatch_ContextEndsMidPoll(t *testing.T) {
 	}
 }
 
+// TestCloudClient_CreateDispatch_RetriesTransientPollFailures: the run keeps
+// generating on the cell, so a 5xx or 429 poll is retried, not fatal.
+func TestCloudClient_CreateDispatch_RetriesTransientPollFailures(t *testing.T) {
+	t.Parallel()
+
+	var reads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			run := testDispatchRun("")
+			run["status"] = dispatchStatusGenerating
+			writeDispatchRun(t, w, http.StatusAccepted, run)
+			return
+		}
+		switch reads.Add(1) {
+		case 1:
+			w.WriteHeader(http.StatusBadGateway)
+		case 2:
+			w.WriteHeader(http.StatusTooManyRequests)
+		default:
+			writeDispatchRun(t, w, http.StatusOK, testDispatchRun("done"))
+		}
+	}))
+	defer srv.Close()
+
+	run, err := newTestCloudClient(t, srv.URL, "t").CreateDispatch(context.Background(), CreateDispatchRequest{Repos: []string{testRepoSlug}}, "")
+	if err != nil {
+		t.Fatalf("CreateDispatch: %v", err)
+	}
+	if run.GeneratedMarkdown != "done" {
+		t.Fatalf("GeneratedMarkdown = %q, want done", run.GeneratedMarkdown)
+	}
+}
+
+// TestCloudClient_CreateDispatch_PollFailureNamesTheRun: a poll failure that
+// is not retried still tells the user which run it was.
+func TestCloudClient_CreateDispatch_PollFailureNamesTheRun(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			run := testDispatchRun("")
+			run["status"] = dispatchStatusGenerating
+			writeDispatchRun(t, w, http.StatusAccepted, run)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	_, err := newTestCloudClient(t, srv.URL, "t").CreateDispatch(context.Background(), CreateDispatchRequest{Repos: []string{testRepoSlug}}, "")
+	if err == nil || !strings.Contains(err.Error(), "dispatch "+testDispatchRunID+":") || !api.IsHTTPErrorStatus(err, http.StatusForbidden) {
+		t.Fatalf("expected a 403 naming the run, got %v", err)
+	}
+}
+
+func TestCloudClient_CreateDispatch_EmptyWindow(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"title":"Not Found","status":404,"detail":"no checkpoints in window"}`)) //nolint:errcheck // test fixture response
+	}))
+	defer srv.Close()
+
+	req := CreateDispatchRequest{Repos: []string{testRepoSlug}, Since: "2026-04-09T00:00:00Z", Until: "2026-04-16T00:00:00Z"}
+	_, err := newTestCloudClient(t, srv.URL, "t").CreateDispatch(context.Background(), req, "")
+	want := "no checkpoints for " + testRepoSlug + " between 2026-04-09T00:00:00Z and 2026-04-16T00:00:00Z"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
 // TestCloudClient_CreateDispatch_BudgetCoversTheCreateRequest: api.Client has
 // no timeout, so a cell that accepts the POST but never answers must still be
 // cut off by the operation budget.
@@ -406,7 +479,7 @@ func TestCloudClient_CreateDispatch_Other404StaysGeneric(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"error":"no checkpoints in window"}`)) //nolint:errcheck // test fixture response
+		_, _ = w.Write([]byte(`{"error":"no repos covered"}`)) //nolint:errcheck // test fixture response
 	}))
 	defer srv.Close()
 
@@ -420,7 +493,7 @@ func TestCloudClient_CreateDispatch_Other404StaysGeneric(t *testing.T) {
 	}
 	var notFound *RepoNotFoundError
 	if errors.As(err, &notFound) {
-		t.Fatalf("an empty-window 404 is not a repo-not-found error: %v", err)
+		t.Fatalf("an unrecognized 404 is not a repo-not-found error: %v", err)
 	}
 }
 

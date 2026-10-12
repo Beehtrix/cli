@@ -22,6 +22,9 @@ accept a core's JWTs.
 | **Resource: git cluster** | `entire-server` / `entiredb` | `git-remote-entire` (clone/push) | `/.well-known/entire-cluster.json` → `core_urls` |
 | **Resource: web/data API** | `entire.io` (`partial.to`) | `activity` / `search` / `trail` | none by default — the acting login's site is the host (`auth.ResolveDataAPI`); under `ENTIRE_API_BASE_URL`, `/.well-known/entire-api.json` → `trusted_issuers` (bearer = the context's login JWT) |
 
+`entire dispatch` does not use the web/data API: it talks to an entire-api
+cell, see "Cloud dispatch" in [API routing](../development/api-routing.md).
+
 `contexts.json` (`$ENTIRE_CONFIG_DIR/contexts.json`, shared with entiredb's
 CLIs) stores each login as `{Name, CoreURL, Handle, KeychainService}` plus a
 `CurrentContext` pointer. `CoreURL` is the JWT `iss` — the core that minted the
