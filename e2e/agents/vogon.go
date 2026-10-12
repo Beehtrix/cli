@@ -56,7 +56,7 @@ func (v *Vogon) RunPrompt(ctx context.Context, dir string, prompt string, opts .
 
 	args := []string{"-p", prompt}
 	displayArgs := []string{"-p", fmt.Sprintf("%q", prompt)}
-	env := filterEnv(os.Environ(), "ENTIRE_TEST_TTY")
+	env := agentEnv(os.Environ())
 	homeDir, err := vogonHomeDir(dir)
 	if err != nil {
 		return Output{}, err
@@ -71,7 +71,7 @@ func (v *Vogon) StartSession(_ context.Context, dir string) (Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s, err := NewTmuxSession(name, dir, []string{"ENTIRE_TEST_TTY"}, "env", "HOME="+homeDir, v.Binary())
+	s, err := NewTmuxSession(name, dir, nil, "env", "HOME="+homeDir, v.Binary())
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +102,7 @@ func (v *Vogon) WriteSessionTranscript(ctx context.Context, dir string, extraEnv
 		"--user-prompt", fmt.Sprintf("%q", userPrompt),
 		"--assistant-message", fmt.Sprintf("%q", assistantMessage),
 	}
-	env := filterEnv(os.Environ(), "ENTIRE_TEST_TTY")
+	env := agentEnv(os.Environ())
 	env = append(env, extraEnv...)
 	if !hasEnvVar(extraEnv, "HOME") {
 		homeDir, err := vogonHomeDir(dir)

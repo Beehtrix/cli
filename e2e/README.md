@@ -39,6 +39,17 @@ e2e/
 - Use the `entire` package for CLI interactions, not raw `exec.Command`.
 - Skip tests pending CLI fixes with `t.Skip("ENT-XXX: reason")`.
 
+### Agents see only real agent signals
+
+Whether a git hook may prompt is decided from the agent's process alone, as on a user's machine, so the harness hands agents no shortcut:
+
+- Agent processes and tmux sessions start without `ENTIRE_TEST_TTY`, `CI`, `GITHUB_ACTIONS` or `GIT_TERMINAL_PROMPT` (`agents.harnessOnlyEnv`). Build a runner's env with `agentEnv`, never from bare `os.Environ()`; `NewTmuxSession` unsets them itself.
+- Headless agents on Unix start in a new session (`setupProcessGroup`), so a run from a developer's terminal has no controlling terminal, as in CI.
+- Test repos keep the default `commit_linking` ("prompt"). Every E2E commit comes from an agent or the harness, so a test fails if any hook logged `strategy.CommitLinkingPromptLogMsg` (`failIfCommitLinkingPrompted`). The prompt gives up after a timeout, so without this a misjudged agent shell only shows as a slower commit.
+- Vogon behaves like a real agent: in interactive mode it turns off canonical input on its terminal as a TUI does, it sets no "don't prompt" variable for its git commands, and on Windows it runs `git` in a console with no window, the console desktop agents give their shell.
+
+These rules exist because every one of those shortcuts hid a hang users hit: Windows `git commit` from Claude Code and Codex desktop blocked on an invisible prompt (#2725, #2726) while E2E stayed green.
+
 ### OpenCode dependency cache
 
 OpenCode setup shares a version-keyed plugin dependency tree under the system
