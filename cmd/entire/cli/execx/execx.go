@@ -31,16 +31,17 @@ func NonInteractive(ctx context.Context, name string, args ...string) *exec.Cmd 
 // forever and the context deadline is silently defeated.
 const KillWaitDelay = 10 * time.Second
 
-// TerminateOnCancel makes cmd and its descendants die when ctx is cancelled.
+// TerminateOnCancel makes cmd and its process group die on Unix when ctx is cancelled.
 // exec.Cmd's default Cancel only kills the direct child, leaving a grandchild
 // (e.g. a sandbox helper or transport helper) alive and holding the output pipe
 // open, which blocks Wait/Run indefinitely past the deadline. A new process
-// group lets Cancel SIGKILL the whole tree; WaitDelay is the backstop that
-// force-closes the pipes if a descendant escapes the group.
+// group lets Cancel SIGKILL the whole group on Unix. Windows retains the default
+// direct-child cancellation. WaitDelay force-closes the pipes if a descendant
+// survives termination.
 //
-// cmd must be created with exec.CommandContext so Cancel runs on ctx-done. Do
-// not combine with NonInteractive on the same cmd: NonInteractive sets Setsid,
-// which conflicts with the Setpgid this sets.
+// cmd must be created with exec.CommandContext so Cancel runs on ctx-done.
+// It may also be created with NonInteractive: the child's new session already
+// supplies the process group used for cancellation.
 func TerminateOnCancel(cmd *exec.Cmd) {
 	cmd.WaitDelay = KillWaitDelay
 	killProcessGroupOnCancel(cmd)
