@@ -1,6 +1,9 @@
 package redact
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // Provider-specific deterministic secret patterns.
 //
@@ -70,6 +73,29 @@ var providerTokenPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`sbp_[a-z0-9_-]{20,}`),
 }
 
+// Bare sk- keys (issue #2728): OpenAI-compatible gateways mint keys that are
+// "sk-" plus a short base64url body — LiteLLM proxy virtual keys are sk- + 22
+// chars. The entropy layer cannot catch these: a match of n chars has entropy
+// at most log2(n), so a 25-char key must have at most one repeated character
+// to clear the 4.5 threshold, and ~96% of random keys of this shape do not.
+// betterleaks only ships rules for specific sub-prefixes (sk-ant-, sk-or-v1-,
+// sk-lf-, sk-api-), not the bare prefix with a short body. A NAME=value
+// assignment happened to be caught only because secretPattern's class
+// includes '_' and '=', so the name lengthened the match and its entropy.
+//
+// Unlike the Supabase prefixes, "sk-" is common inside ordinary words
+// ("risk-", "task-", "disk-"), so this rule anchors the prefix: it must start
+// the input or follow a non-word character. To keep the raw-text fall-back
+// case the Supabase comment above describes, a literal JSON escape (\n, \t,
+// ", ...) also counts as a boundary even though its last byte is a word
+// character.
+//
+// The body must contain a digit or an uppercase letter. Real keys are random
+// base64url, so an all-lowercase, digit-free 20+ char body is vanishingly
+// unlikely to be a key, while kebab-case names such as
+// "sk-learn-model-selection-guide" are exactly that shape.
+var bareSKKeyPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_]|\\[bfnrt]|\\u[0-9A-Fa-f]{4})(sk-[A-Za-z0-9_-]{20,})`)
+
 // detectProviderTokens returns tagged regions for every occurrence of a
 // known provider secret-token prefix in s. Regions use the empty label so
 // they render as the bare "REDACTED" token, consistent with the other
@@ -81,5 +107,15 @@ func detectProviderTokens(s string) []taggedRegion {
 			regions = append(regions, taggedRegion{region: region{loc[0], loc[1]}})
 		}
 	}
+	for _, loc := range bareSKKeyPattern.FindAllStringSubmatchIndex(s, -1) {
+		start, end := loc[2], loc[3]
+		if strings.ContainsFunc(s[start+len("sk-"):end], isDigitOrUpper) {
+			regions = append(regions, taggedRegion{region: region{start, end}})
+		}
+	}
 	return regions
+}
+
+func isDigitOrUpper(r rune) bool {
+	return ('0' <= r && r <= '9') || ('A' <= r && r <= 'Z')
 }
