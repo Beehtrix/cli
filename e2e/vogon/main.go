@@ -619,8 +619,8 @@ func gitRun(dir string, args ...string) {
 	cmd.Stderr = os.Stderr
 	// No GIT_TERMINAL_PROMPT=0 or other "can't prompt" hint: Claude Code and
 	// Codex send none, so the hook has to tell from the terminal alone, as it
-	// does for their users.
-	startLikeDesktopAgentShell(cmd)
+	// does for their users. The terminal is whatever the harness started Vogon
+	// in (see setupProcessGroup in e2e/agents).
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "git %s: %v\n", strings.Join(args, " "), err)
 	}

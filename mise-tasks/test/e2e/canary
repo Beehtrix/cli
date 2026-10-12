@@ -11,6 +11,9 @@ esac
 
 # Build entire CLI
 mise run build
+# go build -o adds no .exe even on Windows; the harness copies this to
+# entire.exe beside it (ensureHookEntireBinary), which is what hooks and
+# exec's extension lookup then find.
 export E2E_ENTIRE_BIN="$PWD/entire"
 
 # Build vogon binary. Go's PATH lookup on Windows only finds it with .exe.
