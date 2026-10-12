@@ -94,11 +94,12 @@ func UnderTest() bool {
 //     interactive prompt from the largest agent population at once. That is a
 //     product call, not a detection fix.
 var agentSubprocessEnvVars = []string{
-	"COPILOT_CLI",     // Copilot CLI hook subprocesses (v0.0.421+)
-	"CURSOR_AGENT",    // cursor-agent shell tool; set alongside CURSOR_CONVERSATION_ID
-	"GEMINI_CLI",      // Gemini CLI shell tool (https://geminicli.com/docs/tools/shell/)
-	"OPENCODE",        // set on opencode's own process, so every child inherits it
-	"PI_CODING_AGENT", // Pi Coding Agent shell tool
+	"ANTIGRAVITY_AGENT", // agy shell tool (seen in 1.2.13): runs commands in a line-mode pty the tty probe accepts
+	"COPILOT_CLI",       // Copilot CLI hook subprocesses (v0.0.421+)
+	"CURSOR_AGENT",      // cursor-agent shell tool; set alongside CURSOR_CONVERSATION_ID
+	"GEMINI_CLI",        // Gemini CLI shell tool (https://geminicli.com/docs/tools/shell/)
+	"OPENCODE",          // set on opencode's own process, so every child inherits it
+	"PI_CODING_AGENT",   // Pi Coding Agent shell tool
 }
 
 // isAgentSubprocessEnv reports whether the env indicates we're running inside

@@ -201,7 +201,7 @@ Tests that spawn the real `entire` or `git` binary need the child to be non-inte
 1. `ENTIRE_TEST_TTY=1` → force interactive ON (any other non-empty value → force OFF).
 2. `testing.Testing()` → false. In-process `go test` runs are non-interactive by default; no per-test `t.Setenv("ENTIRE_TEST_TTY", "0")` is needed.
 3. Agent sentinels → false. `interactive.agentSubprocessEnvVars` is the single
-   source of truth for the presence-checked ones (`COPILOT_CLI`, `CURSOR_AGENT`,
+   source of truth for the presence-checked ones (`ANTIGRAVITY_AGENT`, `COPILOT_CLI`, `CURSOR_AGENT`,
    `GEMINI_CLI`, `OPENCODE`, `PI_CODING_AGENT`) — the function reads it and the
    tests both enumerate and clear it, so adding a vendor is a one-line change.
    `GIT_TERMINAL_PROMPT=0` stays separate because only that exact value counts.
