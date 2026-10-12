@@ -15,7 +15,13 @@ export E2E_ENTIRE_BIN="$PWD/entire"
 
 # Build vogon binary. Go's PATH lookup on Windows only finds it with .exe.
 go build -o "vogon$exe" ./e2e/vogon
-E2E_PATH="$PWD:$PATH"
+# mise hands a Windows shell $PWD as D:/a/..., whose drive colon would split a
+# PATH entry; prepend the POSIX form, which the shell converts back for Go.
+bin_dir="$PWD"
+if [ -n "$exe" ]; then
+  bin_dir="$(cygpath -u "$PWD")"
+fi
+E2E_PATH="$bin_dir:$PATH"
 
 if [ -z "${E2E_ARTIFACT_DIR:-}" ]; then
   E2E_ARTIFACT_DIR="$PWD/e2e/artifacts/canary-$(date +%Y-%m-%dT%H-%M-%S)"
