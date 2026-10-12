@@ -73,27 +73,10 @@ var providerTokenPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`sbp_[a-z0-9_-]{20,}`),
 }
 
-// Bare sk- keys (issue #2728): OpenAI-compatible gateways mint keys that are
-// "sk-" plus a short base64url body — LiteLLM proxy virtual keys are sk- + 22
-// chars. The entropy layer cannot catch these: a match of n chars has entropy
-// at most log2(n), so a 25-char key must have at most one repeated character
-// to clear the 4.5 threshold, and ~96% of random keys of this shape do not.
-// betterleaks only ships rules for specific sub-prefixes (sk-ant-, sk-or-v1-,
-// sk-lf-, sk-api-), not the bare prefix with a short body. A NAME=value
-// assignment happened to be caught only because secretPattern's class
-// includes '_' and '=', so the name lengthened the match and its entropy.
-//
-// Unlike the Supabase prefixes, "sk-" is common inside ordinary words
-// ("risk-", "task-", "disk-"), so this rule anchors the prefix: it must start
-// the input or follow a non-word character. To keep the raw-text fall-back
-// case the Supabase comment above describes, a literal JSON escape (\n, \t,
-// ", ...) also counts as a boundary even though its last byte is a word
-// character.
-//
-// The body must contain a digit or an uppercase letter. Real keys are random
-// base64url, so an all-lowercase, digit-free 20+ char body is vanishingly
-// unlikely to be a key, while kebab-case names such as
-// "sk-learn-model-selection-guide" are exactly that shape.
+// bareSKKeyPattern catches short sk- keys (e.g. LiteLLM virtual keys, sk- + 22
+// chars) that are too short for the entropy layer (#2728). The prefix must
+// start a word or follow a literal JSON escape, so "risk-" doesn't match;
+// detectProviderTokens also requires a digit or uppercase letter in the body.
 var bareSKKeyPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_]|\\[bfnrt]|\\u[0-9A-Fa-f]{4})(sk-[A-Za-z0-9_-]{20,})`)
 
 // detectProviderTokens returns tagged regions for every occurrence of a
