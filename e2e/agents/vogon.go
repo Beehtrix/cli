@@ -61,7 +61,7 @@ func (v *Vogon) RunPrompt(ctx context.Context, dir string, prompt string, opts .
 	if err != nil {
 		return Output{}, err
 	}
-	env = append(env, "HOME="+homeDir)
+	env = append(env, HomeEnv(homeDir)...)
 	return v.run(ctx, dir, args, displayArgs, env)
 }
 
@@ -109,7 +109,7 @@ func (v *Vogon) WriteSessionTranscript(ctx context.Context, dir string, extraEnv
 		if err != nil {
 			return Output{}, err
 		}
-		env = append(env, "HOME="+homeDir)
+		env = append(env, HomeEnv(homeDir)...)
 	}
 	return v.run(ctx, dir, args, displayArgs, env)
 }
@@ -152,6 +152,13 @@ func vogonHomeDir(dir string) (string, error) {
 		return "", fmt.Errorf("create vogon home %s: %w", homeDir, err)
 	}
 	return homeDir, nil
+}
+
+// HomeEnv points both of the variables os.UserHomeDir reads at dir: HOME on
+// Unix, USERPROFILE on Windows. Setting HOME alone leaves a Windows Vogon (and
+// Entire's vogon agent) writing to the real profile.
+func HomeEnv(dir string) []string {
+	return []string{"HOME=" + dir, "USERPROFILE=" + dir}
 }
 
 func hasEnvVar(env []string, key string) bool {

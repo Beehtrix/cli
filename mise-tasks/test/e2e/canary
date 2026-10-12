@@ -4,12 +4,17 @@
 
 set -eu
 
+exe=""
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) exe=".exe" ;;
+esac
+
 # Build entire CLI
 mise run build
 export E2E_ENTIRE_BIN="$PWD/entire"
 
-# Build vogon binary
-go build -o vogon ./e2e/vogon
+# Build vogon binary. Go's PATH lookup on Windows only finds it with .exe.
+go build -o "vogon$exe" ./e2e/vogon
 E2E_PATH="$PWD:$PATH"
 
 if [ -z "${E2E_ARTIFACT_DIR:-}" ]; then
@@ -45,6 +50,14 @@ go run ./e2e/cmd/testreport -color \
   "$E2E_ARTIFACT_DIR/test-events-vogon.json"
 
 # --- roger-roger: external agent tests only (binaries from mise) ---
+# Unix only for now: its external-agent protocol tests have never run on
+# Windows, and the Windows canary exists to cover the hook paths Vogon drives.
+if [ -n "$exe" ]; then
+  echo "--- canary: roger-roger skipped on Windows ---"
+  cat "$E2E_ARTIFACT_DIR/entire-version.txt" 2>/dev/null
+  echo "artifacts: $E2E_ARTIFACT_DIR"
+  exit "$vogon_rc"
+fi
 echo "--- canary: roger-roger ---"
 
 # Preflight: ensure required roger-roger binaries are on PATH so tests don't silently skip
