@@ -98,6 +98,9 @@ func newTransport(skipTLSVerify bool, dialTimeout time.Duration) http.RoundTripp
 		// A composite literal must set Proxy explicitly so HTTP_PROXY, HTTPS_PROXY, and NO_PROXY are honored.
 		Proxy:       http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		// Matches http.DefaultTransport; zero would keep idle pooled
+		// connections open for the life of the process.
+		IdleConnTimeout: 90 * time.Second,
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: skipTLSVerify, //nolint:gosec // intentional for local development

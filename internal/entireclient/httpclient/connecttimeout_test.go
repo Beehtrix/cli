@@ -173,3 +173,14 @@ func TestConnectTimeoutComposesWithCallerTrace(t *testing.T) {
 		t.Fatalf("caller GotConn reused = %v, want [false true]", reused)
 	}
 }
+
+func TestNewTransportClosesIdleConnections(t *testing.T) {
+	t.Parallel()
+	rt, ok := newTransport(false, time.Second).(*connectTimeoutTransport)
+	if !ok {
+		t.Fatalf("newTransport returned %T", rt)
+	}
+	if got := rt.next.IdleConnTimeout; got != 90*time.Second {
+		t.Fatalf("IdleConnTimeout = %s, want 90s", got)
+	}
+}
