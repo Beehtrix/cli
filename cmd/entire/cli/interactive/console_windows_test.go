@@ -15,12 +15,12 @@ import (
 
 const consoleProbeHelperEnv = "ENTIRE_TEST_CONSOLE_PROBE_HELPER"
 
-// TestConsoleProbeHelper is the child half of TestConsoleHasNoWindow: run
+// TestConsoleProbeHelper is the child half of TestConsoleHasNoWindow_Windows: run
 // in a process with a chosen console, it prints what the probe sees.
 func TestConsoleProbeHelper(t *testing.T) {
 	t.Parallel()
 	if os.Getenv(consoleProbeHelperEnv) != "1" {
-		t.Skip("runs only as TestConsoleHasNoWindow's child")
+		t.Skip("runs only as TestConsoleHasNoWindow_Windows's child")
 	}
 	os.Stdout.WriteString("probe=" + strconv.FormatBool(consoleHasNoWindow()) + "\n")
 }
@@ -28,7 +28,7 @@ func TestConsoleProbeHelper(t *testing.T) {
 // A shell a desktop app starts with CREATE_NO_WINDOW has a console but no
 // window, which the probe must report; a console with a window, even a hidden
 // one, it must not.
-func TestConsoleHasNoWindow(t *testing.T) {
+func TestConsoleHasNoWindow_Windows(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name  string
