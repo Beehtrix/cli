@@ -426,6 +426,8 @@ func (a *openCodeAgent) RunPrompt(ctx context.Context, dir string, prompt string
 	cmd := exec.CommandContext(ctx, a.Binary(), args...)
 	cmd.Dir = dir
 	cmd.Env = openCodePromptEnv(os.Environ(), dir)
+	setupProcessGroup(cmd)
+	cmd.WaitDelay = 5 * time.Second
 
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout

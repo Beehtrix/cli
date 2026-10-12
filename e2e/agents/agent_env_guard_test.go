@@ -41,3 +41,30 @@ func TestAgentEnvIsTheOnlyEnvFilter(t *testing.T) {
 		t.Fatalf("matched %d of agentEnv's own %d lines; the guard pattern has gone stale:\n%s", seen, len(allowed), out)
 	}
 }
+
+// TestHeadlessRunnersDetachFromTheRunnersTerminal fails when a runner that
+// starts its agent as a headless process skips setupProcessGroup. Without it
+// the agent keeps the test runner's terminal (Unix) or console (Windows), and
+// its hooks face a terminal they could prompt on rather than the one an IDE or
+// desktop app gives agents. OpenCode's RunPrompt shipped that way once.
+func TestHeadlessRunnersDetachFromTheRunnersTerminal(t *testing.T) {
+	t.Parallel()
+	repoRoot, ok := testutil.GitGrepGuardRepoRoot(t)
+	if !ok {
+		return
+	}
+	// RunPrompt drives a tmux session here, not a headless process.
+	tmuxDriven := []string{"e2e/agents/cursor_cli.go"}
+
+	runners := testutil.GitGrepGuard(t, repoRoot, "-l", "-E", `func \([a-z]+ \*?[A-Za-z]+\) RunPrompt\(`,
+		"--", "e2e/agents/*.go", ":(exclude)e2e/agents/*_test.go")
+	detaching := testutil.GitGrepGuard(t, repoRoot, "-l", "--fixed-strings", "setupProcessGroup(cmd)",
+		"--", "e2e/agents/*.go", ":(exclude)e2e/agents/*_test.go")
+	detached := strings.Fields(detaching)
+	for _, file := range strings.Fields(runners) {
+		if slices.Contains(tmuxDriven, file) || slices.Contains(detached, file) {
+			continue
+		}
+		t.Errorf("%s defines RunPrompt but never calls setupProcessGroup(cmd); headless agents must start detached from the runner's terminal", file)
+	}
+}
