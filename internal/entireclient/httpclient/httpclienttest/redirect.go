@@ -20,10 +20,24 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 // host guard hide a missing TLS guard. No real credentials or network are used.
 func CheckRejectsDowngrade(t *testing.T, run func(*testing.T, string, http.RoundTripper) error) {
 	t.Helper()
+	checkRejectsDowngrade(t, true, run)
+}
+
+// CheckRejectsDowngradeSerial runs the same matrix for callers that replace
+// process-global state. Neither the caller nor its ancestors may be parallel.
+func CheckRejectsDowngradeSerial(t *testing.T, run func(*testing.T, string, http.RoundTripper) error) {
+	t.Helper()
+	checkRejectsDowngrade(t, false, run)
+}
+
+func checkRejectsDowngrade(t *testing.T, parallel bool, run func(*testing.T, string, http.RoundTripper) error) {
+	t.Helper()
 	for _, status := range []int{301, 302, 303, 307, 308} {
 		for _, start := range []string{"https://service.example", "https://127.0.0.1", "http://127.0.0.1"} {
 			t.Run(fmt.Sprintf("%d/%s", status, start), func(t *testing.T) {
-				t.Parallel()
+				if parallel {
+					t.Parallel()
+				}
 				calls, leaks := 0, 0
 				secure := false
 				rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {

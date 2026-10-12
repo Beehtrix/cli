@@ -189,7 +189,8 @@ func (s *ManualCommitStrategy) prePush(ctx context.Context, remote string, prote
 	// has to deliver, and at least one has to actually do so. Delivery must come
 	// from pushRefIfNeeded's delivered return and NOT from err, which is
 	// fail-soft and nil even when the remote refused the ref.
-	deliveredCount, anyFailed := 0, false
+	var deliveredRefs []plumbing.ReferenceName
+	anyFailed := false
 	refs := checkpoint.ResolveRefs(ctx)
 	for _, ref := range refs.Push {
 		delivered, err := pushRefIfNeeded(pushCtx, ps.pushTarget(), ref)
@@ -199,12 +200,13 @@ func (s *ManualCommitStrategy) prePush(ctx context.Context, remote string, prote
 			return err
 		}
 		if delivered {
-			deliveredCount++
+			deliveredRefs = append(deliveredRefs, ref)
 		} else {
 			anyFailed = true
 		}
 	}
 	pushCheckpointsSpan.End()
+	deliveredCount := len(deliveredRefs)
 
 	// Delivered: the election may now follow the push that carried it. A push that
 	// carried nothing — an empty ref set, or a v1 ref that does not exist locally
@@ -215,14 +217,19 @@ func (s *ManualCommitStrategy) prePush(ctx context.Context, remote string, prote
 	if pendingCapture != "" && deliveredCount > 0 && !anyFailed {
 		commitCapturedSyncRemote(ctx, pendingCapture)
 	}
+	// After capture, so the election this compares against is final. A dedicated
+	// checkpoint_remote URL is not a remote name and has no tracking refs.
+	if !ps.hasCheckpointURL() {
+		for _, ref := range deliveredRefs {
+			advanceSyncRemoteTrackingRef(ctx, ps.remote, ref)
+		}
+	}
 	// Only a push that carried checkpoints can say "they are going somewhere
 	// other than where you said"; the gate and every early return above carry
 	// none, and hintGatedCheckpointSync speaks for the gated case.
 	if deliveredCount > 0 {
 		warnIgnoredCheckpointRemote(ctx, ps)
 	}
-
-	cleanupPushedShadowBranches(ctx)
 	return nil
 }
 
@@ -440,8 +447,6 @@ func (s *ManualCommitStrategy) prePushCheckpointRefs(ctx context.Context, ps pus
 		logging.Warn(ctx, "git-refs pre-push: checkpoint ref push failed; refs left queued",
 			slog.String("error", err.Error()))
 	}
-
-	cleanupPushedShadowBranches(ctx)
 	return nil
 }
 
@@ -467,11 +472,6 @@ func PushQueuedCheckpointRefs(ctx context.Context, repo *git.Repository, remote 
 		return 0, false, fmt.Errorf("checkpoint refs stay queued: %w", opfErr)
 	}
 	pushed, err = flushCheckpointRefsQueue(ctx, repo, ps)
-	// Clean up even on a partial/failed flush: a diverged batch can push some
-	// refs and still return an error, and the shadow branches for the refs that
-	// *did* land must still be cleaned up — parity with the pre-push path, which
-	// always runs cleanup after flush regardless of its error.
-	cleanupPushedShadowBranches(ctx)
 	return pushed, false, err
 }
 
@@ -669,19 +669,4 @@ func flushCheckpointRefsQueue(ctx context.Context, repo *git.Repository, ps push
 			attempted-len(pushed), attempted, firstErr)
 	}
 	return len(pushed), nil
-}
-
-// cleanupPushedShadowBranches runs post-push shadow-branch cleanup. Failures are
-// non-fatal — shadow branches just accumulate until `entire clean` or the next
-// successful push.
-func cleanupPushedShadowBranches(ctx context.Context) {
-	if deleted, cleanupErr := CleanupPushedShadowBranches(ctx); cleanupErr != nil {
-		logging.Warn(ctx, "post-push shadow branch cleanup failed",
-			slog.String("error", cleanupErr.Error()),
-		)
-	} else if deleted > 0 {
-		logging.Info(ctx, "cleaned up vestigial shadow branches",
-			slog.Int("count", deleted),
-		)
-	}
 }
