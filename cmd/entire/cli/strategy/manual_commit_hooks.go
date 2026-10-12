@@ -54,6 +54,11 @@ const (
 	ttyResultLinkAlways                  // Link and remember: add trailer + save "always" preference
 )
 
+// CommitLinkingPromptLogMsg is logged when prepare-commit-msg shows the
+// commit-linking prompt. E2E fails any test whose logs contain it: every E2E
+// commit comes from an agent or the harness, and neither can answer.
+const CommitLinkingPromptLogMsg = "prepare-commit-msg: prompting to link commit"
+
 // confirmPromptTimeout bounds how long askConfirmTTY waits for an answer. The
 // prompt runs inside git's prepare-commit-msg hook, so an unanswered prompt
 // hangs the commit itself; a terminal can pass the probe yet be one nobody can
@@ -570,6 +575,10 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 				details = append(details, "Last prompt: "+displayPrompt)
 			}
 
+			logging.Info(logCtx, CommitLinkingPromptLogMsg,
+				slog.String("strategy", "manual-commit"),
+				slog.String("source", source),
+			)
 			result := askConfirmTTY(header, details, "Link this commit to session context?", true)
 			if result == ttyResultSkip {
 				logging.Debug(logCtx, "prepare-commit-msg: user declined trailer",
