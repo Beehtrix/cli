@@ -54,11 +54,16 @@ func WithSecureRedirects(client *http.Client) *http.Client {
 			return err
 		}
 		if policy != nil {
+			proposedScheme := req.URL.Scheme
 			if err := policy(req, via); err != nil {
 				// net/http compares ErrUseLastResponse by identity; do not wrap.
 				return err
 			}
-			// Validate callback rewrites, not just the server's original Location.
+			// The first HTTPS upgrade is not yet in via. Do not let a
+			// callback undo it, even when every previous hop was HTTP.
+			if proposedScheme == SchemeHTTPS && req.URL.Scheme != SchemeHTTPS {
+				return ErrInsecureRedirect
+			}
 			return CheckSecureRedirect(req, via)
 		}
 		return nil

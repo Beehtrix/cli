@@ -100,10 +100,14 @@ func TestWithSecureRedirects_RechecksCallbackURL(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		callbackErr error
+		startHTTP   bool
 	}{
-		{"callback allows modified URL", nil},
-		{"callback stops redirect", http.ErrUseLastResponse},
-		{"callback rejects redirect", denied},
+		{"callback allows modified URL", nil, false},
+		{"callback stops redirect", http.ErrUseLastResponse, false},
+		{"callback rejects redirect", denied, false},
+		{"callback undoes first HTTPS upgrade", nil, true},
+		{"callback stops first HTTPS upgrade", http.ErrUseLastResponse, true},
+		{"callback rejects first HTTPS upgrade", denied, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -124,6 +128,9 @@ func TestWithSecureRedirects_RechecksCallbackURL(t *testing.T) {
 				},
 			})
 			req := redirectRequest(t, "https://service.example/start")
+			if tc.startHTTP {
+				req.URL.Scheme = SchemeHTTP
+			}
 			req.Header.Set("Authorization", "Bearer test-token")
 			resp, err := c.Do(req)
 			if resp != nil {
@@ -131,7 +138,7 @@ func TestWithSecureRedirects_RechecksCallbackURL(t *testing.T) {
 			}
 			switch {
 			case tc.callbackErr == nil:
-				require.ErrorContains(t, err, "insecure scheme")
+				require.ErrorIs(t, err, ErrInsecureRedirect)
 			case errors.Is(tc.callbackErr, http.ErrUseLastResponse):
 				require.NoError(t, err, "ErrUseLastResponse must retain its identity")
 				require.Equal(t, http.StatusTemporaryRedirect, resp.StatusCode)

@@ -18,8 +18,9 @@ Repository paths in code spans are relative to the repository root unless stated
   control-plane client's ordinary HTTP redirects.
 - **Wrap injected clients with `WithSecureRedirects`.** It copies the supplied
   client (nil means `http.DefaultClient`) and validates before and after a
-  successful custom callback. Callback errors, including `http.ErrUseLastResponse`,
-  remain unchanged. Inject a transport via `api.NewClientWithTransport` in tests,
+  successful custom callback. A callback cannot undo a proposed HTTPS upgrade,
+  even before the first HTTPS hop is sent. Callback errors, including
+  `http.ErrUseLastResponse`, remain unchanged. Inject a transport via `api.NewClientWithTransport` in tests,
   not by replacing `http.DefaultTransport`.
 - **Do not classify policy rejections as node failures.** Shared redirect errors
   match `httpclient.ErrRedirectPolicy` with `errors.Is`; downgrades additionally
