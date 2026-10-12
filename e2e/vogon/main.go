@@ -60,8 +60,8 @@ func main() {
 		runTurn(dir, cfg.sessionID, transcriptPath, cfg.prompt)
 	} else {
 		// Interactive mode: read prompts from stdin
-		restore := holdTerminalLikeTUI()
-		defer restore()
+		restoreTerminal = holdTerminalLikeTUI()
+		defer restoreTerminal()
 		fmt.Fprint(os.Stdout, "> ")
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
@@ -719,7 +719,13 @@ func appendTranscriptEntry(path string, entry transcriptEntry) {
 	}
 }
 
+// restoreTerminal undoes holdTerminalLikeTUI. fatal calls it too, since
+// os.Exit skips the deferred restore and would leave the terminal out of
+// canonical mode.
+var restoreTerminal = func() {}
+
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "vogon: "+format+"\n", args...)
+	restoreTerminal()
 	os.Exit(1)
 }
