@@ -1,0 +1,175 @@
+package httpclient
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httptrace"
+	"net/url"
+	"testing"
+	"time"
+)
+
+// stalledListener accepts TCP connections and never answers, standing in for a
+// proxy whose upstream is blackholed (CONNECT never replied to) or a node that
+// accepts TCP and then stalls the TLS handshake.
+func stalledListener(t *testing.T) string {
+	t.Helper()
+	var lc net.ListenConfig
+	l, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		_ = l.Close()
+	})
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				<-done
+				_ = c.Close()
+			}()
+		}
+	}()
+	return l.Addr().String()
+}
+
+func getWithin(t *testing.T, rt http.RoundTripper, rawURL string, limit time.Duration) (*http.Response, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), limit)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	return (&http.Client{Transport: rt}).Do(req)
+}
+
+func TestConnectTimeoutBoundsStalledProxyConnect(t *testing.T) {
+	t.Parallel()
+	proxyURL := &url.URL{Scheme: "http", Host: stalledListener(t)}
+	rt := &connectTimeoutTransport{
+		next:    &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+		timeout: 200 * time.Millisecond,
+	}
+
+	// Without the budget net/http waits a minute for the CONNECT reply; the 5s
+	// limit turns that into a deadline error instead of ErrConnectTimeout.
+	resp, err := getWithin(t, rt, "https://region.auth.entire.io/", 5*time.Second)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("request through a stalled proxy succeeded")
+	}
+	if !errors.Is(err, ErrConnectTimeout) {
+		t.Fatalf("err = %v, want ErrConnectTimeout", err)
+	}
+}
+
+func TestNewTransportBoundsStalledTLSHandshake(t *testing.T) {
+	t.Setenv(EnvConnectTimeout, "1")
+	addr := stalledListener(t)
+
+	start := time.Now()
+	resp, err := getWithin(t, NewTransport(true), "https://"+addr+"/", 5*time.Second)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("request to a stalled TLS server succeeded")
+	}
+	if !errors.Is(err, ErrConnectTimeout) {
+		t.Fatalf("err = %v, want ErrConnectTimeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("gave up after %s, want about the 1s budget", elapsed)
+	}
+}
+
+func TestConnectTimeoutDoesNotLimitResponse(t *testing.T) {
+	t.Parallel()
+	const budget = 100 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(3 * budget) // slow headers
+		w.WriteHeader(http.StatusOK)
+		for i := range 3 {
+			fmt.Fprintf(w, "chunk%d;", i)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(budget) // slow body
+		}
+	}))
+	t.Cleanup(srv.Close)
+	rt := &connectTimeoutTransport{next: &http.Transport{}, timeout: budget}
+
+	resp, err := getWithin(t, rt, srv.URL, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("reading body: %v", err)
+	}
+	if got := string(body); got != "chunk0;chunk1;chunk2;" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestConnectTimeoutKeepsCallerCancellation(t *testing.T) {
+	t.Parallel()
+	addr := stalledListener(t)
+	rt := &connectTimeoutTransport{next: &http.Transport{}, timeout: time.Minute}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr+"/", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := (&http.Client{Transport: rt}).Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("request succeeded")
+	}
+	if errors.Is(err, ErrConnectTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the caller's context.DeadlineExceeded", err)
+	}
+}
+
+func TestConnectTimeoutComposesWithCallerTrace(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+	client := &http.Client{Transport: &connectTimeoutTransport{next: &http.Transport{}, timeout: time.Second}}
+
+	var reused []bool
+	ctx := httptrace.WithClientTrace(t.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) { reused = append(reused, info.Reused) },
+	})
+	for range 2 {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body) //nolint:errcheck // drain for reuse
+		_ = resp.Body.Close()
+	}
+	if len(reused) != 2 || reused[0] || !reused[1] {
+		t.Fatalf("caller GotConn reused = %v, want [false true]", reused)
+	}
+}
