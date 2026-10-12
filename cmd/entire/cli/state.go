@@ -105,6 +105,16 @@ type UntrackedFileStat struct {
 	ChangeTime int64  `json:"ctime_ns,omitempty"`
 }
 
+// Limits on the prompt-start stat pass, which runs inside UserPromptSubmit and
+// so delays every prompt. Above maxUntrackedFileStats files no stats are
+// recorded; past untrackedFileStatBudget the pass stops with what it has.
+// Either way turn end only loses detection of edits to the files left out, as
+// with state written before stats existed.
+const (
+	maxUntrackedFileStats   = 10_000
+	untrackedFileStatBudget = 500 * time.Millisecond
+)
+
 // statUntrackedFiles records an UntrackedFileStat for each of files that is a
 // regular file in the worktree. Fails open: a file it cannot stat is left out
 // and simply never reports a change.
@@ -112,19 +122,40 @@ func statUntrackedFiles(ctx context.Context, files []string) map[string]Untracke
 	if len(files) == 0 {
 		return nil
 	}
+	logCtx := logging.WithComponent(ctx, "state")
+	if len(files) > maxUntrackedFileStats {
+		logging.Debug(logCtx, "skipping untracked file stats: too many untracked files",
+			slog.Int("untracked_files", len(files)), slog.Int("limit", maxUntrackedFileStats))
+		return nil
+	}
 	repoRoot, err := paths.WorktreeRoot(ctx)
 	if err != nil {
-		logging.Debug(logging.WithComponent(ctx, "state"), "skipping untracked file stats: no worktree root",
+		logging.Debug(logCtx, "skipping untracked file stats: no worktree root",
 			slog.String("error", err.Error()))
 		return nil
 	}
-	stats := make(map[string]UntrackedFileStat, len(files))
+	stats, complete := statFilesWithin(repoRoot, files, untrackedFileStatBudget)
+	if !complete {
+		logging.Debug(logCtx, "untracked file stats stopped at time budget",
+			slog.Int("untracked_files", len(files)), slog.Int("recorded", len(stats)))
+	}
+	return stats
+}
+
+// statFilesWithin stats files until budget elapses. complete is false when it
+// stopped early; the stats gathered so far are still returned.
+func statFilesWithin(repoRoot string, files []string, budget time.Duration) (stats map[string]UntrackedFileStat, complete bool) {
+	deadline := time.Now().Add(budget)
+	stats = make(map[string]UntrackedFileStat, len(files))
 	for _, file := range files {
+		if time.Now().After(deadline) {
+			return stats, false
+		}
 		if stat, ok := statWorktreeFile(repoRoot, file); ok {
 			stats[file] = stat
 		}
 	}
-	return stats
+	return stats, true
 }
 
 // ChangedUntrackedFiles returns the files in UntrackedFileStats whose stat
