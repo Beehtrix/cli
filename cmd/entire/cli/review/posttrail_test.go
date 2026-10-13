@@ -237,6 +237,8 @@ func TestMaybePostReviewToTrailPostsNonCleanVerdicts(t *testing.T) {
 		"marked finding before approve":          {aggregate: "[medium] retry.go:42 — the lock leaks on error.\napprove - otherwise fine."},
 		"indented finding before approve":        {aggregate: "Checked the diff.\n  - [high] retry.go:42 — the lock leaks on error.\napprove"},
 		"indented marked finding before approve": {aggregate: "Checked the diff.\n\t[high] retry.go:42 — the lock leaks on error.\napprove"},
+		"plural nits label before approve":       {aggregate: "Nits: rename x\napprove"},
+		"bold suggestions label before approve":  {aggregate: "**Suggestions:** rename x\napprove"},
 		"reviewer finding before approve": {narratives: []string{
 			"Let me inspect the diff.\n1. retry.go:42 never releases the lock on error.\napprove",
 		}},

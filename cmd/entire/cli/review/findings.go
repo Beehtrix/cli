@@ -49,15 +49,29 @@ func TopLevelMarkedFindingText(line string) (string, bool) {
 }
 
 // isFindingShapedLine reports whether a line at any indentation looks like a
-// finding: a bullet, a numbered item, or a severity marker. Unlike the
-// splitter, the clean-verdict check must not read an indented finding as a
-// continuation, or a trailing approve would hide it.
+// finding: a bullet, a numbered item, a severity marker, or a feedback label
+// such as "Nits:". Unlike the splitter, the clean-verdict check must not read
+// an indented finding as a continuation, or a trailing approve would hide it.
 func isFindingShapedLine(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if _, ok := bulletText(trimmed); ok {
 		return true
 	}
-	return startsWithReviewSeverityMarker(trimmed)
+	return startsWithReviewSeverityMarker(trimmed) || startsWithFeedbackLabel(trimmed)
+}
+
+// startsWithFeedbackLabel reports whether s opens with a plural label that
+// introduces feedback, such as "Nits:" or "**Suggestions:**".
+func startsWithFeedbackLabel(s string) bool {
+	s = strings.TrimPrefix(s, "**")
+	s = strings.TrimPrefix(s, "__")
+	lower := strings.ToLower(strings.TrimSpace(s))
+	for _, label := range []string{"nits:", "issues:", "concerns:", "suggestions:"} {
+		if strings.HasPrefix(lower, label) {
+			return true
+		}
+	}
+	return false
 }
 
 func topLevelLine(line string) (string, bool) {
