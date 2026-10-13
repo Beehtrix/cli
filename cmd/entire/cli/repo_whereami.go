@@ -42,9 +42,11 @@ func newRepoWhereamiCmd() *cobra.Command {
 			// resolveForgeRepoCellPlacement bounds itself with
 			// requiredCellResolveTimeout and distinguishes not-logged-in from
 			// repo-not-onboarded; both propagate to stderr via main.go.
+			// Not re-wrapped: resolveForgeRepoCellPlacement's errors already
+			// name the repo, and adding it again here prints it twice.
 			placement, err := resolveForgeRepoCellPlacement(ctx, forge, owner, repo)
 			if err != nil {
-				return fmt.Errorf("resolve hosted placement for %s/%s/%s: %w", forge, owner, repo, err)
+				return err
 			}
 			return json.NewEncoder(cmd.OutOrStdout()).Encode(whereamiOutput{
 				RepoID:       placement.RepoID,

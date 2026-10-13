@@ -92,6 +92,23 @@ func TestWhereamiJSONOutput_NativeRepo(t *testing.T) {
 	}
 }
 
+// Trail #1555 finding: resolveForgeRepoCellPlacement's errors already name
+// the repo, so wrapping them here printed it twice.
+func TestWhereamiPlacementErrorNamesRepoOnce(t *testing.T) {
+	initWhereamiRepo(t, "https://gitlab.com/acme/widget.git")
+
+	stdout, err := runWhereami(t, "--json")
+	if err == nil {
+		t.Fatal("expected an error for an unsupported forge")
+	}
+	if got := strings.Count(err.Error(), "acme/widget"); got != 1 {
+		t.Fatalf("error names acme/widget %d times, want exactly once: %q", got, err)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout must stay empty on failure, got %q", stdout)
+	}
+}
+
 func TestWhereamiNoOriginRemote(t *testing.T) {
 	initWhereamiRepo(t, "")
 
