@@ -177,3 +177,31 @@ func TestFastPath_SessionFromAnotherWorktreeNeedsItsFiles(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(data), "Entire-Checkpoint")
 }
+
+// Matched by the sibling-worktree fallback (the worktree has no sessions of
+// its own), a session that recorded edits there is still held to them on the
+// no-TTY fast path, unless ancestry identifies it as the committer.
+func TestFastPath_FallbackMatchedSessionNeedsItsFiles(t *testing.T) {
+	mainDir, linkedDir := twoWorktrees(t)
+	ctx := context.Background()
+	testutil.WriteFile(t, linkedDir, "a.go", "package a\n")
+	saveSessionMatchState(ctx, t, &ManualCommitStrategy{}, mainDir, &SessionState{
+		SessionID:    "from-main",
+		WorktreePath: mainDir,
+		StepCount:    1,
+		OtherWorktrees: map[string]*session.WorktreeWork{
+			linkedKey(t, linkedDir): {Path: linkedDir, FilesTouched: []string{"a.go"}, TouchedFileHashes: hashTouchedFiles(ctx, linkedDir, []string{"a.go"})},
+		},
+	})
+
+	t.Chdir(linkedDir)
+	clearSessionMatchCaches()
+	msg := filepath.Join(t.TempDir(), "COMMIT_EDITMSG")
+	require.NoError(t, os.WriteFile(msg, []byte("unrelated\n"), 0o600))
+	testutil.WriteFile(t, linkedDir, "other.go", "package other\n")
+	testutil.GitAdd(t, linkedDir, "other.go")
+	require.NoError(t, (&ManualCommitStrategy{}).PrepareCommitMsg(ctx, msg, "message"))
+	data, err := os.ReadFile(msg)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "Entire-Checkpoint")
+}

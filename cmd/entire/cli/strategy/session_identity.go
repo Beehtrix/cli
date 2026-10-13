@@ -36,8 +36,17 @@ func (s *ManualCommitStrategy) findSessionsForCommitLinking(ctx context.Context,
 		return nil, err
 	}
 	sessions, ambiguous := s.findSessionsForWorktreeFromStates(ctx, allStates, worktreePath)
-	if guest := s.findSessionByCommitAncestry(ctx, allStates); guest != nil && !linkingSetContains(sessions, guest.SessionID) {
+	guest := s.findSessionByCommitAncestry(ctx, allStates)
+	if guest != nil && !linkingSetContains(sessions, guest.SessionID) {
 		sessions = append(sessions, guest)
+	}
+	// A session homed elsewhere that recorded edits here, matched by the
+	// sibling fallback rather than identified as the committer, is held to
+	// those edits like one that joins below.
+	for _, state := range sessions {
+		if (guest == nil || state.SessionID != guest.SessionID) && hasWorktreeEntry(state, worktreePath) {
+			state.LinkedByWorktreeEntry = true
+		}
 	}
 	// A session that edited this worktree from elsewhere (an agent launched
 	// in another worktree writing here by path) recorded those edits for it;
