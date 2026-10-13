@@ -95,6 +95,7 @@ func TestAuthToken_LockDirectoryIsolation(t *testing.T) {
 			if got := strings.TrimSpace(string(out)); got != refreshedJWT {
 				t.Fatalf("auth token returned %q, want refreshed token", got)
 			}
+			// Mirrors auth-go tokenmanager's lock name: sha256(ClientID + NUL + Issuer).lock.
 			sum := sha256.Sum256([]byte(auth.OAuthClientID + "\x00" + server.URL))
 			if _, err := os.Stat(filepath.Join(wantDir, fmt.Sprintf("%x.lock", sum))); err != nil {
 				t.Fatalf("refresh did not create its lock in %s: %v", wantDir, err)

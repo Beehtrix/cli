@@ -508,7 +508,7 @@ func TestTokenManagerLockDir_UsesExplicitOverride(t *testing.T) {
 	}
 }
 
-func TestNewContextTokenManager_RejectsRelativeLockDir(t *testing.T) {
+func TestNewRefreshingLoginProvider_RejectsRelativeLockDir(t *testing.T) {
 	// Not parallel: it sets process-wide environment.
 	t.Setenv(authLockDirEnvVar, "relative-auth-locks")
 	c := &contexts.Context{Name: "test", CoreURL: "https://core.example", Handle: "alice", KeychainService: testCoreService}
