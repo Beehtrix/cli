@@ -19,9 +19,16 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 // CheckRejectsDowngrade drives the caller's real client construction and request
 // path. Only the scheme changes: different httptest listener ports would let a
 // host guard hide a missing TLS guard. No real credentials or network are used.
+//
+// It runs one parallel subtest per redirect status and starting origin. Each
+// calls run with the start origin and a fake transport; run must build its
+// client with that transport, issue a single credential-bearing request to
+// the origin, and return the resulting error. The transport redirects HTTP to
+// HTTPS and HTTPS to HTTP, so the error must match ErrInsecureRedirect and the
+// plaintext destination after HTTPS must receive no request.
 func CheckRejectsDowngrade(t *testing.T, run func(*testing.T, string, http.RoundTripper) error) {
 	t.Helper()
-	for _, status := range []int{301, 302, 303, 307, 308} {
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
 		for _, start := range []string{"https://service.example", "https://127.0.0.1", "http://127.0.0.1"} {
 			t.Run(fmt.Sprintf("%d/%s", status, start), func(t *testing.T) {
 				t.Parallel()

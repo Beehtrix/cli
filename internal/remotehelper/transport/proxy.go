@@ -94,7 +94,10 @@ type Proxy struct {
 	discoveryTransport http.RoundTripper
 	setAuth            SetAuthFunc
 	onNodeFailed       func(failedNode string)
-	// Sticky across manual replica failover as well as HTTP redirects.
+	// requireHTTPS is set once this proxy has sent any HTTPS request; from
+	// then on even loopback-HTTP test replicas are refused, so neither a
+	// redirect nor manual replica failover can resume plaintext. Sticky for
+	// the proxy's lifetime.
 	requireHTTPS bool
 	// Only direct test configurations use HTTP loopback entries. Production
 	// replicas.Resolve always supplies an HTTPS entry.
@@ -195,10 +198,10 @@ func (p *Proxy) ErrorBaseURL() string {
 // local test servers, and possible with a misconfigured LB) would
 // otherwise carry Authorization through. We'd rather drop the header
 // than leak it.
+//
+// The shared HTTPS floor and hop cap are applied around this callback by
+// httpclient.New; this hook only adds the replica scheme and cluster rules.
 func (p *Proxy) checkRedirect(req *http.Request, via []*http.Request) error {
-	if err := httpclient.CheckSecureRedirect(req, via); err != nil {
-		return fmt.Errorf("replica redirect: %w", err)
-	}
 	if err := p.validateAndRecordReplicaScheme(req.URL); err != nil {
 		return err
 	}
@@ -528,7 +531,12 @@ func (p *Proxy) doWithFailover(ctx context.Context, makeSuffix string, method st
 		return nil, lastErr
 	}
 	if policyErr != nil {
-		return nil, fmt.Errorf("no replica succeeded: %w", errors.Join(policyErr, lastErr))
+		if lastErr == nil {
+			return nil, fmt.Errorf("no replica succeeded: %w", policyErr)
+		}
+		// fmt rather than errors.Join: Join's newline would split git's
+		// one-line error output.
+		return nil, fmt.Errorf("no replica succeeded: %w; %w", policyErr, lastErr)
 	}
 	if attempted == 0 {
 		return nil, errors.New("no eligible replicas available")

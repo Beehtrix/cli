@@ -16,16 +16,16 @@ func TestCheckSecureRedirect(t *testing.T) {
 		name   string
 		via    []string
 		target string
-		reject bool
+		want   error
 	}{
-		{"same HTTPS", []string{"https://host/a"}, "https://host/b", false},
-		{"host policy belongs to caller", []string{"https://host/a"}, "https://other/b", false},
-		{"initial HTTP", []string{"http://127.0.0.1/a"}, "http://127.0.0.1/b", false},
-		{"upgrade", []string{"http://127.0.0.1/a"}, "https://127.0.0.1/b", false},
-		{"downgrade", []string{"https://host/a"}, "http://host/b", true},
-		{"loopback downgrade", []string{"https://127.0.0.1/a"}, "http://127.0.0.1/b", true},
-		{"upgrade then downgrade", []string{"http://host/a", "https://host/b"}, "http://host/c", true},
-		{"non HTTP scheme", []string{"https://host/a"}, "ftp://host/b", true},
+		{"same HTTPS", []string{"https://host/a"}, "https://host/b", nil},
+		{"host policy belongs to caller", []string{"https://host/a"}, "https://other/b", nil},
+		{"initial HTTP", []string{"http://127.0.0.1/a"}, "http://127.0.0.1/b", nil},
+		{"upgrade", []string{"http://127.0.0.1/a"}, "https://127.0.0.1/b", nil},
+		{"downgrade", []string{"https://host/a"}, "http://host/b", ErrInsecureRedirect},
+		{"loopback downgrade", []string{"https://127.0.0.1/a"}, "http://127.0.0.1/b", ErrInsecureRedirect},
+		{"upgrade then downgrade", []string{"http://host/a", "https://host/b"}, "http://host/c", ErrInsecureRedirect},
+		{"non HTTP scheme", []string{"https://host/a"}, "ftp://host/b", ErrInsecureRedirect},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -34,13 +34,42 @@ func TestCheckSecureRedirect(t *testing.T) {
 				via = append(via, redirectRequest(t, raw))
 			}
 			err := CheckSecureRedirect(redirectRequest(t, tc.target), via)
-			if tc.reject {
-				require.Error(t, err)
-			} else {
+			if tc.want == nil {
 				require.NoError(t, err)
+				return
 			}
+			require.ErrorIs(t, err, tc.want)
+			require.ErrorIs(t, err, ErrRequestPolicy)
 		})
 	}
+}
+
+func TestRedirectErrors(t *testing.T) {
+	t.Parallel()
+	// A loop is an availability failure: callers must treat it as a node
+	// failure, not a security rejection.
+	require.NotErrorIs(t, ErrTooManyRedirects, ErrRequestPolicy)
+	require.ErrorIs(t, ErrInsecureRedirect, ErrRedirectPolicy)
+	require.Equal(t, "refusing redirect from HTTPS to an insecure scheme", ErrInsecureRedirect.Error(), "a chained sentinel must not repeat its parents' text")
+}
+
+func TestWithSecureRedirects_SharedPolicyWinsOverCallbackError(t *testing.T) {
+	t.Parallel()
+	denied := errors.New("custom redirect refusal")
+	c := WithSecureRedirects(&http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return denied }})
+	via := []*http.Request{redirectRequest(t, "https://host/a")}
+	require.ErrorIs(t, c.CheckRedirect(redirectRequest(t, "http://host/b"), via), ErrInsecureRedirect)
+}
+
+func TestCheckSecureRedirect_HopCap(t *testing.T) {
+	t.Parallel()
+	req := redirectRequest(t, "https://host/a")
+	via := make([]*http.Request, maxRedirects)
+	for i := range via {
+		via[i] = req
+	}
+	require.ErrorIs(t, CheckSecureRedirect(req, via), ErrTooManyRedirects)
+	require.NoError(t, CheckSecureRedirect(req, via[1:]))
 }
 
 func redirectRequest(t *testing.T, raw string) *http.Request {
@@ -81,14 +110,20 @@ func TestWithSecureRedirects_PreservesClientAndPolicy(t *testing.T) {
 
 func TestWithSecureRedirects_HopCap(t *testing.T) {
 	t.Parallel()
-	for _, policy := range []func(*http.Request, []*http.Request) error{nil, func(*http.Request, []*http.Request) error { return nil }} {
-		c := WithSecureRedirects(&http.Client{CheckRedirect: policy})
-		req := redirectRequest(t, "https://host/a")
-		via := make([]*http.Request, 10)
-		for i := range via {
-			via[i] = req
-		}
-		require.ErrorContains(t, c.CheckRedirect(req, via), "10 redirects")
+	for name, policy := range map[string]func(*http.Request, []*http.Request) error{
+		"no callback":         nil,
+		"permissive callback": func(*http.Request, []*http.Request) error { return nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := WithSecureRedirects(&http.Client{CheckRedirect: policy})
+			req := redirectRequest(t, "https://host/a")
+			via := make([]*http.Request, maxRedirects)
+			for i := range via {
+				via[i] = req
+			}
+			require.ErrorIs(t, c.CheckRedirect(req, via), ErrTooManyRedirects)
+		})
 	}
 }
 

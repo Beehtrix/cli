@@ -61,7 +61,9 @@ func NewClientWithBaseURL(token, baseURL string) *Client {
 
 // NewClientWithTransport creates an API client using an injected network
 // transport, retaining the standard bearer and redirect policies. A nil
-// transport uses http.DefaultTransport.
+// transport uses http.DefaultTransport. The transport must not rewrite the
+// request URL: the redirect policy only sees the URL it was given, so a
+// scheme rewrite beneath it would hide a downgrade.
 func NewClientWithTransport(token, baseURL string, transport http.RoundTripper) *Client {
 	if transport == nil {
 		transport = http.DefaultTransport
@@ -83,11 +85,8 @@ func NewClientWithTransport(token, baseURL string, transport http.RoundTripper) 
 
 // rejectCrossHostRedirect stops a redirect chain from leaving the origin the
 // client was built for. Same-host redirects (e.g. a trailing-slash normalize)
-// still follow, up to Go's usual 10-hop cap, but never downgrade from HTTPS.
+// still follow; httpclient.New adds the hop cap and HTTPS floor around it.
 func rejectCrossHostRedirect(req *http.Request, via []*http.Request) error {
-	if err := httpclient.CheckSecureRedirect(req, via); err != nil {
-		return fmt.Errorf("API redirect: %w", err)
-	}
 	if len(via) > 0 && !strings.EqualFold(req.URL.Host, via[0].URL.Host) {
 		return fmt.Errorf("refusing redirect to a different host (%s → %s): the Entire bearer must not leave its origin", via[0].URL.Host, req.URL.Host)
 	}
@@ -108,10 +107,10 @@ func requireSameOrigin(baseURL, endpoint string) error {
 		return fmt.Errorf("parse endpoint URL: %w", err)
 	}
 	if b.Scheme == schemeHTTPS && e.Scheme != schemeHTTPS {
-		return errors.New("refusing an insecure endpoint for an HTTPS API base URL")
+		return fmt.Errorf("%w: refusing an insecure endpoint for an HTTPS API base URL", httpclient.ErrRequestPolicy)
 	}
 	if !strings.EqualFold(b.Host, e.Host) {
-		return fmt.Errorf("refusing to send an authenticated request to %q, which is not the API host %q", e.Host, b.Host)
+		return fmt.Errorf("%w: refusing to send an authenticated request to %q, which is not the API host %q", httpclient.ErrRequestPolicy, e.Host, b.Host)
 	}
 	return nil
 }
