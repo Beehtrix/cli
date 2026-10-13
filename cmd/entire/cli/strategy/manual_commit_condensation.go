@@ -1995,6 +1995,20 @@ func clearStagedFilesIn(ctx context.Context, root *os.Root, sessionID, worktreeP
 	}
 }
 
+// filesPendingEverywhere is the session's pending files across its home and
+// other worktrees (each relative to its own worktree), deduplicated, for a
+// checkpoint no commit carries.
+func filesPendingEverywhere(state *SessionState) []string {
+	files := slices.Clone(state.FilesTouched)
+	for _, work := range state.OtherWorktrees {
+		if work != nil {
+			files = append(files, work.FilesTouched...)
+		}
+	}
+	slices.Sort(files)
+	return slices.Compact(files)
+}
+
 // storedCopyRelease is what a successful commit-less condensation needs to
 // release the stored copy it read: the resolved root and, for the log, the
 // session's recorded worktree.
@@ -2109,7 +2123,13 @@ func (s *ManualCommitStrategy) CondenseSessionByID(ctx context.Context, sessionI
 		// Resolve the stored copy's root once: the condensation reads it, and
 		// a successful one releases it from the same root.
 		storedRoot := storedSessionRootOrNil(ctx, state)
+		// This checkpoint is the last record of the session's pending files,
+		// which are cleared below: include those pending in other worktrees,
+		// not only the home's.
+		homeFiles := state.FilesTouched
+		state.FilesTouched = filesPendingEverywhere(state)
 		result, err := s.CondenseSession(ctx, repo, checkpointID, state, nil, condenseOpts{reconcileInterrupted: true, storedRoot: storedRoot})
+		state.FilesTouched = homeFiles
 		if err != nil {
 			return fmt.Errorf("failed to condense session: %w", err)
 		}
