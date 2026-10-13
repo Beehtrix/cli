@@ -86,7 +86,7 @@ func (c *ClaudeCodeAgent) InstallHooks(ctx context.Context, force bool) (int, er
 		return 0, err
 	}
 
-	count, staleDropped := installHookEntries(rawHooks, force)
+	count, staleDropped, timeoutsSet := installHookEntries(rawHooks, force)
 
 	// Unconditional, like the stale-hook migration in installHookEntries: a
 	// plain `entire enable` must drop the retired metadata deny rule, not just
@@ -97,10 +97,10 @@ func (c *ClaudeCodeAgent) InstallHooks(ctx context.Context, force bool) (int, er
 		return 0, fmt.Errorf("failed to update permissions in %s: %w", cfg.Path(), err)
 	}
 
-	// staleDropped forces a write even when nothing was added: a file holding
-	// both a stale and a current hook adds nothing, and returning early here
-	// would leave the stale hook on disk.
-	if count == 0 && !permissionsChanged && !staleDropped {
+	// staleDropped and timeoutsSet force a write even when nothing was added: a
+	// file holding both a stale and a current hook, or a current hook without
+	// its timeout, adds nothing, and returning early here would leave it as is.
+	if count == 0 && !permissionsChanged && !staleDropped && !timeoutsSet {
 		return 0, nil // All hooks and permissions already installed
 	}
 
@@ -124,7 +124,7 @@ func (c *ClaudeCodeAgent) HasStaleManagedHooks(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	_, staleDropped := installHookEntries(rawHooks, false)
+	_, staleDropped, _ := installHookEntries(rawHooks, false)
 	return staleDropped
 }
 
@@ -192,23 +192,38 @@ func loadRawClaudeSettingsForInstall(cfg *agent.HookConfigFile) (rawSettings, ra
 	return rawSettings, rawHooks, rawPermissions, nil
 }
 
+// Claude Code waits on Entire's hooks, and an `entire` launch the OS stalls
+// before main() never returns on its own, so each hook carries a timeout that
+// lets Claude Code kill it and continue.
+const (
+	// quickHookTimeoutSec bounds hooks that only record state. They finish in
+	// milliseconds, and Claude Code blocks startup and every prompt on them.
+	quickHookTimeoutSec = 10
+	// checkpointHookTimeoutSec bounds hooks that write checkpoint data, whose
+	// cost grows with transcript size; a kill mid-write loses that checkpoint.
+	checkpointHookTimeoutSec = 60
+)
+
 type entireSimpleHook struct {
 	hookType string
 	matcher  string
 	command  string
+	timeout  int
 }
 
 // entireSimpleHooks lists the hooks Entire registers alone in their hook
 // type, each under one matcher (empty for all but SubagentStart).
 func entireSimpleHooks() []entireSimpleHook {
 	return []entireSimpleHook{
-		{"SessionStart", "", agent.WrapProductionJSONWarningHookCommand("entire hooks claude-code session-start", agent.WarningFormatMultiLine)},
-		{"SessionEnd", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code session-end")},
-		{"Stop", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code stop")},
-		{"StopFailure", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code stop-failure")},
-		{"SubagentStart", workflowAgentMatcher, agent.WrapProductionSilentHookCommand("entire hooks claude-code subagent-start")},
-		{"SubagentStop", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code subagent-stop")},
-		{"UserPromptSubmit", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code user-prompt-submit")},
+		{"SessionStart", "", agent.WrapProductionJSONWarningHookCommand("entire hooks claude-code session-start", agent.WarningFormatMultiLine), quickHookTimeoutSec},
+		// No timeout: Claude Code gives SessionEnd a short exit grace by default,
+		// and an explicit timeout would make it wait longer on exit.
+		{"SessionEnd", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code session-end"), 0},
+		{"Stop", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code stop"), checkpointHookTimeoutSec},
+		{"StopFailure", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code stop-failure"), checkpointHookTimeoutSec},
+		{"SubagentStart", workflowAgentMatcher, agent.WrapProductionSilentHookCommand("entire hooks claude-code subagent-start"), quickHookTimeoutSec},
+		{"SubagentStop", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code subagent-stop"), checkpointHookTimeoutSec},
+		{"UserPromptSubmit", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code user-prompt-submit"), quickHookTimeoutSec},
 	}
 }
 
@@ -216,6 +231,25 @@ func entireSimpleHooks() []entireSimpleHook {
 func entireToolUseHookCommands() (preTask, postTask string) {
 	return agent.WrapProductionSilentHookCommand("entire hooks claude-code pre-task"),
 		agent.WrapProductionSilentHookCommand("entire hooks claude-code post-task")
+}
+
+// setMissingTimeout gives every entry running command the timeout, leaving any
+// timeout the user already chose. Reports whether it changed an entry.
+func setMissingTimeout(matchers []ClaudeHookMatcher, command string, timeout int) bool {
+	if timeout == 0 {
+		return false
+	}
+	changed := false
+	for i := range matchers {
+		for j := range matchers[i].Hooks {
+			hook := &matchers[i].Hooks[j]
+			if hook.Command == command && hook.Timeout == 0 {
+				hook.Timeout = timeout
+				changed = true
+			}
+		}
+	}
+	return changed
 }
 
 // retiredPostTodoHookCommand is the post-todo command older CLIs installed.
@@ -243,11 +277,12 @@ func EntireHookCommands() map[string][]string {
 }
 
 // installHookEntries mutates rawHooks in place to ensure every Entire hook is
-// present, migrating stale entries (from older CLI versions or, when force is
-// set, any current Entire hook) first. Returns the number of hooks newly
-// added and whether any stale entry was dropped (see the staleDropped comment
-// at its InstallHooks call site for why that forces a write on its own).
-func installHookEntries(rawHooks map[string]json.RawMessage, force bool) (count int, staleDropped bool) {
+// present with its timeout, migrating stale entries (from older CLI versions
+// or, when force is set, any current Entire hook) first. Returns the number of
+// hooks newly added, whether any stale entry was dropped, and whether any entry
+// gained a timeout (see the staleDropped comment at its InstallHooks call site
+// for why either forces a write on its own).
+func installHookEntries(rawHooks map[string]json.RawMessage, force bool) (count int, staleDropped, timeoutsSet bool) {
 	var preToolUse, postToolUse []ClaudeHookMatcher
 	parseHookType(rawHooks, "PreToolUse", &preToolUse)
 	parseHookType(rawHooks, "PostToolUse", &postToolUse)
@@ -323,6 +358,19 @@ func installHookEntries(rawHooks map[string]json.RawMessage, force bool) (count 
 		count++
 	}
 
+	// Covers the entries just added and those older CLIs wrote without one.
+	for _, h := range simpleHooks {
+		if setMissingTimeout(simpleMatchers[h.hookType], h.command, h.timeout) {
+			timeoutsSet = true
+		}
+	}
+	if setMissingTimeout(preToolUse, preTaskCmd, quickHookTimeoutSec) {
+		timeoutsSet = true
+	}
+	if setMissingTimeout(postToolUse, postTaskCmd, checkpointHookTimeoutSec) {
+		timeoutsSet = true
+	}
+
 	// Marshal modified hook types back to rawHooks
 	for _, h := range simpleHooks {
 		marshalHookType(rawHooks, h.hookType, simpleMatchers[h.hookType])
@@ -330,7 +378,7 @@ func installHookEntries(rawHooks map[string]json.RawMessage, force bool) (count 
 	marshalHookType(rawHooks, "PreToolUse", preToolUse)
 	marshalHookType(rawHooks, "PostToolUse", postToolUse)
 
-	return count, staleDropped
+	return count, staleDropped, timeoutsSet
 }
 
 // writeClaudeSettingsFile marshals rawHooks and rawPermissions into
@@ -681,10 +729,7 @@ func hookCommandExistsWithMatcher(matchers []ClaudeHookMatcher, matcherName, com
 }
 
 // addHookToMatcher appends command to the matcher named matcherName, creating it
-// if absent. No timeout is set: Timeout exists on ClaudeHookEntry to round-trip
-// settings files that carry one, but Entire's own hooks all keep Claude Code's
-// default. (The removed local-dev mode was the only thing that needed a longer
-// SessionEnd budget, because it compiled the CLI from source.)
+// if absent. installHookEntries sets the entry's timeout afterwards.
 func addHookToMatcher(matchers []ClaudeHookMatcher, matcherName, command string) []ClaudeHookMatcher {
 	entry := ClaudeHookEntry{
 		Type:    "command",

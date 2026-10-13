@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	agentpkg "github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/testutil"
@@ -567,10 +568,66 @@ func TestUninstallHooks_RemovesLegacyLocalDevHooks(t *testing.T) {
 	}
 }
 
-// TestInstallHooks_SessionEndIsUntimed verifies no hook carries an explicit
-// timeout. The explicit SessionEnd timeout existed only for local-dev hooks,
-// which compiled from source and could exceed Claude Code's exit grace.
-func TestInstallHooks_SessionEndIsUntimed(t *testing.T) {
+// expectedHookTimeout is one installed Entire hook and the timeout it must carry.
+type expectedHookTimeout struct {
+	hookType string
+	matcher  string
+	command  string
+	timeout  int
+}
+
+func expectedHookTimeouts() []expectedHookTimeout {
+	silent := agentpkg.WrapProductionSilentHookCommand
+	return []expectedHookTimeout{
+		{"SessionStart", "", agentpkg.WrapProductionJSONWarningHookCommand("entire hooks claude-code session-start", agentpkg.WarningFormatMultiLine), 10},
+		{"UserPromptSubmit", "", silent("entire hooks claude-code user-prompt-submit"), 10},
+		{"SubagentStart", workflowAgentMatcher, silent("entire hooks claude-code subagent-start"), 10},
+		{"PreToolUse", subagentToolMatcher, silent("entire hooks claude-code pre-task"), 10},
+		{"Stop", "", silent("entire hooks claude-code stop"), 60},
+		{"StopFailure", "", silent("entire hooks claude-code stop-failure"), 60},
+		{"SubagentStop", "", silent("entire hooks claude-code subagent-stop"), 60},
+		{"PostToolUse", subagentToolMatcher, silent("entire hooks claude-code post-task"), 60},
+		{"PostToolUse", skillToolMatcher, silent("entire hooks claude-code post-task"), 60},
+		// Claude Code gives SessionEnd a short exit grace by default; an explicit
+		// timeout would make it wait longer on exit, not shorter.
+		{"SessionEnd", "", silent("entire hooks claude-code session-end"), 0},
+	}
+}
+
+func hookMatchersByType(settings ClaudeSettings) map[string][]ClaudeHookMatcher {
+	h := settings.Hooks
+	return map[string][]ClaudeHookMatcher{
+		"SessionStart":     h.SessionStart,
+		"SessionEnd":       h.SessionEnd,
+		"UserPromptSubmit": h.UserPromptSubmit,
+		"SubagentStart":    h.SubagentStart,
+		"SubagentStop":     h.SubagentStop,
+		"Stop":             h.Stop,
+		"StopFailure":      h.StopFailure,
+		"PreToolUse":       h.PreToolUse,
+		"PostToolUse":      h.PostToolUse,
+	}
+}
+
+func assertHookTimeouts(t *testing.T, settings ClaudeSettings) {
+	t.Helper()
+	byType := hookMatchersByType(settings)
+	for _, want := range expectedHookTimeouts() {
+		hook, ok := lookupHook(byType[want.hookType], want.matcher, want.command)
+		if !ok {
+			t.Errorf("%s hook not found (matcher=%q, command=%q)", want.hookType, want.matcher, want.command)
+			continue
+		}
+		if hook.Timeout != want.timeout {
+			t.Errorf("%s (matcher=%q) timeout = %d, want %d", want.hookType, want.matcher, hook.Timeout, want.timeout)
+		}
+	}
+}
+
+// TestInstallHooks_SetsHookTimeouts pins a per-hook timeout on every Entire hook
+// that Claude Code waits on, so a stalled `entire` launch cannot block startup,
+// prompts, or turn ends indefinitely.
+func TestInstallHooks_SetsHookTimeouts(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Chdir(tempDir)
 
@@ -580,21 +637,104 @@ func TestInstallHooks_SessionEndIsUntimed(t *testing.T) {
 	}
 
 	settings := readClaudeSettings(t, tempDir)
-	if len(settings.Hooks.SessionEnd) == 0 || len(settings.Hooks.SessionEnd[0].Hooks) == 0 {
-		t.Fatal("expected a SessionEnd hook to be installed")
-	}
-	if got := settings.Hooks.SessionEnd[0].Hooks[0].Timeout; got != 0 {
-		t.Errorf("SessionEnd timeout = %d, want 0", got)
-	}
+	assertHookTimeouts(t, settings)
 
-	// Stronger than the parsed check: prove the field is omitted entirely
-	// (omitempty), not written as an explicit "timeout": 0.
+	// SessionEnd must omit the field entirely (omitempty), not write "timeout": 0.
 	raw, err := os.ReadFile(filepath.Join(tempDir, ".claude", "settings.json"))
 	if err != nil {
 		t.Fatalf("failed to read settings.json: %v", err)
 	}
-	if strings.Contains(string(raw), "timeout") {
-		t.Errorf("settings.json must not contain any timeout field, got:\n%s", raw)
+	var parsed struct {
+		Hooks map[string][]struct {
+			Hooks []map[string]json.RawMessage `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("failed to parse settings.json: %v", err)
+	}
+	for _, m := range parsed.Hooks["SessionEnd"] {
+		for _, h := range m.Hooks {
+			if _, ok := h["timeout"]; ok {
+				t.Errorf("SessionEnd hook must not carry a timeout field, got:\n%s", raw)
+			}
+		}
+	}
+}
+
+// TestInstallHooks_BackfillsMissingTimeouts covers configs written by older CLIs:
+// the hook is already present without a timeout, so nothing is added, but the
+// install must still write the timeout.
+func TestInstallHooks_BackfillsMissingTimeouts(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	writeClaudeStopHooks(t, tempDir, []string{agentpkg.WrapProductionSilentHookCommand("entire hooks claude-code stop")})
+
+	ag := &ClaudeCodeAgent{}
+	if _, err := ag.InstallHooks(context.Background(), false); err != nil {
+		t.Fatalf("InstallHooks() error = %v", err)
+	}
+
+	assertHookTimeouts(t, readClaudeSettings(t, tempDir))
+}
+
+// TestInstallHooks_KeepsUserSetTimeout verifies an install never overrides a
+// timeout the user chose for an Entire hook.
+func TestInstallHooks_KeepsUserSetTimeout(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	stopCmd := agentpkg.WrapProductionSilentHookCommand("entire hooks claude-code stop")
+	writeSettingsFile(t, tempDir, fmt.Sprintf(`{
+  "hooks": {
+    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": %q, "timeout": 300}]}]
+  }
+}`, stopCmd))
+
+	ag := &ClaudeCodeAgent{}
+	if _, err := ag.InstallHooks(context.Background(), false); err != nil {
+		t.Fatalf("InstallHooks() error = %v", err)
+	}
+
+	hook, ok := lookupHook(readClaudeSettings(t, tempDir).Hooks.Stop, "", stopCmd)
+	if !ok {
+		t.Fatal("Stop hook not found")
+	}
+	if hook.Timeout != 300 {
+		t.Errorf("Stop timeout = %d, want the user's 300", hook.Timeout)
+	}
+}
+
+// TestInstallHooks_TimeoutsAreIdempotent verifies a second install of an
+// up-to-date config neither adds hooks nor rewrites the file.
+func TestInstallHooks_TimeoutsAreIdempotent(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	ag := &ClaudeCodeAgent{}
+	if _, err := ag.InstallHooks(context.Background(), false); err != nil {
+		t.Fatalf("InstallHooks() error = %v", err)
+	}
+
+	settingsPath := filepath.Join(tempDir, ".claude", "settings.json")
+	past := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(settingsPath, past, past); err != nil {
+		t.Fatalf("Chtimes() error = %v", err)
+	}
+
+	count, err := ag.InstallHooks(context.Background(), false)
+	if err != nil {
+		t.Fatalf("second InstallHooks() error = %v", err)
+	}
+	if count != 0 {
+		t.Errorf("second InstallHooks() count = %d, want 0", count)
+	}
+	info, err := os.Stat(settingsPath)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if !info.ModTime().Equal(past) {
+		t.Errorf("settings.json was rewritten by an install that had nothing to change")
 	}
 }
 
@@ -777,19 +917,27 @@ func TestInstallHooks_PrunesPostTodoHook(t *testing.T) {
 	}
 }
 
-// assertHookExists checks that a hook with the given matcher and command exists
-func assertHookExists(t *testing.T, matchers []ClaudeHookMatcher, matcher, command, description string) {
-	t.Helper()
+// lookupHook returns the hook with the given matcher and command.
+func lookupHook(matchers []ClaudeHookMatcher, matcher, command string) (ClaudeHookEntry, bool) {
 	for _, m := range matchers {
-		if m.Matcher == matcher {
-			for _, h := range m.Hooks {
-				if h.Command == command {
-					return
-				}
+		if m.Matcher != matcher {
+			continue
+		}
+		for _, h := range m.Hooks {
+			if h.Command == command {
+				return h, true
 			}
 		}
 	}
-	t.Errorf("%s was not found (matcher=%q, command=%q)", description, matcher, command)
+	return ClaudeHookEntry{}, false
+}
+
+// assertHookExists checks that a hook with the given matcher and command exists
+func assertHookExists(t *testing.T, matchers []ClaudeHookMatcher, matcher, command, description string) {
+	t.Helper()
+	if _, ok := lookupHook(matchers, matcher, command); !ok {
+		t.Errorf("%s was not found (matcher=%q, command=%q)", description, matcher, command)
+	}
 }
 
 func TestInstallHooks_PreservesUnknownHookTypes(t *testing.T) {
@@ -969,15 +1117,15 @@ func TestInstallHooks_UsesCurrentToolMatchers(t *testing.T) {
 		wantCmd := agentpkg.WrapProductionSilentHookCommand("entire hooks claude-code subagent-stop")
 		assertHookExists(t, settings.Hooks.SubagentStop, "", wantCmd, "SubagentStop hook")
 
-		// Same shape as Stop: single command, empty matcher, no timeout.
+		// Same shape as Stop: single command, empty matcher, Stop's timeout.
 		if len(settings.Hooks.SubagentStop) != 1 || settings.Hooks.SubagentStop[0].Matcher != "" {
 			t.Fatalf("SubagentStop = %+v, want a single matcher with an empty string matcher (same shape as Stop)", settings.Hooks.SubagentStop)
 		}
 		if len(settings.Hooks.SubagentStop[0].Hooks) != 1 {
 			t.Fatalf("SubagentStop hooks = %d, want 1", len(settings.Hooks.SubagentStop[0].Hooks))
 		}
-		if got := settings.Hooks.SubagentStop[0].Hooks[0].Timeout; got != 0 {
-			t.Errorf("SubagentStop timeout = %d, want 0 (no explicit timeout, same as Stop)", got)
+		if got, want := settings.Hooks.SubagentStop[0].Hooks[0].Timeout, settings.Hooks.Stop[0].Hooks[0].Timeout; got != want {
+			t.Errorf("SubagentStop timeout = %d, want %d (same as Stop)", got, want)
 		}
 	})
 }
