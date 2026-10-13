@@ -184,6 +184,12 @@ func (e *reauthError) Unwrap() error { return e.sentinel }
 func contextAuthError(c *contexts.Context, err error) error {
 	coreURL := strings.TrimRight(c.CoreURL, "/")
 	switch {
+	case errors.Is(err, tokenstore.ErrKeyringUnavailable):
+		// The login exists; it just can't be read from here. Name the login
+		// and keep the keyring's explanation, not the store-read chain. First,
+		// because a keyring that could not be read makes any "expired" or
+		// "not logged in" conclusion in the same chain unreliable.
+		return fmt.Errorf("cannot read the saved login for %q (%s): %w", c.Name, coreURL, tokenstore.ErrKeyringUnavailable)
 	case errors.Is(err, tokenmanager.ErrReauthRequired):
 		return &reauthError{
 			msg:      fmt.Sprintf("login session for %q (%s) expired; run `entire login` to re-authenticate", c.Name, coreURL),
@@ -194,10 +200,6 @@ func contextAuthError(c *contexts.Context, err error) error {
 			msg:      fmt.Sprintf("no usable login for %q (%s); run `entire login`", c.Name, coreURL),
 			sentinel: tokenmanager.ErrNotLoggedIn,
 		}
-	case errors.Is(err, tokenstore.ErrKeyringUnavailable):
-		// The login exists; it just can't be read from here. Name the login
-		// and keep the keyring's explanation, not the store-read chain.
-		return fmt.Errorf("cannot read the saved login for %q (%s): %w", c.Name, coreURL, tokenstore.ErrKeyringUnavailable)
 	}
 	return contextUnreachableError(c, coreURL, err)
 }

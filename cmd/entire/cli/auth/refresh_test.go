@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/entireio/auth-go/tokenmanager"
 	"github.com/entireio/auth-go/tokens"
 	authtokenstore "github.com/entireio/auth-go/tokenstore"
 
@@ -285,6 +286,27 @@ func TestNewRefreshingLoginProvider_UnreachableKeyring(t *testing.T) {
 	}
 	if got, want := err.Error(), `cannot read the saved login for "alice@core" (https://core.example): the macOS Keychain is not accessible`; !strings.HasPrefix(got, want) {
 		t.Errorf("error = %q, want prefix %q", got, want)
+	}
+}
+
+// An unreadable keyring wins over any re-login sentinel in the same chain:
+// with the keyring unreadable, "expired" or "not logged in" is a guess.
+func TestContextAuthError_KeyringUnavailableWinsOverReauthSentinels(t *testing.T) {
+	t.Parallel()
+
+	c := &contexts.Context{Name: "alice@core", CoreURL: "https://core.example"}
+	for _, sentinel := range []error{tokenmanager.ErrNotLoggedIn, tokenmanager.ErrReauthRequired} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			t.Parallel()
+
+			err := contextAuthError(c, fmt.Errorf("load: %w", errors.Join(sentinel, tokenstore.ErrKeyringUnavailable)))
+			if !errors.Is(err, tokenstore.ErrKeyringUnavailable) {
+				t.Fatalf("error = %v, want ErrKeyringUnavailable", err)
+			}
+			if errors.Is(err, sentinel) || strings.Contains(err.Error(), "run `entire login`") {
+				t.Errorf("error %q still reports %v and the login hint", err, sentinel)
+			}
+		})
 	}
 }
 
