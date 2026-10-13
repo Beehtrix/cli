@@ -98,15 +98,15 @@ accessor with a safe default is not that.
 
 Locked in by `TestListRepos_UnsentRequiredReadFieldsDecode` and
 `TestListOrgsAndProjects_UnsentCapabilitiesDecode` in `client_test.go`.
-
-`DetachRepoResult.access` is on the same list for the opposite reason: core
-drops the field, and the CLI no longer reads it. Locked in by
-`TestDetachRepo_UnsentAccessDecodes`.
 `RepoIndexEntry` gets the dedicated test because `ListRepos` is the widest
 consumer: the consolidated index is what `resolveRepoCellTarget` routes with
 and what `search`, `repo mirror` and the dispatch wizard page through, so a
 decode failure there takes out cell routing and search together rather than
 one command.
+
+`DetachRepoResult.access` is on the same list for the opposite reason: core
+drops the field, and the CLI no longer reads it. Locked in by
+`TestDetachRepo_UnsentAccessDecodes`.
 
 ## 2c. Nullable objects are typed as the object alone
 

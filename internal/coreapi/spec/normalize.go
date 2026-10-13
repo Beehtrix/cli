@@ -261,7 +261,8 @@ var readModelEnumFields = map[string][]string{
 // readModelOptionalFields lists response read-model fields the spec marks
 // required but the client does not depend on, keyed by component schema name.
 // loosenReadModelRequired drops them from "required" so a server that
-// predates the field, or a test fake that omits it, still decodes.
+// predates the field, a server that has dropped it, or a test fake that
+// omits it, still decodes.
 //
 // "Does not depend on" is the bar, not "never reads": a field may be read
 // through its Opt accessor with a safe default, where absence degrades one

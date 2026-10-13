@@ -41,8 +41,8 @@ func newRepoMirrorDetachCmd() *cobra.Command {
 			"--into. The repository keeps its history and its cluster; its " +
 			"/gh/<owner>/<repo> address is released and answers \"moved\" from then on, " +
 			"and the GitHub repository itself stays live and is no longer synced.\n\n" +
-			"Every run first asks the server for a plan: each precondition the " +
-			"detach needs. --dry-run prints the plan and changes nothing.\n\n" +
+			"Every run first asks the server for a plan, which lists the " +
+			"preconditions the detach needs. --dry-run prints the plan and changes nothing.\n\n" +
 			"After the detach, only the --into project grants member access to the " +
 			"repository: access through GitHub and grants on the mirror are removed. " +
 			"Add everyone who still needs access to the project first. A public " +
@@ -72,7 +72,7 @@ func newRepoMirrorDetachCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&opts.into, "into", "", "Native repository to detach into, as /et/<project>/<repo> (required)")
-	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "Print the preconditions, and change nothing")
+	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "Print the preconditions and change nothing")
 	cmd.Flags().BoolVar(&opts.noWait, "no-wait", false, "Return once the repository is native, without waiting for the rewire to complete")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 30*time.Minute, "How long to wait for the rewire to complete (0 waits indefinitely)")
 	markRequired(cmd, "into")
