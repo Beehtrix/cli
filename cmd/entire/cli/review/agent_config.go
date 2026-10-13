@@ -21,25 +21,6 @@ var agentConfigFields = map[string][]string{
 	"pi":          {"extensions"},
 }
 
-// agentConfigCommandKeys are Claude Code settings whose value is a command.
-var agentConfigCommandKeys = []string{"apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper"}
-
-// projectLaunchers resolve the tool they run from the project before the
-// user's install (local node_modules, project venvs), so the reviewed branch
-// would choose the code.
-var projectLaunchers = []string{"npx", "pnpx", "bunx", "uvx", "yarn", "pnpm", "bun", "deno", "uv", "poetry", "pipx"}
-
-// isProjectLauncher matches a launcher by its program name, so an absolute
-// path to one (/usr/local/bin/npx) is caught too: where it is installed
-// doesn't change that it resolves tools from the project.
-func isProjectLauncher(word string) bool {
-	name := strings.ToLower(filepath.Base(strings.ReplaceAll(word, `\`, "/")))
-	for _, ext := range []string{".exe", ".cmd", ".bat", ".ps1"} {
-		name = strings.TrimSuffix(name, ext)
-	}
-	return slices.Contains(projectLaunchers, name)
-}
-
 var mcpServerNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // toAgentConfig converts a profile's config for a run; nil stays nil.
@@ -50,11 +31,11 @@ func toAgentConfig(cfg *settings.ReviewAgentConfig) *reviewtypes.AgentConfig {
 	return &reviewtypes.AgentConfig{Settings: cfg.Settings, MCPServers: cfg.MCPServers, Extensions: cfg.Extensions}
 }
 
-// ValidateAgentConfig checks a reviewer's profile config before it is saved or
-// used. Every command it names must be an absolute path or a bare tool name,
-// and none may resolve inside forbiddenRoots (the reviewed checkout and the
-// user's own), or the reviewed branch would supply the code that runs.
-func ValidateAgentConfig(agentName string, cfg *reviewtypes.AgentConfig, forbiddenRoots []string) error {
+// ValidateAgentConfig checks that a reviewer's profile config is one the agent
+// can apply. It does not vet the commands the config names: like the hooks in
+// the user's own agent settings, they are the user's code and run in the
+// checkout as configured.
+func ValidateAgentConfig(agentName string, cfg *reviewtypes.AgentConfig) error {
 	if cfg == nil {
 		return nil
 	}
@@ -75,210 +56,95 @@ func ValidateAgentConfig(agentName string, cfg *reviewtypes.AgentConfig, forbidd
 	); err != nil {
 		return err
 	}
+	if len(cfg.Settings) > 0 {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(cfg.Settings, &obj); err != nil {
+			return fmt.Errorf("settings: %w", err)
+		}
+	}
 	for _, name := range sortedStringKeys(cfg.MCPServers) {
 		if !mcpServerNamePattern.MatchString(name) {
 			return fmt.Errorf("MCP server name %q: use letters, digits, '-' and '_'", name)
 		}
-		if err := validateMCPServer(name, cfg.MCPServers[name], forbiddenRoots); err != nil {
-			return err
+		var server struct {
+			Command string `json:"command"`
+			URL     string `json:"url"`
 		}
-	}
-	if len(cfg.Settings) > 0 {
-		if err := validateClaudeSettings(cfg.Settings, forbiddenRoots); err != nil {
-			return err
-		}
-	}
-	for _, ext := range cfg.Extensions {
-		if !filepath.IsAbs(ext) {
-			return fmt.Errorf("extension %q: use an absolute path", ext)
-		}
-		if under(ext, forbiddenRoots) {
-			return fmt.Errorf("extension %q is inside a checkout; keep reviewer extensions outside the repository", ext)
-		}
-	}
-	return nil
-}
-
-func validateMCPServer(name string, raw json.RawMessage, forbiddenRoots []string) error {
-	var server struct {
-		Command string            `json:"command"`
-		Args    []string          `json:"args"`
-		URL     string            `json:"url"`
-		Env     map[string]string `json:"env"`
-	}
-	if err := json.Unmarshal(raw, &server); err != nil {
-		return fmt.Errorf("MCP server %q: %w", name, err)
-	}
-	if err := validateEnv(server.Env, forbiddenRoots); err != nil {
-		return fmt.Errorf("MCP server %q: %w", name, err)
-	}
-	switch {
-	case server.Command != "":
-		// The command is one program path, not a shell line: check it whole.
-		if strings.Contains(server.Command, "CLAUDE_PROJECT_DIR") || isProjectLauncher(server.Command) {
-			return fmt.Errorf("MCP server %q: %q resolves from the reviewed project (a launcher such as npx does even by absolute path); point at the installed tool itself", name, server.Command)
-		}
-		if err := validateCommandWord(server.Command, forbiddenRoots); err != nil {
+		if err := json.Unmarshal(cfg.MCPServers[name], &server); err != nil {
 			return fmt.Errorf("MCP server %q: %w", name, err)
 		}
-		for _, arg := range server.Args {
-			if strings.Contains(arg, "CLAUDE_PROJECT_DIR") {
-				return fmt.Errorf("MCP server %q: argument %q refers to the project directory, which is the reviewed checkout", name, arg)
-			}
-			if isProjectLauncher(arg) {
-				return fmt.Errorf("MCP server %q: argument %q is a launcher that resolves tools from the reviewed project; point at the installed tool itself", name, arg)
-			}
-			if err := validateCommandWord(arg, forbiddenRoots); err != nil {
-				return fmt.Errorf("MCP server %q: %w", name, err)
-			}
-		}
-	case server.URL == "":
-		return fmt.Errorf("MCP server %q needs a command or a url", name)
-	}
-	return nil
-}
-
-func validateClaudeSettings(raw json.RawMessage, forbiddenRoots []string) error {
-	var settingsObj map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &settingsObj); err != nil {
-		return fmt.Errorf("settings: %w", err)
-	}
-	var env map[string]string
-	if rawEnv, ok := settingsObj["env"]; ok {
-		if err := json.Unmarshal(rawEnv, &env); err != nil {
-			return fmt.Errorf("settings env: %w", err)
-		}
-	}
-	if err := validateEnv(env, forbiddenRoots); err != nil {
-		return fmt.Errorf("settings %w", err)
-	}
-	for _, key := range agentConfigCommandKeys {
-		var command string
-		if json.Unmarshal(settingsObj[key], &command) == nil && command != "" {
-			if err := validateCommand(command, forbiddenRoots); err != nil {
-				return fmt.Errorf("settings %s: %w", key, err)
-			}
-		}
-	}
-	// Settings such as statusLine and fileSuggestion run {"command": ...};
-	// any top-level object with a command is checked, so new ones are too.
-	for _, key := range sortedStringKeys(settingsObj) {
-		var obj struct {
-			Command string `json:"command"`
-		}
-		if json.Unmarshal(settingsObj[key], &obj) == nil && obj.Command != "" {
-			if err := validateCommand(obj.Command, forbiddenRoots); err != nil {
-				return fmt.Errorf("settings %s: %w", key, err)
-			}
-		}
-	}
-	var events map[string][]struct {
-		Hooks []struct {
-			Command string `json:"command"`
-		} `json:"hooks"`
-	}
-	if hooks, ok := settingsObj["hooks"]; ok {
-		if err := json.Unmarshal(hooks, &events); err != nil {
-			return fmt.Errorf("settings hooks: %w", err)
-		}
-	}
-	for event, groups := range events {
-		for _, group := range groups {
-			for _, hook := range group.Hooks {
-				if hook.Command == "" {
-					continue
-				}
-				if err := validateCommand(hook.Command, forbiddenRoots); err != nil {
-					return fmt.Errorf("settings hook %s: %w", event, err)
-				}
-			}
+		if server.Command == "" && server.URL == "" {
+			return fmt.Errorf("MCP server %q needs a command or a url", name)
 		}
 	}
 	return nil
 }
 
-// validateEnv keeps environment values from pointing a program back into the
-// checkout: no absolute path inside it, and search-path variables (PATH,
-// NODE_PATH, ...) list only absolute directories or inherited variables.
-func validateEnv(env map[string]string, forbiddenRoots []string) error {
-	for _, key := range sortedStringKeys(env) {
-		value := env[key]
-		if strings.Contains(value, "CLAUDE_PROJECT_DIR") {
-			return fmt.Errorf("env %s refers to the project directory, which is the reviewed checkout", key)
+// AgentConfigWarnings lists values in cfg that name a path inside one of
+// roots or the project directory variable: an easy copy-paste mistake, since
+// those would run the reviewed branch's files. They are warnings, not
+// refusals; the commands are the user's own.
+func AgentConfigWarnings(cfg *reviewtypes.AgentConfig, roots []string) []string {
+	if cfg == nil {
+		return nil
+	}
+	var values []string
+	collectStrings(cfg.Settings, &values)
+	for _, name := range sortedStringKeys(cfg.MCPServers) {
+		collectStrings(cfg.MCPServers[name], &values)
+	}
+	values = append(values, cfg.Extensions...)
+	var warnings []string
+	for _, value := range values {
+		if namesCheckout(value, roots) {
+			warnings = append(warnings, fmt.Sprintf("%q names a path inside the checkout; it would run the reviewed branch's files", value))
 		}
-		searchPath := strings.HasSuffix(strings.ToUpper(key), "PATH")
-		for _, part := range filepath.SplitList(value) {
-			switch {
-			case filepath.IsAbs(part):
-				if under(part, forbiddenRoots) {
-					return fmt.Errorf("env %s: %q is inside a checkout", key, part)
-				}
-			case searchPath && part != "" && !strings.HasPrefix(part, "$"):
-				return fmt.Errorf("env %s: %q is a relative directory, which resolves inside the reviewed checkout; use an absolute path", key, part)
+	}
+	return warnings
+}
+
+func collectStrings(raw json.RawMessage, out *[]string) {
+	var v any
+	if len(raw) == 0 || json.Unmarshal(raw, &v) != nil {
+		return
+	}
+	var walk func(any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case string:
+			*out = append(*out, t)
+		case []any:
+			for _, e := range t {
+				walk(e)
+			}
+		case map[string]any:
+			for _, k := range sortedStringKeys(t) {
+				walk(t[k])
 			}
 		}
 	}
-	return nil
+	walk(v)
 }
 
-// shellSyntax are characters that would make a command a shell program
-// rather than a plain program and arguments.
-const shellSyntax = ";&|<>()$`'\"\\\n"
-
-// validateCommand accepts only a plain command: an absolute program (or a bare
-// tool name) and plain arguments, with no shell syntax. That keeps splitting
-// on whitespace exact, so every word can be checked: paths must be absolute
-// and outside the forbidden roots, and project launchers are refused. Hooks
-// that need shell features belong in a script at an absolute path.
-func validateCommand(command string, forbiddenRoots []string) error {
-	if strings.Contains(command, "CLAUDE_PROJECT_DIR") {
-		return fmt.Errorf("%q refers to the project directory, which is the reviewed checkout", command)
+func namesCheckout(value string, roots []string) bool {
+	if strings.Contains(value, "CLAUDE_PROJECT_DIR") {
+		return true
 	}
-	if strings.ContainsAny(command, shellSyntax) {
-		return fmt.Errorf("%q uses shell syntax; use an absolute program path and plain arguments, or put the logic in a script at an absolute path", command)
-	}
-	words := strings.Fields(command)
-	if len(words) == 0 {
-		return errors.New("empty command")
-	}
+	words := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '=' || r == '"' || r == '\'' || r == filepath.ListSeparator
+	})
 	for _, word := range words {
-		if isProjectLauncher(word) {
-			return fmt.Errorf("%q runs %s, which resolves tools from the reviewed project even by absolute path; point at the installed tool itself", command, word)
-		}
-		if err := validateCommandWord(word, forbiddenRoots); err != nil {
-			return fmt.Errorf("%q: %w", command, err)
+		if filepath.IsAbs(word) && under(word, roots) {
+			return true
 		}
 	}
-	return nil
-}
-
-func validateCommandWord(word string, forbiddenRoots []string) error {
-	v := word
-	if _, value, ok := strings.Cut(word, "="); ok && strings.HasPrefix(word, "-") {
-		v = value // --flag=value: the value is what can be a path
-	}
-	switch {
-	case strings.HasPrefix(v, "$"):
-		return fmt.Errorf("%q depends on a variable; use an absolute path", v)
-	case strings.Contains(v, "://"):
-		// A URL, not a path.
-	case filepath.IsAbs(v):
-		if under(v, forbiddenRoots) {
-			return fmt.Errorf("%q is inside a checkout", v)
-		}
-	case strings.ContainsAny(v, `/\`):
-		return fmt.Errorf("%q is a relative path, which resolves inside the reviewed checkout; use an absolute path", v)
-	}
-	return nil
+	return false
 }
 
 // under reports whether path, or what it resolves to through symlinks, is
 // inside one of roots. Windows paths compare case-insensitively.
 func under(path string, roots []string) bool {
-	candidates := []string{filepath.Clean(path)}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		candidates = append(candidates, resolved)
-	}
+	candidates := []string{filepath.Clean(path), resolveExisting(path)}
 	for _, candidate := range candidates {
 		for _, root := range roots {
 			if root != "" && pathWithin(candidate, filepath.Clean(root)) {
@@ -287,6 +153,23 @@ func under(path string, roots []string) bool {
 		}
 	}
 	return false
+}
+
+// resolveExisting resolves symlinks in the longest existing prefix of path,
+// so a file that doesn't exist yet still resolves through a linked parent.
+func resolveExisting(path string) string {
+	dir, rest := filepath.Clean(path), ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(resolved, rest)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return filepath.Clean(path)
+		}
+		rest = filepath.Join(filepath.Base(dir), rest)
+		dir = parent
+	}
 }
 
 func pathWithin(path, root string) bool {

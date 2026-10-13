@@ -21,7 +21,7 @@ func preparePiReviewConfig(ctx context.Context, cfg reviewtypes.RunConfig) (revi
 	if err != nil {
 		return cfg, nil, err //nolint:wrapcheck // already names the step
 	}
-	if err := review.ValidateAgentConfig("pi", cfg.AgentConfig, run.ForbiddenRoots); err != nil {
+	if err := review.ValidateAgentConfig("pi", cfg.AgentConfig); err != nil {
 		run.Cleanup()
 		return cfg, nil, fmt.Errorf("review profile config: %w", err)
 	}

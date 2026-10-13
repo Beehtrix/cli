@@ -177,17 +177,15 @@ Rules:
   local file when it defines the profile, else clone-local preferences
   (`review_agent_configs`, by profile and reviewer), which overlay only the
   config so the rest of the profile still comes from its own layer.
-- **Commands stay outside the checkout.** Every hook, MCP and helper command
-  must be a plain command: an absolute program outside the reviewed and the
-  user's checkout (or a bare tool name) with plain arguments. Shell syntax
-  (`;`, `&`, `|`, redirects, `$`, backticks, quotes) is refused, so splitting
-  on whitespace is exact and every word is checked; hooks that need a shell go
-  in a script at an absolute path. Relative paths, `$CLAUDE_PROJECT_DIR`, and
-  launchers that resolve tools from the project (`npx`, `uvx`, `bunx`, …, even
-  by absolute path) are refused, at save time and again before each run. `env`
-  values (MCP servers and Claude settings) may not name a path inside a
-  checkout, and `*PATH` variables list only absolute directories or inherited
-  variables. Containment follows symlinks and ignores case on Windows.
+- **Where config comes from is enforced; what commands do is not.** The
+  branch's hooks, MCP servers and extensions are not loaded. The profile's own
+  hooks, MCP servers and helpers are the user's code, like the hooks in their
+  agent settings: they run in the reviewed checkout as configured, and Entire
+  doesn't vet them (a command at an absolute path can still run the branch's
+  `package.json` scripts). A value naming a path inside the checkout or
+  `$CLAUDE_PROJECT_DIR` gets a warning at save time and before each run, since
+  it is usually a copy-paste mistake. Prompts never say nothing runs when the
+  profile configures hooks or MCP servers.
 - **Fail, don't fall back.** An agent that can't apply a field (Codex
   `settings`, Pi `mcp_servers`, …) fails the review with an explanation.
 - **Gate.** Skills and commands can run their own commands, so reviewing

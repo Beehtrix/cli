@@ -25,7 +25,7 @@ func prepareCodexReviewConfig(ctx context.Context, cfg reviewtypes.RunConfig) (r
 	}
 	// Nothing is written for Codex; the run only resolves paths.
 	defer run.Cleanup()
-	if err := review.ValidateAgentConfig("codex", cfg.AgentConfig, run.ForbiddenRoots); err != nil {
+	if err := review.ValidateAgentConfig("codex", cfg.AgentConfig); err != nil {
 		return cfg, nil, fmt.Errorf("review profile config: %w", err)
 	}
 	mainRoot, err := run.MainRepoRoot(ctx)

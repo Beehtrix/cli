@@ -3,6 +3,7 @@ package review_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -195,11 +196,28 @@ func TestConfigure_SetConfigSavesToClonePreferences(t *testing.T) {
 		t.Fatalf("after editing the profile: model %q, config %v; want sonnet with the config kept", got.Model, got.Config)
 	}
 
-	bad := filepath.Join(t.TempDir(), "bad.json")
-	if err := os.WriteFile(bad, []byte(`{"settings":{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./hook.sh"}]}]}}}`), 0o600); err != nil {
+	// A command naming a file in this checkout is saved with a warning.
+	wd, err := os.Getwd()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := run("--configure", "general", "--set-config", "claude-code="+bad); err == nil {
-		t.Fatal("a hook running from the checkout was accepted")
+	inCheckout := filepath.Join(t.TempDir(), "in-checkout.json")
+	hook, err := json.Marshal(filepath.Join(wd, "hook.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inCheckout, []byte(`{"settings":{"hooks":{"Stop":[{"hooks":[{"type":"command","command":`+string(hook)+`}]}]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd := review.NewCommand(deps)
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"--configure", "general", "--set-config", "claude-code=" + inCheckout})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("--set-config with a checkout path: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "inside the checkout") {
+		t.Errorf("no warning for a checkout path; stderr:\n%s", stderr.String())
 	}
 }

@@ -433,7 +433,7 @@ func trustConfirmText(subject TrustSubject, inv TrustInventory, command string) 
 	switch {
 	case len(entries) == 0 && inv.Isolated:
 		title = "Review this branch?"
-		b.WriteString("The review agent uses your profile's config and reads this branch's code and instructions; nothing from it runs on your machine.")
+		b.WriteString("The review agent uses your profile's config, so this branch's hooks, MCP servers and extensions are not loaded. It reads this branch's code and instructions. Your own hooks and MCP servers run in this checkout as you configured them.")
 		return title, b.String()
 	case len(entries) == 0:
 		title = "Review this branch?"
@@ -441,7 +441,7 @@ func trustConfirmText(subject TrustSubject, inv TrustInventory, command string) 
 		return title, b.String()
 	case inv.Isolated:
 		title = "Load this branch's skills during the review?"
-		b.WriteString("The review agent uses your profile's config, but still loads this branch's skills and commands (and Pi settings), which can run commands:\n")
+		b.WriteString("The review agent uses your profile's config, so this branch's hooks, MCP servers and extensions are not loaded. It still loads this branch's skills and commands (and Pi settings), which can run commands:\n")
 	case inv.onlyEntireHooks():
 		title = "Run this branch's hooks during the review?"
 		b.WriteString("The review agent loads this branch's hooks. These run on your machine:\n")
@@ -606,7 +606,10 @@ func printTrustConfig(out io.Writer, subject TrustSubject, inv TrustInventory, a
 	if agents := inv.entireAgents(); len(agents) > 0 {
 		fmt.Fprintf(out, "Entire session tracking: %s\n", strings.Join(agents, ", "))
 	}
-	if len(entries) == 0 {
+	switch {
+	case len(entries) == 0 && len(inv.IsolatedAgents) > 0:
+		fmt.Fprintln(out, "Nothing from this checkout is loaded; your profile's own hooks and MCP servers run in it as you configured them.")
+	case len(entries) == 0:
 		fmt.Fprintln(out, "Nothing from this checkout runs during the review.")
 	}
 	for _, e := range entries {

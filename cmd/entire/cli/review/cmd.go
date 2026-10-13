@@ -1019,7 +1019,8 @@ func runReview(ctx context.Context, cmd *cobra.Command, agentOverride, modelOver
 	}
 	for _, worker := range sortedMapKeys(nonZeroAgentConfigs(profile.Agents)) {
 		if profile.Agents[worker].Config != nil {
-			fmt.Fprintf(cmd.ErrOrStderr(), "%s: using your profile's agent config (this checkout's hooks, MCP servers and extensions are not loaded).\n", worker)
+			fmt.Fprintf(cmd.ErrOrStderr(), "%s: using your profile's agent config; this checkout's hooks, MCP servers and extensions are not loaded.\n", worker)
+			warnAgentConfig(ctx, cmd.ErrOrStderr(), worker, profile.Agents[worker].Config)
 		}
 	}
 

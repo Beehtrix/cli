@@ -34,7 +34,7 @@ func prepareReviewAgentConfig(ctx context.Context, cfg reviewtypes.RunConfig) (r
 		run.Cleanup()
 		return cfg, nil, err
 	}
-	if err := review.ValidateAgentConfig("claude-code", cfg.AgentConfig, run.ForbiddenRoots); err != nil {
+	if err := review.ValidateAgentConfig("claude-code", cfg.AgentConfig); err != nil {
 		return fail(fmt.Errorf("review profile config: %w", err))
 	}
 	settingsJSON, err := reviewProfileSettings(cfg.AgentConfig.Settings)

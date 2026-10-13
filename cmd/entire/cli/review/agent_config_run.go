@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/gitexec"
@@ -26,8 +27,6 @@ type AgentConfigRun struct {
 	dir  string
 	// CheckoutRoot is the reviewed checkout, canonicalized.
 	CheckoutRoot string
-	// ForbiddenRoots are the checkouts no profile command may run from.
-	ForbiddenRoots []string
 }
 
 // NewAgentConfigRun creates the run directory and resolves the checkout.
@@ -39,13 +38,6 @@ func NewAgentConfigRun(ctx context.Context) (*AgentConfigRun, error) {
 	canonical, err := filepath.EvalSymlinks(checkout)
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize %s: %w", checkout, err)
-	}
-	forbidden := []string{checkout, canonical}
-	if caller := strings.TrimSpace(os.Getenv(envReviewFindingsWorktree)); caller != "" {
-		forbidden = append(forbidden, caller)
-		if resolved, err := filepath.EvalSymlinks(caller); err == nil {
-			forbidden = append(forbidden, resolved)
-		}
 	}
 
 	root, err := userdirs.CacheRoot()
@@ -65,11 +57,10 @@ func NewAgentConfigRun(ctx context.Context) (*AgentConfigRun, error) {
 		return nil, fmt.Errorf("create review run dir: %w", err)
 	}
 	return &AgentConfigRun{
-		root:           root,
-		name:           name,
-		dir:            filepath.Join(cacheDir, filepath.FromSlash(name)),
-		CheckoutRoot:   canonical,
-		ForbiddenRoots: forbidden,
+		root:         root,
+		name:         name,
+		dir:          filepath.Join(cacheDir, filepath.FromSlash(name)),
+		CheckoutRoot: canonical,
 	}, nil
 }
 
@@ -118,7 +109,7 @@ func (r *AgentConfigRun) CopyCheckoutTree(ctx context.Context, dirs map[string]s
 				return copied, fmt.Errorf("%s is a symlink or submodule; the review will not load it", name)
 			}
 			rel := strings.TrimPrefix(name, src+"/")
-			if rel == name || strings.Contains(rel, "..") {
+			if rel == name || slices.Contains(strings.Split(rel, "/"), "..") {
 				return copied, fmt.Errorf("unexpected path %q under %s", name, src)
 			}
 			blob, err := gitexec.Run(ctx, r.CheckoutRoot, "cat-file", "blob", fields[2])

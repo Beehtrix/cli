@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,9 +47,18 @@ func loadAgentConfigFile(path string) (*settings.ReviewAgentConfig, error) {
 	return &cfg, nil
 }
 
-// validateAgentConfigForSave checks a config against the user's own checkout;
-// at run time it is checked again against the reviewed checkout.
-func validateAgentConfigForSave(ctx context.Context, agentName string, cfg *settings.ReviewAgentConfig) error {
+// validateAgentConfigForSave checks that agentName can apply cfg, and warns on
+// errOut about values that name a path inside this checkout.
+func validateAgentConfigForSave(ctx context.Context, errOut io.Writer, agentName string, cfg *settings.ReviewAgentConfig) error {
+	if err := ValidateAgentConfig(agentName, toAgentConfig(cfg)); err != nil {
+		return err
+	}
+	warnAgentConfig(ctx, errOut, agentName, cfg)
+	return nil
+}
+
+// warnAgentConfig prints AgentConfigWarnings for cfg against this checkout.
+func warnAgentConfig(ctx context.Context, errOut io.Writer, worker string, cfg *settings.ReviewAgentConfig) {
 	var roots []string
 	if root, err := paths.WorktreeRoot(ctx); err == nil {
 		roots = append(roots, root)
@@ -56,7 +66,9 @@ func validateAgentConfigForSave(ctx context.Context, agentName string, cfg *sett
 			roots = append(roots, resolved)
 		}
 	}
-	return ValidateAgentConfig(agentName, toAgentConfig(cfg), roots)
+	for _, w := range AgentConfigWarnings(toAgentConfig(cfg), roots) {
+		fmt.Fprintf(errOut, "Warning: %s config: %s.\n", worker, w)
+	}
 }
 
 // stripAgentConfigs removes reviewer configs from a profile before it is
@@ -210,7 +222,7 @@ func configureAgentConfigs(ctx context.Context, cmd *cobra.Command, profileName 
 		if err != nil {
 			return fail(err)
 		}
-		if err := validateAgentConfigForSave(ctx, reviewAgentName(worker, workerCfg), cfg); err != nil {
+		if err := validateAgentConfigForSave(ctx, cmd.ErrOrStderr(), reviewAgentName(worker, workerCfg), cfg); err != nil {
 			return fail(fmt.Errorf("--set-config %s: %w", worker, err))
 		}
 		configs[worker] = cfg

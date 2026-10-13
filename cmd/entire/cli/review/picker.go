@@ -893,7 +893,7 @@ func RunReviewProfileConfigPicker(ctx context.Context, out io.Writer, getInstall
 			Skills: dedupeStrings(append(builtinPicks, discoveredPicks...)),
 			Prompt: strings.TrimSpace(prompt),
 		}
-		agentCfg, changed, err := promptReviewAgentConfig(ctx, string(c.name), existing[string(c.name)].Config)
+		agentCfg, changed, err := promptReviewAgentConfig(ctx, out, string(c.name), existing[string(c.name)].Config)
 		if err != nil {
 			return err
 		}
@@ -1368,7 +1368,7 @@ func dedupeStrings(xs []string) []string {
 
 // promptReviewAgentConfig asks which agent config a reviewer runs with. It
 // reports whether the choice changed anything.
-func promptReviewAgentConfig(ctx context.Context, agentName string, current *settings.ReviewAgentConfig) (*settings.ReviewAgentConfig, bool, error) {
+func promptReviewAgentConfig(ctx context.Context, out io.Writer, agentName string, current *settings.ReviewAgentConfig) (*settings.ReviewAgentConfig, bool, error) {
 	if _, supported := agentConfigFields[agentName]; !supported {
 		return current, false, nil
 	}
@@ -1410,7 +1410,7 @@ func promptReviewAgentConfig(ctx context.Context, agentName string, current *set
 	if err != nil {
 		return nil, false, err
 	}
-	if err := validateAgentConfigForSave(ctx, agentName, cfg); err != nil {
+	if err := validateAgentConfigForSave(ctx, out, agentName, cfg); err != nil {
 		return nil, false, fmt.Errorf("agent config for %s: %w", agentName, err)
 	}
 	return cfg, true, nil

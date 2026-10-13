@@ -119,14 +119,3 @@ func TestPrepareReviewAgentConfigRefusesSymlinkedSkill(t *testing.T) {
 		t.Fatalf("err = %v, want a symlink refusal", err)
 	}
 }
-
-// A hook that runs code from the checkout is refused at run time.
-func TestPrepareReviewAgentConfigRefusesCheckoutCommand(t *testing.T) {
-	newReviewConfigRepo(t, nil)
-	cfg := reviewtypes.RunConfig{AgentConfig: &reviewtypes.AgentConfig{
-		Settings: json.RawMessage(`{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./hook.sh"}]}]}}`),
-	}}
-	if _, _, err := prepareReviewAgentConfig(t.Context(), cfg); err == nil || !strings.Contains(err.Error(), "relative path") {
-		t.Fatalf("err = %v, want a relative-path refusal", err)
-	}
-}
