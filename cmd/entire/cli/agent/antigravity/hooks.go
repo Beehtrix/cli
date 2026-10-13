@@ -121,49 +121,42 @@ func entireEntryMatches(existing json.RawMessage, candidate HookConfig) (disable
 	return false, err1 == nil && err2 == nil && bytes.Equal(existingBytes, candidateBytes)
 }
 
-// HooksEntryMatchesHost reports whether the repo's installed "entire" entry is
-// exactly what InstallHooks would write on THIS host. installed is false when
-// there is no entry. A user-disabled entry counts as current. wrongHost is set
-// when the entry is not current and carries a command InstallHooks writes only
-// on the other host family; an entry that is merely outdated (written by an
-// older version for this host) is not current but not wrongHost either, since
-// its hooks still run here.
+// HooksEntryWrongHost reports whether the repo's installed "entire" entry
+// carries a hook command InstallHooks writes only for the other host family.
+// An absent, user-disabled or current entry is not wrong-host, and neither is
+// one merely outdated (written for this host by an older release), since its
+// hooks still run here.
 //
 // It exists for `entire doctor`: the hook command's SHAPE is host-specific
 // (agy runs it through cmd.exe on Windows and sh elsewhere), and a hooks.json
 // committed from a macOS checkout carries a sh wrapper that cmd.exe tears
 // apart — the hook exits 1, the failure shows only in agy's log, and nothing
 // is tracked. A file that merely exists proves nothing about that; comparing
-// against the candidate does, at zero cost and without spawning agy.
-func (a *AntigravityAgent) HooksEntryMatchesHost(ctx context.Context) (installed, current, wrongHost bool, err error) {
+// against the other host's candidate does, at zero cost and without spawning
+// agy.
+func (a *AntigravityAgent) HooksEntryWrongHost(ctx context.Context) (bool, error) {
 	cfg, err := a.hookConfig(ctx)
 	if err != nil {
-		return false, false, false, err
+		return false, err
 	}
 	existing, ok, err := readEntireEntry(cfg)
 	if err != nil || !ok {
-		return false, false, false, err
+		return false, err
 	}
-	if disabled, same := entireEntryMatches(existing, buildEntireHookConfig()); disabled || same {
-		return true, true, false, nil
-	}
-	return true, false, hasOtherHostCommand(existing), nil
-}
-
-// hasOtherHostCommand reports whether any command in an installed entry is one
-// buildEntireHookConfigForHost writes only for the other host family.
-func hasOtherHostCommand(existing json.RawMessage) bool {
 	var existingCfg HookConfig
 	if err := json.Unmarshal(existing, &existingCfg); err != nil {
-		return false
+		return false, fmt.Errorf("parse entire hook entry: %w", err)
+	}
+	if existingCfg.Enabled != nil && !*existingCfg.Enabled {
+		return false, nil
 	}
 	otherHost := hookCommands(buildEntireHookConfigForHost(!agent.HookHostIsWindows()))
 	for _, cmd := range hookCommands(existingCfg) {
 		if slices.Contains(otherHost, cmd) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // hookCommands lists every command in cfg, across all event keys.

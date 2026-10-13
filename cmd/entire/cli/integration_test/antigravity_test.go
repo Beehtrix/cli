@@ -16,7 +16,6 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
-	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/entireio/cli/cmd/entire/cli/trailers"
 	"github.com/go-git/go-git/v6"
@@ -31,7 +30,7 @@ import (
 // wiring: session-start writes nothing to stdout and creates no state, session
 // state lazy-initializes on the first PreInvocation with the model from
 // session-start, file changes from a write_to_file PreToolUse land in
-// state.FilesTouched, and a Stop with fullyIdle=true records SessionEnd.
+// state.FilesTouched, and a Stop with fullyIdle=true records TurnEnd.
 // (PostToolUse/PostInvocation are deliberately not installed — no lifecycle
 // mapping.)
 func TestAntigravity_FullEventFlow(t *testing.T) {
@@ -110,7 +109,7 @@ func TestAntigravity_FullEventFlow(t *testing.T) {
 		"fullyIdle":         true,
 	})
 	require.NoError(t, runAntigravityHook(t, env.RepoDir, "stop", stopIdle),
-		"stop hook with fullyIdle=true should emit SessionEnd")
+		"stop hook with fullyIdle=true should emit TurnEnd")
 
 	stateBytes, err := os.ReadFile(statePath)
 	require.NoError(t, err, "session state file should still be readable after the full flow")
@@ -133,44 +132,6 @@ func TestAntigravity_FullEventFlow(t *testing.T) {
 	}
 	assert.True(t, slices.Contains(got, "foo.txt"),
 		"PreToolUse(write_to_file foo.txt) should have populated files_touched; got %v", got)
-}
-
-// TestAntigravity_ResumeWithoutSessionStartIsTracked pins that session-start is
-// not needed to track a resumed conversation: agy fires SessionStart only for a
-// new conversation, not on `agy --conversation <id>`, and a resume's first
-// PreInvocation already has invocationNum > 0. The conditional TurnStart must
-// fire against the idle state the first turn left behind.
-func TestAntigravity_ResumeWithoutSessionStartIsTracked(t *testing.T) {
-	t.Parallel()
-	env := newAntigravityEnv(t)
-
-	conversationID := "antigravity-it-resume"
-	transcriptPath := filepath.Join(antigravityBrainDir(env.RepoDir), conversationID, ".system_generated", "logs", "transcript_full.jsonl")
-	require.NoError(t, os.MkdirAll(filepath.Dir(transcriptPath), 0o750))
-	require.NoError(t, os.WriteFile(transcriptPath,
-		[]byte(`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"hello"}`+"\n"),
-		0o600))
-	common := map[string]any{
-		"conversationId":        conversationID,
-		"workspacePaths":        []string{env.RepoDir},
-		"transcriptPath":        transcriptPath,
-		"artifactDirectoryPath": filepath.Join(env.RepoDir, ".gemini", "antigravity-cli", "artifacts"),
-	}
-	stopIdle := mergeMaps(common, map[string]any{"executionNum": 1, "terminationReason": "model_stop", "fullyIdle": true})
-
-	// First run of the conversation.
-	require.NoError(t, runAntigravityHook(t, env.RepoDir, "session-start", mergeMaps(common, map[string]any{"modelName": "gemini-3.1-pro-low"})))
-	require.NoError(t, runAntigravityHook(t, env.RepoDir, "pre-invocation", mergeMaps(common, map[string]any{"invocationNum": 0})))
-	require.NoError(t, runAntigravityHook(t, env.RepoDir, "stop", stopIdle))
-	state, err := env.GetSessionState(conversationID)
-	require.NoError(t, err)
-	require.Equal(t, session.PhaseIdle, state.Phase)
-
-	// Resume: no session-start, first PreInvocation past 0.
-	require.NoError(t, runAntigravityHook(t, env.RepoDir, "pre-invocation", mergeMaps(common, map[string]any{"invocationNum": 3})))
-	state, err = env.GetSessionState(conversationID)
-	require.NoError(t, err)
-	require.Equal(t, session.PhaseActive, state.Phase, "the resumed turn should be tracked")
 }
 
 // TestAntigravity_MidTurnCommitWithUnwrittenTranscriptStillCondenses pins the

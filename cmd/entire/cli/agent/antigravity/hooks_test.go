@@ -541,32 +541,24 @@ func TestUninstallHooks_LeavesAForeignOnlyFileUntouched(t *testing.T) {
 	}
 }
 
-// HooksEntryMatchesHost is doctor's zero-cost replacement for the probe: it
-// must call a fresh install current, a foreign-shaped entry stale, an entry
-// written for the other host family wrong-host, an entry from an older release
-// for this host stale but not wrong-host, and a user-disabled entry current
-// (install leaves it alone too).
-func TestHooksEntryMatchesHost(t *testing.T) {
+// HooksEntryWrongHost is doctor's zero-cost replacement for the probe: only
+// an entry carrying the other host family's commands is wrong-host. A fresh
+// install, an entry from an older release for this host, and a user-disabled
+// entry (install leaves it alone too) are not.
+func TestHooksEntryWrongHost(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 	t.Setenv(configDirEnv, t.TempDir())
 	a := &AntigravityAgent{}
 	ctx := context.Background()
-
-	installed, current, wrongHost, err := a.HooksEntryMatchesHost(ctx)
-	if err != nil || installed || current || wrongHost {
-		t.Fatalf("no file: installed=%v current=%v wrongHost=%v err=%v; want false,false,false,nil", installed, current, wrongHost, err)
-	}
-
-	if _, err := a.InstallHooks(ctx, false); err != nil {
-		t.Fatal(err)
-	}
-	installed, current, wrongHost, err = a.HooksEntryMatchesHost(ctx)
-	if err != nil || !installed || !current || wrongHost {
-		t.Fatalf("fresh install: installed=%v current=%v wrongHost=%v err=%v; want true,true,false,nil", installed, current, wrongHost, err)
-	}
-
 	hooksPath := filepath.Join(dir, ".agents", AgentsHooksFileName)
+	check := func(name string, want bool) {
+		t.Helper()
+		got, err := a.HooksEntryWrongHost(ctx)
+		if err != nil || got != want {
+			t.Fatalf("%s: wrongHost=%v err=%v; want %v,nil", name, got, err, want)
+		}
+	}
 	writeEntry := func(cfg HookConfig) {
 		t.Helper()
 		data, err := json.Marshal(HooksFile{"entire": cfg})
@@ -577,36 +569,27 @@ func TestHooksEntryMatchesHost(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	check := func(name string, wantCurrent, wantWrongHost bool) {
-		t.Helper()
-		installed, current, wrongHost, err := a.HooksEntryMatchesHost(ctx)
-		if err != nil || !installed || current != wantCurrent || wrongHost != wantWrongHost {
-			t.Fatalf("%s: installed=%v current=%v wrongHost=%v err=%v; want true,%v,%v,nil",
-				name, installed, current, wrongHost, err, wantCurrent, wantWrongHost)
-		}
-	}
 
-	stale := `{"entire":{"PreInvocation":[{"type":"command","command":"sh -c 'exec entire hooks antigravity pre-invocation'"}]}}`
-	if err := os.WriteFile(hooksPath, []byte(stale), 0o600); err != nil {
+	check("no file", false)
+
+	if _, err := a.InstallHooks(ctx, false); err != nil {
 		t.Fatal(err)
 	}
-	check("foreign shape", false, false)
+	check("fresh install", false)
 
 	otherHost := buildEntireHookConfigForHost(!agent.HookHostIsWindows())
 	writeEntry(otherHost)
-	check("other host", false, true)
+	check("other host", true)
 
-	// The entry releases before session-start installed: it still runs here.
 	outdated := buildEntireHookConfig()
 	outdated.SessionStart = nil
 	writeEntry(outdated)
-	check("outdated", false, false)
+	check("outdated", false)
 
-	disabled := `{"entire":{"enabled":false,"PreInvocation":[{"type":"command","command":"echo off"}]}}`
-	if err := os.WriteFile(hooksPath, []byte(disabled), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	check("user-disabled", true, false)
+	disabled := false
+	otherHost.Enabled = &disabled
+	writeEntry(otherHost)
+	check("user-disabled", false)
 }
 
 // Upgrading from a release that installed only pre-tool-use, pre-invocation

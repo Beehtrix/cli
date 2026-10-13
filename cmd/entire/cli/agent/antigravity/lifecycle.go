@@ -61,7 +61,8 @@ func (a *AntigravityAgent) ParseHookEvent(_ context.Context, hookName string, st
 // AntigravityAgent intentionally does not implement HookResponseWriter, so the
 // dispatcher writes nothing to stdout and agy shows no "tracked by entire"
 // banner, matching the Cursor/OpenCode/Copilot/Pi pattern of silent session
-// tracking. agy ignores a SessionStart hook's stdout and exit status.
+// tracking. agy only logs an error for a SessionStart hook's non-JSON stdout or
+// nonzero exit; the run continues.
 func parseSessionStart(stdin io.Reader) (*agent.Event, error) {
 	raw, err := agent.ReadAndParseHookInput[SessionStartPayload](stdin)
 	if err != nil {

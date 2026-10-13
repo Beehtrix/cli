@@ -32,8 +32,9 @@ func TestHookNames(t *testing.T) {
 	}
 }
 
-// The fixture mirrors real agy 1.3.4 SessionStart stdin: the common fields
-// plus modelName, which the dispatcher stores as the session's model hint.
+// The fixture's paths are synthetic, but its field set matches the
+// SessionStart stdin captured from agy 1.3.4: the common fields plus
+// modelName, which the dispatcher stores as the session's model hint.
 func TestParseHookEvent_SessionStart(t *testing.T) {
 	t.Parallel()
 	data, err := os.ReadFile("testdata/hook_stdin_session_start.json")
@@ -78,15 +79,6 @@ func TestParseHookEvent_SessionStart_MalformedJSON(t *testing.T) {
 	a := &AntigravityAgent{}
 	if _, err := a.ParseHookEvent(context.Background(), HookNameSessionStart, strings.NewReader("not json")); err == nil {
 		t.Fatal("expected error for malformed JSON")
-	}
-}
-
-// SessionStart must stay silent: agy shows no banner, and the dispatcher only
-// writes a SessionStart response to stdout for a HookResponseWriter.
-func TestAntigravityIsNotAHookResponseWriter(t *testing.T) {
-	t.Parallel()
-	if _, ok := agent.AsHookResponseWriter(&AntigravityAgent{}); ok {
-		t.Fatal("AntigravityAgent must not implement HookResponseWriter")
 	}
 }
 

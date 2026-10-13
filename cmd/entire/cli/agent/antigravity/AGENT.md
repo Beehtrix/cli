@@ -33,9 +33,9 @@ hook payloads); tool args can arrive double-encoded.
   `GOOGLE_GEMINI_BASE_URL`. agy prefers `GOOGLE_API_KEY` when both keys are set.
   The default (`cloudcode-pa.googleapis.com`) backend remains entitlement-gated;
   see `e2e/README.md`.
-- Supported floor: agy ≥ 1.1.10 (reliable `Stop` ordering, below). Every
-  installed hook, `SessionStart` included, exists from 1.1.1; how agy ≤ 1.1.0
-  treats the `SessionStart` key is unverified.
+- `SessionStart` exists from agy 1.1.1; earlier releases have no such hook,
+  and how they treat the unknown `SessionStart` key in hooks.json is
+  unverified.
 - Version notes (1.1.1 → 1.3.4): hook surface unchanged (6 hook types,
   `SessionStart` among them; by 1.3.4 the common payload also carries
   `modelName`);
@@ -77,8 +77,9 @@ hooks.json can never fail an agy turn.
 `session-start` writes nothing to stdout: `AntigravityAgent` is not a
 `HookResponseWriter`, so there is no "tracked by entire" banner and no
 `injectSteps` (silent tracking, same as Cursor/OpenCode/Copilot/Pi). agy ignores
-SessionStart's stdout and exit status (verified on 1.3.4), which also covers an
-older `entire` that predates the verb and prints cobra help instead.
+SessionStart's result: on non-JSON stdout or a nonzero exit it logs an error
+and the run continues (verified on 1.3.4). That also covers an older `entire`
+that predates the verb and prints cobra help instead.
 
 ### Hook Input Payloads (Captured)
 
@@ -259,5 +260,6 @@ agy or touching the developer's keychain.
 `testdata/hook_stdin_pre_invocation.json`, `testdata/hook_stdin_pre_tool_use.json`,
 `testdata/hook_stdin_stop.json` — real agy 1.0.x stdin captures (fixtures carry
 the full documented payloads to pin unknown-field tolerance);
-`testdata/hook_stdin_session_start.json` — agy 1.3.4 SessionStart stdin shape;
+`testdata/hook_stdin_session_start.json` — synthetic paths, field set as
+captured from agy 1.3.4 SessionStart stdin;
 `testdata/transcript_sample.jsonl` — captured transcript fixture.
