@@ -75,9 +75,10 @@ var providerTokenPatterns = []*regexp.Regexp{
 
 // bareSKKeyPattern catches short sk- keys (e.g. LiteLLM virtual keys, sk- + 22
 // chars) that are too short for the entropy layer (#2728). The prefix must
-// start a word or follow a literal JSON escape, so "risk-" doesn't match;
-// detectProviderTokens also requires a digit or uppercase letter in the body.
-var bareSKKeyPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_]|\\[bfnrt]|\\u[0-9A-Fa-f]{4})(sk-[A-Za-z0-9_-]{20,})`)
+// follow a non-alphanumeric char ("_" included) or a literal JSON escape, so
+// "risk-" doesn't match; detectProviderTokens also requires a digit or
+// uppercase letter in the body.
+var bareSKKeyPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9]|\\[bfnrt]|\\u[0-9A-Fa-f]{4})(sk-[A-Za-z0-9_-]{20,})`)
 
 // detectProviderTokens returns tagged regions for every occurrence of a
 // known provider secret-token prefix in s. Regions use the empty label so

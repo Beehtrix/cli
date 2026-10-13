@@ -730,14 +730,15 @@ func TestString_BareSKKeys(t *testing.T) {
 	})
 }
 
-// TestDetectProviderTokens_BareSKKeyAfterJSONEscape pins the escape boundaries
-// on the provider layer alone: through String, the entropy layer can swallow
-// an escape's hex digits together with the key and mask a missing boundary.
-func TestDetectProviderTokens_BareSKKeyAfterJSONEscape(t *testing.T) {
+// TestDetectProviderTokens_BareSKKeyBoundaries pins the underscore and escape
+// boundaries on the provider layer alone: through String, the entropy layer can
+// swallow the preceding name or escape digits together with the key and mask a
+// missing boundary.
+func TestDetectProviderTokens_BareSKKeyBoundaries(t *testing.T) {
 	t.Parallel()
 
 	key := bareSKPrefix() + "Qm4Wn8Rt_bVcXzLkJhGfDs"
-	for _, prefix := range []string{`first line\n`, `quote\u0022`} {
+	for _, prefix := range []string{`API_KEY_`, `first line\n`, `quote\u0022`} {
 		input := prefix + key
 		regions := detectProviderTokens(input)
 		if len(regions) != 1 || input[regions[0].start:regions[0].end] != key {
