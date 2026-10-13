@@ -16,6 +16,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/entireio/cli/cmd/entire/cli/trailers"
 	"github.com/go-git/go-git/v6"
@@ -24,13 +25,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestAntigravity_FullEventFlow drives the three installed Antigravity hooks
-// (pre-invocation, pre-tool-use, stop) against a real git repo via
-// `entire hooks antigravity <verb>` subprocesses and verifies the lifecycle
-// wiring: session state lazy-initializes on the first PreInvocation, file
-// changes from a write_to_file PreToolUse land in state.FilesTouched, and a
-// Stop with fullyIdle=true records SessionEnd. (PostToolUse/PostInvocation
-// are deliberately not installed — no lifecycle mapping.)
+// TestAntigravity_FullEventFlow drives the four installed Antigravity hooks
+// (session-start, pre-invocation, pre-tool-use, stop) against a real git repo
+// via `entire hooks antigravity <verb>` subprocesses and verifies the lifecycle
+// wiring: session-start writes nothing to stdout and creates no state, session
+// state lazy-initializes on the first PreInvocation with the model from
+// session-start, file changes from a write_to_file PreToolUse land in
+// state.FilesTouched, and a Stop with fullyIdle=true records SessionEnd.
+// (PostToolUse/PostInvocation are deliberately not installed — no lifecycle
+// mapping.)
 func TestAntigravity_FullEventFlow(t *testing.T) {
 	t.Parallel()
 	env := newAntigravityEnv(t)
@@ -49,6 +52,16 @@ func TestAntigravity_FullEventFlow(t *testing.T) {
 		"artifactDirectoryPath": filepath.Join(env.RepoDir, ".gemini", "antigravity-cli", "artifacts"),
 	}
 
+	statePath := filepath.Join(env.RepoDir, ".git", "entire-sessions", conversationID+".json")
+
+	// agy 1.3.4 SessionStart stdin: the common fields plus modelName.
+	stdout, err := runAntigravityHookStdout(t, env.RepoDir, "session-start", mergeMaps(common, map[string]any{
+		"modelName": "gemini-3.1-pro-low",
+	}))
+	require.NoError(t, err, "session-start hook should succeed")
+	assert.Empty(t, stdout, "session-start must write nothing to agy's stdout")
+	require.NoFileExists(t, statePath, "session-start must not create session state")
+
 	// agy wire format (captured on 1.0.14/1.0.15, re-verified unchanged on
 	// 1.1.1): invocationNum is 0-indexed. The first model
 	// invocation of a conversation carries invocationNum=0; only that one
@@ -62,8 +75,11 @@ func TestAntigravity_FullEventFlow(t *testing.T) {
 	require.NoError(t, runAntigravityHook(t, env.RepoDir, "pre-invocation", preInv),
 		"pre-invocation hook should succeed and lazy-init session state")
 
-	statePath := filepath.Join(env.RepoDir, ".git", "entire-sessions", conversationID+".json")
 	require.FileExists(t, statePath, "session state file should exist after pre-invocation")
+	initState, err := env.GetSessionState(conversationID)
+	require.NoError(t, err)
+	assert.Equal(t, "gemini-3.1-pro-low", initState.ModelName,
+		"the model hint stored at session-start should reach session state")
 
 	preTU := mergeMaps(common, map[string]any{
 		"toolCall": map[string]any{
@@ -117,6 +133,44 @@ func TestAntigravity_FullEventFlow(t *testing.T) {
 	}
 	assert.True(t, slices.Contains(got, "foo.txt"),
 		"PreToolUse(write_to_file foo.txt) should have populated files_touched; got %v", got)
+}
+
+// TestAntigravity_ResumeWithoutSessionStartIsTracked pins that session-start is
+// not needed to track a resumed conversation: agy fires SessionStart only for a
+// new conversation, not on `agy --conversation <id>`, and a resume's first
+// PreInvocation already has invocationNum > 0. The conditional TurnStart must
+// fire against the idle state the first turn left behind.
+func TestAntigravity_ResumeWithoutSessionStartIsTracked(t *testing.T) {
+	t.Parallel()
+	env := newAntigravityEnv(t)
+
+	conversationID := "antigravity-it-resume"
+	transcriptPath := filepath.Join(antigravityBrainDir(env.RepoDir), conversationID, ".system_generated", "logs", "transcript_full.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(transcriptPath), 0o750))
+	require.NoError(t, os.WriteFile(transcriptPath,
+		[]byte(`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"hello"}`+"\n"),
+		0o600))
+	common := map[string]any{
+		"conversationId":        conversationID,
+		"workspacePaths":        []string{env.RepoDir},
+		"transcriptPath":        transcriptPath,
+		"artifactDirectoryPath": filepath.Join(env.RepoDir, ".gemini", "antigravity-cli", "artifacts"),
+	}
+	stopIdle := mergeMaps(common, map[string]any{"executionNum": 1, "terminationReason": "model_stop", "fullyIdle": true})
+
+	// First run of the conversation.
+	require.NoError(t, runAntigravityHook(t, env.RepoDir, "session-start", mergeMaps(common, map[string]any{"modelName": "gemini-3.1-pro-low"})))
+	require.NoError(t, runAntigravityHook(t, env.RepoDir, "pre-invocation", mergeMaps(common, map[string]any{"invocationNum": 0})))
+	require.NoError(t, runAntigravityHook(t, env.RepoDir, "stop", stopIdle))
+	state, err := env.GetSessionState(conversationID)
+	require.NoError(t, err)
+	require.Equal(t, session.PhaseIdle, state.Phase)
+
+	// Resume: no session-start, first PreInvocation past 0.
+	require.NoError(t, runAntigravityHook(t, env.RepoDir, "pre-invocation", mergeMaps(common, map[string]any{"invocationNum": 3})))
+	state, err = env.GetSessionState(conversationID)
+	require.NoError(t, err)
+	require.Equal(t, session.PhaseActive, state.Phase, "the resumed turn should be tracked")
 }
 
 // TestAntigravity_MidTurnCommitWithUnwrittenTranscriptStillCondenses pins the
@@ -629,6 +683,25 @@ func runAntigravityHook(t *testing.T, repoDir, hookName string, input map[string
 // of the real entire binary.
 func runAntigravityHookWithEnv(t *testing.T, repoDir, hookName string, input map[string]any, extraEnv []string) error {
 	t.Helper()
+	output, runErr := antigravityHookCmd(t, repoDir, hookName, input, extraEnv).CombinedOutput()
+	t.Logf("antigravity hook %s output: %s", hookName, output)
+	return runErr
+}
+
+// runAntigravityHookStdout runs an Antigravity hook and returns only its
+// stdout, which is what agy reads as the hook's response.
+func runAntigravityHookStdout(t *testing.T, repoDir, hookName string, input map[string]any) (string, error) {
+	t.Helper()
+	cmd := antigravityHookCmd(t, repoDir, hookName, input, nil)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, runErr := cmd.Output()
+	t.Logf("antigravity hook %s stdout: %s\nstderr: %s", hookName, stdout, stderr.String())
+	return string(stdout), runErr
+}
+
+func antigravityHookCmd(t *testing.T, repoDir, hookName string, input map[string]any, extraEnv []string) *exec.Cmd {
+	t.Helper()
 	inputJSON, err := json.Marshal(input)
 	require.NoError(t, err)
 
@@ -637,9 +710,7 @@ func runAntigravityHookWithEnv(t *testing.T, repoDir, hookName string, input map
 	cmd.Stdin = bytes.NewReader(inputJSON)
 	cmd.Env = append(testutil.GitIsolatedEnv(), antigravityBrainDirEnv(repoDir))
 	cmd.Env = append(cmd.Env, extraEnv...)
-	output, runErr := cmd.CombinedOutput()
-	t.Logf("antigravity hook %s output: %s", hookName, output)
-	return runErr
+	return cmd
 }
 
 func mergeMaps(base, overrides map[string]any) map[string]any {

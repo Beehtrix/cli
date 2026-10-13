@@ -1725,7 +1725,9 @@ func checkAntigravityHooksLoaded(cmd *cobra.Command) {
 	}
 	w := cmd.OutOrStdout()
 
-	if installed, current, err := ag.HooksEntryMatchesHost(cmd.Context()); err == nil && installed && !current {
+	// Only a wrong-host entry is reported: one merely outdated by a newer
+	// release (e.g. missing session-start) still tracks on this host.
+	if _, _, wrongHost, err := ag.HooksEntryMatchesHost(cmd.Context()); err == nil && wrongHost {
 		fmt.Fprintln(w, "Antigravity hooks: STALE FOR THIS HOST")
 		fmt.Fprintln(w, "  The \"entire\" entry in .agents/hooks.json is not the command this host")
 		fmt.Fprintln(w, "  needs (agy runs hooks through cmd.exe on Windows and sh elsewhere), so")
