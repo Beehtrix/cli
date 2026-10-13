@@ -267,6 +267,20 @@ func agentHelpClassified(path string) (agentHelpFacts, bool) {
 	return f, ok
 }
 
+// agentHelpGuidanceFor returns the guidance for cmd and every ancestor that has
+// some, outermost first. Inherited so a group-wide fact (trail needs network and
+// keyring access) reaches the leaf an agent actually looks up, e.g.
+// `agent-help trail finding list`, without repeating it on every subcommand.
+func agentHelpGuidanceFor(cmd *cobra.Command) string {
+	var parts []string
+	for c := cmd; c != nil && c != c.Root(); c = c.Parent() {
+		if g := agentHelpGuidance[agentHelpPath(c)]; g != "" {
+			parts = append([]string{g}, parts...)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 // agentHelpPath is a command's path relative to the root, the key shape used by
 // agentHelpClassification ("status", "checkpoint list").
 func agentHelpPath(cmd *cobra.Command) string {
@@ -623,7 +637,7 @@ func renderAgentHelpJSON(rootCmd, target *cobra.Command, repoLine string, trails
 		Command:  target.CommandPath(),
 		Short:    target.Short,
 		Long:     strings.TrimSpace(target.Long),
-		Guidance: agentHelpGuidance[agentHelpPath(target)],
+		Guidance: agentHelpGuidanceFor(target),
 		Example:  strings.TrimSpace(target.Example),
 		Repo:     repoLine,
 	}
@@ -714,7 +728,7 @@ func renderAgentHelpCommand(cmd *cobra.Command, repoLine string, trailsEnabled b
 	}
 	// Before the flags and examples: whether to use the command at all outranks
 	// how to call it.
-	if guidance := agentHelpGuidance[agentHelpPath(cmd)]; guidance != "" {
+	if guidance := agentHelpGuidanceFor(cmd); guidance != "" {
 		b.WriteString("\nWhen to use this:\n")
 		b.WriteString(guidance)
 		b.WriteString("\n")
