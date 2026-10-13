@@ -155,3 +155,33 @@ func resolved(t *testing.T, path string) string {
 	require.NoError(t, err)
 	return r
 }
+
+// A turn that removes an untracked file it created earlier at home while also
+// editing another worktree records the removal, as a home-only turn does.
+func TestTurnEditingElsewhere_StillRecordsHomeRemovals(t *testing.T) {
+	t.Parallel()
+	parent := NewRepoWithCommit(t)
+	linked := worktreeEnv(t, parent, "removals")
+	sess := parent.NewSession()
+
+	require.NoError(t, parent.SimulateUserPromptSubmitWithPromptAndTranscriptPath(sess.ID, "create", sess.TranscriptPath))
+	home := filepath.Join(parent.RepoDir, "scratch.txt")
+	writeFileAt(t, home, "temp\n")
+	sess.CreateTranscript("create", []FileChange{{Path: home, Content: "temp"}})
+	require.NoError(t, parent.SimulateStop(sess.ID, sess.TranscriptPath))
+	state, err := parent.GetSessionState(sess.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, state.TouchedFileHashes["scratch.txt"], "fixture: the file is recorded with its hash")
+
+	require.NoError(t, parent.SimulateUserPromptSubmitWithPromptAndTranscriptPath(sess.ID, "clean up and edit elsewhere", sess.TranscriptPath))
+	require.NoError(t, os.Remove(home))
+	other := filepath.Join(linked.RepoDir, "x.txt")
+	writeFileAt(t, other, "x\n")
+	sess.CreateTranscript("clean up and edit elsewhere", []FileChange{{Path: other, Content: "x"}})
+	require.NoError(t, parent.SimulateStop(sess.ID, sess.TranscriptPath))
+
+	state, err = parent.GetSessionState(sess.ID)
+	require.NoError(t, err)
+	hash, recorded := state.TouchedFileHashes["scratch.txt"]
+	assert.True(t, recorded && hash == "", "the home removal was not recorded as a deletion: %q (recorded=%v)", hash, recorded)
+}

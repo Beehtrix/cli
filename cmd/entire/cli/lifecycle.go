@@ -1028,6 +1028,16 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 
 	// Check if there are any changes
 	totalChanges := len(relModifiedFiles) + len(relNewFiles) + len(relDeletedFiles)
+	if totalChanges == 0 && len(elsewhere) > 0 {
+		// Nothing git can see changed here, but the turn worked in another
+		// worktree and goes on to save that step. An untracked file it
+		// created here earlier and has now removed is still recorded, as in
+		// the branch below.
+		if recErr := GetStrategy(ctx).RecordVanishedUntrackedFiles(ctx, sessionID); recErr != nil {
+			logging.Warn(logCtx, "failed to record removed untracked files",
+				slog.String("error", recErr.Error()))
+		}
+	}
 	if totalChanges == 0 && len(elsewhere) == 0 {
 		logging.Info(logCtx, "no files modified during session, skipping checkpoint")
 		// A turn that only removed an untracked file the agent created
