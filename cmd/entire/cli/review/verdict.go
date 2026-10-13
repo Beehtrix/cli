@@ -91,9 +91,8 @@ func isCleanReviewVerdict(text string) bool {
 // parseReviewVerdictLine classifies one line. An approve (or approved) is
 // clean only when nothing follows it, or when its reason says nothing needs
 // fixing ("no actionable findings", "looks good") and carries no qualifier.
-// A word directly after "approve" other than "with no"/"with nothing"
-// ("approve if", "approve with suggestions") is a condition, and any other
-// reason may be feedback, so unknown phrasings are posted, not dropped. A labelled or bulleted verdict ("Verdict: approve", "- approve") is
+// Any other reason ("approve if ...", "approve rename x") may be a condition
+// or feedback, so unknown phrasings are posted, not dropped. A labelled or bulleted verdict ("Verdict: approve", "- approve") is
 // not recognized and is posted too.
 func parseReviewVerdictLine(line string) (clean, isVerdict bool) {
 	line = strings.ToLower(line)
@@ -123,9 +122,6 @@ func parseReviewVerdictLine(line string) (clean, isVerdict bool) {
 	words := strings.FieldsFunc(rest, func(r rune) bool { return !unicode.IsLetter(r) })
 	if len(words) == 0 {
 		return true, true
-	}
-	if first, _ := utf8.DecodeRuneInString(rest); unicode.IsLetter(first) && words[0] != "with" {
-		return false, true
 	}
 	for _, word := range words {
 		if reviewVerdictQualifiers[word] {
