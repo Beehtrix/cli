@@ -10,6 +10,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/session"
 )
 
 // SplitEditsByWorktree groups the files a turn's agent edited (absolute, or
@@ -90,19 +91,32 @@ func PruneRemovedWorktrees(ctx context.Context, sessionID, hookRoot string) {
 	if err != nil {
 		return
 	}
-	live := make(map[string]bool, len(registered))
+	// Entries are keyed by worktree ID, which survives `git worktree move`;
+	// a stored path doesn't, so liveness is decided by key, and a moved
+	// worktree's entry takes its new path.
+	live := make(map[string]string, len(registered))
 	for _, p := range registered {
-		live[resolveExisting(p)] = true
+		id, idErr := paths.GetWorktreeID(p)
+		if idErr != nil {
+			// Can't tell which entry this worktree is: prune nothing.
+			return
+		}
+		live[session.WorktreeKey(id)] = resolveExisting(p)
 	}
 	err = MutateSessionState(ctx, sessionID, func(state *SessionState) error {
-		pruned := false
+		changed := false
 		for key, work := range state.OtherWorktrees {
-			if work == nil || work.Path == "" || !live[resolveExisting(work.Path)] {
+			path, ok := live[key]
+			switch {
+			case work == nil || !ok:
 				delete(state.OtherWorktrees, key)
-				pruned = true
+				changed = true
+			case work.Path != path:
+				work.Path = path
+				changed = true
 			}
 		}
-		if !pruned {
+		if !changed {
 			return ErrMutationSkip
 		}
 		if len(state.OtherWorktrees) == 0 {

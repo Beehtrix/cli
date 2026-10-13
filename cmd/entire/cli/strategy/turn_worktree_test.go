@@ -109,3 +109,22 @@ func TestPruneRemovedWorktrees(t *testing.T) {
 	PruneRemovedWorktrees(t.Context(), "prune", mainDir)
 	assert.Nil(t, mustLoad(t, s, "prune").OtherWorktrees)
 }
+
+// A moved worktree keeps its entry (keyed by worktree ID), which takes the new
+// path; only worktrees git no longer lists are pruned.
+func TestPruneRemovedWorktrees_KeepsMovedWorktrees(t *testing.T) {
+	s, mainDir, linkedDir := homedSession(t, "prune-moved")
+	key := linkedKey(t, linkedDir)
+	require.NoError(t, MutateSessionState(t.Context(), "prune-moved", func(state *SessionState) error {
+		state.OtherWorktrees = map[string]*session.WorktreeWork{key: {Path: mustEvalSymlinks(t, linkedDir), FilesTouched: []string{"w.go"}}}
+		return nil
+	}))
+	moved := filepath.Join(t.TempDir(), "moved")
+	testutil.RunGit(t, mainDir, "worktree", "move", linkedDir, moved)
+
+	PruneRemovedWorktrees(t.Context(), "prune-moved", mainDir)
+	work := mustLoad(t, s, "prune-moved").OtherWorktrees[key]
+	require.NotNil(t, work, "a moved worktree's pending edits were pruned")
+	assert.Equal(t, []string{"w.go"}, work.FilesTouched)
+	assert.Equal(t, mustEvalSymlinks(t, moved), work.Path)
+}
