@@ -477,7 +477,9 @@ func PushQueuedCheckpointRefs(ctx context.Context, repo *git.Repository, remote 
 
 // partitionCheckpointRefPushes captures each queued ref's current immutable
 // tip. The queue token remains attached solely for exact-generation cleanup
-// after delivery.
+// after delivery. A ref whose lookup fails for any reason but absence is
+// unreadable: it has no tip to pin, so it stays queued for the next push rather
+// than being pruned over a flaky read.
 func partitionCheckpointRefPushes(
 	repo *git.Repository,
 	entries []checkpoint.PushQueueEntry,
@@ -530,13 +532,17 @@ func flushCheckpointRefsQueue(ctx context.Context, repo *git.Repository, ps push
 	pushCtx, pushSpan := perf.Start(ctx, "push_checkpoint_refs")
 	defer pushSpan.End()
 
-	// Unreadable refs have no tip to pin, so they stay queued untouched.
-	existing, stale, _ := partitionCheckpointRefPushes(repo, queued)
+	existing, stale, unreadable := partitionCheckpointRefPushes(repo, queued)
 	if len(stale) > 0 {
 		if err := queue.RemoveEntries(stale); err != nil {
 			logging.Warn(ctx, "git-refs push: prune stale queue entries failed",
 				slog.String("error", err.Error()))
 		}
+	}
+	if len(unreadable) > 0 {
+		logging.Warn(ctx, "git-refs push: checkpoint refs could not be read; left queued",
+			slog.Int("unreadable", len(unreadable)))
+		fmt.Fprintf(stderrWriter, "[entire] %d checkpoint ref(s) could not be read and stay queued for the next push.\n", len(unreadable))
 	}
 	if len(existing) == 0 {
 		return 0, nil
