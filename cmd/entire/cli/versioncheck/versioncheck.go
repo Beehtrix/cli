@@ -9,36 +9,24 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
+	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
+	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/cmd/entire/cli/versioninfo"
+	"github.com/entireio/cli/internal/entireclient/userdirs"
+	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
-)
-
-const goosWindows = "windows"
-
-// goos is a test seam for runtime.GOOS so the Windows-specific auto-install
-// gating can be exercised from a non-Windows host.
-var goos = runtime.GOOS
-
-const (
-	installManagerBrew    = "brew"
-	installManagerMise    = "mise"
-	installManagerScoop   = "scoop"
-	installManagerUnknown = "unknown"
-	installChannelStable  = "stable"
-	installChannelNightly = "nightly"
 )
 
 // CheckAndNotify performs a version check and notifies the user if a newer version is available.
 // This is the main entry point for the version check system.
 // The function is silent on all errors to avoid interrupting CLI operations.
 func CheckAndNotify(ctx context.Context, w io.Writer, currentVersion string) {
-	// Skip checks for dev builds
-	if currentVersion == "dev" || currentVersion == "" {
+	// Skip checks for local/unreleased builds.
+	if isDevBuild(currentVersion) {
 		return
 	}
 
@@ -86,7 +74,7 @@ func CheckAndNotify(ctx context.Context, w io.Writer, currentVersion string) {
 			return
 		}
 
-		action := MaybeAutoUpdate(ctx, w, currentVersion, latestVersion)
+		action := maybeAutoUpdate(ctx, w, currentVersion, latestVersion)
 		if action == autoUpdateActionSkipUntilNextVersion {
 			cache.SkippedVersion = versionCacheKey(latestVersion)
 			if saveErr := saveCache(cache); saveErr != nil {
@@ -97,48 +85,31 @@ func CheckAndNotify(ctx context.Context, w io.Writer, currentVersion string) {
 	}
 }
 
-// globalConfigDirPath returns the expanded path to the global config directory (~/.config/entire).
-func globalConfigDirPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("getting home directory: %w", err)
-	}
-	return filepath.Join(home, globalConfigDirName), nil
-}
-
 // ensureGlobalConfigDir creates the global config directory if it doesn't exist.
+//
+// It goes through userdirs.ConfigRoot, whose create path is
+// userdirs.EnsurePrivateDir, rather than a bare MkdirAll: this directory is
+// shared with contexts.json and the file token store, both of which hold bearer
+// tokens. The version check runs from the root command's PersistentPostRun, so
+// on a fresh machine it is almost always what creates the directory, before the
+// first login ever runs. Creating it world-readable here left it that way
+// permanently, since MkdirAll cannot change the mode of a directory that
+// already exists.
 func ensureGlobalConfigDir() error {
-	configDir, err := globalConfigDirPath()
-	if err != nil {
-		return err
-	}
-
-	//nolint:gosec // ~/.config/entire is user home directory, 0o755 is appropriate
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
+	if _, err := userdirs.ConfigRoot(); err != nil {
 		return fmt.Errorf("creating config directory: %w", err)
 	}
-
 	return nil
-}
-
-// cacheFilePath returns the full path to the version check cache file.
-func cacheFilePath() (string, error) {
-	configDir, err := globalConfigDirPath()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(configDir, cacheFileName), nil
 }
 
 // loadCache loads the version check cache from disk.
 // Returns an error if the file doesn't exist or is corrupted.
 func loadCache() (*VersionCache, error) {
-	filePath, err := cacheFilePath()
+	root, err := userdirs.ConfigRootForRead()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading cache file: %w", err)
 	}
-
-	data, err := os.ReadFile(filePath) //nolint:gosec // cacheFilePath is safe
+	data, err := osroot.ReadFileNoFollow(root, cacheFileName)
 	if err != nil {
 		return nil, fmt.Errorf("reading cache file: %w", err)
 	}
@@ -154,24 +125,23 @@ func loadCache() (*VersionCache, error) {
 // saveCache saves the version check cache to disk.
 // Uses atomic write semantics (write to temp file, then rename).
 func saveCache(cache *VersionCache) error {
-	filePath, err := cacheFilePath()
-	if err != nil {
-		return err
-	}
-
 	// Marshal to JSON
 	data, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling cache: %w", err)
 	}
 
+	root, err := userdirs.ConfigRoot()
+	if err != nil {
+		return fmt.Errorf("opening config directory: %w", err)
+	}
+
 	// Write to temp file first (atomic write)
-	dir := filepath.Dir(filePath)
-	tmpFile, err := os.CreateTemp(dir, ".version_check_tmp_")
+	tmpFile, tmpName, err := jsonutil.CreateTempIn(root, cacheFileName)
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
 	}
-	defer os.Remove(tmpFile.Name())
+	defer func() { _ = root.Remove(tmpName) }() //nolint:errcheck // best-effort; a successful rename already consumed it
 
 	if _, err := tmpFile.Write(data); err != nil {
 		_ = tmpFile.Close() // cleanup on error path
@@ -183,8 +153,7 @@ func saveCache(cache *VersionCache) error {
 	}
 
 	// Rename temp file to final location
-
-	if err := os.Rename(tmpFile.Name(), filePath); err != nil {
+	if err := root.Rename(tmpName, cacheFileName); err != nil {
 		return fmt.Errorf("renaming cache file: %w", err)
 	}
 
@@ -202,7 +171,7 @@ func fetchLatestVersion(ctx context.Context) (string, error) {
 	}
 
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "entire-cli")
+	req.Header.Set("User-Agent", versioninfo.UserAgent())
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -246,7 +215,7 @@ func fetchLatestNightlyVersion(ctx context.Context) (string, error) {
 	}
 
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "entire-cli/"+versioninfo.Version)
+	req.Header.Set("User-Agent", versioninfo.UserAgent())
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -308,15 +277,30 @@ func isOutdated(current, latest string) bool {
 		latest = "v" + latest
 	}
 
-	// Skip notification for dev builds (e.g., "1.0.0-dev-xxx").
-	// These are local development builds and shouldn't trigger update notifications.
+	// Local/unreleased builds shouldn't trigger update notifications.
 	// Normal prereleases (e.g., "1.0.0-rc1") should still be compared normally.
-	if strings.Contains(semver.Prerelease(current), "dev") {
+	if isDevBuild(current) {
 		return false
 	}
 
 	// semver.Compare returns -1 if current < latest
 	return semver.Compare(current, latest) < 0
+}
+
+// isDevBuild reports whether v identifies a local, unreleased build that
+// should not be nagged to update. This covers the "dev" sentinel and empty
+// string (an unstamped binary), a Go pseudo-version (built from a commit that
+// isn't a tagged release), and any build carrying +metadata such as "+dirty".
+// Released builds — stable tags, nightly tags, and `go install ...@<tag>` —
+// have clean semver and return false.
+func isDevBuild(v string) bool {
+	if v == "" || v == "dev" {
+		return true
+	}
+	if !strings.HasPrefix(v, "v") {
+		v = "v" + v
+	}
+	return !semver.IsValid(v) || module.IsPseudoVersion(v) || semver.Build(v) != ""
 }
 
 func versionCacheKey(version string) string {
@@ -338,78 +322,99 @@ func releaseNotesURL(version string) string {
 // It's a variable so tests can override it.
 var executablePath = os.Executable
 
-func releaseChannel(version string) string {
-	if isNightly(version) {
-		return installChannelNightly
-	}
-	return installChannelStable
-}
-
-func installManagerForCurrentBinary() string {
-	execPath, err := executablePath()
+// normalizePath returns p with symlinks resolved (best-effort), separators as
+// forward slashes, and case folded where the OS compares paths
+// case-insensitively (foldPathCase). Every install-path comparison in this
+// package is a plain prefix or substring test on this form.
+func normalizePath(p string) string {
+	resolved, err := filepath.EvalSymlinks(p)
 	if err != nil {
-		return installManagerUnknown
+		resolved = p
 	}
-
-	realPath, err := filepath.EvalSymlinks(execPath)
-	if err != nil {
-		realPath = execPath
-	}
-	normalizedPath := strings.ReplaceAll(filepath.ToSlash(realPath), "\\", "/")
-
-	switch {
-	case strings.Contains(normalizedPath, "/Cellar/") ||
-		strings.Contains(normalizedPath, "/opt/homebrew/") ||
-		strings.Contains(normalizedPath, "/linuxbrew/") ||
-		strings.Contains(normalizedPath, "/Caskroom/"):
-		return installManagerBrew
-	case strings.Contains(normalizedPath, "/mise/installs/"):
-		return installManagerMise
-	case strings.Contains(normalizedPath, "/scoop/apps/"):
-		return installManagerScoop
-	default:
-		return installManagerUnknown
-	}
+	return foldPathCase(strings.ReplaceAll(filepath.ToSlash(resolved), "\\", "/"))
 }
 
-// canAutoInstall reports whether updateCommand(currentVersion) is safe to
-// execute on the current OS. Returns false on Windows when the install
-// manager is unknown, because the POSIX curl-pipe-bash fallback can't run
-// from cmd.exe and there's no Windows-native installer to substitute.
-func canAutoInstall() bool {
-	if goos != goosWindows {
-		return true
-	}
-	switch installManagerForCurrentBinary() {
-	case installManagerScoop, installManagerMise:
-		return true
-	default:
-		return false
-	}
-}
-
-// downloadsURL is the public page users visit when we can't offer an
-// auto-installable command on their platform.
+// downloadsURL is the GitHub releases page, used for release-notes links.
 const downloadsURL = "https://github.com/entireio/cli/releases"
 
-// updateCommand returns the appropriate update instruction based on how the binary was installed.
-func updateCommand(currentVersion string) string {
-	switch installManagerForCurrentBinary() {
-	case installManagerBrew:
-		if releaseChannel(currentVersion) == installChannelNightly {
-			return "brew upgrade entire@nightly"
-		}
-		return "brew upgrade entire"
-	case installManagerMise:
-		return "mise upgrade entire"
-	case installManagerScoop:
-		return "scoop update entire/cli"
-	}
+// installProbe identifies one install manager from the running binary's path
+// and returns the command that upgrades it. roots are env/config install
+// prefixes (relocated dirs, optional); markers cover default layouts.
+type installProbe struct {
+	roots   func() []string
+	markers []string
+	command func(execPath, currentVersion string) string
+}
 
-	if releaseChannel(currentVersion) == installChannelNightly {
-		return "curl -fsSL https://entire.io/install.sh | bash -s -- --channel nightly"
+func miseRoots() []string {
+	if d := os.Getenv("MISE_INSTALLS_DIR"); d != "" {
+		return []string{d}
 	}
-	return "curl -fsSL https://entire.io/install.sh | bash"
+	if d := os.Getenv("MISE_DATA_DIR"); d != "" {
+		return []string{filepath.Join(d, "installs")}
+	}
+	return nil
+}
+
+// normalizeInstallRoot returns an absolute root in normalizePath form with a
+// trailing slash, or "" for empty/relative values. A root that does not exist
+// on disk still matches by cleaned prefix.
+func normalizeInstallRoot(root string) string {
+	if root == "" || !filepath.IsAbs(root) {
+		return ""
+	}
+	n := normalizePath(filepath.Clean(root))
+	if !strings.HasSuffix(n, "/") {
+		n += "/"
+	}
+	return n
+}
+
+func (p installProbe) matches(execPath string) bool {
+	if p.roots != nil {
+		for _, raw := range p.roots() {
+			if root := normalizeInstallRoot(raw); root != "" && strings.HasPrefix(execPath, root) {
+				return true
+			}
+		}
+	}
+	for _, marker := range p.markers {
+		if strings.Contains(execPath, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+const miseUpgradeCmd = "mise upgrade entire"
+
+func miseUpgradeCommand(_, _ string) string {
+	return miseUpgradeCmd
+}
+
+var miseProbe = installProbe{
+	roots:   miseRoots,
+	markers: []string{"/mise/installs/"},
+	command: miseUpgradeCommand,
+}
+
+// UpdateCommandForCurrentBinary returns the shell command that updates this
+// binary, based on how it was installed.
+//
+// The fallback receives the exec path as the OS reports it (not normalized),
+// so the Windows installer hint can name the directory the binary lives in.
+func UpdateCommandForCurrentBinary(currentVersion string) string {
+	execPath, err := executablePath()
+	if err != nil {
+		return fallbackInstallCommand("", currentVersion)
+	}
+	normalized := normalizePath(execPath)
+	for _, p := range installProbes {
+		if p.matches(normalized) {
+			return p.command(normalized, currentVersion)
+		}
+	}
+	return fallbackInstallCommand(execPath, currentVersion)
 }
 
 // printNotification prints the version update notification to the user.

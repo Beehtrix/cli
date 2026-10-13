@@ -11,17 +11,18 @@ import (
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
-	"github.com/entireio/cli/cmd/entire/cli/textutil"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
 )
 
 // Compile-time interface assertions.
 var (
-	_ agent.TranscriptAnalyzer     = (*FactoryAIDroidAgent)(nil)
-	_ agent.TokenCalculator        = (*FactoryAIDroidAgent)(nil)
-	_ agent.SubagentAwareExtractor = (*FactoryAIDroidAgent)(nil)
-	_ agent.HookResponseWriter     = (*FactoryAIDroidAgent)(nil)
-	_ agent.PromptExtractor        = (*FactoryAIDroidAgent)(nil)
+	_ agent.TranscriptAnalyzer      = (*FactoryAIDroidAgent)(nil)
+	_ agent.TokenCalculator         = (*FactoryAIDroidAgent)(nil)
+	_ agent.SubagentAwareExtractor  = (*FactoryAIDroidAgent)(nil)
+	_ agent.SubagentSessionResolver = (*FactoryAIDroidAgent)(nil)
+	_ agent.HookResponseWriter      = (*FactoryAIDroidAgent)(nil)
+	_ agent.PromptExtractor         = (*FactoryAIDroidAgent)(nil)
+	_ agent.TaskTranscriptMatcher   = (*FactoryAIDroidAgent)(nil)
 )
 
 // WriteHookResponse outputs the hook response as plain text to stdout.
@@ -55,19 +56,19 @@ func (f *FactoryAIDroidAgent) HookNames() []string {
 func (f *FactoryAIDroidAgent) ParseHookEvent(ctx context.Context, hookName string, stdin io.Reader) (*agent.Event, error) {
 	switch hookName {
 	case HookNameSessionStart:
-		return f.parseSessionStart(stdin)
+		return f.parseSessionInfoEvent(stdin, agent.SessionStart)
 	case HookNameUserPromptSubmit:
 		return f.parseTurnStart(stdin)
 	case HookNameStop:
-		return f.parseTurnEnd(stdin)
+		return f.parseTurnEnd(ctx, stdin)
 	case HookNameSessionEnd:
-		return f.parseSessionEnd(stdin)
+		return f.parseSessionInfoEvent(stdin, agent.SessionEnd)
 	case HookNamePreToolUse:
 		return f.parseSubagentStart(ctx, stdin)
 	case HookNamePostToolUse:
 		return f.parseSubagentEnd(ctx, stdin)
 	case HookNamePreCompact:
-		return f.parseCompaction(stdin)
+		return f.parseSessionInfoEvent(stdin, agent.Compaction)
 	case HookNameSubagentStop, HookNameNotification:
 		// Acknowledged hooks with no lifecycle action
 		return nil, nil //nolint:nilnil // nil event = no lifecycle action
@@ -88,7 +89,7 @@ func (f *FactoryAIDroidAgent) GetTranscriptPosition(path string) (int, error) {
 }
 
 // ExtractModifiedFilesFromOffset extracts files modified since a given line offset.
-func (f *FactoryAIDroidAgent) ExtractModifiedFilesFromOffset(path string, startOffset int) ([]string, int, error) {
+func (f *FactoryAIDroidAgent) ExtractModifiedFilesFromOffset(_ context.Context, path string, startOffset int) ([]string, int, error) {
 	lines, currentPos, err := ParseDroidTranscript(path, startOffset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to parse transcript: %w", err)
@@ -109,40 +110,14 @@ func (f *FactoryAIDroidAgent) ExtractPrompts(sessionRef string, fromOffset int) 
 		if lines[i].Type != transcript.TypeUser {
 			continue
 		}
+		// ExtractUserContent already strips IDE tags; stripping again is not a
+		// no-op now that the <timestamp> strip is position-anchored.
 		content := transcript.ExtractUserContent(lines[i].Message)
 		if content != "" {
-			prompts = append(prompts, textutil.StripIDEContextTags(content))
+			prompts = append(prompts, content)
 		}
 	}
 	return prompts, nil
-}
-
-// ExtractSummary extracts the last assistant message as a session summary.
-func (f *FactoryAIDroidAgent) ExtractSummary(sessionRef string) (string, error) {
-	data, err := os.ReadFile(sessionRef) //nolint:gosec // Path comes from agent hook input
-	if err != nil {
-		return "", fmt.Errorf("failed to read transcript: %w", err)
-	}
-	lines, _, err := ParseDroidTranscriptFromBytes(data, 0)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse transcript: %w", err)
-	}
-
-	for i := len(lines) - 1; i >= 0; i-- {
-		if lines[i].Type != transcript.TypeAssistant {
-			continue
-		}
-		var msg transcript.AssistantMessage
-		if err := json.Unmarshal(lines[i].Message, &msg); err != nil {
-			continue
-		}
-		for _, block := range msg.Content {
-			if block.Type == transcript.ContentTypeText && block.Text != "" {
-				return block.Text, nil
-			}
-		}
-	}
-	return "", nil
 }
 
 // --- TokenCalculator ---
@@ -166,13 +141,15 @@ func (f *FactoryAIDroidAgent) CalculateTotalTokenUsage(transcriptData []byte, fr
 
 // --- Internal hook parsing functions ---
 
-func (f *FactoryAIDroidAgent) parseSessionStart(stdin io.Reader) (*agent.Event, error) {
+// parseSessionInfoEvent parses the hooks whose payload is sessionInfoRaw —
+// SessionStart, SessionEnd, and PreCompact differ only in the event type.
+func (f *FactoryAIDroidAgent) parseSessionInfoEvent(stdin io.Reader, eventType agent.EventType) (*agent.Event, error) {
 	raw, err := agent.ReadAndParseHookInput[sessionInfoRaw](stdin)
 	if err != nil {
 		return nil, err
 	}
 	return &agent.Event{
-		Type:       agent.SessionStart,
+		Type:       eventType,
 		SessionID:  raw.SessionID,
 		SessionRef: raw.TranscriptPath,
 		Timestamp:  time.Now(),
@@ -194,7 +171,7 @@ func (f *FactoryAIDroidAgent) parseTurnStart(stdin io.Reader) (*agent.Event, err
 	}, nil
 }
 
-func (f *FactoryAIDroidAgent) parseTurnEnd(stdin io.Reader) (*agent.Event, error) {
+func (f *FactoryAIDroidAgent) parseTurnEnd(ctx context.Context, stdin io.Reader) (*agent.Event, error) {
 	raw, err := agent.ReadAndParseHookInput[stopRaw](stdin)
 	if err != nil {
 		return nil, err
@@ -203,7 +180,7 @@ func (f *FactoryAIDroidAgent) parseTurnEnd(stdin io.Reader) (*agent.Event, error
 	model := raw.Model
 	// If model not provided in hook payload, extract from transcript
 	if model == "" && raw.TranscriptPath != "" {
-		model = ExtractModelFromTranscript(raw.TranscriptPath)
+		model = ExtractModelFromTranscript(ctx, raw.TranscriptPath)
 	}
 
 	return &agent.Event{
@@ -211,19 +188,6 @@ func (f *FactoryAIDroidAgent) parseTurnEnd(stdin io.Reader) (*agent.Event, error
 		SessionID:  raw.SessionID,
 		SessionRef: raw.TranscriptPath,
 		Model:      model,
-		Timestamp:  time.Now(),
-	}, nil
-}
-
-func (f *FactoryAIDroidAgent) parseSessionEnd(stdin io.Reader) (*agent.Event, error) {
-	raw, err := agent.ReadAndParseHookInput[sessionInfoRaw](stdin)
-	if err != nil {
-		return nil, err
-	}
-	return &agent.Event{
-		Type:       agent.SessionEnd,
-		SessionID:  raw.SessionID,
-		SessionRef: raw.TranscriptPath,
 		Timestamp:  time.Now(),
 	}, nil
 }
@@ -274,19 +238,6 @@ func (f *FactoryAIDroidAgent) parseSubagentEnd(ctx context.Context, stdin io.Rea
 		event.SubagentID = agentID
 	}
 	return event, nil
-}
-
-func (f *FactoryAIDroidAgent) parseCompaction(stdin io.Reader) (*agent.Event, error) {
-	raw, err := agent.ReadAndParseHookInput[sessionInfoRaw](stdin)
-	if err != nil {
-		return nil, err
-	}
-	return &agent.Event{
-		Type:       agent.Compaction,
-		SessionID:  raw.SessionID,
-		SessionRef: raw.TranscriptPath,
-		Timestamp:  time.Now(),
-	}, nil
 }
 
 func parseHookToolResponseAgentID(raw json.RawMessage) string {

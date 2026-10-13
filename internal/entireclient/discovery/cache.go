@@ -1,0 +1,264 @@
+package discovery
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
+	"github.com/entireio/cli/cmd/entire/cli/osroot"
+	"github.com/entireio/cli/internal/entireclient/userdirs"
+	"github.com/gofrs/flock"
+)
+
+const (
+	cacheFileName = "nodes.json"
+	lockTimeout   = 5 * time.Second
+	lockRetry     = 100 * time.Millisecond
+
+	// DefaultTTL is the cache TTL for replica sets discovered via info/refs.
+	DefaultTTL = 24 * time.Hour
+)
+
+// ClusterCache is the top-level cache structure, keyed by cluster host.
+type ClusterCache map[string]*ClusterEntry
+
+// ClusterEntry holds cached data for a single cluster.
+type ClusterEntry struct {
+	Repos map[string]*RepoEntry `json:"repos,omitempty"`
+}
+
+// RepoEntry caches the hosting nodes for a single repository.
+type RepoEntry struct {
+	Nodes     []string  `json:"nodes"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// LoadCache reads the node cache from disk. Returns an empty cache if the file
+// does not exist. This is an unlocked read — fine for read-only callers; use
+// ModifyCache for read-modify-write sequences.
+func LoadCache(cacheDir string) (ClusterCache, error) {
+	return readCacheNoLock(cacheFile{dir: cacheDir, name: cacheFileName})
+}
+
+// ModifyCache atomically applies fn to the node cache under a single
+// exclusive flock — load, mutate, and write all happen with the lock held.
+// Use this for any read-modify-write sequence, so concurrent writers
+// (e.g. two parallel clone/fetch/push processes updating nodes.json) can't
+// lose each other's entries.
+func ModifyCache(cacheDir string, fn func(ClusterCache) error) error {
+	return modifyCacheFile(cacheDir, cacheFileName, readCacheNoLock, writeCacheNoLock, fn)
+}
+
+func readCacheNoLock(f cacheFile) (ClusterCache, error) {
+	cache := make(ClusterCache)
+	err := loadCacheFile(f, &cache, func() ClusterCache { return make(ClusterCache) })
+	return cache, err
+}
+
+func writeCacheNoLock(f cacheFile, cache ClusterCache) error {
+	return writeCacheFile(f, cache)
+}
+
+// --- shared cache-file primitives (used by every cache file in this
+// package: nodes.json, cluster_cores.json) ---
+
+// withCacheFileLock ensures cacheDir exists, takes the exclusive flock for
+// the named cache file, and runs fn with the file's path.
+func withCacheFileLock(cacheDir, fileName string, fn func(cacheFile) error) error {
+	// Before the MkdirAll, for the reason contexts.FilePath gives: cacheFile.root
+	// refuses a relative directory, but only at the read, by which point this
+	// has already created ./<value> and dropped a .lock in it.
+	if err := userdirs.RequireAbsoluteOverride("cache dir", cacheDir); err != nil {
+		return err //nolint:wrapcheck // the error already names the directory and its value
+	}
+	if err := os.MkdirAll(cacheDir, 0700); err != nil {
+		return fmt.Errorf("create cache dir: %w", err)
+	}
+	f := cacheFile{dir: cacheDir, name: fileName}
+	unlock, err := lockCache(f.path())
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return fn(f)
+}
+
+// modifyCacheFile runs a load → mutate → write cycle for one cache file with
+// the file's flock held throughout, so concurrent processes filling the same
+// entry don't clobber each other.
+func modifyCacheFile[T any](cacheDir, fileName string, read func(cacheFile) (T, error), write func(cacheFile, T) error, fn func(T) error) error {
+	return withCacheFileLock(cacheDir, fileName, func(f cacheFile) error {
+		c, err := read(f)
+		if err != nil {
+			return err
+		}
+		if err := fn(c); err != nil {
+			return err
+		}
+		return write(f, c)
+	})
+}
+
+func lockCache(path string) (func(), error) {
+	fl := flock.New(path + ".lock")
+	ctx, cancel := context.WithTimeout(context.Background(), lockTimeout)
+	defer cancel()
+
+	locked, err := fl.TryLockContext(ctx, lockRetry)
+	if err != nil {
+		return nil, fmt.Errorf("acquire cache lock: %w", err)
+	}
+	if !locked {
+		return nil, errors.New("timeout acquiring cache lock")
+	}
+	return func() { _ = fl.Unlock() }, nil //nolint:errcheck // unlock failure is non-fatal
+}
+
+// loadCacheFile reads path and unmarshals it into dst. A missing file leaves
+// dst at its caller-initialized (empty) value; a corrupt file resets dst via
+// newEmpty so a damaged cache self-heals on the next write instead of wedging
+// callers. Returns an error only on a genuine read failure. Returning error
+// (rather than the cache value itself) keeps this generic helper off the
+// ireturn linter while still sharing the read/unmarshal logic across caches.
+func loadCacheFile[T any](f cacheFile, dst *T, newEmpty func() T) error {
+	data, exists, err := readCacheBytes(f)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if json.Unmarshal(data, dst) != nil {
+		*dst = newEmpty() // corrupt → start fresh
+	}
+	return nil
+}
+
+// writeCacheFile marshals v and writes it atomically (tmp + rename).
+func writeCacheFile[T any](f cacheFile, v T) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal cache: %w", err)
+	}
+	return writeCacheBytesAtomic(f, data)
+}
+
+// cacheFile names one cache file by the DIRECTORY it lives in and its name
+// inside that directory, rather than by a joined path.
+//
+// The split is the point. Every read and write here goes through a root, and a
+// root anchored at filepath.Dir of the target contains exactly the one fixed
+// name it was handed — every component the caller resolved sits above it, so
+// the containment enforces nothing. Keeping the two apart means the base is
+// always the cache directory the caller chose ($XDG_CACHE_HOME/entire, or an
+// explicit one under test) and the name is always something this package owns.
+//
+// Cache file names are fixed today (nodes.json, cluster_cores.json,
+// api_discovery.json), but the entries inside them are keyed by cluster slug and
+// jurisdiction — the kind of value that becomes a filename the moment someone
+// shards the cache per cluster. The root means that change cannot reach outside
+// the cache directory.
+type cacheFile struct {
+	dir  string
+	name string
+}
+
+// path is the joined form, for the flock and for error text. Nothing does I/O
+// on it.
+func (f cacheFile) path() string { return filepath.Join(f.dir, f.name) }
+
+// root opens f.dir and returns f's name inside it.
+// A relative f.dir is refused rather than absolutized, for the reason
+// contexts.configRoot gives: it comes from $XDG_CACHE_HOME, and resolving it
+// against the working directory names a different cache in every process.
+func (f cacheFile) root() (*os.Root, string, error) {
+	if err := userdirs.RequireAbsoluteOverride("cache dir", f.dir); err != nil {
+		return nil, "", err //nolint:wrapcheck // the error already names the directory and its value
+	}
+	root, err := osroot.Shared(f.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Unwrapped so readCacheBytes can classify a cold cache.
+			return nil, "", err //nolint:wrapcheck // see comment
+		}
+		return nil, "", fmt.Errorf("open cache dir: %w", err)
+	}
+	return root, f.name, nil
+}
+
+// readCacheBytes returns the file contents and whether the file exists. A
+// missing file is (nil, false, nil); other read errors propagate.
+func readCacheBytes(f cacheFile) ([]byte, bool, error) {
+	root, name, err := f.root()
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No cache directory means no cache, the same as no file. Callers
+			// treat both as a cold cache and refetch.
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	data, err := osroot.ReadFileNoFollow(root, name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read cache: %w", err)
+	}
+	return data, true, nil
+}
+
+// writeCacheBytesAtomic writes data via a tmp file + rename so a reader never
+// observes a half-written cache.
+func writeCacheBytesAtomic(f cacheFile, data []byte) error {
+	root, name, err := f.root()
+	if err != nil {
+		return err
+	}
+	if err := jsonutil.WriteFileAtomicIn(root, name, data, 0o600); err != nil {
+		return fmt.Errorf("write cache: %w", err)
+	}
+	return nil
+}
+
+// GetRepoNodes returns cached hosting nodes for a repo. The second return
+// value indicates freshness.
+func (c ClusterCache) GetRepoNodes(cluster, repoPath string) ([]string, bool) {
+	entry := c[cluster]
+	if entry == nil || entry.Repos == nil {
+		return nil, false
+	}
+	repo := entry.Repos[repoPath]
+	if repo == nil || len(repo.Nodes) == 0 {
+		return nil, false
+	}
+	return repo.Nodes, time.Now().Before(repo.ExpiresAt)
+}
+
+// SetRepoNodes caches hosting nodes for a specific repo.
+func (c ClusterCache) SetRepoNodes(cluster, repoPath string, nodes []string, ttl time.Duration) {
+	entry := c[cluster]
+	if entry == nil {
+		entry = &ClusterEntry{}
+		c[cluster] = entry
+	}
+	if entry.Repos == nil {
+		entry.Repos = make(map[string]*RepoEntry)
+	}
+	entry.Repos[repoPath] = &RepoEntry{
+		Nodes:     nodes,
+		ExpiresAt: time.Now().Add(ttl),
+	}
+}
+
+// InvalidateRepo removes the cached repo entry.
+func (c ClusterCache) InvalidateRepo(cluster, repoPath string) {
+	if entry := c[cluster]; entry != nil && entry.Repos != nil {
+		delete(entry.Repos, repoPath)
+	}
+}

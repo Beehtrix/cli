@@ -3,12 +3,9 @@
 package testutil
 
 import (
-	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
-	"sync"
+	"runtime"
 	"testing"
 	"time"
 
@@ -16,10 +13,13 @@ import (
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/object"
+
+	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
+	"github.com/entireio/cli/cmd/entire/cli/testutil/gitenv"
 )
 
-// RewindPoint mirrors the rewind --list JSON output.
-type RewindPoint struct {
+// PendingCheckpoint mirrors the `checkpoint list --pending --json` JSON output.
+type PendingCheckpoint struct {
 	ID               string    `json:"id"`
 	Message          string    `json:"message"`
 	MetadataDir      string    `json:"metadata_dir"`
@@ -38,6 +38,7 @@ func InitRepo(t *testing.T, repoDir string) {
 	if err != nil {
 		t.Fatalf("failed to init git repo: %v", err)
 	}
+	defer repo.Close()
 
 	// Configure git user for commits
 	cfg, err := repo.Config()
@@ -56,6 +57,19 @@ func InitRepo(t *testing.T, repoDir string) {
 
 	if err := repo.SetConfig(cfg); err != nil {
 		t.Fatalf("failed to set repo config: %v", err)
+	}
+}
+
+// SkipWithoutSymlinks skips a test that needs to create a symlink. On Windows
+// that takes elevation or developer mode, neither of which CI has.
+//
+// Here rather than per-package because six copies in three different wordings
+// had accumulated across cli, agent, worktreedir and vercelconfig tests, so
+// there was nowhere to make the change when a runner does gain the privilege.
+func SkipWithoutSymlinks(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs elevation on Windows")
 	}
 }
 
@@ -79,47 +93,15 @@ func WriteFile(t *testing.T, repoDir, path, content string) {
 	}
 }
 
-// ReadFile reads a file from the repo directory.
-func ReadFile(t *testing.T, repoDir, path string) string {
-	t.Helper()
-
-	fullPath := filepath.Join(repoDir, path)
-	//nolint:gosec // test code, path is from test setup
-	data, err := os.ReadFile(fullPath)
-	if err != nil {
-		t.Fatalf("failed to read file %s: %v", path, err)
-	}
-	return string(data)
-}
-
-// TryReadFile reads a file from the repo directory, returning empty string if not found.
-func TryReadFile(t *testing.T, repoDir, path string) string {
-	t.Helper()
-
-	fullPath := filepath.Join(repoDir, path)
-	//nolint:gosec // test code, path is from test setup
-	data, err := os.ReadFile(fullPath)
-	if err != nil {
-		return ""
-	}
-	return string(data)
-}
-
-// FileExists checks if a file exists in the repo directory.
-func FileExists(repoDir, path string) bool {
-	fullPath := filepath.Join(repoDir, path)
-	_, err := os.Stat(fullPath)
-	return err == nil
-}
-
 // GitAdd stages files for commit.
 func GitAdd(t *testing.T, repoDir string, paths ...string) {
 	t.Helper()
 
-	repo, err := git.PlainOpen(repoDir)
+	repo, err := gitrepo.OpenPath(repoDir)
 	if err != nil {
 		t.Fatalf("failed to open git repo: %v", err)
 	}
+	defer repo.Close()
 
 	worktree, err := repo.Worktree()
 	if err != nil {
@@ -137,10 +119,11 @@ func GitAdd(t *testing.T, repoDir string, paths ...string) {
 func GitCommit(t *testing.T, repoDir, message string) {
 	t.Helper()
 
-	repo, err := git.PlainOpen(repoDir)
+	repo, err := gitrepo.OpenPath(repoDir)
 	if err != nil {
 		t.Fatalf("failed to open git repo: %v", err)
 	}
+	defer repo.Close()
 
 	worktree, err := repo.Worktree()
 	if err != nil {
@@ -163,23 +146,18 @@ func GitCommit(t *testing.T, repoDir, message string) {
 // Uses git CLI to work around go-git v5 bug with checkout deleting untracked files.
 func GitCheckoutNewBranch(t *testing.T, repoDir, branchName string) {
 	t.Helper()
-
-	//nolint:noctx // test code, no context needed for git checkout
-	cmd := exec.Command("git", "checkout", "-b", branchName)
-	cmd.Dir = repoDir
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("failed to checkout new branch %s: %v\nOutput: %s", branchName, err, output)
-	}
+	RunGit(t, repoDir, "checkout", "-b", branchName)
 }
 
 // GetHeadHash returns the current HEAD commit hash.
 func GetHeadHash(t *testing.T, repoDir string) string {
 	t.Helper()
 
-	repo, err := git.PlainOpen(repoDir)
+	repo, err := gitrepo.OpenPath(repoDir)
 	if err != nil {
 		t.Fatalf("failed to open git repo: %v", err)
 	}
+	defer repo.Close()
 
 	head, err := repo.Head()
 	if err != nil {
@@ -189,36 +167,84 @@ func GetHeadHash(t *testing.T, repoDir string) string {
 	return head.Hash().String()
 }
 
+// EnvGitHermetic opts a test process into gitenv's hermetic transport config;
+// see gitenv.EnvHermetic.
+const EnvGitHermetic = gitenv.EnvHermetic
+
+// GitIsolatedEnv returns os.Environ() with git isolation variables set; see
+// gitenv.Isolated. The implementation lives in the dependency-free gitenv
+// subpackage so internal tests of packages testutil imports (e.g. gitrepo)
+// can use it without an import cycle; everything else keeps this spelling.
+func GitIsolatedEnv() []string {
+	return gitenv.Isolated()
+}
+
+// IsolateGitConfigEnv applies git config isolation to the current process;
+// see gitenv.IsolateProcess.
+func IsolateGitConfigEnv(t *testing.T) {
+	t.Helper()
+	gitenv.IsolateProcess(t)
+}
+
+// RunGit runs one git command in dir with an isolated git config, failing the
+// test on error and returning combined output. Use it for operations go-git
+// cannot express (force-add past .gitignore, rm --cached, worktree add) or
+// where shelling out is simply clearer. See gitenv.Run.
+//
+//nolint:unparam // the output is used by callers in other packages
+func RunGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	return gitenv.Run(t, dir, args...)
+}
+
+// GitAddForce stages paths past .gitignore. GitAdd goes through go-git's
+// worktree.Add, which has no force option.
+func GitAddForce(t *testing.T, repoDir string, paths ...string) {
+	t.Helper()
+	RunGit(t, repoDir, append([]string{"add", "-f"}, paths...)...)
+}
+
 // CreateBranch creates a local branch at the current HEAD.
 func CreateBranch(t *testing.T, dir string, name string) {
 	t.Helper()
-	cmd := exec.Command("git", "branch", name) //nolint:noctx // test helper, no context needed
-	cmd.Dir = dir
-	cmd.Env = GitIsolatedEnv()
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git branch %s: %v\n%s", name, err, out)
-	}
+	RunGit(t, dir, "branch", name)
+}
+
+// AddRemote adds a git remote named name pointing at url in repoDir.
+func AddRemote(t *testing.T, repoDir, name, url string) {
+	t.Helper()
+	RunGit(t, repoDir, "remote", "add", name, url)
+}
+
+// WriteCheckpointPushRemoteSetting writes .entire/settings.json configuring
+// strategy_options.checkpoint_push_remote to remoteName (with enabled: true).
+func WriteCheckpointPushRemoteSetting(t *testing.T, repoDir, remoteName string) {
+	t.Helper()
+	content := `{"enabled": true, "strategy_options": {"checkpoint_push_remote": "` + remoteName + `"}}`
+	WriteFile(t, repoDir, filepath.Join(".entire", "settings.json"), content)
+}
+
+// GitUpdateRef points ref at hash in repoDir via git update-ref.
+func GitUpdateRef(t *testing.T, repoDir, ref, hash string) {
+	t.Helper()
+	RunGit(t, repoDir, "update-ref", ref, hash)
 }
 
 // GitReset runs git reset --hard to the given ref.
 func GitReset(t *testing.T, dir string, ref string) {
 	t.Helper()
-	cmd := exec.Command("git", "reset", "--hard", ref) //nolint:noctx // test helper, no context needed
-	cmd.Dir = dir
-	cmd.Env = GitIsolatedEnv()
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git reset --hard %s: %v\n%s", ref, err, out)
-	}
+	RunGit(t, dir, "reset", "--hard", ref)
 }
 
 // BranchExists checks if a branch exists in the repository.
 func BranchExists(t *testing.T, repoDir, branchName string) bool {
 	t.Helper()
 
-	repo, err := git.PlainOpen(repoDir)
+	repo, err := gitrepo.OpenPath(repoDir)
 	if err != nil {
 		t.Fatalf("failed to open git repo: %v", err)
 	}
+	defer repo.Close()
 
 	refs, err := repo.References()
 	if err != nil {
@@ -235,115 +261,4 @@ func BranchExists(t *testing.T, repoDir, branchName string) bool {
 	})
 
 	return found
-}
-
-// GetCommitMessage returns the commit message for the given commit hash.
-func GetCommitMessage(t *testing.T, repoDir, hash string) string {
-	t.Helper()
-
-	repo, err := git.PlainOpen(repoDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	commitHash := plumbing.NewHash(hash)
-	commit, err := repo.CommitObject(commitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit %s: %v", hash, err)
-	}
-
-	return commit.Message
-}
-
-// GetLatestCheckpointIDFromHistory walks backwards from HEAD and returns
-// the checkpoint ID from the first commit with an Entire-Checkpoint trailer.
-// Returns an error if no checkpoint trailer is found in any commit.
-func GetLatestCheckpointIDFromHistory(t *testing.T, repoDir string) (string, error) {
-	t.Helper()
-
-	repo, err := git.PlainOpen(repoDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	head, err := repo.Head()
-	if err != nil {
-		t.Fatalf("failed to get HEAD: %v", err)
-	}
-
-	commitIter, err := repo.Log(&git.LogOptions{From: head.Hash()})
-	if err != nil {
-		t.Fatalf("failed to iterate commits: %v", err)
-	}
-
-	var checkpointID string
-	//nolint:errcheck,gosec // ForEach callback returns error to stop iteration
-	commitIter.ForEach(func(c *object.Commit) error {
-		// Look for Entire-Checkpoint trailer
-		for line := range strings.SplitSeq(c.Message, "\n") {
-			line = strings.TrimSpace(line)
-			if value, found := strings.CutPrefix(line, "Entire-Checkpoint:"); found {
-				checkpointID = strings.TrimSpace(value)
-				return errors.New("stop iteration")
-			}
-		}
-		return nil
-	})
-
-	if checkpointID == "" {
-		return "", errors.New("no commit with Entire-Checkpoint trailer found in history")
-	}
-
-	return checkpointID, nil
-}
-
-// SafeIDPrefix returns first 12 chars of ID or the full ID if shorter.
-// Use this when logging checkpoint IDs to avoid index out of bounds panic.
-func SafeIDPrefix(id string) string {
-	if len(id) >= 12 {
-		return id[:12]
-	}
-	return id
-}
-
-// gitEmptyConfigPath returns the path to an empty file suitable for use as
-// GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM. We use an empty file instead of
-// os.DevNull because git on Windows cannot open NUL as a config file.
-var gitEmptyConfig string
-var gitEmptyConfigOnce sync.Once
-
-func gitEmptyConfigPath() string {
-	gitEmptyConfigOnce.Do(func() {
-		f, err := os.CreateTemp("", "git-empty-config-*")
-		if err != nil {
-			panic("create empty git config: " + err.Error())
-		}
-		_ = f.Close()
-		gitEmptyConfig = f.Name()
-	})
-	return gitEmptyConfig
-}
-
-// GitIsolatedEnv returns os.Environ() with git isolation variables set.
-// This prevents user/system git config (global gitignore, aliases, etc.) from
-// affecting test behavior. Use this for any exec.Command that runs git or the
-// CLI binary in integration tests.
-//
-// See https://git-scm.com/docs/git#Documentation/git.txt-GITCONFIGGLOBAL
-//
-// Existing GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM entries are filtered out before
-// appending overrides to ensure they take effect regardless of parent env.
-func GitIsolatedEnv() []string {
-	env := os.Environ()
-	filtered := make([]string, 0, len(env)+2)
-	for _, e := range env {
-		if strings.HasPrefix(e, "GIT_CONFIG_GLOBAL=") || strings.HasPrefix(e, "GIT_CONFIG_SYSTEM=") {
-			continue
-		}
-		filtered = append(filtered, e)
-	}
-	return append(filtered,
-		"GIT_CONFIG_GLOBAL="+gitEmptyConfigPath(), // Isolate from user's global git config (e.g. global gitignore)
-		"GIT_CONFIG_SYSTEM="+gitEmptyConfigPath(), // Isolate from system git config
-	)
 }

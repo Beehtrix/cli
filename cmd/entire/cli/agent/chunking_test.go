@@ -4,11 +4,11 @@ import (
 	"context"
 	"strings"
 	"testing"
-
-	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 )
 
 func TestChunkJSONL_SmallContent(t *testing.T) {
+	t.Parallel()
+
 	// Small transcript should not be chunked
 	content := []byte(`{"type":"human","message":"hello"}
 {"type":"assistant","message":"hi"}`)
@@ -26,6 +26,8 @@ func TestChunkJSONL_SmallContent(t *testing.T) {
 }
 
 func TestChunkJSONL_LargeContent(t *testing.T) {
+	t.Parallel()
+
 	// Create a transcript larger than MaxChunkSize
 	var lines []string
 	lineContent := `{"type":"human","message":"` + strings.Repeat("x", 1000) + `"}`
@@ -60,6 +62,8 @@ func TestChunkJSONL_LargeContent(t *testing.T) {
 }
 
 func TestChunkTranscript_SmallContent_NoAgent(t *testing.T) {
+	t.Parallel()
+
 	// Without a registered agent, ChunkTranscript falls back to JSONL
 	content := []byte(`{"type":"human","message":"hello"}`)
 
@@ -73,6 +77,8 @@ func TestChunkTranscript_SmallContent_NoAgent(t *testing.T) {
 }
 
 func TestChunkFileName(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		baseName string
 		index    int
@@ -94,6 +100,8 @@ func TestChunkFileName(t *testing.T) {
 }
 
 func TestParseChunkIndex(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		filename string
 		baseName string
@@ -106,6 +114,16 @@ func TestParseChunkIndex(t *testing.T) {
 		{"full.jsonl.100", "full.jsonl", 100},
 		{"other.txt", "full.jsonl", -1},
 		{"full.jsonl.abc", "full.jsonl", -1},
+		// jsonutil.CreateTempIn residue: a suffix that merely STARTS with
+		// digits is not a chunk index. "%03d" via fmt.Sscanf accepted these.
+		{"full.jsonl.123abcdef0123456.tmp", "full.jsonl", -1},
+		{"full.jsonl.9f0e1d2c3b4a5968.tmp", "full.jsonl", -1},
+		{"full.jsonl.0a1b2c3d4e5f6071.tmp", "full.jsonl", -1},
+		{"full.jsonl.001.tmp", "full.jsonl", -1},
+		{"full.jsonl.", "full.jsonl", -1},
+		// More than 999 chunks still parses: the format string pads to three
+		// digits but does not truncate above them.
+		{"full.jsonl.1000", "full.jsonl", 1000},
 	}
 
 	for _, tt := range tests {
@@ -117,6 +135,8 @@ func TestParseChunkIndex(t *testing.T) {
 }
 
 func TestSortChunkFiles(t *testing.T) {
+	t.Parallel()
+
 	files := []string{"full.jsonl.003", "full.jsonl.001", "full.jsonl", "full.jsonl.002"}
 	expected := []string{"full.jsonl", "full.jsonl.001", "full.jsonl.002", "full.jsonl.003"}
 
@@ -133,6 +153,8 @@ func TestSortChunkFiles(t *testing.T) {
 }
 
 func TestReassembleJSONL_SingleChunk(t *testing.T) {
+	t.Parallel()
+
 	content := []byte(`{"type":"human","message":"hello"}`)
 	chunks := [][]byte{content}
 
@@ -143,6 +165,8 @@ func TestReassembleJSONL_SingleChunk(t *testing.T) {
 }
 
 func TestReassembleTranscript_EmptyChunks(t *testing.T) {
+	t.Parallel()
+
 	result, err := ReassembleTranscript([][]byte{}, "")
 	if err != nil {
 		t.Fatalf("ReassembleTranscript error: %v", err)
@@ -153,6 +177,8 @@ func TestReassembleTranscript_EmptyChunks(t *testing.T) {
 }
 
 func TestReassembleJSONL_MultipleChunks(t *testing.T) {
+	t.Parallel()
+
 	chunk1 := []byte(`{"line":1}`)
 	chunk2 := []byte(`{"line":2}`)
 	chunks := [][]byte{chunk1, chunk2}
@@ -166,6 +192,8 @@ func TestReassembleJSONL_MultipleChunks(t *testing.T) {
 }
 
 func TestChunkJSONL_OversizedLine(t *testing.T) {
+	t.Parallel()
+
 	// A single line that exceeds maxSize should return an error
 	maxSize := 100
 	oversizedLine := `{"type":"human","message":"` + strings.Repeat("x", maxSize) + `"}`
@@ -181,6 +209,8 @@ func TestChunkJSONL_OversizedLine(t *testing.T) {
 }
 
 func TestChunkJSONL_OversizedLineInMiddle(t *testing.T) {
+	t.Parallel()
+
 	// An oversized line in the middle of content should return an error
 	maxSize := 100
 	normalLine := `{"type":"human","message":"short"}`
@@ -196,40 +226,22 @@ func TestChunkJSONL_OversizedLineInMiddle(t *testing.T) {
 	}
 }
 
-func TestDetectAgentTypeFromContent(t *testing.T) {
-	tests := []struct {
-		name     string
-		content  []byte
-		expected types.AgentType
-	}{
-		{
-			name:     "Gemini JSON",
-			content:  []byte(`{"messages":[{"type":"user","content":"hi"}]}`),
-			expected: AgentTypeGemini,
-		},
-		{
-			name:     "JSONL",
-			content:  []byte(`{"type":"human","message":"hi"}`),
-			expected: "",
-		},
-		{
-			name:     "Empty messages array",
-			content:  []byte(`{"messages":[]}`),
-			expected: "", // Empty messages should not be detected as Gemini
-		},
-		{
-			name:     "Invalid JSON",
-			content:  []byte(`not json`),
-			expected: "",
-		},
-	}
+// Gemini CLI is no longer registered, but its chunked transcripts in stored
+// checkpoints are JSON documents: JSONL reassembly would join them into
+// invalid JSON.
+func TestReassembleTranscript_HistoricalGeminiChunks(t *testing.T) {
+	t.Parallel()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := DetectAgentTypeFromContent(tt.content)
-			if result != tt.expected {
-				t.Errorf("DetectAgentTypeFromContent() = %q, want %q", result, tt.expected)
-			}
-		})
+	chunks := [][]byte{
+		[]byte(`{"messages":[{"type":"user","content":"hello"}]}`),
+		[]byte(`{"messages":[{"type":"gemini","content":"hi"}]}`),
+	}
+	result, err := ReassembleTranscript(chunks, AgentTypeGemini)
+	if err != nil {
+		t.Fatalf("ReassembleTranscript error: %v", err)
+	}
+	want := `{"messages":[{"type":"user","content":"hello"},{"type":"gemini","content":"hi"}]}`
+	if string(result) != want {
+		t.Errorf("ReassembleTranscript = %s, want %s", result, want)
 	}
 }

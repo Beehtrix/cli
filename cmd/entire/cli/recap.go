@@ -123,72 +123,71 @@ func runRecap(ctx context.Context, w, errW io.Writer, f *recapFlags) error {
 	if err != nil {
 		return err
 	}
-	client, err := newRecapClient(f.insecureHTTP)
+	// repoName is the human owner/repo label for the scope line: the ?repo=
+	// scope value is a repo_id ULID when routed to a cell (echoed back verbatim
+	// by the response), which is meaningless to show a user. Both are empty when
+	// no repo query is sent, so an unscoped recap isn't mislabelled.
+	client, repoScope, repoName, err := newRecapClient(ctx, f.insecureHTTP)
 	if err != nil {
-		var keyringErr *keyringReadError
-		switch {
-		case errors.Is(err, api.ErrInsecureHTTP):
-			fmt.Fprintf(errW, "ENTIRE_API_BASE_URL is set to an insecure http:// URL (%s). Use https:// for production, or pass --insecure-http-auth for local dev.\n", api.BaseURL())
-		case errors.As(err, &keyringErr):
-			fmt.Fprintf(errW, "Could not read your auth token from the system keyring: %v. Running `entire login` may not help — the keyring may be locked or inaccessible. Check your OS keychain settings.\n", keyringErr.Cause)
-		default:
-			return err
+		if errors.Is(err, api.ErrInsecureHTTP) {
+			// Name the variable and the host it points at: the generic error says
+			// only that *some* base URL is http, which sends the reader looking for
+			// a setting they may not know they have. newRecapClient rejects the
+			// override before resolving anything, so an http URL here is always
+			// this one. insecureDataOverrideNote strips any credentials from it.
+			fmt.Fprintf(errW, "%s. Use https:// for production, or pass --insecure-http-auth for local dev.\n", insecureDataOverrideNote())
+			return NewSilentError(err)
 		}
-		return NewSilentError(err)
+		// Not logged in gets the login hint; every other failure (refresh
+		// rejected, network error, no cell for the home jurisdiction) surfaces
+		// verbatim rather than being misattributed to a missing login.
+		return renderDataAPIAuthError(ctx, errW, "", err)
 	}
 	rangeKey := f.rangeKey()
-	repoSlug := currentRepoSlug(ctx)
 	if f.useTUI(interactive.IsTerminalWriter(w), interactive.CanPromptInteractively(), IsAccessibleMode()) {
 		return runRecapTUI(ctx, client, recapTUIOptions{
-			Range: rangeKey,
-			View:  mode,
-			Agent: f.agentName(),
-			Repo:  repoSlug,
-			Color: color,
+			Range:    rangeKey,
+			View:     mode,
+			Agent:    f.agentName(),
+			Repo:     repoScope,
+			RepoName: repoName,
+			Color:    color,
 		})
 	}
 	start, end := rangeKey.Bounds(time.Now())
-	resp, err := recap.FetchMeRecap(ctx, client, start, end, repoSlug, 0)
+	resp, err := recap.FetchMeRecap(ctx, client, start, end, repoScope, 0)
 	if err != nil {
 		return handleRecapFetchError(errW, err)
 	}
 	fmt.Fprint(w, recap.RenderStaticRecap(resp, recap.RenderOptions{
-		Range: rangeKey,
-		View:  mode,
-		Agent: f.agentName(),
-		Width: terminalWidth(w),
-		Color: color,
+		Range:    rangeKey,
+		View:     mode,
+		Agent:    f.agentName(),
+		Width:    terminalWidth(w),
+		Color:    color,
+		RepoName: repoName,
 	}))
 	fmt.Fprintln(w)
 	return nil
 }
 
-// keyringReadError marks a failure to read the auth token from the system
-// keyring (locked, permission denied, etc.) — distinct from "no token saved",
-// which keyring.ErrNotFound resolves to (token=="", err==nil) upstream.
-type keyringReadError struct{ Cause error }
-
-func (e *keyringReadError) Error() string {
-	return "read auth token from keyring: " + e.Cause.Error()
-}
-func (e *keyringReadError) Unwrap() error { return e.Cause }
-
-// newRecapClient does not gate on a missing token; FetchMeRecap surfaces 401s
-// via recapLoadErrorMessage so flag effects (--week, --agent, ...) and the
-// real auth error are not collapsed into one "sign in" hint. A keyring read
-// failure is surfaced as *keyringReadError so the caller can show a targeted
-// message instead of misattributing it to a missing login.
-func newRecapClient(insecureHTTP bool) (*api.Client, error) {
-	token, err := auth.LookupCurrentToken()
+// newRecapClient returns a client for the caller's home entire-api cell, the
+// value to pass as /me/recap's ?repo= (the current repo's ULID, its
+// team/contributors scope), and the repo's owner/repo display name. Both are
+// empty when the current repo can't be resolved; recap then shows the personal
+// side only.
+//
+// There is no data-API fallback: the BFF answers /me/recap by proxying to that
+// same home cell, so a caller the cell path cannot serve gets nothing better
+// there. Client-construction errors (not logged in, no cell for the home
+// jurisdiction, refresh rejected) are returned for runRecap to render.
+func newRecapClient(ctx context.Context, insecureHTTP bool) (client *api.Client, repoScope, repoName string, err error) {
+	client, err = auth.NewEntireAPICellClient(ctx, insecureHTTP, nil)
 	if err != nil {
-		return nil, &keyringReadError{Cause: err}
+		return nil, "", "", err //nolint:wrapcheck // auth returns contextual, user-facing errors
 	}
-	if token != "" && !insecureHTTP {
-		if err := api.RequireSecureURL(api.BaseURL()); err != nil {
-			return nil, fmt.Errorf("base URL check: %w", err)
-		}
-	}
-	return api.NewClient(token), nil
+	repoID, repoSlug := currentRepoRef(ctx)
+	return client, repoID, repoSlug, nil
 }
 
 func handleRecapFetchError(w io.Writer, err error) error {
@@ -218,17 +217,25 @@ func terminalWidth(w io.Writer) int {
 	if !isatty.IsTerminal(file.Fd()) {
 		return recap.DefaultWidth
 	}
-	width, _, err := term.GetSize(int(file.Fd())) //nolint:gosec // fd values fit in int on supported platforms
+	width, _, err := term.GetSize(int(file.Fd()))
 	if err != nil || width <= 0 {
 		return recap.DefaultWidth
 	}
 	return width
 }
 
-func currentRepoSlug(ctx context.Context) string {
-	_, owner, repoName, err := gitremote.ResolveRemoteRepo(ctx, "origin")
+// currentRepoSlugWithForge returns the origin remote as owner/repo, with the forge
+// prefix (e.g. "gh/owner/repo", "et/proj/repo") when the remote maps to a
+// known forge. Code search needs this because the repo index FullName may
+// include the forge prefix (especially for Entire forge repos stored as
+// "et/proj/repo").
+func currentRepoSlugWithForge(ctx context.Context) string {
+	forge, owner, repoName, err := gitremote.ResolveRemoteRepo(ctx, "origin")
 	if err != nil || owner == "" || repoName == "" {
 		return ""
+	}
+	if forge != "" {
+		return forge + "/" + owner + "/" + repoName
 	}
 	return owner + "/" + repoName
 }

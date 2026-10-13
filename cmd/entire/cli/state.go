@@ -5,21 +5,27 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/entiredir"
+	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
-	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/validation"
+	"github.com/entireio/cli/cmd/entire/cli/worktreedir"
 
 	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 // PrePromptState stores the state captured before a user prompt
@@ -27,6 +33,21 @@ type PrePromptState struct {
 	SessionID      string   `json:"session_id"`
 	Timestamp      string   `json:"timestamp"`
 	UntrackedFiles []string `json:"untracked_files"`
+
+	// UntrackedScanSkipped records that the pre-prompt untracked scan failed
+	// (e.g. the status walk breached its wall-clock budget). Turn-end must
+	// then skip new-file detection entirely: with no baseline, every
+	// untracked file in the worktree would be misreported as created by this
+	// turn.
+	UntrackedScanSkipped bool `json:"untracked_scan_skipped,omitempty"`
+
+	// UntrackedFileStats records the size and modification time of each
+	// regular file in UntrackedFiles. Turn-end compares them to find
+	// pre-existing untracked files the turn changed: git status reports those
+	// as untracked both before and after, and an edit made through a shell
+	// command is never named in the transcript. Absent in state written by
+	// older versions, which then detect no such changes.
+	UntrackedFileStats map[string]UntrackedFileStat `json:"untracked_file_stats,omitempty"`
 
 	// TranscriptOffset is the unified transcript position when this state was captured.
 	// For Claude Code (JSONL), this is the line count.
@@ -49,6 +70,13 @@ type PrePromptState struct {
 	// Deprecated: LastTranscriptLineCount is the oldest name for transcript position.
 	// Migrated to TranscriptOffset on load.
 	LastTranscriptLineCount int `json:"last_transcript_line_count,omitempty"`
+
+	// TokenBaseline is an opaque, agent-defined token position captured at turn
+	// start for OutOfBandTokenSource agents (currently Antigravity). At TurnEnd
+	// the lifecycle passes it back to CalculateTokenUsageSince to compute the
+	// checkpoint-scoped token delta. Empty for agents with transcript-embedded
+	// token data.
+	TokenBaseline json.RawMessage `json:"token_baseline,omitempty"`
 }
 
 // PreUntrackedFiles returns the untracked files list, or nil if the receiver is nil.
@@ -64,6 +92,108 @@ func (s *PrePromptState) PreUntrackedFiles() []string {
 		return []string{}
 	}
 	return s.UntrackedFiles
+}
+
+// UntrackedFileStat is enough of an untracked file's metadata to tell whether
+// it changed, without hashing its content on every prompt: the stat fields
+// git's index compares for the same purpose. Inode and ChangeTime are zero
+// where the platform does not expose them (see fileChangeStamp).
+type UntrackedFileStat struct {
+	Size       int64  `json:"size"`
+	ModTime    int64  `json:"mod_time_ns"`
+	Inode      uint64 `json:"ino,omitempty"`
+	ChangeTime int64  `json:"ctime_ns,omitempty"`
+}
+
+// Limits on the prompt-start stat pass, which runs inside UserPromptSubmit and
+// so delays every prompt. Above maxUntrackedFileStats files no stats are
+// recorded; past untrackedFileStatBudget the pass stops with what it has.
+// Either way turn end only loses detection of edits to the files left out, as
+// with state written before stats existed.
+const (
+	maxUntrackedFileStats   = 10_000
+	untrackedFileStatBudget = 500 * time.Millisecond
+)
+
+// statUntrackedFiles records an UntrackedFileStat for each of files that is a
+// regular file in the worktree. Fails open: a file it cannot stat is left out
+// and simply never reports a change.
+func statUntrackedFiles(ctx context.Context, files []string) map[string]UntrackedFileStat {
+	if len(files) == 0 {
+		return nil
+	}
+	logCtx := logging.WithComponent(ctx, "state")
+	if len(files) > maxUntrackedFileStats {
+		logging.Debug(logCtx, "skipping untracked file stats: too many untracked files",
+			slog.Int("untracked_files", len(files)), slog.Int("limit", maxUntrackedFileStats))
+		return nil
+	}
+	repoRoot, err := paths.WorktreeRoot(ctx)
+	if err != nil {
+		logging.Debug(logCtx, "skipping untracked file stats: no worktree root",
+			slog.String("error", err.Error()))
+		return nil
+	}
+	stats, complete := statFilesWithin(repoRoot, files, untrackedFileStatBudget)
+	if !complete {
+		logging.Debug(logCtx, "untracked file stats stopped at time budget",
+			slog.Int("untracked_files", len(files)), slog.Int("recorded", len(stats)))
+	}
+	return stats
+}
+
+// statFilesWithin stats files until budget elapses. complete is false when it
+// stopped early; the stats gathered so far are still returned.
+func statFilesWithin(repoRoot string, files []string, budget time.Duration) (stats map[string]UntrackedFileStat, complete bool) {
+	deadline := time.Now().Add(budget)
+	stats = make(map[string]UntrackedFileStat, len(files))
+	for _, file := range files {
+		if time.Now().After(deadline) {
+			return stats, false
+		}
+		if stat, ok := statWorktreeFile(repoRoot, file); ok {
+			stats[file] = stat
+		}
+	}
+	return stats, true
+}
+
+// ChangedUntrackedFiles returns the files in UntrackedFileStats whose stat
+// fields no longer match: pre-existing untracked files changed
+// since the prompt started. A file that is gone or no longer a regular file is
+// not reported; one that was committed since is reported, and turn-end's
+// filterToUncommittedFiles drops it.
+func (s *PrePromptState) ChangedUntrackedFiles(repoRoot string) []string {
+	if s == nil || len(s.UntrackedFileStats) == 0 {
+		return nil
+	}
+	var changed []string
+	for file, before := range s.UntrackedFileStats {
+		if now, ok := statWorktreeFile(repoRoot, file); ok && now != before {
+			changed = append(changed, file)
+		}
+	}
+	slices.Sort(changed)
+	return changed
+}
+
+// statWorktreeFile stats file, a repo-relative path, through the worktree root
+// without following a final symlink. ok is false unless it is a regular file.
+func statWorktreeFile(repoRoot, file string) (UntrackedFileStat, bool) {
+	root, err := worktreedir.OpenAt(repoRoot)
+	if err != nil {
+		return UntrackedFileStat{}, false
+	}
+	name, err := worktreedir.Name(repoRoot, file)
+	if err != nil {
+		return UntrackedFileStat{}, false
+	}
+	info, err := root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() {
+		return UntrackedFileStat{}, false
+	}
+	inode, changeTime := fileChangeStamp(info)
+	return UntrackedFileStat{Size: info.Size(), ModTime: info.ModTime().UnixNano(), Inode: inode, ChangeTime: changeTime}, true
 }
 
 // normalizePrePromptState migrates deprecated fields after loading from JSON.
@@ -86,6 +216,9 @@ func (s *PrePromptState) normalizePrePromptState() {
 	s.StartMessageIndex = 0
 }
 
+// unknownSessionID is the fallback session ID used when no session ID is provided.
+const unknownSessionID = "unknown"
+
 // CapturePrePromptState captures current untracked files and transcript position before a prompt
 // and saves them to a state file.
 //
@@ -103,19 +236,17 @@ func CapturePrePromptState(ctx context.Context, ag agent.Agent, sessionID, sessi
 		return fmt.Errorf("invalid session ID for pre-prompt state: %w", err)
 	}
 
-	// Get absolute path for tmp directory
-	tmpDirAbs := resolveTmpDir(ctx)
-
-	// Create tmp directory if it doesn't exist
-	if err := os.MkdirAll(tmpDirAbs, 0o750); err != nil {
-		return fmt.Errorf("failed to create tmp directory: %w", err)
-	}
-
-	// Get list of untracked files (excluding .entire directory itself)
-	untrackedFiles, err := getUntrackedFilesForState(ctx)
+	// Open the shared .entire root and ensure tmp/ exists under it.
+	root, err := openTmpDir(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get untracked files: %w", err)
+		return err
 	}
+
+	// Get list of untracked files (excluding .entire directory itself).
+	// Fail open on error: hooks must never break the agent, and the rest of
+	// the snapshot (transcript position) is still worth capturing. The
+	// skipped-scan marker tells turn-end to disable new-file detection.
+	untrackedFiles, scanSkipped := untrackedFilesOrSkip(ctx)
 
 	// Get transcript position using TranscriptAnalyzer if available
 	var transcriptOffset int
@@ -131,10 +262,24 @@ func CapturePrePromptState(ctx context.Context, ag agent.Agent, sessionID, sessi
 
 	// Create state file using os.Root for traversal-resistant write
 	state := PrePromptState{
-		SessionID:        sessionID,
-		Timestamp:        time.Now().UTC().Format(time.RFC3339),
-		UntrackedFiles:   untrackedFiles,
-		TranscriptOffset: transcriptOffset,
+		SessionID:            sessionID,
+		Timestamp:            time.Now().UTC().Format(time.RFC3339),
+		UntrackedFiles:       untrackedFiles,
+		UntrackedScanSkipped: scanSkipped,
+		UntrackedFileStats:   statUntrackedFiles(ctx, untrackedFiles),
+		TranscriptOffset:     transcriptOffset,
+	}
+
+	// Out-of-band token baseline: agents whose token usage lives outside the
+	// transcript (Antigravity) snapshot their cumulative token position now so
+	// TurnEnd can compute the per-checkpoint delta.
+	if src, ok := agent.AsOutOfBandTokenSource(ag); ok {
+		baseline, blErr := src.SnapshotTokenBaseline(ctx, sessionID)
+		if blErr != nil {
+			logging.Warn(logging.WithComponent(ctx, "state"), "failed to snapshot out-of-band token baseline", "error", blErr.Error())
+		} else {
+			state.TokenBaseline = baseline
+		}
 	}
 
 	data, err := jsonutil.MarshalIndentWithNewline(state, "", "  ")
@@ -142,14 +287,7 @@ func CapturePrePromptState(ctx context.Context, ag agent.Agent, sessionID, sessi
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
-	fileName := fmt.Sprintf("pre-prompt-%s.json", sessionID)
-	root, err := os.OpenRoot(tmpDirAbs)
-	if err != nil {
-		return fmt.Errorf("failed to open tmp directory root: %w", err)
-	}
-	defer root.Close()
-
-	if err := osroot.WriteFile(root, fileName, data, 0o600); err != nil {
+	if err := entiredir.WriteFile(root, tmpFile("pre-prompt-%s.json", sessionID), data, 0o600); err != nil {
 		return fmt.Errorf("failed to write state file: %w", err)
 	}
 
@@ -166,20 +304,16 @@ func LoadPrePromptState(ctx context.Context, sessionID string) (*PrePromptState,
 		return nil, fmt.Errorf("invalid session ID for pre-prompt state: %w", err)
 	}
 
-	tmpDirAbs := resolveTmpDir(ctx)
-
-	root, err := os.OpenRoot(tmpDirAbs)
+	root, err := entiredir.OpenForRead(ctx)
 	if err != nil {
-		// Directory doesn't exist yet — no state file
-		if os.IsNotExist(err) {
+		// .entire doesn't exist yet — no state file
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil //nolint:nilnil // already present in codebase
 		}
-		return nil, fmt.Errorf("failed to open tmp directory root: %w", err)
+		return nil, fmt.Errorf("failed to open %s: %w", paths.EntireDir, err)
 	}
-	defer root.Close()
 
-	fileName := fmt.Sprintf("pre-prompt-%s.json", sessionID)
-	data, err := osroot.ReadFile(root, fileName)
+	data, err := entiredir.ReadFile(root, tmpFile("pre-prompt-%s.json", sessionID))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil //nolint:nilnil // already present in codebase
@@ -202,20 +336,21 @@ func CleanupPrePromptState(ctx context.Context, sessionID string) error {
 	if err := validation.ValidateSessionID(sessionID); err != nil {
 		return fmt.Errorf("invalid session ID for pre-prompt state cleanup: %w", err)
 	}
+	return cleanupTmpStateFile(ctx, fmt.Sprintf("pre-prompt-%s.json", sessionID))
+}
 
-	tmpDirAbs := resolveTmpDir(ctx)
-
-	root, err := os.OpenRoot(tmpDirAbs)
+// cleanupTmpStateFile removes one state file from .entire/tmp, treating a
+// missing directory as already clean.
+func cleanupTmpStateFile(ctx context.Context, fileName string) error {
+	root, err := entiredir.OpenForRead(ctx)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // Directory doesn't exist, nothing to clean up
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // .entire doesn't exist, nothing to clean up
 		}
-		return fmt.Errorf("failed to open tmp directory root: %w", err)
+		return fmt.Errorf("failed to open %s: %w", paths.EntireDir, err)
 	}
-	defer root.Close()
 
-	fileName := fmt.Sprintf("pre-prompt-%s.json", sessionID)
-	return osroot.Remove(root, fileName) //nolint:wrapcheck // best-effort cleanup, caller adds context via wrapping function name
+	return osroot.RemoveNoSymlinks(root, entireTmpName+"/"+fileName) //nolint:wrapcheck // best-effort cleanup, caller adds context via wrapping function name
 }
 
 // FileChanges holds categorized file changes from git status.
@@ -234,15 +369,14 @@ func shouldIgnoreSessionTrackingPath(relPath string) bool {
 	}
 
 	for _, file := range agent.AllProtectedFiles() {
-		cleanFile := filepath.Clean(filepath.FromSlash(file))
-		if cleanPath == cleanFile {
+		if paths.Equal(cleanPath, file) {
 			return true
 		}
 	}
 
 	for _, dir := range agent.AllProtectedDirs() {
 		cleanDir := filepath.Clean(filepath.FromSlash(dir))
-		if paths.IsSubpath(cleanDir, cleanPath) {
+		if paths.IsProtectedSubpath(cleanDir, cleanPath) {
 			return true
 		}
 	}
@@ -259,18 +393,31 @@ func shouldIgnoreSessionTrackingPath(relPath string) bool {
 // Modified includes both worktree and staging modified/added files.
 // Deleted includes both staged and unstaged deletions.
 // All results exclude .entire/ directory.
+//
+// The status walk is budget-bounded (gitrepo.StatusWithBudget) because every
+// caller but one is an agent-hook capture path. User-attended commands use
+// detectFileChangesUnbounded instead.
 func DetectFileChanges(ctx context.Context, previouslyUntracked []string) (*FileChanges, error) {
+	return detectFileChanges(ctx, previouslyUntracked, gitrepo.StatusWithBudget)
+}
+
+// detectFileChangesUnbounded is DetectFileChanges without the status-walk
+// budget, for user-attended commands (`entire session adopt`) where a
+// slow-but-healthy repo (NFS, cold cache) should finish rather than error at
+// the budget — the user is watching and can Ctrl-C, so there is no orphaned
+// process to prevent. Hook paths must never use this.
+func detectFileChangesUnbounded(ctx context.Context) (*FileChanges, error) {
+	return detectFileChanges(ctx, nil, gitrepo.Status)
+}
+
+func detectFileChanges(ctx context.Context, previouslyUntracked []string, statusFn func(context.Context, *git.Repository) (git.Status, error)) (*FileChanges, error) {
 	repo, err := openRepository(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open repository: %w", err)
 	}
+	defer repo.Close()
 
-	worktree, err := repo.Worktree()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get worktree: %w", err)
-	}
-
-	status, err := worktree.Status()
+	status, err := statusFn(ctx, repo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get status: %w", err)
 	}
@@ -315,6 +462,16 @@ func DetectFileChanges(ctx context.Context, previouslyUntracked []string) (*File
 // (already condensed by PostCommit) back to FilesTouched via SaveStep. Files not in
 // HEAD or with different content in the working tree are kept. Fails open: if any git
 // operation errors, returns the original list unchanged.
+//
+// "Same content" is decided by Git's own clean filters, via
+// gitrepo.HashWorktreeFiles (git hash-object), not by comparing the working
+// tree's raw bytes against the blob. Under core.autocrlf — the Git for Windows
+// default, and what e2e/testutil/repo.go sets — the working tree holds CRLF
+// while the blob holds LF, so a byte comparison reports every committed text
+// file as still modified. That defeats the caller's "no changes, skip" gate and
+// records a fresh turn-end step for files PostCommit already condensed; no
+// commit ever claims them, so the session stays pending for nothing. The same reasoning applies to .gitattributes eol/text rules and to
+// clean filters such as Git LFS, which a byte comparison also gets wrong.
 func filterToUncommittedFiles(ctx context.Context, files []string, repoRoot string) []string {
 	if len(files) == 0 {
 		return files
@@ -324,6 +481,7 @@ func filterToUncommittedFiles(ctx context.Context, files []string, repoRoot stri
 	if err != nil {
 		return files // fail open
 	}
+	defer repo.Close()
 
 	head, err := repo.Head()
 	if err != nil {
@@ -342,7 +500,14 @@ func filterToUncommittedFiles(ctx context.Context, files []string, repoRoot stri
 
 	logCtx := logging.WithComponent(ctx, "filter-uncommitted")
 
+	// Pass 1: split into "not in HEAD" (uncommitted by definition) and
+	// candidates that need a content comparison.
+	type candidate struct {
+		path     string
+		headFile *object.File
+	}
 	var result []string
+	var candidates []candidate
 	for _, relPath := range files {
 		headFile, err := headTree.File(relPath)
 		if err != nil {
@@ -353,25 +518,68 @@ func filterToUncommittedFiles(ctx context.Context, files []string, repoRoot stri
 			result = append(result, relPath)
 			continue
 		}
+		candidates = append(candidates, candidate{path: relPath, headFile: headFile})
+	}
+	if len(candidates) == 0 {
+		return result
+	}
 
-		// File is in HEAD — compare content with working tree
-		absPath := filepath.Join(repoRoot, relPath)
-		workingContent, err := os.ReadFile(absPath) //nolint:gosec // path from controlled source
-		if err != nil {
-			// Can't read working tree file (deleted?) — keep it
-			result = append(result, relPath)
+	// Hash the regular files through native Git so the comparison sees the
+	// same clean-filtered bytes Git would have committed. HashableWorktreeEntry
+	// withholds the paths hash-object would answer wrongly or block on — a
+	// symlink on either side, a FIFO, a tracked file replaced by another type —
+	// and those take the raw fallback below instead.
+	hashPaths := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		if !worktreedir.HashableEntry(repoRoot, c.path, c.headFile.Mode) {
+			continue
+		}
+		hashPaths = append(hashPaths, c.path)
+	}
+	var worktreeHashes map[string]plumbing.Hash
+	if len(hashPaths) > 0 {
+		var hashErr error
+		worktreeHashes, hashErr = gitrepo.HashWorktreeFiles(ctx, repoRoot, hashPaths)
+		if hashErr != nil {
+			// Partial results are still usable; only the paths Git could not
+			// hash fall back to the raw comparison below.
+			logging.Debug(logCtx, "native git could not hash every candidate; falling back to raw comparison for those paths",
+				slog.String("error", hashErr.Error()))
+		}
+	}
+
+	// Pass 2: decide each candidate, preserving the input order.
+	for _, c := range candidates {
+		if worktreeHash, ok := worktreeHashes[c.path]; ok {
+			// Equal, not ==: plumbing.Hash carries an object-format field
+			// alongside its bytes and == compares that field too, which the
+			// tree decoder and FromHex do not always agree on.
+			if !worktreeHash.Equal(c.headFile.Hash) {
+				result = append(result, c.path)
+			}
 			continue
 		}
 
-		headContent, err := headFile.Contents()
+		// Fallback for every path withheld above and for anything native Git
+		// could not hash: compare the raw working-tree bytes. Filter-unaware,
+		// so it can report a clean file as modified, which keeps a file rather
+		// than dropping one — the same direction this function already fails.
+		workingContent, ok := readWorktreeFileSafely(repoRoot, c.path)
+		if !ok {
+			// Can't read working tree file (deleted?) — keep it
+			result = append(result, c.path)
+			continue
+		}
+
+		headContent, err := c.headFile.Contents()
 		if err != nil {
-			result = append(result, relPath)
+			result = append(result, c.path)
 			continue
 		}
 
 		if string(workingContent) != headContent {
 			// Working tree differs from HEAD — uncommitted changes
-			result = append(result, relPath)
+			result = append(result, c.path)
 		}
 		// else: content matches HEAD — already committed, skip
 	}
@@ -414,14 +622,69 @@ func mergeUnique(base, extra []string) []string {
 	return base
 }
 
-// resolveTmpDir returns the absolute path to the .entire/tmp directory,
-// falling back to a relative path if the repo root can't be determined.
-func resolveTmpDir(ctx context.Context) string {
-	abs, err := paths.AbsPath(ctx, paths.EntireTmpDir)
+// entireTmpName is .entire/tmp expressed relative to the .entire root, which is
+// the coordinate every read and write below uses.
+var entireTmpName = entiredir.MustName(paths.EntireTmpDir)
+
+// tmpFile formats a state file name relative to the .entire root. The format
+// arguments are already-validated session and tool-use IDs; the root confines
+// the resulting open regardless.
+func tmpFile(format string, args ...any) string {
+	return entireTmpName + "/" + fmt.Sprintf(format, args...)
+}
+
+// sessionMetadataName returns a session's metadata directory relative to the
+// .entire root. sessionID reaches here from agent hook input; callers validate
+// it, and the root confines the open either way.
+func sessionMetadataName(sessionID string) string {
+	return entiredir.MustName(paths.SessionMetadataDirFromSessionID(sessionID))
+}
+
+// openTmpDir returns the shared .entire root with tmp/ created under it, for
+// the capture paths that are about to write a state file.
+func openTmpDir(ctx context.Context) (*os.Root, error) {
+	root, err := entiredir.Open(ctx)
 	if err != nil {
-		return paths.EntireTmpDir
+		return nil, fmt.Errorf("failed to open %s: %w", paths.EntireDir, err)
 	}
-	return abs
+	if err := osroot.MkdirAllNoSymlink(root, entireTmpName, 0o750); err != nil {
+		return nil, fmt.Errorf("failed to create tmp directory: %w", err)
+	}
+	return root, nil
+}
+
+// untrackedFilesOrSkip runs the pre-prompt/pre-task untracked scan, degrading
+// instead of failing. Deliberately wider than the status-budget feature that
+// introduced it: EVERY scan error fails open — budget breach, repo-open
+// failure, corrupted .git, anything — because these captures run inside
+// TurnStart/SubagentStart hooks, and any error propagated from here used to
+// fail the hook and break the agent's turn. That fail-hook behavior was the
+// bug, not a safety property: the scan only feeds new-file detection, so the
+// correct degrade is to warn, mark the scan skipped (the paired end-hook then
+// disables new-file detection for the turn), and let capture proceed with
+// transcript-derived data.
+func untrackedFilesOrSkip(ctx context.Context) (untrackedFiles []string, scanSkipped bool) {
+	untrackedFiles, err := getUntrackedFilesForState(ctx)
+	if err != nil {
+		logStatusDegrade(logging.WithComponent(ctx, "state"),
+			"untracked-file scan failed; capture degraded: new-file detection disabled for this turn", err)
+		return nil, true
+	}
+	return untrackedFiles, false
+}
+
+// logStatusDegrade logs a status-derived degrade at the appropriate level:
+// budget breaches were already warned about — with repo root, elapsed, and
+// budget — by the gitrepo layer at the moment of the breach, so re-warning
+// here would double-log the same event; they get Debug. Any other status
+// error (repo-open failure, corrupted .git, …) has no other warning source
+// and keeps Warn.
+func logStatusDegrade(ctx context.Context, msg string, err error) {
+	if errors.Is(err, gitrepo.ErrStatusBudgetExceeded) {
+		logging.Debug(ctx, msg, slog.String("error", err.Error()))
+		return
+	}
+	logging.Warn(ctx, msg, slog.String("error", err.Error()))
 }
 
 // getUntrackedFilesForState returns a list of untracked files using go-git
@@ -431,13 +694,9 @@ func getUntrackedFilesForState(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer repo.Close()
 
-	worktree, err := repo.Worktree()
-	if err != nil {
-		return nil, err //nolint:wrapcheck // already present in codebase
-	}
-
-	status, err := worktree.Status()
+	status, err := gitrepo.StatusWithBudget(ctx, repo)
 	if err != nil {
 		return nil, err //nolint:wrapcheck // already present in codebase
 	}
@@ -459,6 +718,10 @@ type PreTaskState struct {
 	ToolUseID      string   `json:"tool_use_id"`
 	Timestamp      string   `json:"timestamp"`
 	UntrackedFiles []string `json:"untracked_files"`
+
+	// UntrackedScanSkipped mirrors PrePromptState.UntrackedScanSkipped for the
+	// subagent path: when set, subagent-end must skip new-file detection.
+	UntrackedScanSkipped bool `json:"untracked_scan_skipped,omitempty"`
 }
 
 // PreUntrackedFiles returns the untracked files list, or nil if the receiver is nil.
@@ -485,25 +748,22 @@ func CapturePreTaskState(ctx context.Context, toolUseID string) error {
 		return fmt.Errorf("invalid tool use ID for pre-task state: %w", err)
 	}
 
-	// Get absolute path for tmp directory
-	tmpDirAbs := resolveTmpDir(ctx)
-
-	// Create tmp directory if it doesn't exist
-	if err := os.MkdirAll(tmpDirAbs, 0o750); err != nil {
-		return fmt.Errorf("failed to create tmp directory: %w", err)
-	}
-
-	// Get list of untracked files (excluding .entire directory itself)
-	untrackedFiles, err := getUntrackedFilesForState(ctx)
+	// Open the shared .entire root and ensure tmp/ exists under it.
+	root, err := openTmpDir(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get untracked files: %w", err)
+		return err
 	}
+
+	// Get list of untracked files (excluding .entire directory itself).
+	// Fail open on error, same as CapturePrePromptState.
+	untrackedFiles, scanSkipped := untrackedFilesOrSkip(ctx)
 
 	// Create state file using os.Root for traversal-resistant write
 	state := PreTaskState{
-		ToolUseID:      toolUseID,
-		Timestamp:      time.Now().UTC().Format(time.RFC3339),
-		UntrackedFiles: untrackedFiles,
+		ToolUseID:            toolUseID,
+		Timestamp:            time.Now().UTC().Format(time.RFC3339),
+		UntrackedFiles:       untrackedFiles,
+		UntrackedScanSkipped: scanSkipped,
 	}
 
 	data, err := jsonutil.MarshalIndentWithNewline(state, "", "  ")
@@ -511,14 +771,7 @@ func CapturePreTaskState(ctx context.Context, toolUseID string) error {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
-	fileName := fmt.Sprintf("pre-task-%s.json", toolUseID)
-	root, err := os.OpenRoot(tmpDirAbs)
-	if err != nil {
-		return fmt.Errorf("failed to open tmp directory root: %w", err)
-	}
-	defer root.Close()
-
-	if err := osroot.WriteFile(root, fileName, data, 0o600); err != nil {
+	if err := entiredir.WriteFile(root, tmpFile("pre-task-%s.json", toolUseID), data, 0o600); err != nil {
 		return fmt.Errorf("failed to write state file: %w", err)
 	}
 
@@ -534,19 +787,15 @@ func LoadPreTaskState(ctx context.Context, toolUseID string) (*PreTaskState, err
 		return nil, fmt.Errorf("invalid tool use ID for pre-task state: %w", err)
 	}
 
-	tmpDirAbs := resolveTmpDir(ctx)
-
-	root, err := os.OpenRoot(tmpDirAbs)
+	root, err := entiredir.OpenForRead(ctx)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil //nolint:nilnil // already present in codebase
 		}
-		return nil, fmt.Errorf("failed to open tmp directory root: %w", err)
+		return nil, fmt.Errorf("failed to open %s: %w", paths.EntireDir, err)
 	}
-	defer root.Close()
 
-	fileName := fmt.Sprintf("pre-task-%s.json", toolUseID)
-	data, err := osroot.ReadFile(root, fileName)
+	data, err := entiredir.ReadFile(root, tmpFile("pre-task-%s.json", toolUseID))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil //nolint:nilnil // already present in codebase
@@ -567,20 +816,7 @@ func CleanupPreTaskState(ctx context.Context, toolUseID string) error {
 	if err := validation.ValidateToolUseID(toolUseID); err != nil {
 		return fmt.Errorf("invalid tool use ID for pre-task state cleanup: %w", err)
 	}
-
-	tmpDirAbs := resolveTmpDir(ctx)
-
-	root, err := os.OpenRoot(tmpDirAbs)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // Directory doesn't exist, nothing to clean up
-		}
-		return fmt.Errorf("failed to open tmp directory root: %w", err)
-	}
-	defer root.Close()
-
-	fileName := fmt.Sprintf("pre-task-%s.json", toolUseID)
-	return osroot.Remove(root, fileName) //nolint:wrapcheck // best-effort cleanup, caller adds context via wrapping function name
+	return cleanupTmpStateFile(ctx, fmt.Sprintf("pre-task-%s.json", toolUseID))
 }
 
 // preTaskFilePrefix is the prefix for pre-task state files
@@ -592,8 +828,11 @@ const preTaskFilePrefix = "pre-task-"
 // modified one.
 // Works correctly from any subdirectory within the repository.
 func FindActivePreTaskFile(ctx context.Context) (taskToolUseID string, found bool) {
-	tmpDirAbs := resolveTmpDir(ctx)
-	entries, err := os.ReadDir(tmpDirAbs)
+	root, err := entiredir.OpenForRead(ctx)
+	if err != nil {
+		return "", false
+	}
+	entries, err := osroot.ReadDirNoSymlinks(root, entireTmpName)
 	if err != nil {
 		return "", false
 	}
@@ -629,30 +868,4 @@ func FindActivePreTaskFile(ctx context.Context) (taskToolUseID string, found boo
 	toolUseID := strings.TrimPrefix(latestFile, preTaskFilePrefix)
 	toolUseID = strings.TrimSuffix(toolUseID, ".json")
 	return toolUseID, true
-}
-
-// GetNextCheckpointSequence returns the next sequence number for incremental checkpoints.
-// It counts existing checkpoint files in the task metadata checkpoints directory.
-// Returns 1 if no checkpoints exist yet.
-func GetNextCheckpointSequence(sessionID, taskToolUseID string) int {
-	// Use the session ID directly as the metadata directory name
-	sessionMetadataDir := paths.SessionMetadataDirFromSessionID(sessionID)
-	taskMetadataDir := strategy.TaskMetadataDir(sessionMetadataDir, taskToolUseID)
-	checkpointsDir := filepath.Join(taskMetadataDir, "checkpoints")
-
-	entries, err := os.ReadDir(checkpointsDir)
-	if err != nil {
-		// Directory doesn't exist or can't be read - start at 1
-		return 1
-	}
-
-	// Count JSON files (checkpoints)
-	count := 0
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
-			count++
-		}
-	}
-
-	return count + 1
 }

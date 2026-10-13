@@ -4,22 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
-	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/spf13/cobra"
 )
@@ -39,9 +37,10 @@ func setupCleanTestRepo(t *testing.T) (*git.Repository, plumbing.Hash) {
 	t.Helper()
 
 	dir := t.TempDir()
-	repo, err := git.PlainInit(dir, false)
+	testutil.InitRepo(t, dir)
+	repo, err := git.PlainOpen(dir)
 	if err != nil {
-		t.Fatalf("failed to init git repo: %v", err)
+		t.Fatalf("failed to open git repo: %v", err)
 	}
 
 	t.Chdir(dir)
@@ -113,6 +112,12 @@ func createSessionStateFile(t *testing.T, repoRoot string, sessionID string, com
 	return sessionFile
 }
 
+// legacyShadowBranchName returns a branch name in the shape older CLIs gave
+// shadow branches (entire/<commit[:7]>-<worktreeHash[:6]>).
+func legacyShadowBranchName(commitHash plumbing.Hash) string {
+	return "entire/" + commitHash.String()[:7] + "-e3b0c4"
+}
+
 func writeCleanSettingsFile(t *testing.T, repoRoot, content string) {
 	t.Helper()
 
@@ -127,29 +132,6 @@ func writeCleanSettingsFile(t *testing.T, repoRoot, content string) {
 	}
 }
 
-func runCleanGit(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-
-	cmd := exec.CommandContext(t.Context(), "git", args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %s failed: %s: %v", strings.Join(args, " "), strings.TrimSpace(string(output)), err)
-	}
-	return string(output)
-}
-
-func addCleanBareOrigin(t *testing.T, repoRoot string) string {
-	t.Helper()
-
-	remoteDir := filepath.Join(t.TempDir(), "origin.git")
-	runCleanGit(t, "", "init", "--bare", remoteDir)
-	runCleanGit(t, repoRoot, "remote", "add", "origin", remoteDir)
-	return remoteDir
-}
-
 func TestCleanLongDescription_DefaultIsGeneric(t *testing.T) {
 	repo, _ := setupCleanTestRepo(t)
 
@@ -161,321 +143,9 @@ func TestCleanLongDescription_DefaultIsGeneric(t *testing.T) {
 
 	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {}}`)
 
-	description := cleanLongDescription(context.Background())
-	if strings.Contains(description, "checkpoints v2") {
-		t.Fatalf("did not expect v2-specific help text by default, got: %s", description)
-	}
+	description := cleanLongDescription()
 	if strings.Contains(description, "entire/checkpoints/v1") {
 		t.Fatalf("did not expect stale v1 preservation text, got: %s", description)
-	}
-}
-
-func TestCleanLongDescription_IncludesV2CleanupWhenEnabled(t *testing.T) {
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-
-	description := cleanLongDescription(context.Background())
-	if !strings.Contains(description, "Archived v2 full transcripts older than the configured 14-day retention window") {
-		t.Fatalf("expected v2 cleanup help text when enabled, got: %s", description)
-	}
-}
-
-func createCleanV2Ref(t *testing.T, repo *git.Repository, refName plumbing.ReferenceName) {
-	t.Helper()
-
-	treeHash, err := checkpoint.BuildTreeFromEntries(context.Background(), repo, map[string]object.TreeEntry{})
-	if err != nil {
-		t.Fatalf("failed to build empty tree for %s: %v", refName, err)
-	}
-
-	commitHash, err := checkpoint.CreateCommit(context.Background(), repo, treeHash, plumbing.ZeroHash, "init v2 ref", "test", "test@test.com")
-	if err != nil {
-		t.Fatalf("failed to create commit for %s: %v", refName, err)
-	}
-
-	ref := plumbing.NewHashReference(refName, commitHash)
-	if err := repo.Storer.SetReference(ref); err != nil {
-		t.Fatalf("failed to create %s: %v", refName, err)
-	}
-}
-
-func createArchivedGenerationRef(t *testing.T, repo *git.Repository, generation string, oldest, newest time.Time) {
-	t.Helper()
-
-	gen := checkpoint.GenerationMetadata{
-		OldestCheckpointAt: oldest.UTC(),
-		NewestCheckpointAt: newest.UTC(),
-	}
-
-	genJSON, err := json.Marshal(gen)
-	if err != nil {
-		t.Fatalf("failed to marshal generation metadata: %v", err)
-	}
-
-	genBlobHash, err := checkpoint.CreateBlobFromContent(repo, genJSON)
-	if err != nil {
-		t.Fatalf("failed to create generation blob: %v", err)
-	}
-
-	transcriptBlobHash, err := checkpoint.CreateBlobFromContent(repo, []byte(`{"transcript":"data"}`))
-	if err != nil {
-		t.Fatalf("failed to create transcript blob: %v", err)
-	}
-
-	entries := map[string]object.TreeEntry{
-		paths.GenerationFileName: {
-			Name: paths.GenerationFileName,
-			Mode: filemode.Regular,
-			Hash: genBlobHash,
-		},
-		"aa/bbccddeeff/0/" + paths.TranscriptFileName: {
-			Name: paths.TranscriptFileName,
-			Mode: filemode.Regular,
-			Hash: transcriptBlobHash,
-		},
-	}
-
-	treeHash, err := checkpoint.BuildTreeFromEntries(context.Background(), repo, entries)
-	if err != nil {
-		t.Fatalf("failed to build archived generation tree: %v", err)
-	}
-
-	commitHash, err := checkpoint.CreateCommit(context.Background(), repo, treeHash, plumbing.ZeroHash, "archived generation", "test", "test@test.com")
-	if err != nil {
-		t.Fatalf("failed to create archived generation commit: %v", err)
-	}
-
-	refName := plumbing.ReferenceName(paths.V2FullRefPrefix + generation)
-	ref := plumbing.NewHashReference(refName, commitHash)
-	if err := repo.Storer.SetReference(ref); err != nil {
-		t.Fatalf("failed to create archived generation ref %s: %v", refName, err)
-	}
-}
-
-func createArchivedGenerationRefWithRawTranscript(
-	t *testing.T,
-	repo *git.Repository,
-	generation string,
-	cpID id.CheckpointID,
-	generationOldest time.Time,
-	generationNewest time.Time,
-	rawOldest time.Time,
-	rawNewest time.Time,
-) {
-	t.Helper()
-
-	gen := checkpoint.GenerationMetadata{
-		OldestCheckpointAt: generationOldest.UTC(),
-		NewestCheckpointAt: generationNewest.UTC(),
-	}
-	genJSON, err := json.Marshal(gen)
-	if err != nil {
-		t.Fatalf("failed to marshal generation metadata: %v", err)
-	}
-	genBlobHash, err := checkpoint.CreateBlobFromContent(repo, genJSON)
-	if err != nil {
-		t.Fatalf("failed to create generation blob: %v", err)
-	}
-
-	transcript := `{"type":"user","timestamp":` + strconv.Quote(rawOldest.UTC().Format(time.RFC3339Nano)) + "}\n" +
-		`{"type":"assistant","timestamp":` + strconv.Quote(rawNewest.UTC().Format(time.RFC3339Nano)) + "}\n"
-	transcriptBlobHash, err := checkpoint.CreateBlobFromContent(repo, []byte(transcript))
-	if err != nil {
-		t.Fatalf("failed to create transcript blob: %v", err)
-	}
-
-	entries := map[string]object.TreeEntry{
-		paths.GenerationFileName: {
-			Name: paths.GenerationFileName,
-			Mode: filemode.Regular,
-			Hash: genBlobHash,
-		},
-		cpID.Path() + "/0/" + paths.V2RawTranscriptFileName: {
-			Name: paths.V2RawTranscriptFileName,
-			Mode: filemode.Regular,
-			Hash: transcriptBlobHash,
-		},
-	}
-
-	treeHash, err := checkpoint.BuildTreeFromEntries(context.Background(), repo, entries)
-	if err != nil {
-		t.Fatalf("failed to build archived generation tree: %v", err)
-	}
-
-	commitHash, err := checkpoint.CreateCommit(context.Background(), repo, treeHash, plumbing.ZeroHash, "archived generation", "test", "test@test.com")
-	if err != nil {
-		t.Fatalf("failed to create archived generation commit: %v", err)
-	}
-
-	refName := plumbing.ReferenceName(paths.V2FullRefPrefix + generation)
-	ref := plumbing.NewHashReference(refName, commitHash)
-	if err := repo.Storer.SetReference(ref); err != nil {
-		t.Fatalf("failed to create archived generation ref %s: %v", refName, err)
-	}
-}
-
-func createRemoteOnlyArchivedGenerationRef(
-	t *testing.T,
-	repo *git.Repository,
-	repoRoot string,
-	generation string,
-	oldest time.Time,
-	newest time.Time,
-) string {
-	t.Helper()
-
-	createArchivedGenerationRef(t, repo, generation, oldest, newest)
-	refName := paths.V2FullRefPrefix + generation
-	ref, err := repo.Reference(plumbing.ReferenceName(refName), true)
-	if err != nil {
-		t.Fatalf("failed to read archived generation ref %s: %v", refName, err)
-	}
-	runCleanGit(t, repoRoot, "push", "origin", refName+":"+refName)
-	if err := strategy.DeleteRefCLI(context.Background(), refName, ref.Hash().String()); err != nil {
-		t.Fatalf("failed to remove local archived generation ref %s: %v", refName, err)
-	}
-	return ref.Hash().String()
-}
-
-func createRemoteOnlyArchivedGenerationRefFromSeparateRepo(
-	t *testing.T,
-	remoteDir string,
-	generation string,
-	oldest time.Time,
-	newest time.Time,
-) {
-	t.Helper()
-
-	gen := checkpoint.GenerationMetadata{
-		OldestCheckpointAt: oldest.UTC(),
-		NewestCheckpointAt: newest.UTC(),
-	}
-	genJSON, err := json.Marshal(gen)
-	if err != nil {
-		t.Fatalf("failed to marshal generation metadata: %v", err)
-	}
-
-	createRemoteOnlyArchivedGenerationRefFromSeparateRepoWithMetadata(t, remoteDir, generation, genJSON)
-}
-
-func createRemoteOnlyArchivedGenerationRefFromSeparateRepoWithMetadata(
-	t *testing.T,
-	remoteDir string,
-	generation string,
-	generationJSON []byte,
-) {
-	t.Helper()
-
-	producerDir := filepath.Join(t.TempDir(), "producer")
-	testutil.InitRepo(t, producerDir)
-	testutil.WriteFile(t, producerDir, paths.GenerationFileName, string(generationJSON))
-	testutil.WriteFile(t, producerDir, "aa/bbccddeeff/0/"+paths.TranscriptFileName, `{"transcript":"data"}`)
-
-	runCleanGit(t, producerDir, "add", ".")
-	runCleanGit(t, producerDir, "commit", "--no-gpg-sign", "-m", "archived generation")
-
-	refName := paths.V2FullRefPrefix + generation
-	runCleanGit(t, producerDir, "push", remoteDir, "HEAD:"+refName)
-}
-
-func createV2MainMetadataRef(t *testing.T, repo *git.Repository, cpID id.CheckpointID, createdAt time.Time) {
-	t.Helper()
-
-	sessionMetadata := checkpoint.CommittedMetadata{
-		CheckpointID: cpID,
-		SessionID:    "session-" + cpID.String(),
-		Strategy:     "manual-commit",
-		CreatedAt:    createdAt.UTC(),
-	}
-	sessionMetadataJSON, err := json.Marshal(sessionMetadata)
-	if err != nil {
-		t.Fatalf("failed to marshal session metadata: %v", err)
-	}
-	sessionMetadataHash, err := checkpoint.CreateBlobFromContent(repo, sessionMetadataJSON)
-	if err != nil {
-		t.Fatalf("failed to create session metadata blob: %v", err)
-	}
-
-	summary := checkpoint.CheckpointSummary{
-		CheckpointID: cpID,
-		Strategy:     "manual-commit",
-		Sessions: []checkpoint.SessionFilePaths{
-			{Metadata: "/" + cpID.Path() + "/0/" + paths.MetadataFileName},
-		},
-	}
-	summaryJSON, err := json.Marshal(summary)
-	if err != nil {
-		t.Fatalf("failed to marshal checkpoint summary: %v", err)
-	}
-	summaryHash, err := checkpoint.CreateBlobFromContent(repo, summaryJSON)
-	if err != nil {
-		t.Fatalf("failed to create checkpoint summary blob: %v", err)
-	}
-
-	entries := map[string]object.TreeEntry{
-		cpID.Path() + "/" + paths.MetadataFileName: {
-			Name: paths.MetadataFileName,
-			Mode: filemode.Regular,
-			Hash: summaryHash,
-		},
-		cpID.Path() + "/0/" + paths.MetadataFileName: {
-			Name: paths.MetadataFileName,
-			Mode: filemode.Regular,
-			Hash: sessionMetadataHash,
-		},
-	}
-
-	treeHash, err := checkpoint.BuildTreeFromEntries(context.Background(), repo, entries)
-	if err != nil {
-		t.Fatalf("failed to build v2 main tree: %v", err)
-	}
-	commitHash, err := checkpoint.CreateCommit(context.Background(), repo, treeHash, plumbing.ZeroHash, "v2 main", "test", "test@test.com")
-	if err != nil {
-		t.Fatalf("failed to create v2 main commit: %v", err)
-	}
-	ref := plumbing.NewHashReference(plumbing.ReferenceName(paths.V2MainRefName), commitHash)
-	if err := repo.Storer.SetReference(ref); err != nil {
-		t.Fatalf("failed to create v2 main ref: %v", err)
-	}
-}
-
-func createArchivedGenerationRefWithoutMetadata(t *testing.T, repo *git.Repository, generation string) {
-	t.Helper()
-
-	transcriptBlobHash, err := checkpoint.CreateBlobFromContent(repo, []byte(`{"transcript":"data"}`))
-	if err != nil {
-		t.Fatalf("failed to create transcript blob: %v", err)
-	}
-
-	entries := map[string]object.TreeEntry{
-		"aa/bbccddeeff/0/" + paths.TranscriptFileName: {
-			Name: paths.TranscriptFileName,
-			Mode: filemode.Regular,
-			Hash: transcriptBlobHash,
-		},
-	}
-
-	treeHash, err := checkpoint.BuildTreeFromEntries(context.Background(), repo, entries)
-	if err != nil {
-		t.Fatalf("failed to build archived generation tree: %v", err)
-	}
-
-	commitHash, err := checkpoint.CreateCommit(context.Background(), repo, treeHash, plumbing.ZeroHash, "archived generation without metadata", "test", "test@test.com")
-	if err != nil {
-		t.Fatalf("failed to create archived generation commit: %v", err)
-	}
-
-	refName := plumbing.ReferenceName(paths.V2FullRefPrefix + generation)
-	ref := plumbing.NewHashReference(refName, commitHash)
-	if err := repo.Storer.SetReference(ref); err != nil {
-		t.Fatalf("failed to create archived generation ref %s: %v", refName, err)
 	}
 }
 
@@ -504,13 +174,9 @@ func TestCleanCmd_DefaultMode_WithForce(t *testing.T) {
 		t.Fatalf("failed to get worktree: %v", err)
 	}
 	worktreePath := wt.Filesystem().Root()
-	worktreeID, err := paths.GetWorktreeID(worktreePath)
-	if err != nil {
-		t.Fatalf("failed to get worktree ID: %v", err)
-	}
 
-	// Create shadow branch
-	shadowBranch := checkpoint.ShadowBranchNameForCommit(commitHash.String(), worktreeID)
+	// Create a legacy shadow branch an older CLI left behind
+	shadowBranch := legacyShadowBranchName(commitHash)
 	shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName(shadowBranch), commitHash)
 	if err := repo.Storer.SetReference(shadowRef); err != nil {
 		t.Fatalf("failed to create shadow branch: %v", err)
@@ -550,13 +216,9 @@ func TestCleanCmd_DefaultMode_DryRun(t *testing.T) {
 		t.Fatalf("failed to get worktree: %v", err)
 	}
 	worktreePath := wt.Filesystem().Root()
-	worktreeID, err := paths.GetWorktreeID(worktreePath)
-	if err != nil {
-		t.Fatalf("failed to get worktree ID: %v", err)
-	}
 
-	// Create shadow branch
-	shadowBranch := checkpoint.ShadowBranchNameForCommit(commitHash.String(), worktreeID)
+	// Create a legacy shadow branch an older CLI left behind
+	shadowBranch := legacyShadowBranchName(commitHash)
 	shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName(shadowBranch), commitHash)
 	if err := repo.Storer.SetReference(shadowRef); err != nil {
 		t.Fatalf("failed to create shadow branch: %v", err)
@@ -654,13 +316,9 @@ func TestCleanCmd_DefaultMode_MultipleSessions(t *testing.T) {
 		t.Fatalf("failed to get worktree: %v", err)
 	}
 	worktreePath := wt.Filesystem().Root()
-	worktreeID, err := paths.GetWorktreeID(worktreePath)
-	if err != nil {
-		t.Fatalf("failed to get worktree ID: %v", err)
-	}
 
-	// Create shadow branch
-	shadowBranch := checkpoint.ShadowBranchNameForCommit(commitHash.String(), worktreeID)
+	// Create a legacy shadow branch an older CLI left behind
+	shadowBranch := legacyShadowBranchName(commitHash)
 	shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName(shadowBranch), commitHash)
 	if err := repo.Storer.SetReference(shadowRef); err != nil {
 		t.Fatalf("failed to create shadow branch: %v", err)
@@ -917,7 +575,7 @@ func TestCleanCmd_All_NotGitRepository(t *testing.T) {
 	}
 }
 
-func TestCleanCmd_All_InvalidSettingsWarnsAndContinues(t *testing.T) {
+func TestCleanCmd_All_InvalidSettingsIgnoredWithoutV2Scan(t *testing.T) {
 	repo, _ := setupCleanTestRepo(t)
 
 	wt, err := repo.Worktree()
@@ -938,8 +596,8 @@ func TestCleanCmd_All_InvalidSettingsWarnsAndContinues(t *testing.T) {
 		t.Fatalf("clean --all --dry-run error = %v", err)
 	}
 
-	if !strings.Contains(stderr.String(), "Warning: failed to load settings") {
-		t.Fatalf("expected settings warning, got stderr=%q", stderr.String())
+	if stderr.String() != "" {
+		t.Fatalf("expected no settings warning, got stderr=%q", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "No items to clean up.") {
 		t.Fatalf("expected command to continue cleanup flow, got stdout=%q", stdout.String())
@@ -994,13 +652,9 @@ func TestCleanCmd_All_FindsSessionWithShadowBranch(t *testing.T) {
 		t.Fatalf("failed to get worktree: %v", err)
 	}
 	worktreePath := wt.Filesystem().Root()
-	worktreeID, err := paths.GetWorktreeID(worktreePath)
-	if err != nil {
-		t.Fatalf("failed to get worktree ID: %v", err)
-	}
 
 	// Create shadow branch for the session's base commit
-	shadowBranch := checkpoint.ShadowBranchNameForCommit(commitHash.String(), worktreeID)
+	shadowBranch := legacyShadowBranchName(commitHash)
 	shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName(shadowBranch), commitHash)
 	if err := repo.Storer.SetReference(shadowRef); err != nil {
 		t.Fatalf("failed to create shadow branch: %v", err)
@@ -1038,414 +692,6 @@ func TestCleanCmd_All_FindsSessionWithShadowBranch(t *testing.T) {
 	}
 }
 
-func TestCleanCmd_All_DryRunListsEligibleV2Generations(t *testing.T) {
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-	createArchivedGenerationRef(t, repo, "0000000000001", time.Now().AddDate(0, 0, -20), time.Now().AddDate(0, 0, -15))
-
-	cmd := newCleanCmd()
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--all", "--dry-run"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("clean --all --dry-run error = %v", err)
-	}
-
-	output := stdout.String()
-	if !strings.Contains(output, "Archived v2 generations (1):") {
-		t.Fatalf("expected archived v2 generation section, got: %s", output)
-	}
-	if !strings.Contains(output, "0000000000001") {
-		t.Fatalf("expected archived generation ref in output, got: %s", output)
-	}
-}
-
-func TestCleanCmd_All_DryRunListsRemoteOnlyEligibleV2Generations(t *testing.T) {
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-	addCleanBareOrigin(t, repoRoot)
-	createRemoteOnlyArchivedGenerationRef(t, repo, repoRoot, "0000000000001", time.Now().AddDate(0, 0, -20), time.Now().AddDate(0, 0, -15))
-
-	cmd := newCleanCmd()
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--all", "--dry-run"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("clean --all --dry-run error = %v", err)
-	}
-
-	output := stdout.String()
-	if !strings.Contains(output, "Archived v2 generations (1):") {
-		t.Fatalf("expected archived v2 generation section, got: %s", output)
-	}
-	if !strings.Contains(output, "0000000000001") {
-		t.Fatalf("expected remote-only archived generation ref in output, got: %s", output)
-	}
-	if _, err := repo.Reference(plumbing.ReferenceName(paths.V2FullRefPrefix+"0000000000001"), true); err == nil {
-		t.Fatal("dry-run should not leave remote-only archived generation as a local ref")
-	}
-	if _, err := repo.Reference(plumbing.ReferenceName("refs/entire-clean-tmp/v2/full/0000000000001"), true); err == nil {
-		t.Fatal("dry-run should remove temporary fetched generation ref")
-	}
-}
-
-func TestCleanCmd_All_DryRunReadsGitMaterializedRemoteGenerationMetadata(t *testing.T) {
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-	remoteDir := addCleanBareOrigin(t, repoRoot)
-	runCleanGit(t, remoteDir, "config", "uploadpack.allowFilter", "true")
-	runCleanGit(t, repoRoot, "config", "protocol.file.allow", "always")
-	for _, generation := range []string{"0000000000007", "0000000000008"} {
-		refName := paths.V2FullRefPrefix + generation
-		createRemoteOnlyArchivedGenerationRefFromSeparateRepo(
-			t,
-			remoteDir,
-			generation,
-			time.Now().AddDate(0, 0, -20),
-			time.Now().AddDate(0, 0, -15),
-		)
-		runCleanGit(t, repoRoot, "-c", "protocol.file.allow=always", "fetch", "--filter=blob:none", "--depth=1", "--no-tags", "file://"+remoteDir, refName+":"+refName)
-	}
-
-	cmd := newCleanCmd()
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--all", "--dry-run"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("clean --all --dry-run error = %v", err)
-	}
-
-	if strings.Contains(stderr.String(), "missing generation.json") {
-		t.Fatalf("did not expect missing generation warning for Git-readable remote generation, got stdout=%q stderr=%q", stdout.String(), stderr.String())
-	}
-
-	output := stdout.String()
-	if !strings.Contains(output, "Archived v2 generations (2):") {
-		t.Fatalf("expected archived v2 generation section, got stdout=%q stderr=%q", output, stderr.String())
-	}
-	for _, generation := range []string{"0000000000007", "0000000000008"} {
-		if !strings.Contains(output, generation) {
-			t.Fatalf("expected remote generation %s to be eligible, got stdout=%q stderr=%q", generation, output, stderr.String())
-		}
-	}
-}
-
-func TestCleanCmd_All_DryRunContinuesAfterInvalidGitMaterializedGenerationMetadata(t *testing.T) {
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-	remoteDir := addCleanBareOrigin(t, repoRoot)
-	runCleanGit(t, remoteDir, "config", "uploadpack.allowFilter", "true")
-	runCleanGit(t, repoRoot, "config", "protocol.file.allow", "always")
-
-	invalidRefName := paths.V2FullRefPrefix + "0000000000007"
-	createRemoteOnlyArchivedGenerationRefFromSeparateRepoWithMetadata(
-		t,
-		remoteDir,
-		"0000000000007",
-		[]byte(`{"oldest_checkpoint_at":`),
-	)
-	runCleanGit(t, repoRoot, "-c", "protocol.file.allow=always", "fetch", "--filter=blob:none", "--depth=1", "--no-tags", "file://"+remoteDir, invalidRefName+":"+invalidRefName)
-
-	validRefName := paths.V2FullRefPrefix + "0000000000008"
-	createRemoteOnlyArchivedGenerationRefFromSeparateRepo(
-		t,
-		remoteDir,
-		"0000000000008",
-		time.Now().AddDate(0, 0, -20),
-		time.Now().AddDate(0, 0, -15),
-	)
-	runCleanGit(t, repoRoot, "-c", "protocol.file.allow=always", "fetch", "--filter=blob:none", "--depth=1", "--no-tags", "file://"+remoteDir, validRefName+":"+validRefName)
-
-	cmd := newCleanCmd()
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--all", "--dry-run"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("clean --all --dry-run error = %v", err)
-	}
-
-	if !strings.Contains(stderr.String(), "generation 0000000000007: failed to read generation.json: parse git-readable generation.json") {
-		t.Fatalf("expected invalid generation parse warning, got stdout=%q stderr=%q", stdout.String(), stderr.String())
-	}
-
-	output := stdout.String()
-	if !strings.Contains(output, "Archived v2 generations (1):") {
-		t.Fatalf("expected one eligible archived v2 generation, got stdout=%q stderr=%q", output, stderr.String())
-	}
-	if !strings.Contains(output, "0000000000008") {
-		t.Fatalf("expected valid remote generation to remain eligible after invalid batch entry, got stdout=%q stderr=%q", output, stderr.String())
-	}
-	if strings.Contains(output, "0000000000007") {
-		t.Fatalf("invalid remote generation should not be eligible, got stdout=%q stderr=%q", output, stderr.String())
-	}
-}
-
-func TestCleanCmd_All_PrefersGenerationJSONOverRawTranscript(t *testing.T) {
-	// generation.json says "now"; raw transcripts say 15–20 days ago. The
-	// generation must not be eligible for cleanup.
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-
-	cpID := id.MustCheckpointID("aabbccddeeff")
-	createV2MainMetadataRef(t, repo, cpID, time.Now())
-	createArchivedGenerationRefWithRawTranscript(t, repo, "0000000000005", cpID,
-		time.Now(), time.Now(),
-		time.Now().AddDate(0, 0, -20), time.Now().AddDate(0, 0, -15))
-
-	cmd := newCleanCmd()
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--all", "--dry-run"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("clean --all --dry-run error = %v", err)
-	}
-
-	output := stdout.String()
-	if strings.Contains(output, "0000000000005") {
-		t.Fatalf("expected generation to be skipped because generation.json is within retention, got: %s", output)
-	}
-}
-
-func TestCleanCmd_All_ForceDeletesRemoteOnlyEligibleV2Generations(t *testing.T) {
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-	addCleanBareOrigin(t, repoRoot)
-	refOID := createRemoteOnlyArchivedGenerationRef(t, repo, repoRoot, "0000000000006", time.Now().AddDate(0, 0, -20), time.Now().AddDate(0, 0, -15))
-
-	cmd := newCleanCmd()
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--all", "--force"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("clean --all --force error = %v", err)
-	}
-
-	if _, err := repo.Reference(plumbing.ReferenceName(paths.V2FullRefPrefix+"0000000000006"), true); err == nil {
-		t.Fatal("remote-only archived generation should not be left locally")
-	}
-	remoteOutput := runCleanGit(t, repoRoot, "ls-remote", "origin", paths.V2FullRefPrefix+"0000000000006")
-	if strings.Contains(remoteOutput, refOID) {
-		t.Fatalf("expected remote archived generation to be deleted, got: %s", remoteOutput)
-	}
-	if !strings.Contains(stdout.String(), "Archived v2 generations") {
-		t.Fatalf("expected deletion output to include archived v2 generations, got: %s", stdout.String())
-	}
-}
-
-func TestCleanCmd_All_ForceDeletesEligibleV2Generations(t *testing.T) {
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-	createCleanV2Ref(t, repo, plumbing.ReferenceName(paths.V2MainRefName))
-	createCleanV2Ref(t, repo, plumbing.ReferenceName(paths.V2FullCurrentRefName))
-	createArchivedGenerationRef(t, repo, "0000000000002", time.Now().AddDate(0, 0, -20), time.Now().AddDate(0, 0, -15))
-
-	cmd := newCleanCmd()
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--all", "--force"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("clean --all --force error = %v", err)
-	}
-
-	if _, err := repo.Reference(plumbing.ReferenceName(paths.V2FullRefPrefix+"0000000000002"), true); err == nil {
-		t.Fatal("archived v2 generation ref should be deleted")
-	}
-	if _, err := repo.Reference(plumbing.ReferenceName(paths.V2MainRefName), true); err != nil {
-		t.Fatalf("v2 main ref should remain: %v", err)
-	}
-	if _, err := repo.Reference(plumbing.ReferenceName(paths.V2FullCurrentRefName), true); err != nil {
-		t.Fatalf("v2 full current ref should remain: %v", err)
-	}
-}
-
-func TestCleanCmd_All_DryRunSkipsV2GenerationsWithinRetention(t *testing.T) {
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-	createArchivedGenerationRef(t, repo, "0000000000003", time.Now().AddDate(0, 0, -5), time.Now().AddDate(0, 0, -1))
-
-	cmd := newCleanCmd()
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--all", "--dry-run"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("clean --all --dry-run error = %v", err)
-	}
-
-	output := stdout.String()
-	if strings.Contains(output, "Archived v2 generations") {
-		t.Fatalf("did not expect archived v2 generation section for retained generation, got: %s", output)
-	}
-	if strings.Contains(output, "0000000000003") {
-		t.Fatalf("did not expect retained generation ref in output, got: %s", output)
-	}
-}
-
-func TestCleanCmd_All_ForceSkipsV2GenerationMissingMetadata(t *testing.T) {
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-	createArchivedGenerationRefWithoutMetadata(t, repo, "0000000000001")
-
-	cmd := newCleanCmd()
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--all", "--force"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("clean --all --force error = %v", err)
-	}
-
-	if _, err := repo.Reference(plumbing.ReferenceName(paths.V2FullRefPrefix+"0000000000001"), true); err != nil {
-		t.Fatalf("archived generation ref with missing metadata should remain: %v", err)
-	}
-	if !strings.Contains(stderr.String(), "missing generation.json") {
-		t.Fatalf("expected missing generation warning, got stdout=%q stderr=%q", stdout.String(), stderr.String())
-	}
-}
-
-func TestCleanCmd_All_ForceSkipsV2GenerationWithInvalidTimestamps(t *testing.T) {
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-	createArchivedGenerationRef(t, repo, "0000000000004", time.Now().AddDate(0, 0, -1), time.Now().AddDate(0, 0, -20))
-
-	cmd := newCleanCmd()
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--all", "--force"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("clean --all --force error = %v", err)
-	}
-
-	if _, err := repo.Reference(plumbing.ReferenceName(paths.V2FullRefPrefix+"0000000000004"), true); err != nil {
-		t.Fatalf("archived generation ref with invalid timestamps should remain: %v", err)
-	}
-	if !strings.Contains(stderr.String(), "invalid timestamps") {
-		t.Fatalf("expected invalid timestamp warning, got stdout=%q stderr=%q", stdout.String(), stderr.String())
-	}
-}
-
-func TestCleanCmd_All_ForceWarnsWithErrorDetailsForUnreadableV2Ref(t *testing.T) {
-	repo, _ := setupCleanTestRepo(t)
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-	repoRoot := wt.Filesystem().Root()
-
-	writeCleanSettingsFile(t, repoRoot, `{"enabled": true, "strategy_options": {"checkpoints_v2": true, "full_transcript_generation_retention_days": 14}}`)
-
-	genName := "0000000000010"
-	refName := plumbing.ReferenceName(paths.V2FullRefPrefix + genName)
-	brokenHash := plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	if err := repo.Storer.SetReference(plumbing.NewHashReference(refName, brokenHash)); err != nil {
-		t.Fatalf("failed to create broken archived generation ref: %v", err)
-	}
-
-	cmd := newCleanCmd()
-	var stdout, stderr bytes.Buffer
-	cmd.SetOut(&stdout)
-	cmd.SetErr(&stderr)
-	cmd.SetArgs([]string{"--all", "--force"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("clean --all --force error = %v", err)
-	}
-
-	warningText := stderr.String()
-	if !strings.Contains(warningText, "generation "+genName+": cannot read ref:") {
-		t.Fatalf("expected warning with ref error details, got stdout=%q stderr=%q", stdout.String(), warningText)
-	}
-}
-
 // --- runCleanAllWithItems unit tests ---
 
 func TestRunCleanAllWithItems_PartialFailure(t *testing.T) {
@@ -1462,7 +708,7 @@ func TestRunCleanAllWithItems_PartialFailure(t *testing.T) {
 	}
 
 	cmd, stdout, stderr := newTestCleanCmd(t)
-	err := runCleanAllWithItems(cmd.Context(), cmd, true, false, items, nil)
+	err := runCleanAllWithItems(cmd.Context(), cmd, true, false, items, nil, nil, nil)
 
 	if err == nil {
 		t.Fatal("runCleanAllWithItems() should return error when items fail to delete")
@@ -1496,7 +742,7 @@ func TestRunCleanAllWithItems_AllFailures(t *testing.T) {
 	}
 
 	cmd, stdout, stderr := newTestCleanCmd(t)
-	err := runCleanAllWithItems(cmd.Context(), cmd, true, false, items, nil)
+	err := runCleanAllWithItems(cmd.Context(), cmd, true, false, items, nil, nil, nil)
 
 	if err == nil {
 		t.Fatal("runCleanAllWithItems() should return error when items fail to delete")
@@ -1520,7 +766,7 @@ func TestRunCleanAllWithItems_NoItems(t *testing.T) {
 	setupCleanTestRepo(t)
 
 	cmd, stdout, _ := newTestCleanCmd(t)
-	err := runCleanAllWithItems(cmd.Context(), cmd, false, false, []strategy.CleanupItem{}, nil)
+	err := runCleanAllWithItems(cmd.Context(), cmd, false, false, []strategy.CleanupItem{}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("runCleanAllWithItems() error = %v", err)
 	}
@@ -1541,14 +787,14 @@ func TestRunCleanAllWithItems_MixedTypes_Preview(t *testing.T) {
 	}
 
 	cmd, stdout, _ := newTestCleanCmd(t)
-	err := runCleanAllWithItems(cmd.Context(), cmd, false, true, items, nil)
+	err := runCleanAllWithItems(cmd.Context(), cmd, false, true, items, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("runCleanAllWithItems() error = %v", err)
 	}
 
 	output := stdout.String()
-	if !strings.Contains(output, "Shadow branches") {
-		t.Errorf("Expected 'Shadow branches' section, got: %s", output)
+	if !strings.Contains(output, "Legacy shadow branches") {
+		t.Errorf("Expected 'Legacy shadow branches' section, got: %s", output)
 	}
 	if !strings.Contains(output, "Session states") {
 		t.Errorf("Expected 'Session states' section, got: %s", output)
@@ -1578,5 +824,244 @@ func TestCleanCmd_MutuallyExclusiveFlags(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cannot be used together") {
 		t.Errorf("Expected mutual exclusion error, got: %v", err)
+	}
+}
+
+// --- Temp file deletion ---
+
+// TestDeleteTempFiles_ToleratesVanishedFile covers the race the OpenCode export
+// staging introduces: listAllTempFiles snapshots .entire/tmp, and a staged export
+// can be renamed into place before deleteTempFiles gets to it. A name that is
+// already gone is not a deletion failure.
+func TestDeleteTempFiles_ToleratesVanishedFile(t *testing.T) {
+	setupCleanTestRepo(t)
+	ctx := context.Background()
+
+	tmpDirAbs, err := paths.AbsPath(ctx, paths.EntireTmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(tmpDirAbs, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDirAbs, "present.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, failed := deleteTempFiles(ctx, []string{"present.json", ".export-ses_x.json-42"})
+
+	if len(failed) != 0 {
+		t.Errorf("deleteTempFiles reported %d failure(s) for an already-gone file: %+v", len(failed), failed)
+	}
+	if len(deleted) != 1 || deleted[0] != "present.json" {
+		t.Errorf("deleted = %v, want [present.json]", deleted)
+	}
+}
+
+// .entire/tmp is where deleteTempFiles unlinks names it found on a previous
+// walk, so a link swapped in at the directory must be refused rather than
+// deleted through. os.Root stops only the links that leave the repository, and
+// this one does not have to.
+func TestDeleteTempFiles_RefusesASymlinkedTmpDirectory(t *testing.T) {
+	if runtime.GOOS == windowsGOOS {
+		t.Skip("symlink creation is not generally available on Windows")
+	}
+	setupCleanTestRepo(t)
+	ctx := context.Background()
+
+	entireDirAbs, err := paths.AbsPath(ctx, ".entire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(entireDirAbs, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// The victim lives inside the repository, so nothing here escapes the root.
+	victimDir := filepath.Join(entireDirAbs, "victim")
+	if err := os.MkdirAll(victimDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(victimDir, "keep.json")
+	if err := os.WriteFile(victim, []byte(`{"keep":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("victim", filepath.Join(entireDirAbs, "tmp")); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	deleted, failed := deleteTempFiles(ctx, []string{"keep.json"})
+
+	if len(deleted) != 0 {
+		t.Errorf("deleted = %v, want none: the delete must not follow the link", deleted)
+	}
+	if len(failed) != 1 {
+		t.Fatalf("failed = %+v, want exactly one refusal", failed)
+	}
+	if !errors.Is(failed[0].Err, osroot.ErrSymlinkedPath) {
+		t.Errorf("failed[0].Err = %v, want %v", failed[0].Err, osroot.ErrSymlinkedPath)
+	}
+	if _, err := os.Lstat(victim); err != nil {
+		t.Errorf("the link target must survive: %v", err)
+	}
+}
+
+// A failed listing does not abort the command, which means the summary is the
+// only place a caller learns the list was not complete. The warning goes to
+// stderr and the counts go to stdout, so stdout has to say it too.
+func TestRunCleanAllWithItems_NamesTheScansThatFailed(t *testing.T) {
+	t.Run("with nothing else to clean", func(t *testing.T) {
+		cmd, stdout, _ := newTestCleanCmd(t)
+
+		err := runCleanAllWithItems(cmd.Context(), cmd, true, false,
+			[]strategy.CleanupItem{}, nil, nil, []string{"stray agent temp files"})
+		if err != nil {
+			t.Fatalf("runCleanAllWithItems() error = %v", err)
+		}
+
+		out := stdout.String()
+		if !strings.Contains(out, "No items to clean up.") {
+			t.Errorf("stdout should still report what was found, got:\n%s", out)
+		}
+		if !strings.Contains(out, "Could not scan stray agent temp files") {
+			t.Errorf("stdout should name the failed scan, got:\n%s", out)
+		}
+	})
+
+	t.Run("in the preview", func(t *testing.T) {
+		cmd, stdout, _ := newTestCleanCmd(t)
+
+		err := runCleanAllWithItems(cmd.Context(), cmd, false, true,
+			[]strategy.CleanupItem{}, []string{"a.json"}, nil,
+			[]string{"temp files", "stray agent temp files"})
+		if err != nil {
+			t.Fatalf("runCleanAllWithItems() error = %v", err)
+		}
+
+		out := stdout.String()
+		if !strings.Contains(out, "Could not scan temp files or stray agent temp files") {
+			t.Errorf("preview should name both failed scans, got:\n%s", out)
+		}
+	})
+
+	t.Run("and stays quiet when every scan worked", func(t *testing.T) {
+		cmd, stdout, _ := newTestCleanCmd(t)
+
+		err := runCleanAllWithItems(cmd.Context(), cmd, true, false,
+			[]strategy.CleanupItem{}, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("runCleanAllWithItems() error = %v", err)
+		}
+
+		if strings.Contains(stdout.String(), "Could not scan") {
+			t.Errorf("a complete scan must not print the note, got:\n%s", stdout.String())
+		}
+	})
+}
+
+// The plain clean confirmation lists what it deletes and says that clearing a
+// session with pending agent work drops that work's link to a future
+// checkpoint, pointing at `entire doctor --force` for deleting only branches.
+func TestPrintCurrentHeadCleanItems_WarnsAboutPendingWork(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	printCurrentHeadCleanItems(&out, []*strategy.SessionState{
+		{SessionID: "pending-session", StepCount: 2, FilesTouched: []string{"a.go"}},
+		{SessionID: "empty-session"},
+	}, []string{"entire/1234567-abcdef"})
+
+	text := out.String()
+	assertContains(t, text, "Session states (2):")
+	assertContains(t, text, "pending-session")
+	assertContains(t, text, "1 of these hold agent work not yet committed")
+	assertContains(t, text, "Legacy shadow branches (1):")
+	assertContains(t, text, "entire/1234567-abcdef")
+	assertContains(t, text, "entire doctor --force")
+}
+
+func assertContains(t *testing.T, text, want string) {
+	t.Helper()
+	if !strings.Contains(text, want) {
+		t.Errorf("output missing %q:\n%s", want, text)
+	}
+}
+
+// writeActiveSessionStateFile writes a session state in the ACTIVE phase based
+// on commitHash.
+func writeActiveSessionStateFile(t *testing.T, repoRoot, sessionID string, commitHash plumbing.Hash) string {
+	t.Helper()
+	sessionFile := createSessionStateFile(t, repoRoot, sessionID, commitHash)
+	data, err := json.Marshal(map[string]any{
+		"session_id":  sessionID,
+		"base_commit": commitHash.String(),
+		"phase":       "active",
+		"started_at":  time.Now().Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal session state: %v", err)
+	}
+	if err := os.WriteFile(sessionFile, data, 0o600); err != nil {
+		t.Fatalf("failed to write session state file: %v", err)
+	}
+	return sessionFile
+}
+
+// An ACTIVE session refuses a plain clean, and the refusal lists what --force
+// would delete, including the doctor route for the legacy branches alone.
+func TestCleanCmd_DefaultMode_ActiveRefusalListsItems(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	shadowBranch := legacyShadowBranchName(commitHash)
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(plumbing.NewBranchReferenceName(shadowBranch), commitHash)); err != nil {
+		t.Fatalf("failed to create shadow branch: %v", err)
+	}
+	sessionFile := writeActiveSessionStateFile(t, wt.Filesystem().Root(), "2026-10-08-active", commitHash)
+
+	cmd := newCleanCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("clean command error = %v", err)
+	}
+
+	out := stderr.String()
+	for _, want := range []string{"Active sessions detected", "Cleaning would delete:", "2026-10-08-active", shadowBranch, "entire clean --force", "entire doctor --force"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("refusal output missing %q:\n%s", want, out)
+		}
+	}
+	if _, err := os.Stat(sessionFile); err != nil {
+		t.Errorf("refused clean must keep the session state: %v", err)
+	}
+}
+
+// --force deletes without a prompt but still lists what it deletes.
+func TestCleanCmd_DefaultMode_ForceListsItems(t *testing.T) {
+	repo, commitHash := setupCleanTestRepo(t)
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get worktree: %v", err)
+	}
+	sessionFile := writeActiveSessionStateFile(t, wt.Filesystem().Root(), "2026-10-08-forced", commitHash)
+
+	cmd := newCleanCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"--force"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("clean command error = %v", err)
+	}
+
+	if out := stdout.String(); !strings.Contains(out, "This will delete:") || !strings.Contains(out, "2026-10-08-forced") {
+		t.Errorf("--force output should list the deleted session:\n%s", out)
+	}
+	if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+		t.Error("session state file should be deleted")
 	}
 }

@@ -1,33 +1,90 @@
 package checkpoint
 
 import (
+	"context"
+
 	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
-// Compile-time check that GitStore implements the Store interface.
-var _ Store = (*GitStore)(nil)
+var (
+	_ PersistentStore = (*GitStore)(nil)
+	_ AuthorReader    = (*GitStore)(nil)
+	_ Writer          = (*GitStore)(nil)
+)
 
-// GitStore provides operations for both temporary and committed checkpoint storage.
-// It implements the Store interface by wrapping a git repository.
-type GitStore struct {
-	repo        *git.Repository
-	blobFetcher BlobFetchFunc
+// treeWriter holds the repo-only machinery for building a single checkpoint's
+// subtree from write requests: entry builders, transcript/session writers, and
+// the per-request appliers (applySessionWrite / applyTranscriptBackfill /
+// applySummaryBackfill). It is independent of where
+// the resulting subtree is committed, so both the git-branch store (which nests
+// the subtree under <shard>/<id>/ on the v1 branch) and the git-refs store
+// (which keeps it at the root of a per-checkpoint ref) embed it and share this
+// code.
+type treeWriter struct {
+	repo *git.Repository
 }
 
-// NewGitStore creates a new checkpoint store backed by the given git repository.
-func NewGitStore(repo *git.Repository) *GitStore {
-	return &GitStore{repo: repo}
+// GitStore is the committed (persistent) checkpoint store. Writes target
+// refs.Primary; committed reads resolve against refs.Read. It embeds
+// *treeWriter for the shared subtree-building machinery.
+type GitStore struct {
+	*treeWriter
+
+	refs                  PersistentRefs
+	blobFetcher           BlobFetchFunc
+	metadataBranchFetcher MetadataBranchFetchFunc
+	// metadataBranchFetchTried latches the one recovery attempt per store; see
+	// tryFetchMetadataBranch.
+	metadataBranchFetchTried bool
+	// readRemotes is the ordered checkpoint read-candidate chain consulted by
+	// committed reads after the local tree; see OpenOptions.ReadRemotes. nil
+	// means the legacy origin-only fallback.
+	readRemotes []string
+}
+
+// NewGitStore creates a checkpoint store backed by the given git repository
+// and committed-metadata topology. Pass DefaultV1Refs() for the v1-only default
+// or ResolveRefs(ctx) in code paths that honor settings.
+func NewGitStore(repo *git.Repository, refs PersistentRefs) *GitStore {
+	return &GitStore{treeWriter: &treeWriter{repo: repo}, refs: refs}
 }
 
 // SetBlobFetcher configures the store to automatically fetch missing blobs
-// on demand when reading from metadata trees. This is used after treeless
-// fetches where tree objects are local but blob objects are not.
+// on demand when reading from metadata trees.
 func (s *GitStore) SetBlobFetcher(f BlobFetchFunc) {
 	s.blobFetcher = f
 }
 
-// Repository returns the underlying git repository.
-// This is useful for strategies that need direct repository access.
-func (s *GitStore) Repository() *git.Repository {
-	return s.repo
+// SetReadRemotes configures the ordered checkpoint read-candidate remotes
+// (elected sync remote first, then the legacy origin tier) whose tracking
+// refs committed reads consult after the local tree. Selection happens by
+// requested checkpoint, so an existing but incomplete tree does not mask a
+// later candidate. This is a pure read — the chain never seeds or advances
+// local refs. nil keeps the legacy origin-only fallback.
+func (s *GitStore) SetReadRemotes(remotes []string) {
+	s.readRemotes = remotes
+}
+
+// SetMetadataBranchFetcher configures the store to fetch the metadata branch
+// from the checkpoint remote when it is missing both locally and on origin.
+// See MetadataBranchFetchFunc for when it is appropriate to wire this.
+func (s *GitStore) SetMetadataBranchFetcher(f MetadataBranchFetchFunc) {
+	s.metadataBranchFetcher = f
+}
+
+// Refs returns the committed-metadata topology the store was constructed with.
+func (s *GitStore) Refs() PersistentRefs {
+	return s.refs
+}
+
+func (s *GitStore) updatePrimaryRef(ctx context.Context, build func(parentHash, rootTreeHash plumbing.Hash) (plumbing.Hash, error)) error {
+	return updatePersistentRef(ctx, s.repo, s.refs.Primary, func() (plumbing.Hash, plumbing.Hash, error) {
+		parentHash, rootTreeHash, err := s.getSessionsBranchRef()
+		if err != nil {
+			return plumbing.ZeroHash, plumbing.ZeroHash, err
+		}
+		newHash, buildErr := build(parentHash, rootTreeHash)
+		return newHash, parentHash, buildErr
+	})
 }

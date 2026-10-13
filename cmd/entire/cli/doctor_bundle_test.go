@@ -5,13 +5,13 @@ import (
 	"context"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
+	"github.com/entireio/cli/redact"
 )
 
 func TestWriteDoctorBundle_ContainsExpectedEntries(t *testing.T) {
@@ -73,6 +73,29 @@ func TestWriteDoctorBundle_ContainsExpectedEntries(t *testing.T) {
 		if !got[name] {
 			t.Errorf("missing entry %q in bundle. Have: %v", name, mapKeys(got))
 		}
+	}
+}
+
+// The bundle must record entire's git refs.
+func TestWriteDoctorBundle_CapturesEntireRefs(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	testutil.WriteFile(t, dir, "f.txt", "init")
+	testutil.GitAdd(t, dir, "f.txt")
+	testutil.GitCommit(t, dir, "init")
+
+	runDoctorBundleGit(t, dir, "update-ref", "refs/heads/entire/checkpoints/v1", "HEAD")
+
+	out := filepath.Join(dir, "bundle.zip")
+	if err := writeDoctorBundle(context.Background(), dir, out, false); err != nil {
+		t.Fatalf("writeDoctorBundle: %v", err)
+	}
+
+	content := readZipEntry(t, out, "entire-refs.txt")
+	if !strings.Contains(content, "refs/heads/entire/checkpoints/v1") {
+		t.Errorf("entire-refs.txt missing v1 branch ref, got:\n%s", content)
 	}
 }
 
@@ -158,12 +181,7 @@ func readZipEntry(t *testing.T, zipPath, name string) string {
 func runDoctorBundleGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 
-	cmd := exec.Command("git", args...) //nolint:noctx // test helper, no context needed
-	cmd.Dir = dir
-	cmd.Env = testutil.GitIsolatedEnv()
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, out)
-	}
+	testutil.RunGit(t, dir, args...)
 }
 
 func TestWriteDoctorBundle_RedactsLogContents(t *testing.T) {
@@ -300,5 +318,21 @@ func TestDoctorBundleCmd_StderrBannerNamesMode(t *testing.T) {
 				t.Errorf("stdout should contain bundle path %q. Got: %s", outZip, stdout.String())
 			}
 		})
+	}
+}
+
+// Not parallel: WithScannerDegradedSole mutates process-global scanner state.
+// The bundle leaves the machine, so a JSON entry that redaction cannot certify
+// (scanner degraded, or a line it could not rewrite) must be withheld rather
+// than downgraded to the byte-level scrubber.
+func TestRedactBundleEntry_WithholdsJSONWhenScannerDegraded(t *testing.T) {
+	redact.WithScannerDegradedSole(t)
+
+	got := string(redactBundleEntry("entry.jsonl", []byte(`{"msg":"hello"}`)))
+	if !strings.Contains(got, "entry withheld") {
+		t.Fatalf("degraded-scanner JSON entry must be withheld, got %q", got)
+	}
+	if strings.Contains(got, "hello") {
+		t.Fatalf("withheld entry must not carry the original content, got %q", got)
 	}
 }

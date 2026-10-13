@@ -3,14 +3,21 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/entireio/cli/cmd/entire/cli/versioninfo"
 )
 
-const testBearerHeader = "Bearer tok"
+const (
+	testBearerHeader = "Bearer tok"
+	jsonContentType  = "application/json"
+)
 
 func TestBearerTransport_InjectsAuthHeader(t *testing.T) {
 	t.Parallel()
@@ -47,11 +54,51 @@ func TestBearerTransport_InjectsAuthHeader(t *testing.T) {
 	if gotAuth != "Bearer test-token-123" {
 		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer test-token-123")
 	}
-	if gotUA != "entire-cli" {
-		t.Errorf("User-Agent = %q, want %q", gotUA, "entire-cli")
+	if want := versioninfo.UserAgent(); gotUA != want {
+		t.Errorf("User-Agent = %q, want %q", gotUA, want)
 	}
-	if gotAccept != "application/json" {
-		t.Errorf("Accept = %q, want %q", gotAccept, "application/json")
+	if gotAccept != jsonContentType {
+		t.Errorf("Accept = %q, want %q", gotAccept, jsonContentType)
+	}
+}
+
+func TestBearerTransport_EmptyTokenOmitsAuthHeader(t *testing.T) {
+	t.Parallel()
+
+	// recap's logged-out path constructs a client with token="" and expects
+	// the request to reach the server (which then returns a typed 401 that
+	// recap handles specially). The transport must omit the Authorization
+	// header rather than fail locally or send a malformed "Bearer ".
+	var gotAuth string
+	var gotUA string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotUA = r.Header.Get("User-Agent")
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	transport := &bearerTransport{token: "", base: http.DefaultTransport}
+	client := &http.Client{Transport: transport}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL+"/test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotAuth != "" {
+		t.Errorf("Authorization = %q, want empty", gotAuth)
+	}
+	if want := versioninfo.UserAgent(); gotUA != want {
+		t.Errorf("User-Agent = %q, want %q", gotUA, want)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 (server should have decided, not the transport)", resp.StatusCode)
 	}
 }
 
@@ -129,13 +176,12 @@ func TestClient_Get(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer my-token" {
 			t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
 		}
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", jsonContentType)
 		w.Write([]byte(`{"ok": true}`)) //nolint:errcheck // test handler
 	}))
 	defer server.Close()
 
-	c := NewClient("my-token")
-	c.baseURL = server.URL
+	c := NewClientWithBaseURL("my-token", server.URL)
 
 	resp, err := c.Get(context.Background(), "/api/v1/test")
 	if err != nil {
@@ -145,6 +191,26 @@ func TestClient_Get(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// The client's base transport names network causes: a host that cannot be
+// resolved says so instead of surfacing as a bare dial error. RFC 6761
+// reserves .invalid, so the lookup fails without depending on any server.
+func TestClient_Get_NamesUnresolvableHost(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	c := NewClientWithBaseURL("tok", "https://entire-netcause-test.invalid")
+	resp, err := c.Get(ctx, "/api/v1/test")
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("unresolvable host: want an error")
+	}
+	if want := "could not resolve entire-netcause-test.invalid"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q missing %q", err, want)
 	}
 }
 
@@ -165,8 +231,7 @@ func TestClient_Post_JSON(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewClient("tok")
-	c.baseURL = server.URL
+	c := NewClientWithBaseURL("tok", server.URL)
 
 	resp, err := c.Post(context.Background(), "/api/v1/things", map[string]string{"name": "test"})
 	if err != nil {
@@ -177,7 +242,7 @@ func TestClient_Post_JSON(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Errorf("status = %d, want 201", resp.StatusCode)
 	}
-	if gotContentType != "application/json" {
+	if gotContentType != jsonContentType {
 		t.Errorf("Content-Type = %q, want application/json", gotContentType)
 	}
 	if gotBody["name"] != "test" {
@@ -196,8 +261,7 @@ func TestClient_Post_NilBody(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewClient("tok")
-	c.baseURL = server.URL
+	c := NewClientWithBaseURL("tok", server.URL)
 
 	resp, err := c.Post(context.Background(), "/api/v1/action", nil)
 	if err != nil {
@@ -226,7 +290,7 @@ func TestCheckResponse_ErrorWithJSON(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", jsonContentType)
 		w.WriteHeader(http.StatusForbidden)
 		w.Write([]byte(`{"error": "insufficient permissions"}`)) //nolint:errcheck // test handler
 	}))
@@ -244,6 +308,72 @@ func TestCheckResponse_ErrorWithJSON(t *testing.T) {
 	}
 	if got := err.Error(); got != "API error: insufficient permissions (status 403)" {
 		t.Errorf("error = %q", got)
+	}
+}
+
+func TestCheckResponse_ErrorWithObjectEnvelope(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", jsonContentType)
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":{"code":"not_found","message":"session not found","field":null,"retryable":false}}`)) //nolint:errcheck // test handler
+	}))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL) //nolint:noctx // test helper
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	err = CheckResponse(resp)
+	if err == nil {
+		t.Fatal("CheckResponse(404) = nil, want error")
+	}
+	if got := err.Error(); got != "API error: session not found (status 404)" {
+		t.Errorf("error = %q", got)
+	}
+}
+
+func TestCheckResponse_CarriesStableCode(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"problem details", `{"type":"https://entire.io/errors/rate_limited","title":"Too Many Requests","status":429,"detail":"slow down","code":"rate_limited","request_id":"r1"}`, "rate_limited"},
+		{"compact cell error with code", `{"code":"wrong_cell","error":"not the primary"}`, "wrong_cell"},
+		{"legacy nested envelope", `{"error":{"code":"not_found","message":"session not found"}}`, "not_found"},
+		{"no code", `{"error":"insufficient permissions"}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", jsonContentType)
+				w.WriteHeader(http.StatusTooManyRequests)
+				w.Write([]byte(tc.body)) //nolint:errcheck // test handler
+			}))
+			defer server.Close()
+
+			resp, err := http.Get(server.URL) //nolint:noctx // test helper
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			err = CheckResponse(resp)
+			var httpErr *HTTPError
+			if !errors.As(err, &httpErr) {
+				t.Fatalf("CheckResponse = %v, want *HTTPError", err)
+			}
+			if httpErr.Code != tc.want {
+				t.Errorf("Code = %q, want %q", httpErr.Code, tc.want)
+			}
+		})
 	}
 }
 
@@ -275,7 +405,7 @@ func TestDecodeJSONResponse(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", jsonContentType)
 		w.Write([]byte(`{"id": "abc", "status": "ok"}`)) //nolint:errcheck // test handler
 	}))
 	defer server.Close()
@@ -333,7 +463,7 @@ func TestDecodeJSONResponse_LargeBodyOverOldCap(t *testing.T) {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", jsonContentType)
 		w.Write(encoded) //nolint:errcheck // test handler
 	}))
 	defer server.Close()
@@ -352,5 +482,148 @@ func TestDecodeJSONResponse_LargeBodyOverOldCap(t *testing.T) {
 	}
 	if len(got.Items) != itemCount {
 		t.Errorf("decoded %d items, want %d", len(got.Items), itemCount)
+	}
+}
+
+// TestClient_RefusesCrossHostPath verifies a path that resolves to a host other
+// than the client's base is rejected before any request (and its bearer) is
+// sent — covering absolute and scheme-relative URLs.
+func TestClient_RefusesCrossHostPath(t *testing.T) {
+	t.Parallel()
+
+	var reached bool
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer other.Close()
+
+	c := NewClientWithBaseURL("secret-token", "https://api.example")
+
+	for _, path := range []string{other.URL + "/leak", "//evil.example/x", "https://evil.example/x"} {
+		resp, err := c.Get(context.Background(), path)
+		if err == nil {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			t.Errorf("Get(%q) = nil error, want cross-host rejection", path)
+		}
+	}
+	if reached {
+		t.Fatal("request reached another host; the bearer must not be sent off-origin")
+	}
+}
+
+// TestClient_RefusesCrossHostRedirect verifies a backend redirect to another
+// host is refused rather than followed with the bearer.
+func TestClient_RefusesCrossHostRedirect(t *testing.T) {
+	t.Parallel()
+
+	var reached bool
+	var leakedAuth string
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		leakedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer other.Close()
+
+	base := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/leak", http.StatusFound)
+	}))
+	defer base.Close()
+
+	client := NewClientWithBaseURL("secret-token", base.URL)
+	resp, err := client.Get(context.Background(), "/start")
+	if err == nil {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		t.Fatal("expected cross-host redirect to be refused")
+	}
+	if reached {
+		t.Fatalf("request reached the other host (Authorization=%q); bearer must not follow a cross-host redirect", leakedAuth)
+	}
+}
+
+// TestClient_Request_RespectsCallerContentType verifies a caller-supplied
+// Content-Type survives (the -H escape hatch), while a body with no
+// Content-Type still defaults to JSON.
+func TestClient_Request_RespectsCallerContentType(t *testing.T) {
+	t.Parallel()
+
+	var gotCT string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCT = r.Header.Get("Content-Type")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c := NewClientWithBaseURL("tok", server.URL)
+
+	resp, err := c.Request(context.Background(), http.MethodPost, "/x",
+		http.Header{"Content-Type": {"text/plain"}}, strings.NewReader("hi"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if gotCT != "text/plain" {
+		t.Errorf("caller Content-Type = %q, want text/plain (must not be clobbered)", gotCT)
+	}
+
+	resp, err = c.Request(context.Background(), http.MethodPost, "/y", nil, strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if gotCT != jsonContentType {
+		t.Errorf("default Content-Type = %q, want application/json", gotCT)
+	}
+}
+
+func TestCheckResponse_ErrorWithProblemDetail(t *testing.T) {
+	t.Parallel()
+
+	resp := &http.Response{
+		StatusCode: http.StatusNotFound,
+		Header:     http.Header{"Content-Type": {"application/problem+json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"type":"https://example.test/problems/not_found","title":"Not Found","status":404,"detail":"repository not found: a/b","code":"not_found","request_id":"request-example"}`)),
+	}
+	err := CheckResponse(resp)
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("expected *HTTPError, got %T", err)
+	}
+	if httpErr.Message != "repository not found: a/b" {
+		t.Fatalf("expected problem detail as message, got %q", httpErr.Message)
+	}
+	if httpErr.RequestID != "request-example" {
+		t.Fatalf("request id = %q, want request-example", httpErr.RequestID)
+	}
+	if want := "API error: repository not found: a/b (status 404) [request request-example]"; httpErr.Error() != want {
+		t.Fatalf("error = %q, want %q", httpErr.Error(), want)
+	}
+}
+
+// A problem body may carry only the coarse title; it is still better for the
+// user than echoing raw JSON, and request_id must survive that path too.
+func TestCheckResponse_ProblemDetailTitleOnly(t *testing.T) {
+	t.Parallel()
+
+	resp := &http.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     http.Header{"Content-Type": {"application/problem+json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"type":"https://example.test/problems/forbidden","title":"Forbidden","status":403,"request_id":"req-42"}`)),
+	}
+	err := CheckResponse(resp)
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("expected *HTTPError, got %T", err)
+	}
+	if httpErr.Message != "Forbidden" {
+		t.Fatalf("message = %q, want Forbidden", httpErr.Message)
+	}
+	if httpErr.RequestID != "req-42" {
+		t.Fatalf("request id = %q, want req-42", httpErr.RequestID)
 	}
 }

@@ -39,6 +39,7 @@ type AssistantMessage struct {
 // ContentBlock represents a block within an assistant message.
 type ContentBlock struct {
 	Type  string          `json:"type"`
+	ID    string          `json:"id,omitempty"`
 	Text  string          `json:"text,omitempty"`
 	Name  string          `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
@@ -54,6 +55,8 @@ type ToolInput struct {
 	Pattern      string `json:"pattern,omitempty"`
 	// Skill tool fields
 	Skill string `json:"skill,omitempty"`
+	// Task/Agent tool fields: the dispatched subagent's name.
+	SubagentType string `json:"subagent_type,omitempty"`
 	// WebFetch tool fields
 	URL    string `json:"url,omitempty"`
 	Prompt string `json:"prompt,omitempty"`

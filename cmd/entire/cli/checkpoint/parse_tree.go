@@ -11,7 +11,6 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
-	"github.com/entireio/cli/cmd/entire/cli/paths"
 
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -347,8 +346,9 @@ func readTreeEntriesViaCLI(ctx context.Context, hash plumbing.Hash) ([]object.Tr
 }
 
 // WalkCheckpointShards iterates over the two-level shard structure (<id[:2]>/<id[2:]>/)
-// in a checkpoint tree, calling fn for each checkpoint found. Skips non-directory entries
-// at both levels (e.g., generation.json at the root). The callback receives the parsed
+// in a checkpoint tree, calling fn for each checkpoint found. It skips non-directory
+// and non-shard entries at both levels, such as legacy generation.json files or
+// other metadata kept outside shard directories. The callback receives the parsed
 // checkpoint ID and the tree hash of the checkpoint subtree.
 func WalkCheckpointShards(ctx context.Context, repo *git.Repository, tree *object.Tree, fn func(cpID id.CheckpointID, cpTreeHash plumbing.Hash) error) error {
 	for _, bucketEntry := range tree.Entries {
@@ -406,9 +406,29 @@ func normalizeGitTreePath(path string) (string, error) {
 		if part == "." || part == ".." {
 			return "", fmt.Errorf("path contains invalid segment %q", part)
 		}
+		if isDotGitComponent(part) {
+			return "", fmt.Errorf("path contains reserved segment %q", part)
+		}
 	}
 
 	return path, nil
+}
+
+// isDotGitComponent reports whether a single path component refers to a
+// repository's own `.git` metadata, matching go-git's IsDotGitName: the
+// literal ".git" and its case-insensitive forms, plus the NTFS 8.3
+// short-name alias "git~1". Git forbids these as tree path components
+// (fsck_tree), and go-git's Tree.Encode rejects them outright, so a file
+// whose path carries such a component must be skipped rather than allowed
+// to fail the whole checkpoint. This is a pre-filter, not the authority.
+// go-git's encoder remains the backstop for exotic HFS+/NTFS disguises we
+// deliberately do not reimplement here.
+func isDotGitComponent(part string) bool {
+	switch strings.ToLower(part) {
+	case ".git", "git~1":
+		return true
+	}
+	return false
 }
 
 func isAbsoluteGitTreePath(path string) bool {
@@ -441,13 +461,12 @@ func splitFirstSegment(path string) (first, rest string) {
 	return parts[0], parts[1]
 }
 
-// getSessionsBranchRef returns the sessions branch parent commit hash and root tree hash
-// without flattening the tree.
+// getSessionsBranchRef returns the primary metadata ref's commit hash and root tree
+// hash without flattening the tree.
 func (s *GitStore) getSessionsBranchRef() (plumbing.Hash, plumbing.Hash, error) {
-	refName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
-	ref, err := s.repo.Reference(refName, true)
+	ref, err := s.repo.Reference(s.refs.Primary, true)
 	if err != nil {
-		return plumbing.ZeroHash, plumbing.ZeroHash, fmt.Errorf("failed to get sessions branch reference: %w", err)
+		return plumbing.ZeroHash, plumbing.ZeroHash, fmt.Errorf("failed to get primary metadata ref %s: %w", s.refs.Primary, err)
 	}
 
 	parentCommit, err := s.repo.CommitObject(ref.Hash())

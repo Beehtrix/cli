@@ -60,6 +60,18 @@ detect_os() {
         linux)
             echo "linux"
             ;;
+        mingw*|msys*|cygwin*)
+            error "install.sh does not support Windows. Run this from PowerShell 5.1 or later:
+
+    irm https://entire.io/install.ps1 -UseBasicParsing | iex
+
+  Or install the Entire CLI using Scoop:
+
+    scoop install entire/entire
+
+  Or download the Windows zip from:
+    https://github.com/entireio/cli/releases/latest"
+            ;;
         *)
             error "Unsupported operating system: $os"
             ;;
@@ -243,6 +255,16 @@ main() {
         error "Cannot write to ${install_dir}."
     fi
     mv "$binary_path" "$install_path"
+
+    # Install the git remote helper binary alongside entire so
+    # `git clone entire://…` resolves it on PATH. It ships in the same
+    # archive as a separate binary.
+    if [[ -f "${tmp_dir}/git-remote-entire" ]]; then
+        chmod +x "${tmp_dir}/git-remote-entire"
+        mv "${tmp_dir}/git-remote-entire" "${install_dir}/git-remote-entire"
+    else
+        warn "git-remote-entire not found in archive; entire:// clones won't work until the next release includes it."
+    fi
 
     # Verify installation
     if "$install_path" version &> /dev/null; then

@@ -2,137 +2,176 @@ package strategy
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
-	"github.com/entireio/cli/cmd/entire/cli/checkpoint/remote"
+	"github.com/entireio/cli/cmd/entire/cli/gitdir"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/session"
-	"github.com/entireio/cli/cmd/entire/cli/settings"
 
-	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
-)
-
-const (
-	// sessionGracePeriod is the minimum age a session must have before it can be
-	// considered orphaned. This protects active sessions that haven't created
-	// their first checkpoint yet.
-	sessionGracePeriod = 10 * time.Minute
 )
 
 // CleanupType identifies the type of item to clean up.
 type CleanupType string
 
 const (
+	// CleanupTypeShadowBranch is a legacy shadow branch: older CLIs kept each
+	// session's in-progress work on a local "entire/<commit>-<worktree>" branch.
+	// Nothing writes them anymore, and nothing removes them automatically:
+	// `entire doctor` reports them, and `entire doctor --force`, `entire clean`
+	// and uninstall delete what upgraded repositories still carry.
 	CleanupTypeShadowBranch CleanupType = "shadow-branch"
 	CleanupTypeSessionState CleanupType = "session-state"
 	CleanupTypeCheckpoint   CleanupType = "checkpoint"
-	CleanupTypeV2Generation CleanupType = "v2-generation"
+	// CleanupTypeRedactCache is the redaction prefix cache in the git common dir.
+	// Purely derived data -- it is rebuilt on the next checkpoint -- so it is
+	// removed wholesale rather than per entry.
+	CleanupTypeRedactCache CleanupType = "redact-cache"
 )
+
+// cleanAllReason marks an item discovered by the unfiltered sweep, as opposed
+// to one selected by an orphan or staleness rule.
+const cleanAllReason = "clean all"
 
 // CleanupItem represents an item that can be cleaned up.
 type CleanupItem struct {
 	Type   CleanupType
 	ID     string // Branch name, session ID, or checkpoint ID
-	RefOID string // For ref-based items: the OID observed at listing time (compare-and-swap)
 	Reason string // Why this item is being cleaned
 }
 
 // CleanupResult contains the results of a cleanup operation.
 type CleanupResult struct {
-	ShadowBranches    []string // Deleted shadow branches
+	RedactCaches      []string // Deleted redaction prefix cache directories
+	ShadowBranches    []string // Deleted legacy shadow branches
 	SessionStates     []string // Deleted session state files
 	Checkpoints       []string // Deleted checkpoint metadata
-	V2Generations     []string // Deleted archived v2 generation refs
-	FailedBranches    []string // Shadow branches that failed to delete
+	FailedBranches    []string // Legacy shadow branches that failed to delete
 	FailedStates      []string // Session states that failed to delete
 	FailedCheckpoints []string // Checkpoints that failed to delete
-	FailedV2Refs      []string // Archived v2 generation refs that failed to delete
+	FailedRedactCache []string // Redaction caches that failed to delete
 }
 
-// shadowBranchPattern matches shadow branch names in both old and new formats:
+// legacyShadowBranchPattern matches the shadow branch names older CLIs wrote,
+// in both of their formats:
 //   - Old format: entire/<commit[:7+]>
-//   - New format: entire/<commit[:7+]>-<worktreeHash[:6]>
+//   - Newer format: entire/<commit[:7+]>-<worktreeHash[:6]>
 //
 // The pattern requires at least 7 hex characters for the commit, optionally followed
 // by a dash and exactly 6 hex characters for the worktree hash.
-var shadowBranchPattern = regexp.MustCompile(`^entire/[0-9a-fA-F]{7,}(-[0-9a-fA-F]{6})?$`)
+//
+// This pattern is name-shape ONLY -- matching it is not proof Entire created the
+// branch. In particular the "old format" half (bare "entire/<hex>", no worktree
+// suffix) is also a plausible human branch-naming convention (e.g. tracking a
+// short commit SHA), and nothing here is namespace-reserved. Use this broad
+// pattern only for listing/reporting paths that a human confirms before any
+// deletion happens (ListLegacyShadowBranches, ListAllItems, `entire clean
+// --all`'s interactive picker). For `entire clean` and `entire doctor`, use
+// isAutoDeletableLegacyShadowBranch instead.
+var legacyShadowBranchPattern = regexp.MustCompile(`^entire/[0-9a-fA-F]{7,}(-[0-9a-fA-F]{6})?$`)
 
-// IsShadowBranch returns true if the branch name matches the shadow branch pattern.
-// Shadow branches have the format "entire/<commit-hash>-<worktree-hash>" where the
-// commit hash is at least 7 hex characters and worktree hash is 6 hex characters.
-// The "entire/checkpoints/v1" branch is NOT a shadow branch.
-func IsShadowBranch(branchName string) bool {
-	// Explicitly exclude metadata and trails branches
+// autoDeletableLegacyShadowBranchPattern is the SAME pattern with the
+// worktree-hash suffix made mandatory. Every shadow branch the CLI wrote since
+// the suffix was introduced has this shape (the worktree hash was a real 6-hex
+// value even for the main worktree), and a human branch would have to
+// coincidentally match "entire/<7+ hex>-<exactly 6 hex>" to be at risk. The
+// bare "entire/<hex>" form is deliberately excluded from `entire clean` and
+// `entire doctor` even though it is Entire's own oldest naming: a human
+// short-SHA branch looks exactly like it. Old-format branches stay listed and deletable through the
+// interactive `entire clean --all` path, where a human confirms first.
+var autoDeletableLegacyShadowBranchPattern = regexp.MustCompile(`^entire/[0-9a-fA-F]{7,}-[0-9a-fA-F]{6}$`)
+
+// IsLegacyShadowBranch reports whether the branch name has the shape of a
+// shadow branch written by an older CLI. The metadata and trails branches are
+// never shadow branches.
+//
+// This is a name-shape check, not an ownership check -- see the
+// legacyShadowBranchPattern doc comment. Do not use it to gate deletion a
+// human has not reviewed; use isAutoDeletableLegacyShadowBranch for that.
+func IsLegacyShadowBranch(branchName string) bool {
 	if branchName == paths.MetadataBranchName || branchName == paths.TrailsBranchName {
 		return false
 	}
-	return shadowBranchPattern.MatchString(branchName)
+	return legacyShadowBranchPattern.MatchString(branchName)
 }
 
-// ListShadowBranches returns all shadow branches in the repository.
-// Shadow branches match the pattern "entire/<commit-hash>" (7+ hex chars).
-// The "entire/checkpoints/v1" branch is excluded as it stores permanent metadata.
-// Returns an empty slice (not nil) if no shadow branches exist.
-func ListShadowBranches(ctx context.Context) ([]string, error) {
+// isAutoDeletableLegacyShadowBranch returns true only for the strict,
+// worktree-suffixed shadow branch shape; see
+// autoDeletableLegacyShadowBranchPattern.
+func isAutoDeletableLegacyShadowBranch(branchName string) bool {
+	if branchName == paths.MetadataBranchName || branchName == paths.TrailsBranchName {
+		return false
+	}
+	return autoDeletableLegacyShadowBranchPattern.MatchString(branchName)
+}
+
+// ListLegacyShadowBranches returns the local branches that look like shadow
+// branches written by an older CLI (IsLegacyShadowBranch), sorted. Returns an
+// empty slice (not nil) if there are none.
+func ListLegacyShadowBranches(ctx context.Context) ([]string, error) {
+	heads, err := listLegacyShadowBranchHeads(ctx, IsLegacyShadowBranch)
+	if err != nil {
+		return nil, err
+	}
+	return sortedBranchNames(heads), nil
+}
+
+func sortedBranchNames(heads map[string]plumbing.Hash) []string {
+	branches := make([]string, 0, len(heads))
+	for branch := range heads {
+		branches = append(branches, branch)
+	}
+	sort.Strings(branches)
+	return branches
+}
+
+func listLegacyShadowBranchHeads(ctx context.Context, match func(string) bool) (map[string]plumbing.Hash, error) {
 	repo, err := OpenRepository(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open git repository: %w", err)
 	}
+	defer repo.Close()
 
 	refs, err := repo.References()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get references: %w", err)
 	}
 
-	var shadowBranches []string
-
+	heads := map[string]plumbing.Hash{}
 	err = refs.ForEach(func(ref *plumbing.Reference) error {
 		if err := ctx.Err(); err != nil {
 			return err //nolint:wrapcheck // Propagating context cancellation
 		}
-		// Only look at branch references
 		if !ref.Name().IsBranch() {
 			return nil
 		}
-
-		// Extract branch name without refs/heads/ prefix
-		branchName := strings.TrimPrefix(ref.Name().String(), "refs/heads/")
-
-		if IsShadowBranch(branchName) {
-			shadowBranches = append(shadowBranches, branchName)
+		if branchName := ref.Name().Short(); match(branchName) {
+			heads[branchName] = ref.Hash()
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to iterate references: %w", err)
 	}
-
-	// Ensure we return empty slice, not nil
-	if shadowBranches == nil {
-		shadowBranches = []string{}
-	}
-
-	return shadowBranches, nil
+	return heads, nil
 }
 
-// DeleteShadowBranches deletes the specified branches from the repository.
+// DeleteLegacyShadowBranches deletes the specified branches from the repository.
 // Returns two slices: successfully deleted branches and branches that failed to delete.
 // Individual branch deletion failures do not stop the operation - all branches are attempted.
-func DeleteShadowBranches(ctx context.Context, branches []string) (deleted []string, failed []string, err error) { //nolint:unparam // already present in codebase
+func DeleteLegacyShadowBranches(ctx context.Context, branches []string) (deleted []string, failed []string) {
 	if len(branches) == 0 {
-		return []string{}, []string{}, nil
+		return []string{}, []string{}
 	}
 
 	for _, branch := range branches {
@@ -146,84 +185,7 @@ func DeleteShadowBranches(ctx context.Context, branches []string) (deleted []str
 		deleted = append(deleted, branch)
 	}
 
-	return deleted, failed, nil
-}
-
-// ListOrphanedSessionStates returns session state files that are orphaned.
-// A session state is orphaned if:
-//   - No checkpoints on entire/checkpoints/v1 reference this session ID
-//   - No shadow branch exists for the session's base commit
-//
-// This is strategy-agnostic as session states are shared by all strategies.
-func ListOrphanedSessionStates(ctx context.Context) ([]CleanupItem, error) {
-	repo, err := OpenRepository(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open git repository: %w", err)
-	}
-
-	// Get all session states
-	store, err := session.NewStateStore(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create state store: %w", err)
-	}
-
-	states, err := store.List(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list session states: %w", err)
-	}
-
-	if len(states) == 0 {
-		return []CleanupItem{}, nil
-	}
-
-	// Get all checkpoints to find which sessions have checkpoints
-	cpStore := checkpoint.NewGitStore(repo)
-
-	sessionsWithCheckpoints := make(map[string]bool)
-	checkpoints, listErr := cpStore.ListCommitted(ctx)
-	if listErr == nil {
-		for _, cp := range checkpoints {
-			sessionsWithCheckpoints[cp.SessionID] = true
-		}
-	}
-
-	// Get all shadow branches as a set for quick lookup
-	shadowBranches, _ := ListShadowBranches(ctx) //nolint:errcheck // Best effort
-	shadowBranchSet := make(map[string]bool)
-	for _, branch := range shadowBranches {
-		shadowBranchSet[branch] = true
-	}
-
-	var orphaned []CleanupItem
-	now := time.Now()
-
-	for _, state := range states {
-		// Skip sessions that started recently - they may be actively in use
-		// but haven't created their first checkpoint yet
-		if now.Sub(state.StartedAt) < sessionGracePeriod {
-			continue
-		}
-
-		// Check if session has checkpoints on entire/checkpoints/v1
-		hasCheckpoints := sessionsWithCheckpoints[state.SessionID]
-
-		// Check if shadow branch exists for this session's base commit and worktree
-		// Shadow branches are now worktree-specific: entire/<commit[:7]>-<worktreeHash[:6]>
-		expectedBranch := checkpoint.ShadowBranchNameForCommit(state.BaseCommit, state.WorktreeID)
-		hasShadowBranch := shadowBranchSet[expectedBranch]
-
-		// Session is orphaned if it has no checkpoints AND no shadow branch
-		if !hasCheckpoints && !hasShadowBranch {
-			reason := "no checkpoints or shadow branch found"
-			orphaned = append(orphaned, CleanupItem{
-				Type:   CleanupTypeSessionState,
-				ID:     state.SessionID,
-				Reason: reason,
-			})
-		}
-	}
-
-	return orphaned, nil
+	return deleted, failed
 }
 
 // DeleteOrphanedSessionStates deletes the specified session state files.
@@ -258,12 +220,12 @@ func DeleteOrphanedCheckpoints(ctx context.Context, checkpointIDs []string) (del
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open git repository: %w", err)
 	}
+	defer repo.Close()
 
-	// Get sessions branch
-	refName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
-	ref, err := repo.Reference(refName, true)
+	refs := checkpoint.ResolveRefs(ctx)
+	ref, err := repo.Reference(refs.Primary, true)
 	if err != nil {
-		return nil, nil, fmt.Errorf("sessions branch not found: %w", err)
+		return nil, nil, fmt.Errorf("primary metadata ref %s not found: %w", refs.Primary, err)
 	}
 
 	parentCommit, err := repo.CommitObject(ref.Hash())
@@ -335,9 +297,7 @@ func DeleteOrphanedCheckpoints(ctx context.Context, checkpointIDs []string) (del
 		return nil, nil, fmt.Errorf("failed to store commit: %w", err)
 	}
 
-	// Update branch reference
-	newRef := plumbing.NewHashReference(refName, commitHash)
-	if err := repo.Storer.SetReference(newRef); err != nil {
+	if err := setRefHash(repo, refs.Primary, commitHash); err != nil {
 		return nil, nil, fmt.Errorf("failed to update branch: %w", err)
 	}
 
@@ -345,358 +305,20 @@ func DeleteOrphanedCheckpoints(ctx context.Context, checkpointIDs []string) (del
 	return checkpointIDs, []string{}, nil
 }
 
-// ListEligibleV2Generations returns archived checkpoints v2 /full/* generations
-// eligible for deletion based on the configured retention window, along with
-// warnings for malformed generations that were skipped.
-//
-// Timestamps come from each generation's generation.json blob (read in one
-// `git cat-file --batch`). The per-checkpoint tree walk is only a fallback
-// when generation.json is absent or zero — walking every checkpoint via
-// go-git is prohibitively slow on repos with many archived generations. A
-// stale generation.json reporting an older timestamp than reality would
-// delete prematurely; generation_repair.go keeps it correct.
-func ListEligibleV2Generations(ctx context.Context, s *settings.EntireSettings) ([]CleanupItem, []string, error) {
-	repo, err := OpenRepository(ctx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open git repository: %w", err)
-	}
-
-	store := checkpoint.NewV2GitStore(repo)
-	candidates, tempRefs, warnings, err := listArchivedV2GenerationCandidates(ctx, repo, store)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to list archived generations: %w", err)
-	}
-	defer removeTempRefs(repo, tempRefs)
-
-	metadataRefs := make([]plumbing.ReferenceName, 0, len(candidates))
-	for _, candidate := range candidates {
-		metadataRefs = append(metadataRefs, candidate.RefName)
-	}
-	generationMetadata := readGenerationMetadataFiles(ctx, metadataRefs)
-
-	cutoff := time.Now().AddDate(0, 0, -s.GetFullTranscriptGenerationRetentionDays())
-	cleanupItems := make([]CleanupItem, 0, len(candidates))
-
-	for _, candidate := range candidates {
-		if err := ctx.Err(); err != nil {
-			return nil, warnings, err //nolint:wrapcheck // propagate context cancellation unwrapped so callers can detect it
-		}
-		commitHash, treeHash, refErr := store.GetRefState(candidate.RefName)
-		if refErr != nil {
-			warnings = append(warnings, fmt.Sprintf("generation %s: cannot read ref: %v", candidate.Name, refErr))
-			continue
-		}
-
-		md, mdOK := generationMetadata[candidate.RefName]
-		if mdOK && md.err != nil {
-			warnings = append(warnings, fmt.Sprintf("generation %s: failed to read generation.json: %v", candidate.Name, md.err))
-			continue
-		}
-
-		var gen checkpoint.GenerationMetadata
-		switch {
-		case mdOK && (!md.gen.OldestCheckpointAt.IsZero() || !md.gen.NewestCheckpointAt.IsZero()):
-			gen = md.gen
-		default:
-			var found bool
-			var timestampErr error
-			gen, found, timestampErr = store.ComputeGenerationTimestampsFromTrees(ctx, treeHash, nil)
-			if timestampErr != nil {
-				if errors.Is(timestampErr, context.Canceled) || errors.Is(timestampErr, context.DeadlineExceeded) {
-					return nil, warnings, timestampErr //nolint:wrapcheck // propagate context cancellation unwrapped
-				}
-				warnings = append(warnings, fmt.Sprintf("generation %s: failed to compute raw transcript timestamps: %v", candidate.Name, timestampErr))
-				continue
-			}
-			if !found {
-				warnings = append(warnings, fmt.Sprintf("generation %s: missing generation.json", candidate.Name))
-				continue
-			}
-		}
-
-		hasOldest := !gen.OldestCheckpointAt.IsZero()
-		hasNewest := !gen.NewestCheckpointAt.IsZero()
-		switch {
-		case !hasOldest && !hasNewest:
-			warnings = append(warnings, fmt.Sprintf("generation %s: missing generation.json", candidate.Name))
-			continue
-		case hasOldest != hasNewest:
-			warnings = append(warnings, fmt.Sprintf("generation %s: incomplete generation.json", candidate.Name))
-			continue
-		case gen.OldestCheckpointAt.After(gen.NewestCheckpointAt):
-			warnings = append(warnings, fmt.Sprintf("generation %s: invalid timestamps", candidate.Name))
-			continue
-		}
-		if !gen.NewestCheckpointAt.Before(cutoff) {
-			continue
-		}
-
-		refOID := candidate.RefOID
-		if refOID == "" {
-			refOID = commitHash.String()
-		}
-		cleanupItems = append(cleanupItems, CleanupItem{
-			Type:   CleanupTypeV2Generation,
-			ID:     candidate.Name,
-			RefOID: refOID,
-			Reason: "expired archived full transcript generation",
-		})
-	}
-
-	return cleanupItems, warnings, nil
-}
-
-type generationGitReadResult struct {
-	gen checkpoint.GenerationMetadata
-	err error
-}
-
-func readGenerationMetadataFiles(ctx context.Context, refNames []plumbing.ReferenceName) map[plumbing.ReferenceName]generationGitReadResult {
-	results := make(map[plumbing.ReferenceName]generationGitReadResult, len(refNames))
-	if len(refNames) == 0 {
-		return results
-	}
-
-	specs := make([]string, len(refNames))
-	for i, refName := range refNames {
-		specs[i] = fmt.Sprintf("%s:%s", refName, paths.GenerationFileName)
-	}
-
-	catResults := remote.CatFiles(ctx, remote.CatFilesOptions{Specs: specs})
-	for i, refName := range refNames {
-		results[refName] = generationMetadataFromCatFileResult(catResults[specs[i]])
-	}
-	return results
-}
-
-func generationMetadataFromCatFileResult(catResult remote.CatFileResult) generationGitReadResult {
-	if catResult.Err != nil {
-		return generationGitReadResult{err: catResult.Err}
-	}
-	if catResult.Missing {
-		return generationGitReadResult{}
-	}
-
-	var gen checkpoint.GenerationMetadata
-	if err := json.Unmarshal(catResult.Content, &gen); err != nil {
-		return generationGitReadResult{err: fmt.Errorf("parse git-readable %s: %w", paths.GenerationFileName, err)}
-	}
-	return generationGitReadResult{gen: gen}
-}
-
-type archivedV2GenerationCandidate struct {
-	Name      string
-	RefName   plumbing.ReferenceName
-	RefOID    string
-	HasRemote bool
-}
-
-func listArchivedV2GenerationCandidates(
-	ctx context.Context,
-	repo *git.Repository,
-	store *checkpoint.V2GitStore,
-) ([]archivedV2GenerationCandidate, []plumbing.ReferenceName, []string, error) {
-	localNames, err := store.ListArchivedGenerations()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("list local archived generations: %w", err)
-	}
-
-	candidatesByName := make(map[string]archivedV2GenerationCandidate, len(localNames))
-	for _, name := range localNames {
-		refName := plumbing.ReferenceName(paths.V2FullRefPrefix + name)
-		ref, refErr := repo.Reference(refName, true)
-		if refErr != nil {
-			continue
-		}
-		candidatesByName[name] = archivedV2GenerationCandidate{
-			Name:    name,
-			RefName: refName,
-			RefOID:  ref.Hash().String(),
-		}
-	}
-
-	var warnings []string
-	var tempRefs []plumbing.ReferenceName
-	target, targetErr := remote.FetchURL(ctx)
-	if targetErr == nil && target != "" {
-		remoteRefs, remoteErr := listRemoteArchivedV2GenerationRefs(ctx, target)
-		if remoteErr != nil {
-			warnings = append(warnings, fmt.Sprintf("failed to list remote v2 generations: %v", remoteErr))
-		} else {
-			fetchTarget, fetchTargetErr := remote.ResolveFetchTarget(ctx, target)
-			if fetchTargetErr != nil {
-				warnings = append(warnings, fmt.Sprintf("failed to resolve remote for v2 generation fetch: %v", fetchTargetErr))
-			} else {
-				for name, remoteOID := range remoteRefs {
-					if candidate, ok := candidatesByName[name]; ok {
-						if candidate.RefOID == remoteOID {
-							candidate.HasRemote = true
-							candidatesByName[name] = candidate
-							continue
-						}
-						warnings = append(warnings, fmt.Sprintf("generation %s: local archived ref OID %s differs from remote OID %s; skipping cleanup", name, candidate.RefOID, remoteOID))
-						delete(candidatesByName, name)
-						continue
-					}
-					tempRef, fetchErr := fetchArchivedV2Generation(ctx, fetchTarget, name)
-					if fetchErr != nil {
-						warnings = append(warnings, fmt.Sprintf("generation %s: failed to fetch remote ref: %v", name, fetchErr))
-						continue
-					}
-					tempRefs = append(tempRefs, tempRef)
-					candidatesByName[name] = archivedV2GenerationCandidate{
-						Name:      name,
-						RefName:   tempRef,
-						RefOID:    remoteOID,
-						HasRemote: true,
-					}
-				}
-			}
-		}
-	}
-
-	names := make([]string, 0, len(candidatesByName))
-	for name := range candidatesByName {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	candidates := make([]archivedV2GenerationCandidate, 0, len(names))
-	for _, name := range names {
-		candidates = append(candidates, candidatesByName[name])
-	}
-	return candidates, tempRefs, warnings, nil
-}
-
-func listRemoteArchivedV2GenerationRefs(ctx context.Context, target string) (map[string]string, error) {
-	output, err := remote.LsRemote(ctx, target, paths.V2FullRefPrefix+"*")
-	if err != nil {
-		return nil, fmt.Errorf("ls remote v2 generations: %w", err)
-	}
-
-	refs := make(map[string]string)
-	for line := range strings.SplitSeq(strings.TrimSpace(string(output)), "\n") {
-		if line == "" {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
-			continue
-		}
-		refName := parts[1]
-		suffix := strings.TrimPrefix(refName, paths.V2FullRefPrefix)
-		if suffix == "current" || !checkpoint.GenerationRefPattern.MatchString(suffix) {
-			continue
-		}
-		refs[suffix] = parts[0]
-	}
-	return refs, nil
-}
-
-func fetchArchivedV2Generation(ctx context.Context, fetchTarget, name string) (plumbing.ReferenceName, error) {
-	refName := paths.V2FullRefPrefix + name
-	tempRef := plumbing.ReferenceName("refs/entire-clean-tmp/v2/full/" + name)
-	refSpec := fmt.Sprintf("+%s:%s", refName, tempRef)
-	if output, err := remote.Fetch(ctx, remote.FetchOptions{
-		Remote:   fetchTarget,
-		RefSpecs: []string{refSpec},
-		NoTags:   true,
-		NoFilter: true,
-	}); err != nil {
-		return "", fmt.Errorf("%s: %w", strings.TrimSpace(string(output)), err)
-	}
-	return tempRef, nil
-}
-
-func removeTempRefs(repo *git.Repository, refs []plumbing.ReferenceName) {
-	for _, ref := range refs {
-		_ = repo.Storer.RemoveReference(ref) //nolint:errcheck // cleanup is best-effort
-	}
-}
-
-// V2GenerationRef pairs a generation name with the OID observed at listing time.
-type V2GenerationRef struct {
-	Name   string
-	RefOID string // Commit hash for compare-and-swap; empty skips the check
-}
-
-// DeleteV2Generations deletes archived checkpoints v2 /full/* generation refs.
-// When RefOID is set, deletion uses compare-and-swap to avoid deleting a ref
-// that was repointed after enumeration.
-func DeleteV2Generations(ctx context.Context, generations []V2GenerationRef) (deleted []string, failed []string, err error) { //nolint:unparam // err kept for consistency with other Delete* functions
-	if len(generations) == 0 {
-		return []string{}, []string{}, nil
-	}
-
-	pushTarget, _, pushTargetErr := remote.PushURL(ctx, "origin")
-
-	for _, gen := range generations {
-		refName := plumbing.ReferenceName(paths.V2FullRefPrefix + gen.Name)
-		localErr := DeleteRefCLI(ctx, refName.String(), gen.RefOID)
-		if errors.Is(localErr, ErrRefNotFound) {
-			localErr = nil
-		}
-		if localErr != nil {
-			failed = append(failed, gen.Name)
-			continue
-		}
-		if pushTargetErr == nil && pushTarget != "" {
-			if remoteErr := deleteRemoteRef(ctx, pushTarget, refName.String(), gen.RefOID); remoteErr != nil {
-				failed = append(failed, gen.Name)
-				continue
-			}
-		}
-		deleted = append(deleted, gen.Name)
-	}
-
-	return deleted, failed, nil
-}
-
-func deleteRemoteRef(ctx context.Context, target, refName, expectedOID string) error {
-	return pushWithLease(ctx, target, ":"+refName, refName, expectedOID,
-		"delete remote ref "+refName)
-}
-
-// pushWithLease runs `git push <target> <refSpec>` with an optional
-// `--force-with-lease=<leaseRef>:<expectedOID>` guard. errCtx prefixes the
-// error message when no stderr output is available from the push.
-func pushWithLease(ctx context.Context, target, refSpec, leaseRef, expectedOID, errCtx string) error {
-	extraArgs := []string{}
-	if expectedOID != "" {
-		extraArgs = append(extraArgs, fmt.Sprintf("--force-with-lease=%s:%s", leaseRef, expectedOID))
-	}
-	result, err := remote.PushWithOptions(ctx, remote.PushOptions{
-		Remote:    target,
-		RefSpecs:  []string{refSpec},
-		ExtraArgs: extraArgs,
-	})
-	if err != nil {
-		output := strings.TrimSpace(result.Output)
-		if output != "" {
-			return fmt.Errorf("%s: %w", output, err)
-		}
-		return fmt.Errorf("%s: %w", errCtx, err)
-	}
-	return nil
-}
-
-// ListAllItems returns all Entire items for full cleanup.
-// This includes all shadow branches and all session states regardless of
-// whether they have checkpoints or active shadow branches.
+// ListAllItems returns all Entire items for full cleanup: legacy shadow
+// branches left by older CLIs, all session states, and the redaction cache.
 func ListAllItems(ctx context.Context) ([]CleanupItem, error) {
 	var cleanupItems []CleanupItem
 
-	// All shadow branches (using ListShadowBranches directly, not
-	// ListOrphanedItems, so this won't break if orphan filtering is added)
-	branches, err := ListShadowBranches(ctx)
+	branches, err := ListLegacyShadowBranches(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("listing shadow branches: %w", err)
+		return nil, fmt.Errorf("listing legacy shadow branches: %w", err)
 	}
 	for _, branch := range branches {
 		cleanupItems = append(cleanupItems, CleanupItem{
 			Type:   CleanupTypeShadowBranch,
 			ID:     branch,
-			Reason: "clean all",
+			Reason: cleanAllReason,
 		})
 	}
 
@@ -715,11 +337,33 @@ func ListAllItems(ctx context.Context) ([]CleanupItem, error) {
 		cleanupItems = append(cleanupItems, CleanupItem{
 			Type:   CleanupTypeSessionState,
 			ID:     state.SessionID,
-			Reason: "clean all",
+			Reason: cleanAllReason,
 		})
 	}
 
+	// The redaction prefix cache accumulates one small entry per session and is
+	// never superseded, so without this it would survive every `entire clean`.
+	if dir, err := redactCacheDir(ctx); err == nil && dir != "" {
+		if _, statErr := os.Stat(dir); statErr == nil {
+			cleanupItems = append(cleanupItems, CleanupItem{
+				Type:   CleanupTypeRedactCache,
+				ID:     checkpoint.RedactCacheDirName,
+				Reason: cleanAllReason,
+			})
+		}
+	}
+
 	return cleanupItems, nil
+}
+
+// redactCacheDir resolves the redaction prefix cache directory, or "" when the
+// git common dir cannot be resolved.
+func redactCacheDir(ctx context.Context) (string, error) {
+	commonDir, err := session.GetGitCommonDir(ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolve git common dir: %w", err)
+	}
+	return filepath.Join(commonDir, checkpoint.RedactCacheDirName), nil
 }
 
 // DeleteAllCleanupItems deletes all specified cleanup items.
@@ -735,33 +379,44 @@ func DeleteAllCleanupItems(ctx context.Context, items []CleanupItem) (*CleanupRe
 	}
 
 	// Group items by type
-	var branches, states, checkpoints []string
-	var v2Generations []V2GenerationRef
+	var branches, states, checkpoints, redactCaches []string
 	for _, item := range items {
 		switch item.Type {
 		case CleanupTypeShadowBranch:
 			branches = append(branches, item.ID)
 		case CleanupTypeSessionState:
 			states = append(states, item.ID)
+		case CleanupTypeRedactCache:
+			redactCaches = append(redactCaches, item.ID)
 		case CleanupTypeCheckpoint:
 			checkpoints = append(checkpoints, item.ID)
-		case CleanupTypeV2Generation:
-			v2Generations = append(v2Generations, V2GenerationRef{Name: item.ID, RefOID: item.RefOID})
 		}
 	}
 
-	// Delete shadow branches
-	if len(branches) > 0 {
-		deleted, failed, err := DeleteShadowBranches(ctx, branches)
-		if err != nil {
-			return result, err
+	// Remove the redaction prefix cache. Derived data, so a failure is recorded
+	// but never blocks the rest of the cleanup.
+	if len(redactCaches) > 0 {
+		if err := deleteRedactCache(ctx); err != nil {
+			result.FailedRedactCache = redactCaches
+			logging.Warn(logCtx, "failed to delete redaction cache",
+				slog.String("type", string(CleanupTypeRedactCache)),
+				slog.String("error", err.Error()))
+		} else {
+			result.RedactCaches = redactCaches
+			logging.Info(logCtx, "deleted redaction cache",
+				slog.String("type", string(CleanupTypeRedactCache)))
 		}
+	}
+
+	// Delete legacy shadow branches
+	if len(branches) > 0 {
+		deleted, failed := DeleteLegacyShadowBranches(ctx, branches)
 		result.ShadowBranches = deleted
 		result.FailedBranches = failed
 
 		// Log deleted branches
 		for _, id := range deleted {
-			logging.Info(logCtx, "deleted shadow branch",
+			logging.Info(logCtx, "deleted legacy shadow branch",
 				slog.String("type", string(CleanupTypeShadowBranch)),
 				slog.String("id", id),
 				slog.String("reason", reasonMap[id]),
@@ -769,7 +424,7 @@ func DeleteAllCleanupItems(ctx context.Context, items []CleanupItem) (*CleanupRe
 		}
 		// Log failed branches
 		for _, id := range failed {
-			logging.Warn(logCtx, "failed to delete shadow branch",
+			logging.Warn(logCtx, "failed to delete legacy shadow branch",
 				slog.String("type", string(CleanupTypeShadowBranch)),
 				slog.String("id", id),
 				slog.String("reason", reasonMap[id]),
@@ -831,45 +486,37 @@ func DeleteAllCleanupItems(ctx context.Context, items []CleanupItem) (*CleanupRe
 		}
 	}
 
-	if len(v2Generations) > 0 {
-		deleted, failed, err := DeleteV2Generations(ctx, v2Generations)
-		if err != nil {
-			return result, err
-		}
-		result.V2Generations = deleted
-		result.FailedV2Refs = failed
-
-		for _, id := range deleted {
-			logging.Info(logCtx, "deleted v2 generation",
-				slog.String("type", string(CleanupTypeV2Generation)),
-				slog.String("id", id),
-				slog.String("reason", reasonMap[id]),
-			)
-		}
-		for _, id := range failed {
-			logging.Warn(logCtx, "failed to delete v2 generation",
-				slog.String("type", string(CleanupTypeV2Generation)),
-				slog.String("id", id),
-				slog.String("reason", reasonMap[id]),
-			)
-		}
-	}
-
 	// Log summary
-	totalDeleted := len(result.ShadowBranches) + len(result.SessionStates) + len(result.Checkpoints) + len(result.V2Generations)
-	totalFailed := len(result.FailedBranches) + len(result.FailedStates) + len(result.FailedCheckpoints) + len(result.FailedV2Refs)
+	totalDeleted := len(result.ShadowBranches) + len(result.SessionStates) + len(result.Checkpoints)
+	totalFailed := len(result.FailedBranches) + len(result.FailedStates) + len(result.FailedCheckpoints)
 	if totalDeleted > 0 || totalFailed > 0 {
 		logging.Info(logCtx, "cleanup completed",
 			slog.Int("deleted_branches", len(result.ShadowBranches)),
 			slog.Int("deleted_session_states", len(result.SessionStates)),
 			slog.Int("deleted_checkpoints", len(result.Checkpoints)),
-			slog.Int("deleted_v2_generations", len(result.V2Generations)),
 			slog.Int("failed_branches", len(result.FailedBranches)),
 			slog.Int("failed_session_states", len(result.FailedStates)),
 			slog.Int("failed_checkpoints", len(result.FailedCheckpoints)),
-			slog.Int("failed_v2_generations", len(result.FailedV2Refs)),
 		)
 	}
 
 	return result, nil
+}
+
+// deleteRedactCache removes the redaction prefix cache directory. Every entry is
+// derived data rebuilt on the next checkpoint, so removing the whole directory is
+// always safe; a missing directory is not an error.
+func deleteRedactCache(ctx context.Context) error {
+	dir, err := redactCacheDir(ctx)
+	if err != nil {
+		return err
+	}
+	root, err := gitdir.Open(ctx)
+	if err != nil {
+		return fmt.Errorf("open git common dir: %w", err)
+	}
+	if err := root.RemoveAll(checkpoint.RedactCacheDirName); err != nil {
+		return fmt.Errorf("remove redaction cache %s: %w", dir, err)
+	}
+	return nil
 }

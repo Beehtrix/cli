@@ -39,8 +39,7 @@ func TestFetchDoesNotPolluteOriginConfig(t *testing.T) {
 	testutil.GitCommit(t, localDir, "init")
 	runGit(t, localDir, "remote", "add", "origin", bareDir)
 	runGit(t, localDir, "branch", paths.MetadataBranchName)
-	runGit(t, localDir, "update-ref", paths.V2MainRefName, "HEAD")
-	runGit(t, localDir, "push", "origin", "HEAD:refs/heads/main", paths.MetadataBranchName, paths.V2MainRefName)
+	runGit(t, localDir, "push", "origin", "HEAD:refs/heads/main", paths.MetadataBranchName)
 	runGit(t, bareDir, "symbolic-ref", "HEAD", "refs/heads/main")
 
 	// Clone fresh so local has no metadata branch yet — this is the scenario
@@ -67,8 +66,6 @@ func TestFetchDoesNotPolluteOriginConfig(t *testing.T) {
 	}{
 		{"FetchMetadataBranch", FetchMetadataBranch},
 		{"FetchMetadataTreeOnly", FetchMetadataTreeOnly},
-		{"FetchV2MainTreeOnly", FetchV2MainTreeOnly},
-		{"FetchV2MainRef", FetchV2MainRef},
 	}
 
 	for _, tc := range cases {
@@ -96,12 +93,7 @@ func TestFetchDoesNotPolluteOriginConfig(t *testing.T) {
 
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.CommandContext(t.Context(), "git", args...)
-	cmd.Dir = dir
-	cmd.Env = testutil.GitIsolatedEnv()
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %s failed: %v\nOutput: %s", strings.Join(args, " "), err, output)
-	}
+	testutil.RunGit(t, dir, args...)
 }
 
 func runGitAllow(t *testing.T, dir string, args ...string) error {
