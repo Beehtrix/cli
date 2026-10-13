@@ -83,7 +83,7 @@ These mostly **pin current behavior first**; several will surface product decisi
 | B6 | `ENTIRE_CHECKPOINT_TOKEN` with SSH-shaped origin URL (`git@host:o/r.git` pointing at the HTTPS test server via insteadOf or URL rewrite): fetch **and** push both coerce to HTTPS (regression `7afdaa33e`) | integration (HTTPS) | both |
 | B7 | Local-path origin (bare dir added as `origin`): `ParseURL` fails → raw-origin fallback still pushes/fetches correctly; no crash in URL derivation (pin; latent gap `isLocalPath`) | integration | both |
 
-### C. Cross-machine: clone → fetch → resume/explain/attribution — P0
+### C. Cross-machine: clone → fetch → resume/explain/blame — P0
 
 | # | Test | Layer | Backend |
 |---|---|---|---|
@@ -92,7 +92,7 @@ These mostly **pin current behavior first**; several will surface product decisi
 | C3 | git-refs offline read: unreachable remote + locally-missing ref → real error, **not** "checkpoint not found" (regression `7bbdad09c`) | integration | gr |
 | C4 | Clone over HTTPS with token: resume auto-fetch works with auth (e2e today is file-path only) | integration (HTTPS) | both |
 | C5 | Shallow user clone (`git clone --depth=1`): enable, session, commit, push, resume — no `.git/shallow` self-infliction (regressions #1443, #1276), replay refuses at shallow boundary rather than corrupting | integration | both |
-| C6 | Partial clone (`--filter=blob:none`): explain/attribution lazily fetch blobs via `fetch-pack`, no promisor config stamped onto `[remote "origin"]` (regressions #1069, #934 — extend the existing config-guard) | integration | both |
+| C6 | Partial clone (`--filter=blob:none`): explain/blame lazily fetch blobs via `fetch-pack`, no promisor config stamped onto `[remote "origin"]` (regressions #1069, #934 — extend the existing config-guard) | integration | both |
 
 ### D. Divergence & recovery matrix — P0 (the most re-broken area)
 
@@ -131,7 +131,7 @@ Systematize the ahead/behind/diverged/disconnected × operation matrix that item
 ### G. E2E additions (real agents optional, vogon default) — P1
 
 - G1: extend `resume_remote_test.go` + `explain_test.go` clone tests to rely on the real hook (drop `PushCheckpointRefs`, see A5) and run under both `E2E_CHECKPOINT_STORE` values in the CI canary matrix.
-- G2: one e2e worktree scenario: session in a linked worktree, commit, push from the worktree, clone elsewhere, resume (covers worktree shadow-branch namespace + shared queue end-to-end).
+- G2: one e2e worktree scenario: session in a linked worktree, commit, push from the worktree, clone elsewhere, resume (covers per-worktree session state + shared queue end-to-end).
 - G3: doctor e2e on a repo with unreachable remote (today `TestDoctorNoIssues` only covers healthy).
 
 ### H. Explicit non-goals (for now)
@@ -146,7 +146,7 @@ Systematize the ahead/behind/diverged/disconnected × operation matrix that item
 
 - **D-1 non-origin reads**: pushing checkpoints to `upstream` (hook `$1`) while every read path fetches from `origin` is incoherent. Decide: teach reads to use the checkpoint-bearing remote (e.g. remember last push remote, or consult `branch.<name>.remote`), or document origin-only support and warn on non-origin pushes. B1/B2/B4 pin whichever is chosen.
 - **D-2 multi-remote queue clearing** (git-refs): queue entries are deleted after a successful push to *any* remote — second remote permanently misses refs. Probably needs per-remote tracking or "delete only when pushed to the fetch-resolution target". D7 pins current behavior until then.
-- **D-3 forge map / provider table**: only `github.com`→`gh` and github/gitlab provider hosts exist; GHE/self-hosted silently degrade (`{repo_id}`, trails). Decide config story before writing tests beyond pinning.
+- **D-3 forge map / provider table**: `checkpoint_remote` accepts github and gitlab (per-feature gates in `docs/development/checkpoint-implementation.md`). Still open: `gitremote.hostToForge` only maps `github.com`→`gh`, so the `entire://` push-through mirror and trails remain github-only; `--issue-link` hard-codes github.com; repo protection keys off the control-plane `provider` enum; and GHE/self-hosted gitlab silently degrade (`{repo_id}`, trails). Decide config story before writing tests beyond pinning.
 
 ## 5. Suggested sequencing
 

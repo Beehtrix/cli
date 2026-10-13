@@ -6,7 +6,7 @@ Entire stores AI session transcripts and metadata in your git repository. This d
 
 ### Where data is stored
 
-When you use Entire with an AI agent (Claude Code, Codex, Gemini CLI, OpenCode, Cursor, Factory AI Droid, Copilot CLI, Pi), session transcripts, user prompts, and checkpoint metadata are committed to **your own git repository**. They stay out of your working branches' history, but they live in the same repo and travel with it.
+When you use Entire with an AI agent (Claude Code, Codex, Antigravity, OpenCode, Cursor, Factory AI Droid, Copilot CLI, Pi), session transcripts, user prompts, and checkpoint metadata are committed to **your own git repository**. They stay out of your working branches' history, but they live in the same repo and travel with it.
 
 Exactly where depends on the [checkpoint backend](architecture/ref-checkpoint-backend.md) the repo uses:
 
@@ -17,7 +17,9 @@ Exactly where depends on the [checkpoint backend](architecture/ref-checkpoint-ba
 
 Which one a repo is on is recorded as `checkpoints.primary.type` in `.entire/settings.json` (or `settings.local.json`); an absent `checkpoints` block means `git-branch`. The redaction described in this document applies identically to both — the pipeline is shared, and only the destination differs. Where the distinction matters below, it is called out.
 
-Entire also creates temporary local **shadow branches** (e.g. `entire/<commit>-<worktree>`) as working storage during a session, on both backends. Metadata written there — transcripts, prompts, incremental checkpoint data, subagent transcripts — goes through the same redaction pipeline as a committed checkpoint. **Code-file snapshots, however, are written as raw blobs of your working tree without redaction**, so any hardcoded secrets in your source code would appear unredacted on the shadow branch. Gitignored files (e.g., `.env`) are filtered out of these snapshots as a partial defense. Shadow branches are **not** pushed by Entire; do not push them manually, because unredacted source content would be visible on the remote. They are cleaned up when session data is condensed into a checkpoint at commit time.
+Between commits, Entire writes nothing to git. At the end of each agent turn it records the paths the agent touched and their git blob hashes in local session state (`.git/entire-sessions/`), and keeps the sanitized transcript in `.entire/metadata/<session>/full.jsonl` (see [Persistence of un-redacted-by-OPF content](#persistence-of-un-redacted-by-opf-content)). Older Entire versions instead wrote local **shadow branches** (`entire/<commit>-<worktree>`) at turn end, whose code-file snapshots were raw, unredacted blobs of your working tree. Current versions do not delete them automatically: `entire doctor` reports them and `entire doctor --force` deletes the `entire/<commit>-<worktree>` form without touching session state. Plain `entire clean` deletes them too, but also clears the state of every session based on HEAD, which is now the only record of pending agent work. `entire disable --uninstall` deletes the `entire/<commit>-<worktree>` form as well, and lists the oldest `entire/<commit>` form by name without deleting it (a user's own branch named like a short SHA matches it); `entire clean --all` deletes that form after you confirm. Deleting a branch leaves its objects unreachable until git prunes them: `git gc` reclaims the space once they are two weeks old (git's default `gc.pruneExpire`). `git gc --prune=now` frees it at once but drops every unreachable object, recently dropped stashes included, and must only run when no other git process is active.
+
+**Antigravity title-tee (machine-global):** setting up the Antigravity agent installs `entire hooks antigravity title-tee` into agy's *global* settings (`~/.gemini/antigravity-cli/settings.json`), because agy exposes token usage only through its window-title/statusline feed. Once installed, the tee runs on every agy state change on the machine — including in repositories where Entire is not enabled — and persists **only** the conversation ID and token counts (`context_window` totals) to Entire's local cache directory; the rest of the payload is discarded and no prompt or file content is captured. Stale per-conversation snapshots are cleaned up after 14 days. Removing the Antigravity agent (`entire agent remove antigravity`) uninstalls the tee.
 
 Anyone with access to your repository can read committed checkpoint data: the full prompt/response history and session metadata. Note that transcripts capture all tool interactions — including file contents, MCP server calls, and other data exchanged during the session. Per-checkpoint refs are less *visible* than a branch, but they are not less accessible: a `git fetch` of `refs/entire/checkpoints/*` reads them just as well.
 
@@ -27,7 +29,7 @@ If your repository is **public**, this data is visible to the entire internet.
 
 Entire automatically scans transcript and metadata content before writing it to a git object. Five always-on secret detection methods plus a configurable scanner layer (pattern matching, method 2 below) run during condensation, plus a conditional seventh pass for user-defined secret rules (see [Customizing redaction](#customizing-redaction) below), an opt-in eighth pass for PII (see [Optional PII redaction](#optional-pii-redaction) below), and an opt-in ninth pass that shells out to the OpenAI Privacy Filter model (see [Optional OpenAI Privacy Filter](#optional-openai-privacy-filter-opf) below):
 
-1. **Entropy scoring** — Identifies high-entropy strings (Shannon entropy > 4.5) that look like randomly generated secrets, even if they don't match a known pattern.
+1. **Entropy scoring** — Identifies high-entropy strings (Shannon entropy > 4.5) that look like randomly generated secrets, even if they don't match a known pattern. One exact shape is exempt from this layer only: a string that is, in its entirety, a Claude Code tool-use id (`toolu_01` plus 22 letters or digits). The other layers still scan it, and a secret attached to an id forms a longer string that is not exempt.
 2. **Pattern matching** — Runs one or both configurable scanner engines against known secret formats: [Betterleaks](https://github.com/betterleaks/betterleaks) (default on) and/or [goredact](https://github.com/lastpersonlabs/goredact) (default off). See [Choosing secret-scanner engines](#choosing-secret-scanner-engines) below.
 3. **Provider token prefixes** — Deterministically redacts known secret-key prefixes (e.g. Supabase `sb_secret_`, `sbp_`) regardless of entropy or surrounding context.
 4. **Credentialed URI detection** — Redacts URLs with embedded passwords, such as `scheme://user:password@host`.
@@ -47,16 +49,16 @@ What that means for an image you paste is **not uniform across agents**, because
 | Claude Code | **Stored unredacted**, inline in the transcript as base64. The text scanner skips it (the `type: image` / `type: base64` skip rule below) rather than scanning it. | **Stored unredacted** as a raw binary blob under the checkpoint's `assets/` folder. |
 | Codex | **Destroyed.** Codex writes images as `data:` URIs inside `image_url` and tool-output strings, which the skip rule does not match, so the entropy layer treats the base64 as a secret and replaces it. The stored transcript keeps the surrounding message; the image is gone. | **Stored unredacted** under `assets/` (externalization runs before redaction, which is what preserves it). |
 | Cursor | **Not stored in the repository at all.** Cursor keeps images in its own per-session SQLite store, never in the transcript Entire reads. | **Stored unredacted** under `assets/`, captured from that store. |
-| Gemini CLI, OpenCode, Copilot CLI, Factory Droid, Pi | Depends on the agent's own transcript shape; Entire has no image handling for these. Assume the Claude Code row unless you have checked. | Unchanged — the setting only affects the three agents above. |
+| OpenCode, Copilot CLI, Factory Droid, Pi | Depends on the agent's own transcript shape; Entire has no image handling for these. Assume the Claude Code row unless you have checked. | Unchanged — the setting only affects the three agents above. |
 
 **Do not treat the Codex row as a protection.** It is a side effect of a skip rule not matching a shape, not a deliberate safeguard: it destroys data you may want, it does not apply to the `assets/` path, and a change to either the rule or Codex's format would flip it to the exposure case without notice.
 
 Where an image *is* stored, it is byte-for-byte what you pasted — completely unredacted — because byte-level regex and entropy redaction cannot inspect binary image data without corrupting it, so Entire does not attempt it. That is a deliberate design choice, not a bug.
 
-Two things about *when* those bytes reach git, both of which narrow the window you have to catch a mistake:
+Two things about *when* those bytes reach git:
 
 - **A checkpoint's copy** lands on `entire/checkpoints/v1` (or the equivalent per-checkpoint ref on the `git-refs` backend). Like all checkpoint data it is written locally and pushed separately, so it reaches your remote only when checkpoint data is pushed — see the **Review before pushing** bullet under [Recommendations](#recommendations).
-- **A shadow-branch copy** is written earlier, at the end of the agent turn, before you commit anything and regardless of the setting above. The shadow write does not externalize images, so for Claude Code the base64 is committed into your local git objects at turn end. Shadow branches are local-only and are never pushed (see [Where data is stored](#where-data-is-stored) above), but `entire checkpoint list` will not show this copy — it exists before any checkpoint does.
+- **Before you commit**, the image exists only in the agent's own transcript and in Entire's local sanitized copy (`.entire/metadata/<session>/full.jsonl`); nothing is written to git at turn end.
 
 **If you would not commit an image to your repository unredacted, do not paste it into an agent conversation.** This applies equally to a private repository — anyone with read access to checkpoint data can see it — and especially to a public one.
 
@@ -311,7 +313,7 @@ Several places retain content that OPF *didn't* redact, with different lifetimes
 |---|---|---|---|
 | `.entire/metadata/<session>/full.jsonl` | **None** — sanitized, not redacted | Until the session's data is cleaned up (`entire clean`) | No |
 | The agent's own transcript (e.g. `~/.claude/projects/…`) | **None — raw** | Owned and managed by the agent | No |
-| Shadow branch `entire/<commit>-<worktree>` | 8-layer | Auto-deleted after the next successful push (only when its session has ended cleanly) | No |
+| Legacy shadow branch `entire/<commit>-<worktree>` (written by older versions only) | 8-layer metadata; **raw** code-file snapshots | Until you run `entire doctor --force` (`entire clean --all` for the bare `entire/<commit>` form; `entire doctor` reports them); objects remain until `git gc` prunes them, once they are two weeks old (`git gc --prune=now` at once; see the caveat above) | No |
 | Unreachable git objects after the pre-push rewrite | 8-layer | Until `git gc --prune` (default `gc.pruneExpire` is 2 weeks) | No |
 | Local `refs/entire/checkpoints/*` (`git-refs`) | 8-layer before push, 9-layer after the rewrite | Kept indefinitely — these refs are never deleted after pushing | Yes, once pushed |
 | Local `entire/checkpoints/v1` (`git-branch`) | 8-layer before push, 9-layer after the rewrite | Until you delete the branch | Yes, once pushed |
@@ -330,7 +332,7 @@ Two `git-branch`-shaped leftovers are easy to miss once a repo has moved on:
 - **A `git-branch` mirror never gets OPF'd.** Mirrors receive best-effort write fan-out only and never ref-level mutations, so a mirror branch keeps 8-layer content indefinitely. It isn't pushed at pre-push, so it doesn't reach the remote — but it is local content, and it has a `refs/heads/` reflog.
 - **Migration doesn't delete the old branch.** `entire doctor migrate-checkpoints` imports from `entire/checkpoints/v1` and leaves it in place, 8-layer, along with its reflog. Migrated refs also carry no OPF trailer, so the first push after a migration re-OPFs every migrated ref — one commit per ref keeps the commit cap happy, but the 2 MiB batch cap is the realistic trip point.
 
-`.entire/metadata/<session>/full.jsonl` is Entire's own local working copy of the transcript, written mode `0600`. It is *sanitized* (agent state that cannot be replayed out of a checkpoint is stripped) but **not redacted** — redaction happens on the way into a git object, not on this file. It is the input the shadow-branch walk and condensation read from.
+`.entire/metadata/<session>/full.jsonl` is Entire's own local working copy of the transcript, written mode `0600`. It is *sanitized* (agent state that cannot be replayed out of a checkpoint is stripped) but **not redacted** — redaction happens on the way into a git object, not on this file. It is the input condensation reads from when the live agent transcript is no longer available.
 
 The agent's own transcript is never modified at all. Entire reads from it and leaves it alone, because the agent is writing to it continuously and editing under the agent's feet would corrupt the session.
 
@@ -346,7 +348,7 @@ git reflog expire --expire-unreachable=now refs/heads/entire/checkpoints/v1
 git gc --prune=now
 ```
 
-This is I/O-heavy on large repositories; it's not run automatically. If you want it as part of your push workflow, wrap `git push` in a script that invokes it after a successful push.
+`--prune=now` drops every unreachable object in the repository, not only Entire's (recently dropped stashes included), and git warns it can corrupt the repository if another git process is writing at the same time: run it only when nothing else is using the repository. This is I/O-heavy on large repositories; it's not run automatically. If you want it as part of your push workflow, wrap `git push` in a script that invokes it after a successful push.
 
 #### Verifying OPF is working
 
@@ -387,7 +389,7 @@ If your AI sessions will touch sensitive data:
 - **Use a private repository.** This is the simplest and most complete protection. Committed checkpoints are then only visible to collaborators.
 - **Avoid passing sensitive files to your agent.** Content that never enters the agent conversation never appears in transcripts.
 - **Never paste a screenshot or image containing secrets or personal data.** Nothing in Entire reads what an image depicts, and on most agents the image is stored unredacted — see [What Entire does NOT understand: pasted images and screenshots](#what-entire-does-not-understand-pasted-images-and-screenshots).
-- **Review before pushing.** Checkpoints are written locally at commit time and pushed separately, so there is always a window to inspect them:
+- **Review before pushing.** Checkpoints are written locally — at commit time, or when a session with no file changes is snapshotted with the hidden `entire checkpoint create` — and pushed separately, so there is always a window to inspect them:
 
   ```fish
   # git-refs: list local checkpoint refs, then read one
@@ -582,10 +584,10 @@ repository would otherwise be a binary Entire executes.
 
 ## Why agent instruction fields are local-only
 
-`investigate.always_prompt`, every review `prompt` (per-agent and judge, in
-`review_profiles` and the legacy `review` map), and every review profile's
-`task` are placed verbatim in the prompts of agents that `entire investigate`
-and `entire review` spawn with approval checks disabled (claude-code's
+Every review `prompt` (per-agent and judge, in
+`review_profiles` and the legacy `review` map) and every review profile's
+`task` are placed verbatim in the prompts of agents that
+`entire review` spawns with approval checks disabled (claude-code's
 `bypassPermissions`, codex's `--dangerously-bypass-approvals-and-sandbox`). The
 prompt is the stated control for those spawns, so whoever writes these strings
 gets the last word in it. `task` and `prompt` are adjacent sections of the same
@@ -601,9 +603,15 @@ clone-local review preferences (stored inside `.git/`, which a clone never
 populates) or `.entire/settings.local.json` verified untracked in both the
 index and `HEAD`. Rejection is a downgrade, never an error — a dropped task
 falls back to the built-in text for conventional profile names, and
-`entire review` / `entire investigate` print a one-line notice naming the
+`entire review` prints a one-line notice naming the
 dropped field and where it has to move (suppressed when the dropped task equals
 the built-in default, since that drop changes nothing).
+
+The `entire-investigate` plugin applies the same reasoning to its own
+`always_prompt`, against its own `.entire/investigate.local.json`. That file
+has no committed counterpart at all, so there is no layer to gate — only a
+check that the file itself is untracked. It is outside this repository's
+control; see the plugin's `internal/config`.
 
 Deliberately not gated: `skills` (review validates every configured skill
 against the locally installed set before spawning, so free text there fails the
