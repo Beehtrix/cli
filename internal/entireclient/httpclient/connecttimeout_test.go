@@ -265,3 +265,43 @@ func TestConnectTimeoutCoversRetryAfterDeadReusedConn(t *testing.T) {
 		t.Fatalf("err = %v, want ErrConnectTimeout from the redial", err)
 	}
 }
+
+// TestNewTransportEndsAbandonedTLSHandshake: net/http keeps dialing after the
+// connect budget cancels the request (the dial ignores request cancellation so
+// a later request could reuse the conn), so the inner transport must bound the
+// handshake itself or the abandoned dial holds the socket until the peer hangs up.
+func TestNewTransportEndsAbandonedTLSHandshake(t *testing.T) {
+	t.Parallel()
+	var lc net.ListenConfig
+	l, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	closedByClient := make(chan struct{})
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		// Never answer the ClientHello; Read returns once the client gives up.
+		_, _ = io.Copy(io.Discard, c) //nolint:errcheck // only the return matters
+		close(closedByClient)
+	}()
+
+	const budget = 200 * time.Millisecond
+	resp, err := getWithin(t, newTransport(false, budget), "https://"+l.Addr().String()+"/")
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("request to a stalled TLS server succeeded")
+	}
+	if !errors.Is(err, ErrConnectTimeout) {
+		t.Fatalf("err = %v, want ErrConnectTimeout", err)
+	}
+	select {
+	case <-closedByClient:
+	case <-time.After(15 * budget):
+		t.Fatal("abandoned TLS handshake still running after the request gave up")
+	}
+}

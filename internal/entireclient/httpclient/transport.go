@@ -101,6 +101,11 @@ func newTransport(skipTLSVerify bool, dialTimeout time.Duration) http.RoundTripp
 		// Matches http.DefaultTransport; zero would keep idle pooled
 		// connections open for the life of the process.
 		IdleConnTimeout: 90 * time.Second,
+		// net/http keeps dialing after the connect budget cancels the
+		// request, so this is what ends an abandoned handshake to a stalled
+		// node. Twice the budget so the budget, with its clearer error,
+		// always fires first.
+		TLSHandshakeTimeout: 2 * dialTimeout,
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: skipTLSVerify, //nolint:gosec // intentional for local development
