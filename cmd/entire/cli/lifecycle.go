@@ -457,8 +457,6 @@ func normalizeToolUsePaths(files []string, eventCWD, repoRoot string) []string {
 	return FilterAndNormalizePaths(resolved, repoRoot)
 }
 
-// handleLifecycleTurnStart handles turn start: captures pre-prompt state,
-// ensures strategy setup, initializes session.
 // entireTrailContextInjection is the one-time, model-facing pointer Entire
 // injects on the first turn of a session. It points at `entire agent-help` for
 // the full flag/subcommand surface — fetched on demand so that surface never goes
@@ -477,8 +475,10 @@ func normalizeToolUsePaths(files []string, eventCWD, repoRoot string) []string {
 // sometimes-appropriate query as an always-do step. Which commands suit a given
 // task is agent-help's job, where it is pulled on demand and grouped by who
 // should initiate the command (see agentHelpAudience); this string carries only
-// invariants that hold on every turn of every session.
-func entireTrailContextInjection(scope trailEnablementScope) string {
+// invariants that hold on every turn of every session. The one model-dependent
+// invariant is what a trail is: under project trails (ENTIRE_PROJECT_TRAILS=1)
+// a trail number names project intent, not one branch, so say so once.
+func entireTrailContextInjection(scope trailEnablementScope, projectTrails bool) string {
 	repo := ""
 	if scope.Forge != "" && scope.Owner != "" && scope.Repo != "" {
 		repo = trailEnablementRepoKey(scope.Forge, scope.Owner, scope.Repo)
@@ -486,6 +486,9 @@ func entireTrailContextInjection(scope trailEnablementScope) string {
 	var b strings.Builder
 	b.WriteString("Entire is enabled for this repo. Run `entire agent-help` to see what entire does and which subcommand to use, then `entire agent-help <command>` for that command's exact, current flags. ")
 	b.WriteString("Commits automatically capture the AI session as a checkpoint, so never create checkpoints by hand — just commit normally. Leave setup and destructive commands (enable, disable, clean, auth) to the user. ")
+	if projectTrails {
+		b.WriteString("Trails here are project-scoped: one trail spans repositories and branches, and its number is project-wide; see `entire agent-help trail`. ")
+	}
 	// Mirror agentHelpRepoBlock's defense-in-depth: this string is injected raw
 	// into the agent's model context (no escaping), so a repo key carrying control
 	// characters (e.g. an <sessionID>.trail-scope.json cache written by a pre-fix
@@ -555,7 +558,7 @@ func emitContextInjection(ctx context.Context, ag agent.Agent, event *agent.Even
 		return
 	}
 
-	payload, err := injector.RenderContextInjection(agent.ContextInjection{Text: entireTrailContextInjection(scope)})
+	payload, err := injector.RenderContextInjection(agent.ContextInjection{Text: entireTrailContextInjection(scope, projectTrailsEnabled())})
 	if err != nil {
 		logging.Warn(logCtx, "failed to render context injection",
 			slog.String("error", err.Error()))
@@ -987,6 +990,10 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 		// Git status catches any tracked file with working-tree changes.
 		relModifiedFiles = mergeUnique(relModifiedFiles, FilterAndNormalizePaths(changes.Modified, repoRoot))
 	}
+	// Pre-existing untracked files the turn changed: git status lists them as
+	// untracked both before and after, so neither New nor Modified carries
+	// them, and a shell edit leaves no trace in the transcript.
+	relModifiedFiles = mergeUnique(relModifiedFiles, FilterAndNormalizePaths(preState.ChangedUntrackedFiles(repoRoot), repoRoot))
 
 	// Filter detected changes to exclude state already committed to HEAD.
 	// When an agent commits files mid-turn, those changes are condensed by
@@ -999,8 +1006,8 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 	// relNewFiles (untracked ⇒ never in HEAD) and relDeletedFiles (git status
 	// cannot report a committed deletion) are uncommitted by construction —
 	// filtering them against HEAD would wrongly drop deletions of files
-	// created-then-deleted within the session (absent from HEAD) and make
-	// checkpoint rewind resurrect them.
+	// created-then-deleted within the session (absent from HEAD) from the
+	// session's record.
 	relModifiedFiles = filterToUncommittedFiles(ctx, relModifiedFiles, repoRoot)
 	// Drop paths no commit can carry (see strategy.FilterTrackableChanges).
 	relModifiedFiles, relNewFiles, relDeletedFiles = strategy.FilterTrackableChanges(ctx, repoRoot, relModifiedFiles, relNewFiles, relDeletedFiles)
@@ -1700,6 +1707,7 @@ func recordInFlightTaskLaunch(logCtx context.Context, event *agent.Event) error 
 			ToolUseID:       event.ToolUseID,
 			AgentID:         event.SubagentID,
 			StartedAt:       time.Now(),
+			Background:      true,
 			SubagentType:    event.SubagentType,
 			TaskDescription: event.TaskDescription,
 		}
@@ -1842,9 +1850,11 @@ func handleSubagentStopFinal(logCtx context.Context, ag agent.Agent, event *agen
 	// would risk sweeping in the parent's or another agent's later edits. See
 	// subagentCaptureOptions.analyzerFilesOnly.
 	captureErr := completeSubagentTaskRecord(logCtx, ag, event, subagentCaptureOptions{
-		bypassNoChangesSkip: true,
-		analyzerFilesOnly:   true,
-		eventFilesOnly:      event.CompletionWithoutLaunch,
+		bypassNoChangesSkip:     true,
+		analyzerFilesOnly:       true,
+		background:              true,
+		claimUnrecordedNewFiles: !event.CompletionWithoutLaunch,
+		eventFilesOnly:          event.CompletionWithoutLaunch,
 	})
 	if captureErr != nil {
 		return captureErr
@@ -1949,6 +1959,17 @@ type subagentCaptureOptions struct {
 	// rationale. Never set for the foreground launch-time path, which keeps
 	// its original (correct, worktree-scan-based) behavior unchanged.
 	analyzerFilesOnly bool
+
+	// background marks the record as a background task's
+	// (session.TaskRecord.Background), including one this capture creates
+	// because no launch marker exists (a resumed run under a new key, or a
+	// completion without a launch), so overlapping tasks still see it.
+	background bool
+
+	// claimUnrecordedNewFiles, with analyzerFilesOnly, also captures untracked
+	// files created since the task launched that no session in the worktree
+	// has recorded. See unrecordedNewFilesSinceLaunch.
+	claimUnrecordedNewFiles bool
 
 	// eventFilesOnly means the adapter already derived child-scoped files from
 	// a shared parent transcript. Do not resolve or scan a child transcript.
@@ -2090,7 +2111,8 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 	// deletions by the subagent are also uncapturable in analyzer-only mode
 	// (only the worktree scan detects them), but those are the lesser
 	// failures: over-capture steals attribution from someone else's work,
-	// which is worse and harder to notice.
+	// which is worse and harder to notice. claimUnrecordedNewFiles narrows the
+	// shell side-effect gap for new files; see unrecordedNewFilesSinceLaunch.
 	var changes *FileChanges
 	if !opts.analyzerFilesOnly {
 		preState, preErr := LoadPreTaskState(logCtx, event.ToolUseID)
@@ -2139,6 +2161,9 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 		relDeletedFiles = FilterAndNormalizePaths(changes.Deleted, repoRoot)
 		relModifiedFiles = mergeUnique(relModifiedFiles, FilterAndNormalizePaths(changes.Modified, repoRoot))
 	}
+	if opts.analyzerFilesOnly && opts.claimUnrecordedNewFiles {
+		relNewFiles = mergeUnique(relNewFiles, unrecordedNewFilesSinceLaunch(logCtx, event, repoRoot))
+	}
 	relModifiedFiles, relNewFiles, relDeletedFiles = strategy.FilterTrackableChanges(logCtx, repoRoot, relModifiedFiles, relNewFiles, relDeletedFiles)
 
 	// If no changes, skip — unless this is a Final (SubagentStop) capture: a
@@ -2171,6 +2196,7 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 		ToolUseID:                event.ToolUseID,
 		AgentID:                  event.SubagentID,
 		StartedAt:                time.Now(),
+		Background:               opts.background,
 		SubagentType:             event.SubagentType,
 		TaskDescription:          event.TaskDescription,
 		DeclaredTranscriptPath:   subagentTranscriptPath,
@@ -2205,6 +2231,62 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 
 	_ = CleanupPreTaskState(logCtx, event.ToolUseID) //nolint:errcheck // best-effort cleanup
 	return nil
+}
+
+// unrecordedNewFilesSinceLaunch returns the untracked files created since a
+// background task launched that no session in the worktree has recorded. A
+// subagent's shell command can create files its transcript never names, and
+// once the parent's next prompt starts they sit in that prompt's untracked
+// baseline, so no later turn end claims them either.
+//
+// Files the parent created during its own turns are excluded: its turn ends
+// recorded them. So are files another session has recorded. What remains can
+// still include a file the user created while the parent was idle, or one an
+// agent mid-turn has not recorded yet; claiming those only adds a session link
+// to the commit that carries them, the same as a turn end claiming a user's
+// edit made during an active turn.
+//
+// Returns nil when there is no launch baseline, when the scan cannot tell
+// which files other sessions own, or when another background task in the
+// worktree ran during this one: a new file could then be either task's, and
+// the first to stop would claim both.
+func unrecordedNewFilesSinceLaunch(ctx context.Context, event *agent.Event, repoRoot string) []string {
+	preState, err := LoadPreTaskState(ctx, event.ToolUseID)
+	if err != nil {
+		logging.Warn(ctx, "failed to load pre-task state", slog.String("error", err.Error()))
+		return nil
+	}
+	if preState == nil || preState.UntrackedScanSkipped {
+		return nil
+	}
+	changes, err := DetectFileChanges(ctx, preState.PreUntrackedFiles())
+	if err != nil {
+		logStatusDegrade(ctx, "failed to compute files created since task launch", err)
+		return nil
+	}
+	created := FilterAndNormalizePaths(changes.New, repoRoot)
+	if len(created) == 0 {
+		return nil
+	}
+	claims, ok, err := strategy.LoadBackgroundClaimContext(ctx, event.SessionID, event.ToolUseID)
+	if err != nil || !ok {
+		if err != nil {
+			logging.Warn(ctx, "failed to list files recorded by sessions", slog.String("error", err.Error()))
+		}
+		return nil
+	}
+	if claims.Overlapped {
+		logging.Info(ctx, "not claiming new untracked files: another background task overlapped this one",
+			slog.Int("candidates", len(created)))
+		return nil
+	}
+	unrecorded := make([]string, 0, len(created))
+	for _, file := range created {
+		if _, seen := claims.Recorded[file]; !seen {
+			unrecorded = append(unrecorded, file)
+		}
+	}
+	return unrecorded
 }
 
 // loadLiveTaskRecords returns sessionID's still-in-flight task records, or nil

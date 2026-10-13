@@ -38,7 +38,7 @@ at session start. Follow its related links when the task crosses those boundarie
 | Ref-based checkpoint backend | [Ref backend](docs/architecture/ref-checkpoint-backend.md) |
 | Agent integrations | [Agent guide](docs/architecture/agent-guide.md), [integration checklist](docs/architecture/agent-integration-checklist.md) |
 | External commands or agents | [External commands](docs/architecture/external-commands.md), [agent protocol](docs/architecture/external-agent-protocol.md) |
-| Security, privacy, scanners, OPF | [Security and privacy](docs/security-and-privacy.md), [implementation contracts](docs/development/checkpoint-implementation.md) |
+| Security, privacy, scanners | [Security and privacy](docs/security-and-privacy.md), [implementation contracts](docs/development/checkpoint-implementation.md) |
 | Review command | [Review architecture](docs/architecture/review-command.md) |
 | E2E tests | [E2E guide](e2e/README.md) |
 
@@ -53,7 +53,7 @@ at session start. Follow its related links when the task crosses those boundarie
 | Format and lint | `mise run fmt && mise run lint` |
 | Before every commit | **`mise run check`** (format, lint, all CI tests) |
 | Before any push or remote code update | **`mise run lint` on the current tree**, after the latest formatting pass |
-| After every push to an open PR | **check the trail's findings** (`entire trail finding list --freshness any`; uses the current branch's trail, or pass `--trail <trail number>` — not the PR number); fix real ones, resolve with `-m`, and re-check after the fix lands. Not done until findings are clear |
+| After every push to an open PR | **check the trail's findings** (`entire trail finding list cli/<n> --freshness any` with `ENTIRE_PROJECT_TRAILS=1`, else `entire trail finding list <n> --freshness any`; `<n>` is the PR branch's cli trail number, not the PR number); fix real ones, resolve with `-m`, and re-check after the fix lands. Not done until findings are clear |
 | Duplication checks | `mise run dup` or `mise run dup:staged`; normal lint also checks duplication |
 | Windows installer | `mise run test:ps1`; see testing reference for prerequisites |
 
@@ -145,7 +145,7 @@ I/O beneath it.** Read the filesystem reference before adding or changing I/O.
   honor intentionally exported repo selectors.
 - PATH scanners use `execx.PathScanDirs()`; external-agent execution requires
   absolute binary paths. User-directory overrides use the checked `userdirs`
-  resolvers before any I/O. Preserve the documented developer-owned OPF exception.
+  resolvers before any I/O.
 - When Entire owns execution, pass arguments separately; never interpolate
   dynamic values into `cmd.exe`. Agent-owned shell execution uses the shared
   escaping helper. See the reference for the literal-only Unix updater exception.
