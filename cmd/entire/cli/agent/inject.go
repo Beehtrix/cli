@@ -42,7 +42,8 @@ type ContextInjector interface {
 }
 
 // AsContextInjector returns ag as a ContextInjector when it implements the
-// interface. Context injection is built-in only, so it needs no DeclaredCaps gate.
+// interface. DeclaredCaps has no field for context injection, so there is no
+// declaration gate.
 func AsContextInjector(ag Agent) (ContextInjector, bool) {
 	return builtinCapability[ContextInjector](ag)
 }

@@ -1,13 +1,18 @@
 package agent
 
 // CapabilityDeclarer is implemented by agents that declare their capabilities
-// at registration time (e.g., external plugin agents). The As* helper functions
-// below use this interface to gate capability access: an agent must both implement
-// the optional interface AND declare the capability as true.
+// at registration time (e.g., external plugin agents). Each As* helper resolves
+// through one of three functions, which treat a CapabilityDeclarer differently:
 //
-// Built-in agents (Claude Code, Codex, etc.) do NOT implement this interface.
-// For those agents, the As* helpers fall through to a direct type assertion,
-// preserving existing behavior.
+//   - declaredCapability: it must implement the interface AND declare the
+//     matching DeclaredCaps field as true.
+//   - builtinCapability: implementing the interface is enough; there is no
+//     DeclaredCaps field to check.
+//   - nonDeclarerCapability: it is refused even when it implements the
+//     interface.
+//
+// Built-in agents (Claude Code, Codex, etc.) do NOT implement this interface,
+// so for them every helper is a plain type assertion.
 type CapabilityDeclarer interface {
 	DeclaredCapabilities() DeclaredCaps
 }
@@ -24,16 +29,21 @@ type CapabilityDeclarer interface {
 //   - EffectiveHookDiagnostics
 //   - HomeLayoutProvider
 //   - HomeScopedInventoryExtractor
+//   - HookConfigLocator
 //   - HookFreshness
 //   - InventoryAwareExtractor
-//   - LateTranscriptWriter
+//   - LateTranscriptWriter (refuses CapabilityDeclarer agents)
 //   - ModelExtractor
 //   - ModelLister
-//   - OutOfBandTokenSource
+//   - OutOfBandTokenSource (refuses CapabilityDeclarer agents)
 //   - PermissionConfigOwner
+//   - ProtectedFilesProvider
+//   - RestoredSessionPathResolver
 //   - SessionBaseDirProvider
 //   - SessionEndBudgeter
+//   - SessionFileCandidatesProvider
 //   - SidecarImageProvider
+//   - SkillDiscoverer
 //   - SkillEventExtractor
 //   - StaleHookReporter
 //   - SubagentSessionResolver
@@ -42,8 +52,10 @@ type CapabilityDeclarer interface {
 //   - TranscriptFetcher
 //   - TranscriptSanitizer
 //
-// Their As* helpers resolve through builtinCapability, or builtinOnlyCapability
-// when external agents must be refused, with no DeclaredCaps gate.
+// Their As* helpers resolve through builtinCapability, or through
+// nonDeclarerCapability for the entries marked as refusing CapabilityDeclarer
+// agents. Callers reach every capability through its As* helper, never by
+// type-asserting an agent directly.
 type DeclaredCaps struct {
 	Hooks                  bool `json:"hooks"`
 	TranscriptAnalyzer     bool `json:"transcript_analyzer"`
@@ -71,8 +83,9 @@ func declaredCapability[T any](ag Agent, declared func(DeclaredCaps) bool) (T, b
 
 // builtinCapability returns the agent as T by type assertion alone, with no
 // DeclaredCaps gate. CapabilityDeclarer agents that implement T are not
-// refused; use builtinOnlyCapability when they must be.
-func builtinCapability[T any](ag Agent) (T, bool) {
+// refused; use nonDeclarerCapability when they must be. ag is an any so a
+// helper can resolve a narrower view of an agent, such as a SessionLocator.
+func builtinCapability[T any](ag any) (T, bool) {
 	var zero T
 	if ag == nil {
 		return zero, false
@@ -84,10 +97,10 @@ func builtinCapability[T any](ag Agent) (T, bool) {
 	return t, true
 }
 
-// builtinOnlyCapability returns the agent as T like builtinCapability, but
+// nonDeclarerCapability returns the agent as T like builtinCapability, but
 // refuses CapabilityDeclarer agents even when they implement T, for
 // capabilities external agents must never take on.
-func builtinOnlyCapability[T any](ag Agent) (T, bool) {
+func nonDeclarerCapability[T any](ag Agent) (T, bool) {
 	t, ok := builtinCapability[T](ag)
 	if !ok {
 		return t, false
@@ -146,6 +159,28 @@ func AsSidecarImageProvider(ag Agent) (SidecarImageProvider, bool) {
 	return builtinCapability[SidecarImageProvider](ag)
 }
 
+// AsProtectedFilesProvider returns the agent as ProtectedFilesProvider if it
+// implements the interface. External agents report protected files through
+// their info response, which the external adapter forwards, so there is no
+// DeclaredCaps gate.
+func AsProtectedFilesProvider(ag Agent) (ProtectedFilesProvider, bool) {
+	return builtinCapability[ProtectedFilesProvider](ag)
+}
+
+// AsRestoredSessionPathResolver returns the agent as RestoredSessionPathResolver
+// if it implements the interface. The external protocol has no restored-path
+// hook, so there is no DeclaredCaps gate.
+func AsRestoredSessionPathResolver(ag Agent) (RestoredSessionPathResolver, bool) {
+	return builtinCapability[RestoredSessionPathResolver](ag)
+}
+
+// AsSkillDiscoverer returns the agent as SkillDiscoverer if it implements the
+// interface. Discovery only feeds the review skill picker, so there is no
+// DeclaredCaps gate.
+func AsSkillDiscoverer(ag Agent) (SkillDiscoverer, bool) {
+	return builtinCapability[SkillDiscoverer](ag)
+}
+
 // AsTranscriptSanitizer returns the agent as TranscriptSanitizer if it implements
 // the interface. This is a pure local byte transform with no external process to
 // negotiate with, so it needs no DeclaredCaps gate.
@@ -194,7 +229,7 @@ func AsTokenCalculator(ag Agent) (TokenCalculator, bool) {
 // is wire-format knowledge the external protocol does not currently express,
 // and DeclaredCaps has no field for this capability to opt into.
 func AsLateTranscriptWriter(ag Agent) (LateTranscriptWriter, bool) {
-	return builtinOnlyCapability[LateTranscriptWriter](ag)
+	return nonDeclarerCapability[LateTranscriptWriter](ag)
 }
 
 // AsOutOfBandTokenSource returns the agent as OutOfBandTokenSource if supported.
@@ -202,7 +237,7 @@ func AsLateTranscriptWriter(ag Agent) (LateTranscriptWriter, bool) {
 // store is fed by a built-in shim subcommand they cannot provide, and
 // DeclaredCaps has no field for this capability to opt into.
 func AsOutOfBandTokenSource(ag Agent) (OutOfBandTokenSource, bool) {
-	return builtinOnlyCapability[OutOfBandTokenSource](ag)
+	return nonDeclarerCapability[OutOfBandTokenSource](ag)
 }
 
 // AsInventoryAwareExtractor returns the agent as InventoryAwareExtractor when

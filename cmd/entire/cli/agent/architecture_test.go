@@ -19,6 +19,17 @@ type capabilityHelper struct {
 	position   token.Position
 }
 
+// The three resolvers an As* helper may return. nonDeclarerCapability is the
+// only one that refuses CapabilityDeclarer agents, so the DeclaredCaps doc
+// marks its entries and the list test checks the mark against the resolver.
+const (
+	builtinResolver     = "builtinCapability"
+	nonDeclarerResolver = "nonDeclarerCapability"
+	declaredResolver    = "declaredCapability"
+
+	refusesDeclarersMark = "(refuses CapabilityDeclarer agents)"
+)
+
 func TestCapabilityHelpersUseStandardResolver(t *testing.T) {
 	t.Parallel()
 
@@ -29,14 +40,14 @@ func TestCapabilityHelpersUseStandardResolver(t *testing.T) {
 
 	for _, helper := range helpers {
 		switch helper.resolver {
-		case "builtinCapability", "builtinOnlyCapability", "declaredCapability":
+		case builtinResolver, nonDeclarerResolver, declaredResolver:
 			if helper.capability == "" {
 				t.Errorf("%s: %s must resolve a single named capability type",
 					helper.position, helper.function)
 			}
 		case "":
-			t.Errorf("%s: %s must return builtinCapability[T], builtinOnlyCapability[T], or declaredCapability[T]",
-				helper.position, helper.function)
+			t.Errorf("%s: %s must be a single `return %s[T](ag)`, `return %s[T](ag)`, or `return %s[T](ag, ...)`",
+				helper.position, helper.function, builtinResolver, nonDeclarerResolver, declaredResolver)
 		default:
 			t.Errorf("%s: %s uses unsupported resolver %s",
 				helper.position, helper.function, helper.resolver)
@@ -47,21 +58,29 @@ func TestCapabilityHelpersUseStandardResolver(t *testing.T) {
 func TestDeclaredCapsBuiltinListMatchesCapabilityHelpers(t *testing.T) {
 	t.Parallel()
 
-	var resolved []string
+	var resolved, refusing []string
 	for _, helper := range discoverCapabilityHelpers(t) {
-		if helper.resolver == "builtinCapability" || helper.resolver == "builtinOnlyCapability" {
+		if helper.resolver == builtinResolver || helper.resolver == nonDeclarerResolver {
 			resolved = append(resolved, helper.capability)
+		}
+		if helper.resolver == nonDeclarerResolver {
+			refusing = append(refusing, helper.capability)
 		}
 	}
 	slices.Sort(resolved)
+	slices.Sort(refusing)
 
-	documented := documentedBuiltinCapabilities(t)
+	documented, documentedRefusing := documentedBuiltinCapabilities(t)
 	if !slices.IsSorted(documented) {
 		t.Fatalf("DeclaredCaps built-in capability list must be sorted: %v", documented)
 	}
 	if !slices.Equal(documented, resolved) {
 		t.Fatalf("DeclaredCaps built-in capability list is out of sync\ndocumented: %v\nresolved:   %v",
 			documented, resolved)
+	}
+	if !slices.Equal(documentedRefusing, refusing) {
+		t.Fatalf("DeclaredCaps entries marked %q must be exactly the helpers that use %s\nmarked:   %v\nresolved: %v",
+			refusesDeclarersMark, nonDeclarerResolver, documentedRefusing, refusing)
 	}
 }
 
@@ -146,7 +165,9 @@ func indexedCall(expr ast.Expr) (*ast.Ident, ast.Expr) {
 	}
 }
 
-func documentedBuiltinCapabilities(t *testing.T) []string {
+// documentedBuiltinCapabilities returns the capabilities listed in the
+// DeclaredCaps doc comment, and the subset marked as refusing declarers.
+func documentedBuiltinCapabilities(t *testing.T) ([]string, []string) {
 	t.Helper()
 
 	path := filepath.Join(findAgentDir(t), "capabilities.go")
@@ -174,27 +195,31 @@ func documentedBuiltinCapabilities(t *testing.T) []string {
 				t.Fatal("DeclaredCaps must have a doc comment")
 			}
 
-			var capabilities []string
+			var capabilities, refusing []string
 			for _, comment := range doc.List {
 				line := strings.TrimSpace(strings.TrimPrefix(comment.Text, "//"))
-				name, ok := strings.CutPrefix(line, "- ")
+				entry, ok := strings.CutPrefix(line, "- ")
 				if !ok {
 					continue
 				}
-				if fields := strings.Fields(name); len(fields) != 1 || !ast.IsExported(name) {
+				name, mark, _ := strings.Cut(entry, " ")
+				if !ast.IsExported(name) || (mark != "" && mark != refusesDeclarersMark) {
 					t.Fatalf("invalid capability entry in DeclaredCaps doc: %q", line)
 				}
 				capabilities = append(capabilities, name)
+				if mark != "" {
+					refusing = append(refusing, name)
+				}
 			}
 			if len(capabilities) == 0 {
 				t.Fatal("DeclaredCaps doc must list built-in capabilities as '- CapabilityName' entries")
 			}
-			return capabilities
+			return capabilities, refusing
 		}
 	}
 
 	t.Fatal("DeclaredCaps type not found")
-	return nil
+	return nil, nil
 }
 
 // TestAgentPackages_NoForbiddenImports verifies that agent implementation packages

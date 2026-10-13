@@ -662,3 +662,77 @@ func TestAsStreamingTextGenerator(t *testing.T) {
 		}
 	})
 }
+
+// mockLocatorAgent implements the capabilities that callers used to reach by
+// inline type assertion. None of them has a DeclaredCaps field.
+type mockLocatorAgent struct {
+	mockBaseAgent
+}
+
+func (m *mockLocatorAgent) DiscoverReviewSkills(context.Context) ([]DiscoveredSkill, error) {
+	return nil, nil
+}
+func (m *mockLocatorAgent) ResolveRestoredSessionFile(string, string, []byte) (string, error) {
+	return "", nil
+}
+func (m *mockLocatorAgent) ProtectedFiles() []string                             { return nil }
+func (m *mockLocatorAgent) HookConfigRelPath() string                            { return "" }
+func (m *mockLocatorAgent) ResolveSessionFileCandidates(string, string) []string { return nil }
+
+// mockDeclaringLocatorAgent is mockLocatorAgent as an external agent that
+// declares nothing. These capabilities have no declaration to make, so it must
+// still be accepted: the external adapter forwards ProtectedFiles this way.
+type mockDeclaringLocatorAgent struct {
+	mockLocatorAgent
+}
+
+func (m *mockDeclaringLocatorAgent) DeclaredCapabilities() DeclaredCaps { return DeclaredCaps{} }
+
+func TestUndeclaredCapabilityHelpers(t *testing.T) {
+	t.Parallel()
+
+	helpers := map[string]func(Agent) bool{
+		"AsSkillDiscoverer": func(ag Agent) bool {
+			_, ok := AsSkillDiscoverer(ag)
+			return ok
+		},
+		"AsRestoredSessionPathResolver": func(ag Agent) bool {
+			_, ok := AsRestoredSessionPathResolver(ag)
+			return ok
+		},
+		"AsProtectedFilesProvider": func(ag Agent) bool {
+			_, ok := AsProtectedFilesProvider(ag)
+			return ok
+		},
+		"AsHookConfigLocator": func(ag Agent) bool {
+			_, ok := AsHookConfigLocator(ag)
+			return ok
+		},
+		"AsSessionFileCandidatesProvider": func(ag Agent) bool {
+			_, ok := AsSessionFileCandidatesProvider(ag)
+			return ok
+		},
+	}
+
+	cases := []struct {
+		name string
+		ag   Agent
+		want bool
+	}{
+		{"nil agent", nil, false},
+		{"not implemented", &mockBaseAgent{}, false},
+		{"builtin agent", &mockLocatorAgent{}, true},
+		{"capability declarer", &mockDeclaringLocatorAgent{}, true},
+	}
+
+	for name, resolve := range helpers {
+		for _, tc := range cases {
+			t.Run(name+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				if got := resolve(tc.ag); got != tc.want {
+					t.Errorf("%s(%s) ok = %v, want %v", name, tc.name, got, tc.want)
+				}
+			})
+		}
+	}
+}

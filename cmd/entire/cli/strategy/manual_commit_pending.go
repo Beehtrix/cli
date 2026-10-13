@@ -388,7 +388,7 @@ func (s *ManualCommitStrategy) RestoreLogsOnly(ctx context.Context, w, errW io.W
 			fmt.Fprintf(errW, "  Warning: session %d (%s) resolves outside its session directory, skipping\n", i, sessionID)
 			continue
 		}
-		if resolver, ok := sessionAgent.(agent.RestoredSessionPathResolver); ok {
+		if resolver, ok := agent.AsRestoredSessionPathResolver(sessionAgent); ok {
 			if resolved, ok := restoredSessionFile(errW, resolver, restoreStore, sessionAgentDir, sessionID, content.Transcript, i); ok {
 				sessionFile = resolved
 			}
@@ -470,7 +470,7 @@ func restoredPromptPreview(sessionAgent agent.Agent, promptContent string, trans
 	if prompt := strings.TrimSpace(reviewPrompt); prompt != "" {
 		return prompt
 	}
-	extractor, ok := sessionAgent.(agent.PromptExtractor)
+	extractor, ok := agent.AsPromptExtractor(sessionAgent)
 	if !ok || len(transcript) == 0 {
 		return ""
 	}
