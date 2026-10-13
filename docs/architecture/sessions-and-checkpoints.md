@@ -614,9 +614,7 @@ write. It is also **skipped when the compacted output exceeds the 50MB blob cap*
 — unlike `full.jsonl`, `transcript.jsonl` is not chunked, so a very long session
 whose full compaction exceeds the cap will lack a compact transcript on those
 checkpoints. This is a known limitation; `full.jsonl` remains authoritative and
-the compact transcript is regenerable from it. During the OPF finalize rewrite, a
-failed or skipped regeneration **drops** the prior `transcript.jsonl` and clears
-`compact_transcript_start` rather than shipping a stale, less-redacted compact.
+the compact transcript is regenerable from it.
 
 **Root-level metadata.json (`CheckpointSummary`):**
 ```json
@@ -920,11 +918,9 @@ What it means for the domain model:
   the removal to the sync remote.
 - **Local and remote `v1` stay in one line.** After the removal is pushed to
   a `v1` push destination, local `v1` is rebuilt on that pushed commit (local
-  unpushed checkpoints replayed on top), so the next push is a fast-forward and
-  the OPF pre-push rewrite does not see a diverged branch. This happens only
+  unpushed checkpoints replayed on top), so the next push is a fast-forward. This happens only
   when the two removal commits are the whole difference: a remote that was
-  ahead or rewritten before the delete is left for pre-push to reconcile (or
-  for OPF to refuse), and with several pushurls only the first destination is
+  ahead or rewritten before the delete is left for pre-push to reconcile, and with several pushurls only the first destination is
   adopted, so the others can still diverge.
 - **`--local-only` copies can come back into view.** On git-refs, a read
   (explain, backfill) that misses locally fetches the remote copy and recreates
