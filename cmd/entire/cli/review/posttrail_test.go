@@ -140,3 +140,96 @@ func TestMaybePostReviewToTrail(t *testing.T) {
 		}
 	})
 }
+
+func postTrailRuns(narratives ...string) reviewtypes.RunSummary {
+	summary := reviewtypes.RunSummary{}
+	for i, narrative := range narratives {
+		summary.AgentRuns = append(summary.AgentRuns, reviewtypes.AgentRun{
+			Name:   fmt.Sprintf("reviewer-%d", i),
+			Status: reviewtypes.AgentStatusSucceeded,
+			Buffer: []reviewtypes.Event{reviewtypes.AssistantText{Text: narrative}},
+		})
+	}
+	return summary
+}
+
+type postTrailVerdictCase struct {
+	aggregate  string
+	narratives []string
+}
+
+func runPostTrailVerdictCase(t *testing.T, tc postTrailVerdictCase) (posted bool, out string) {
+	t.Helper()
+	var buf bytes.Buffer
+	deps := Deps{PostReviewToTrail: func(context.Context, io.Writer, string, string) error {
+		posted = true
+		return nil
+	}}
+	summary := postTrailRuns(tc.narratives...)
+	if len(tc.narratives) == 0 {
+		summary = postTrailSummary("reviewer narrative")
+	}
+	maybePostReviewToTrail(context.Background(), &buf, deps, ReviewOutputTrail, "general", summary, tc.aggregate)
+	return posted, buf.String()
+}
+
+func TestMaybePostReviewToTrailSkipsCleanVerdicts(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]postTrailVerdictCase{
+		"single verdict":        {aggregate: "APPROVE - no actionable findings."},
+		"period separator":      {aggregate: "approve. no actionable findings."},
+		"plain-language reason": {aggregate: "approve with no actionable findings"},
+		"bold verdict":          {aggregate: "**approve** — no actionable findings."},
+		"punctuation boundary":  {aggregate: "approve! looks good."},
+		"heading verdict":       {aggregate: "## approve"},
+		"reviewer preamble":     {narratives: []string{"I checked the scoped diff and all call sites.\napprove — no actionable defects found."}},
+		"every reviewer clean": {narratives: []string{
+			"approve - no actionable findings.",
+			"## Summary\nLet me inspect the diff.\napprove — nothing to report.",
+		}},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			posted, out := runPostTrailVerdictCase(t, tc)
+			if posted {
+				t.Fatal("clean review must not be posted to the trail")
+			}
+			if !strings.Contains(out, "Nothing to report") {
+				t.Errorf("expected a 'nothing to report' confirmation, got %q", out)
+			}
+		})
+	}
+}
+
+func TestMaybePostReviewToTrailPostsNonCleanVerdicts(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]postTrailVerdictCase{
+		"request changes":              {aggregate: "REQUEST CHANGES - missing input validation."},
+		"approve with nits":            {aggregate: "APPROVE WITH NITS - rename the confusing variable."},
+		"punctuated approve nits":      {aggregate: "APPROVE: WITH NITS - rename the confusing variable."},
+		"non-verdict approve word":     {aggregate: "APPROVED pending another review."},
+		"trailing conditional approve": {aggregate: "request changes - retry.go:42 never stops on cancel.\n\nApprove once that is fixed."},
+		"reworded nits":                {aggregate: "approve with minor nits - rename x."},
+		"parenthesized nits":           {aggregate: "approve (nits: rename x)"},
+		"qualified approve":            {aggregate: "approve, but tighten the error in foo.go:12."},
+		"one reviewer requests": {narratives: []string{
+			"request changes - foo.go:10 leaks the lock on error.",
+			"approve - no actionable findings.",
+		}},
+		"one reviewer has no verdict": {narratives: []string{
+			"The lock in foo.go:10 leaks on error.",
+			"approve - no actionable findings.",
+		}},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if posted, out := runPostTrailVerdictCase(t, tc); !posted {
+				t.Fatalf("non-clean review must be posted to the trail, got %q", out)
+			}
+		})
+	}
+}

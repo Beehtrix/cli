@@ -1599,10 +1599,14 @@ func maybePostReviewToTrail(
 		return
 	}
 	verdict := strings.TrimSpace(aggregateOutput)
+	clean := verdict != "" && isCleanReviewVerdict(verdict)
 	if verdict == "" {
 		verdict = combinedReviewNarratives(summary)
+		clean = verdict != "" && allReviewNarrativesClean(summary)
 	}
-	if verdict == "" {
+	// A clean verdict is review metadata, not a finding. Posting it would make
+	// the trail show an "Unspecified finding" for a review that found nothing.
+	if verdict == "" || clean {
 		fmt.Fprintln(out, "Nothing to report, so nothing was posted to the trail.")
 		return
 	}
