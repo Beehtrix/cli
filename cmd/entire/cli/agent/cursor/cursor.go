@@ -91,6 +91,18 @@ func (c *CursorAgent) ResolveSessionFile(sessionDir, agentSessionID string) stri
 	return filepath.Join(sessionDir, agentSessionID+".jsonl")
 }
 
+// ResolveSessionFileCandidates returns the nested <id>/<id>.jsonl layout
+// followed by the flat <id>.jsonl layout, so discovery still finds a session
+// whose nested directory exists but holds no transcript.
+func (c *CursorAgent) ResolveSessionFileCandidates(sessionDir, agentSessionID string) []string {
+	return []string{
+		filepath.Join(sessionDir, agentSessionID, agentSessionID+".jsonl"),
+		filepath.Join(sessionDir, agentSessionID+".jsonl"),
+	}
+}
+
+var _ agent.SessionFileCandidatesProvider = (*CursorAgent)(nil)
+
 // ProtectedDirs returns directories that Cursor uses for config/state.
 func (c *CursorAgent) ProtectedDirs() []string { return []string{".cursor"} }
 
@@ -112,7 +124,7 @@ func (c *CursorAgent) GetSessionDir(repoPath string) (string, error) {
 		return "", fmt.Errorf("failed to get home directory: %w", err)
 	}
 
-	projectDir := sanitizePathForCursor(repoPath)
+	projectDir := SanitizePathForCursor(repoPath)
 	return filepath.Join(homeDir, ".cursor", "projects", projectDir, "agent-transcripts"), nil
 }
 
@@ -245,10 +257,10 @@ func (c *CursorAgent) FormatResumeCommand(_ string) string {
 	return "Open this project in Cursor."
 }
 
-// sanitizePathForCursor converts a path to Cursor's project directory format.
+// SanitizePathForCursor converts a path to Cursor's project directory format.
 var nonAlphanumericRegex = regexp.MustCompile(`[^a-zA-Z0-9]`)
 
-func sanitizePathForCursor(path string) string {
+func SanitizePathForCursor(path string) string {
 	path = strings.TrimLeft(path, "/")
 	return nonAlphanumericRegex.ReplaceAllString(path, "-")
 }
