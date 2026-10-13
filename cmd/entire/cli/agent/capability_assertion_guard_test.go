@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"io/fs"
 	"maps"
 	"os"
@@ -37,10 +38,11 @@ var nonCapabilityInterfaces = map[string]string{
 //
 // The check parses every production Go file rather than grepping it, so an
 // import under another name (agentpkg, cliagent) and a type-switch case list
-// that wraps onto a second line are both seen. Assertions to an interface
-// literal or to an interface declared in the asserting package are matched by
-// their capability methods, since naming the package-agent interface is not the
-// only way to reach one.
+// that wraps onto a second line are both seen. Naming the package-agent
+// interface is not the only way to reach one, so an asserted type is also
+// followed through aliases, defined types, interface literals, and interfaces
+// declared in any repository package, and matched by the capability methods or
+// embedded capability interfaces it reaches.
 func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 	t.Parallel()
 
@@ -50,14 +52,13 @@ func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 	}
 
 	interfaces, helpers := agentPackageDecls(t)
-	methods := capabilityMethods(interfaces)
-
-	type parsedFile struct {
-		rel  string
-		file *ast.File
+	resolver := &assertionResolver{
+		interfaces: interfaces,
+		methods:    capabilityMethods(interfaces),
+		decls:      map[string]map[string][]typeDecl{},
 	}
-	var files []parsedFile
-	localInterfaces := map[string]map[string]*ast.InterfaceType{}
+
+	var files []*sourceFile
 	fset := token.NewFileSet()
 	for _, rel := range productionGoFiles(t, repoRoot) {
 		src, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(rel)))
@@ -71,57 +72,43 @@ func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", rel, err)
 		}
-		file, err := parser.ParseFile(fset, rel, src, parser.SkipObjectResolution)
+		parsed, err := parser.ParseFile(fset, rel, src, parser.SkipObjectResolution)
 		if err != nil {
 			// A file with a syntax error cannot compile either, so it cannot
 			// hide an assertion; it is more likely an untracked scratch file.
 			t.Logf("skipping %s: %v", rel, err)
 			continue
 		}
-		files = append(files, parsedFile{rel, file})
-		dir := path.Dir(rel)
-		for name, iface := range declaredInterfaces(file) {
-			if localInterfaces[dir] == nil {
-				localInterfaces[dir] = map[string]*ast.InterfaceType{}
-			}
-			localInterfaces[dir][name] = iface
-		}
+		file := newSourceFile(rel, parsed)
+		files = append(files, file)
+		resolver.addDecls(file)
 	}
 
-	// Only assertions outside package agent count toward the staleness check:
-	// the resolvers' own CapabilityDeclarer assertions are always found, so
-	// counting them would keep the check from ever firing.
-	checkedOutside := 0
+	// The staleness check counts the files it scans that import package agent
+	// rather than matched assertions, so routing the last allowed assertion
+	// through a helper does not read as broken detection.
+	importingFiles := 0
 	for _, f := range files {
-		qualifier := agentImportName(f.file, f.rel)
-		inAgentPackage := path.Dir(f.rel) == agentPackageDir
-		local := localInterfaces[path.Dir(f.rel)]
-		resolve := func(e ast.Expr) *ast.InterfaceType { return asInterfaceType(e, local) }
-		for _, expr := range assertedTypes(f.file) {
+		if f.qualifier != "-" && f.dir != agentPackageDir {
+			importingFiles++
+		}
+		for _, expr := range assertedTypes(f.ast) {
 			pos := fset.Position(expr.Pos())
-			name, ok := agentInterfaceName(expr, qualifier, interfaces)
-			if ok {
-				if !inAgentPackage {
-					checkedOutside++
-				}
+			if name, ok := agentInterfaceName(expr, f.qualifier, interfaces); ok {
 				if _, allowed := nonCapabilityInterfaces[name]; !allowed {
 					t.Errorf("%s:%d: asserts an agent to capability %s directly; %s",
 						f.rel, pos.Line, name, helperAdvice(name, helpers))
 				}
 				continue
 			}
-			iface := resolve(expr)
-			if iface == nil {
-				continue
-			}
-			if capability, via, found := reachedCapability(iface, qualifier, interfaces, methods, resolve, map[*ast.InterfaceType]bool{}); found {
-				t.Errorf("%s:%d: asserts to an interface that reaches capability %s through %s; %s",
-					f.rel, pos.Line, capability, via, helperAdvice(capability, helpers))
+			if capability, via, found := resolver.reach(expr, f, map[ast.Expr]bool{}); found {
+				t.Errorf("%s:%d: asserts to %s, which reaches capability %s through %s; if the value is an agent, %s",
+					f.rel, pos.Line, types.ExprString(expr), capability, via, helperAdvice(capability, helpers))
 			}
 		}
 	}
-	if checkedOutside == 0 {
-		t.Fatal("no assertions outside package agent checked — the guard's detection has gone stale")
+	if importingFiles == 0 {
+		t.Fatalf("no file outside package agent imports %s — the guard's import detection has gone stale", agentImportPath)
 	}
 
 	for name := range nonCapabilityInterfaces {
@@ -131,7 +118,132 @@ func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 	}
 }
 
-const agentPackageDir = "cmd/entire/cli/agent"
+const (
+	modulePath      = "github.com/entireio/cli"
+	agentPackageDir = "cmd/entire/cli/agent"
+	agentImportPath = modulePath + "/" + agentPackageDir
+)
+
+// sourceFile is a parsed production file and the names it uses for the
+// packages it imports.
+type sourceFile struct {
+	rel       string
+	dir       string
+	ast       *ast.File
+	qualifier string            // see agentImportName
+	imports   map[string]string // local package name to directory, for repository packages
+}
+
+func newSourceFile(rel string, file *ast.File) *sourceFile {
+	f := &sourceFile{
+		rel:       rel,
+		dir:       path.Dir(rel),
+		ast:       file,
+		qualifier: agentImportName(file, rel),
+		imports:   map[string]string{},
+	}
+	for _, imp := range file.Imports {
+		dir, ok := strings.CutPrefix(strings.Trim(imp.Path.Value, `"`), modulePath+"/")
+		if !ok {
+			continue
+		}
+		// Without an alias the package name is assumed to match its directory,
+		// which holds for the repository's packages.
+		name := path.Base(dir)
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		f.imports[name] = dir
+	}
+	return f
+}
+
+// typeDecl is a named type declared in a scanned file.
+type typeDecl struct {
+	typ  ast.Expr
+	file *sourceFile
+}
+
+// assertionResolver follows an asserted type to the package-agent capability
+// it reaches, if any.
+type assertionResolver struct {
+	interfaces map[string]*ast.InterfaceType // package agent's interfaces
+	methods    map[string]string             // see capabilityMethods
+	// decls holds every named type by directory and name. A name can have
+	// several declarations when build-tagged files declare it differently.
+	decls map[string]map[string][]typeDecl
+}
+
+func (r *assertionResolver) addDecls(file *sourceFile) {
+	for _, decl := range file.ast.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			typeSpec, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			if r.decls[file.dir] == nil {
+				r.decls[file.dir] = map[string][]typeDecl{}
+			}
+			name := typeSpec.Name.Name
+			r.decls[file.dir][name] = append(r.decls[file.dir][name], typeDecl{typeSpec.Type, file})
+		}
+	}
+}
+
+// reach reports the capability typ, as written in file, reaches: by naming a
+// package-agent capability interface, declaring one of its methods, or naming
+// or embedding a type that does. via describes the step that reached it.
+func (r *assertionResolver) reach(typ ast.Expr, file *sourceFile, seen map[ast.Expr]bool) (string, string, bool) {
+	if seen[typ] {
+		return "", "", false
+	}
+	seen[typ] = true
+	if name, ok := agentInterfaceName(typ, file.qualifier, r.interfaces); ok {
+		if _, allowed := nonCapabilityInterfaces[name]; allowed {
+			return "", "", false
+		}
+		return name, "agent." + name, true
+	}
+	switch t := typ.(type) {
+	case *ast.ParenExpr:
+		return r.reach(t.X, file, seen)
+	case *ast.InterfaceType:
+		for _, field := range t.Methods.List {
+			for _, name := range field.Names {
+				if capability, ok := r.methods[name.Name]; ok {
+					return capability, "method " + name.Name, true
+				}
+			}
+			if len(field.Names) == 0 {
+				if capability, via, ok := r.reach(field.Type, file, seen); ok {
+					return capability, via, true
+				}
+			}
+		}
+	case *ast.Ident:
+		return r.reachDecls(file.dir, t.Name, seen)
+	case *ast.SelectorExpr:
+		if pkg, ok := t.X.(*ast.Ident); ok {
+			if dir, ok := file.imports[pkg.Name]; ok {
+				return r.reachDecls(dir, t.Sel.Name, seen)
+			}
+		}
+	}
+	return "", "", false
+}
+
+func (r *assertionResolver) reachDecls(dir, name string, seen map[ast.Expr]bool) (string, string, bool) {
+	for _, decl := range r.decls[dir][name] {
+		if capability, via, ok := r.reach(decl.typ, decl.file, seen); ok {
+			return capability, via, true
+		}
+	}
+	return "", "", false
+}
 
 // helperAdvice tells the developer how to reach capability through its As*
 // helper, including how to add one when the capability has none yet.
@@ -205,60 +317,6 @@ func declaredInterfaces(file *ast.File) map[string]*ast.InterfaceType {
 	}
 	return interfaces
 }
-
-// asInterfaceType returns expr's interface type when it is an interface
-// literal or names an interface declared in the asserting package.
-func asInterfaceType(expr ast.Expr, local map[string]*ast.InterfaceType) *ast.InterfaceType {
-	switch e := expr.(type) {
-	case *ast.InterfaceType:
-		return e
-	case *ast.ParenExpr:
-		return asInterfaceType(e.X, local)
-	case *ast.Ident:
-		return local[e.Name]
-	}
-	return nil
-}
-
-// reachedCapability reports the first capability iface reaches, through a
-// declared method or an embedded interface, and describes how it reaches it.
-func reachedCapability(
-	iface *ast.InterfaceType,
-	qualifier string,
-	interfaces map[string]*ast.InterfaceType,
-	methods map[string]string,
-	resolve func(ast.Expr) *ast.InterfaceType,
-	seen map[*ast.InterfaceType]bool,
-) (string, string, bool) {
-	if seen[iface] {
-		return "", "", false
-	}
-	seen[iface] = true
-	for _, field := range iface.Methods.List {
-		for _, name := range field.Names {
-			if capability, ok := methods[name.Name]; ok {
-				return capability, "method " + name.Name, true
-			}
-		}
-		if len(field.Names) > 0 {
-			continue
-		}
-		if name, ok := agentInterfaceName(field.Type, qualifier, interfaces); ok {
-			if _, allowed := nonCapabilityInterfaces[name]; !allowed {
-				return name, "an embedded " + name, true
-			}
-			continue
-		}
-		if embedded := resolve(field.Type); embedded != nil {
-			if capability, method, ok := reachedCapability(embedded, qualifier, interfaces, methods, resolve, seen); ok {
-				return capability, method, true
-			}
-		}
-	}
-	return "", "", false
-}
-
-const agentImportPath = "github.com/entireio/cli/cmd/entire/cli/agent"
 
 // agentImportName returns the identifier file uses to qualify package agent's
 // names: the import's alias, or "agent" when it is imported plainly. Inside
