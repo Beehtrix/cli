@@ -2,6 +2,7 @@ package httpclient
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/http/httptrace"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -44,9 +46,11 @@ func stalledListener(t *testing.T) string {
 	return l.Addr().String()
 }
 
-func getWithin(t *testing.T, rt http.RoundTripper, rawURL string, limit time.Duration) (*http.Response, error) {
+// getWithin issues a GET that gives up after 5s, so a missing connect budget
+// fails the test instead of hanging it.
+func getWithin(t *testing.T, rt http.RoundTripper, rawURL string) (*http.Response, error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), limit)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	t.Cleanup(cancel)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -65,7 +69,7 @@ func TestConnectTimeoutBoundsStalledProxyConnect(t *testing.T) {
 
 	// Without the budget net/http waits a minute for the CONNECT reply; the 5s
 	// limit turns that into a deadline error instead of ErrConnectTimeout.
-	resp, err := getWithin(t, rt, "https://region.auth.entire.io/", 5*time.Second)
+	resp, err := getWithin(t, rt, "https://region.auth.entire.io/")
 	if err == nil {
 		_ = resp.Body.Close()
 		t.Fatal("request through a stalled proxy succeeded")
@@ -80,7 +84,7 @@ func TestNewTransportBoundsStalledTLSHandshake(t *testing.T) {
 	addr := stalledListener(t)
 
 	start := time.Now()
-	resp, err := getWithin(t, NewTransport(true), "https://"+addr+"/", 5*time.Second)
+	resp, err := getWithin(t, NewTransport(true), "https://"+addr+"/")
 	if err == nil {
 		_ = resp.Body.Close()
 		t.Fatal("request to a stalled TLS server succeeded")
@@ -110,7 +114,7 @@ func TestConnectTimeoutDoesNotLimitResponse(t *testing.T) {
 	t.Cleanup(srv.Close)
 	rt := &connectTimeoutTransport{next: &http.Transport{}, timeout: budget}
 
-	resp, err := getWithin(t, rt, srv.URL, 5*time.Second)
+	resp, err := getWithin(t, rt, srv.URL)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -182,5 +186,82 @@ func TestNewTransportClosesIdleConnections(t *testing.T) {
 	}
 	if got := rt.next.IdleConnTimeout; got != 90*time.Second {
 		t.Fatalf("IdleConnTimeout = %s, want 90s", got)
+	}
+}
+
+// holdAfterFirst passes the first accepted connection through and holds every
+// later one open without serving it, so a redial stalls in the TLS handshake.
+type holdAfterFirst struct {
+	net.Listener
+
+	accepted atomic.Int32
+	held     chan net.Conn
+}
+
+func (l *holdAfterFirst) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if l.accepted.Add(1) == 1 {
+			return c, nil
+		}
+		l.held <- c
+	}
+}
+
+// TestConnectTimeoutCoversRetryAfterDeadReusedConn: when a reused keep-alive
+// connection turns out dead, net/http redials inside the same RoundTrip. That
+// redial must get its own connect budget rather than inherit the stopped one.
+func TestConnectTimeoutCoversRetryAfterDeadReusedConn(t *testing.T) {
+	t.Parallel()
+	var served atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if served.Add(1) == 1 {
+			fmt.Fprint(w, "ok")
+			return
+		}
+		// Second request on the reused conn: hang up before any response
+		// byte, which net/http treats as a dead idle conn and retries.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("ResponseWriter not Hijacker")
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	held := make(chan net.Conn, 8)
+	srv.Listener = &holdAfterFirst{Listener: srv.Listener, held: held}
+	srv.StartTLS()
+	t.Cleanup(func() {
+		srv.Close()
+		close(held)
+		for c := range held {
+			_ = c.Close()
+		}
+	})
+	rt := &connectTimeoutTransport{
+		next:    &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+		timeout: 200 * time.Millisecond,
+	}
+
+	resp, err := getWithin(t, rt, srv.URL)
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body) //nolint:errcheck // drain for reuse
+	_ = resp.Body.Close()
+
+	resp, err = getWithin(t, rt, srv.URL)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("second request succeeded against a stalled redial")
+	}
+	if !errors.Is(err, ErrConnectTimeout) {
+		t.Fatalf("err = %v, want ErrConnectTimeout from the redial", err)
 	}
 }

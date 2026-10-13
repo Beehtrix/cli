@@ -21,8 +21,8 @@ var ErrConnectTimeout = errors.New("connection setup timed out")
 // CONNECT reply, so a blackholed replica would cost a minute per failover
 // attempt instead of the configured budget.
 //
-// The budget stops once a connection is ready (httptrace GotConn), so it never
-// cuts off a slow response or a long pack stream.
+// The budget runs per connection attempt, from httptrace GetConn until GotConn,
+// so it never cuts off a slow response or a long pack stream.
 type connectTimeoutTransport struct {
 	next    *http.Transport
 	timeout time.Duration
@@ -33,6 +33,10 @@ func (t *connectTimeoutTransport) RoundTrip(req *http.Request) (*http.Response, 
 	ctx, cancel := context.WithCancelCause(req.Context())
 	timer := time.AfterFunc(t.timeout, func() { cancel(ErrConnectTimeout) })
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		// GetConn fires for every connection attempt, including the redial
+		// net/http makes inside this RoundTrip when a reused keep-alive
+		// connection turns out dead, so each attempt gets the full budget.
+		GetConn: func(string) { timer.Reset(t.timeout) },
 		GotConn: func(httptrace.GotConnInfo) { timer.Stop() },
 	})
 
