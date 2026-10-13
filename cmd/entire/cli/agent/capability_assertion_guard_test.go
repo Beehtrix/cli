@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"maps"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"slices"
@@ -61,7 +60,10 @@ func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 
 	var files []*sourceFile
 	fset := token.NewFileSet()
-	for _, rel := range productionGoFiles(t, repoRoot) {
+	for _, rel := range testutil.GuardGoFiles(t, repoRoot) {
+		if strings.HasSuffix(rel, "_test.go") {
+			continue
+		}
 		src, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(rel)))
 		if errors.Is(err, fs.ErrNotExist) {
 			// A tracked file deleted from the working tree or excluded by a
@@ -453,32 +455,6 @@ func assertedTypes(node ast.Node) []ast.Expr {
 		return true
 	})
 	return types
-}
-
-// productionGoFiles lists the repository's tracked and untracked Go files
-// outside _test.go, slash-separated relative to repoRoot, with the same
-// isolation as testutil.GitGrepGuard. -z keeps non-ASCII paths unquoted, since
-// GuardGitEnv drops the caller's core.quotePath setting.
-func productionGoFiles(t *testing.T, repoRoot string) []string {
-	t.Helper()
-
-	cmd := exec.Command("git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.go") //nolint:noctx // guard test, no cancellation needed
-	cmd.Dir = repoRoot
-	cmd.Env = testutil.GuardGitEnv()
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("git ls-files: %v", err)
-	}
-	var files []string
-	for name := range strings.SplitSeq(string(out), "\x00") {
-		if name != "" && !strings.HasSuffix(name, "_test.go") {
-			files = append(files, name)
-		}
-	}
-	if len(files) == 0 {
-		t.Fatal("git ls-files found no Go files — the guard's file discovery has gone stale")
-	}
-	return files
 }
 
 // agentPackageDecls returns the interfaces declared in the production files of

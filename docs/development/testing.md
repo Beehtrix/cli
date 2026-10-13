@@ -246,8 +246,10 @@ invariants the compiler cannot. Examples include `TestRootBasesAreTrusted` (root
 `TestGitStatusCallSitesPassNoOptionalLocks`, and
 `TestAllHookConfigRelPaths_CoversEveryWorktreeConfigAgent`.
 
-**Grep-based guards go through `testutil.GitGrepGuard`, which owns three flags.** Each was
-missing from at least one guard, and the same one was missing from three:
+**Guards discover files through testutil's guard helpers: `GitGrepGuard` for
+grep-based guards and `GuardGoFiles` for guards that list files to parse.**
+They own the protections below. Each was missing from at least one hand-written
+guard call, and the same one was missing from three:
 
 - `--untracked`. `git grep` searches the INDEX. Every one of these guards has
   "someone just added a file" as its subject, so the file it most needs to see is
@@ -277,20 +279,8 @@ Two rules for writing one:
   forever. `GitGrepGuard` does this itself; the `checked == 0` tallies are the
   second half of the same idea.
 
-The one exception is `TestCapabilitiesAreOnlyReachedThroughHelpers`, which must
-see type assertions under any import alias and type-switch cases that wrap
-across lines, so it parses files instead of grepping them. It lists files with
-`git ls-files -z --cached --others` and `testutil.GuardGitEnv()`, which keeps
-the same untracked-file and repo-selector protections, restricts the pathspec
-to `*.go`, and fails when no scanned file outside package `agent` imports it.
-It counts importing files rather than matched assertions, so removing the last
-allowed assertion does not look like broken detection, and separately fails
-when it finds no type assertions at all. An asserted type is followed through
-aliases, defined types, generic instantiations, interface literals, interfaces
-declared inside the asserting function or in any repository package, and dot
-imports, and is flagged when it reaches a capability interface or one of its
-methods. A tracked file missing from the working tree
-is skipped, and any other read error fails the guard.
+Guards that parse files instead of grepping them list them with
+`testutil.GuardGoFiles`.
 
 ### Code Duplication Prevention
 
