@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"github.com/entireio/cli/cmd/entire/cli/proclive"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -41,7 +43,10 @@ func TestSaveAttachSessionState_KeepsTokenOffsetMovedMeanwhile(t *testing.T) {
 		// phaseOnDisk is the session's phase on disk; empty means running.
 		phaseOnDisk session.Phase
 		// quietFor is how long the session has had no interaction.
-		quietFor      time.Duration
+		quietFor time.Duration
+		// owner is the session's recorded agent process; "" records none,
+		// "dead" an exited one and "alive" this test process.
+		owner         string
 		wantStart     int
 		wantPendingOK bool
 		wantTotal     int
@@ -53,6 +58,9 @@ func TestSaveAttachSessionState_KeepsTokenOffsetMovedMeanwhile(t *testing.T) {
 		{name: "condensed in place", hookMovedTo: 2, pendingOnDisk: 3, checkpointOnDisk: id.MustCheckpointID("b1b2c3d4e5f6"), wantStart: 2, wantPendingOK: true, wantTotal: 12},
 		// No Stop will come for these, so attach takes the whole-transcript total.
 		{name: "stuck running session", hookMovedTo: 2, pendingOnDisk: 3, quietFor: 2 * session.StuckActiveThreshold, wantStart: 4, wantTotal: 9},
+		{name: "exited agent", hookMovedTo: 2, pendingOnDisk: 3, owner: "dead", wantStart: 4, wantTotal: 9},
+		// A live agent's long turn still ends in a Stop, however quiet.
+		{name: "quiet live agent", hookMovedTo: 2, pendingOnDisk: 3, quietFor: 2 * session.StuckActiveThreshold, owner: "alive", wantStart: 4, wantTotal: 12},
 		{name: "idle session", hookMovedTo: 2, pendingOnDisk: 3, phaseOnDisk: session.PhaseIdle, wantStart: 4, wantTotal: 9},
 		{name: "no earlier state", hookMovedTo: -1, wantStart: 4, wantTotal: 9},
 	} {
@@ -80,6 +88,16 @@ func TestSaveAttachSessionState_KeepsTokenOffsetMovedMeanwhile(t *testing.T) {
 				TokenUsage:           &agent.TokenUsage{OutputTokens: 12, SubagentTokens: &agent.TokenUsage{OutputTokens: 1}},
 				CheckpointTokenUsage: &agent.TokenUsage{OutputTokens: tc.pendingOnDisk},
 				LastCheckpointID:     tc.checkpointOnDisk,
+			}
+			switch tc.owner {
+			case "dead":
+				onDisk.Owner = &proclive.Identity{PID: os.Getpid(), Start: "bogus-start-fingerprint"}
+			case "alive":
+				owner, ok := proclive.ResolveOwner()
+				if !ok {
+					continue // no stable process owner resolvable in this environment
+				}
+				onDisk.Owner = &owner
 			}
 			onDisk.SetTokenStart(tc.hookMovedTo)
 			require.NoError(t, store.Save(ctx, onDisk))

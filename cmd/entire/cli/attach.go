@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/entireio/cli/cmd/entire/cli/proclive"
 	"io"
 	"log/slog"
 	"os"
@@ -1409,8 +1410,12 @@ func saveAttachSessionState(ctx context.Context, repo *git.Repository, existingS
 	pendingOnDisk := state.CheckpointTokenUsage
 	lastCheckpointOnDisk := state.LastCheckpointID
 	// Read before LastInteractionTime is refreshed below: a running session
-	// whose agent exited or went quiet will send no Stop for its turn.
-	noStopComing := state.OwnerExited() || state.IsStuckActive()
+	// whose agent exited will send no Stop for its turn. Inactivity stands in
+	// for that only when the owner's liveness can't be checked, since a live
+	// agent's long turn still ends in a Stop.
+	ownerLiveness := state.OwnerLiveness()
+	noStopComing := ownerLiveness == proclive.LivenessDead ||
+		(ownerLiveness == proclive.LivenessUnknown && state.IsStuckActive())
 
 	// Populate BaseCommit from HEAD if not already set, so the session becomes
 	// active and future commits in the same session receive Entire-Checkpoint trailers.
