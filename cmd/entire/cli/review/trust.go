@@ -385,7 +385,7 @@ func (g trustGate) run(ctx context.Context, errOut io.Writer) error {
 	// Agents can hold a PTY, so they never get the confirm. No terminal gets the
 	// same text, so an undetected agent isn't invited to approve itself.
 	if g.AgentCaller != "" || !g.Interactive || g.Confirm == nil {
-		printTrustRefusal(errOut, what, g.Inventory.Isolated, g.Command, g.Subject.HeadSHA)
+		printTrustRefusal(errOut, what, g.Inventory, g.Command, g.Subject.HeadSHA)
 		return errTrustRefused
 	}
 	title, description := trustConfirmText(g.Subject, g.Inventory, g.Command)
@@ -400,11 +400,12 @@ func (g trustGate) run(ctx context.Context, errOut io.Writer) error {
 	return nil
 }
 
-func printTrustRefusal(errOut io.Writer, what string, isolated bool, command, head string) {
+func printTrustRefusal(errOut io.Writer, what string, inv TrustInventory, command, head string) {
+	isolated := inv.Isolated
 	fmt.Fprintln(errOut, "Not run: this review needs the user's approval.")
 	switch {
 	case isolated && what != trustWhatNothing:
-		fmt.Fprintf(errOut, "The code is by someone else; the review agent uses the profile's config but would still load the branch's skills and commands, and Pi's settings (%s --show-config lists them).\n", command)
+		fmt.Fprintf(errOut, "The code is by someone else; the review agent uses the profile's config but would still load the branch's skills and commands%s (%s --show-config lists them).\n", inv.piSettingsNote(", and Pi's settings"), command)
 	case what == trustWhatNothing:
 		fmt.Fprintf(errOut, "The code is by someone else (%s --show-config shows what the review reads).\n", command)
 	default:
@@ -441,7 +442,7 @@ func trustConfirmText(subject TrustSubject, inv TrustInventory, command string) 
 		return title, b.String()
 	case inv.Isolated:
 		title = "Load this branch's skills during the review?"
-		b.WriteString("The review agent uses your profile's config, so this branch's hooks, MCP servers and extensions are not loaded. It still loads this branch's skills and commands (and Pi settings), which can run commands:\n")
+		b.WriteString("The review agent uses your profile's config, so this branch's hooks, MCP servers and extensions are not loaded. It still loads this branch's skills and commands" + inv.piSettingsNote(" (and Pi settings)") + ", which can run commands:\n")
 	case inv.onlyEntireHooks():
 		title = "Run this branch's hooks during the review?"
 		b.WriteString("The review agent loads this branch's hooks. These run on your machine:\n")
@@ -628,4 +629,13 @@ func printTrustConfig(out io.Writer, subject TrustSubject, inv TrustInventory, a
 		fmt.Fprintf(out, "Instructions the reviewer reads: %s\n", strings.Join(inv.Instructions, ", "))
 	}
 	return nil
+}
+
+// piSettingsNote returns note when an isolated Pi reviewer runs: Pi still
+// loads the branch's .pi/settings.json, the other agents load no settings.
+func (inv TrustInventory) piSettingsNote(note string) string {
+	if slices.Contains(inv.IsolatedAgents, "pi") {
+		return note
+	}
+	return ""
 }

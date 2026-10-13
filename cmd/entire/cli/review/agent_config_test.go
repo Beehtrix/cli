@@ -137,8 +137,12 @@ func TestTrustConfirmTextForProfileConfig(t *testing.T) {
 		{Agent: "claude-code", Kind: TrustKindSkill, Name: "review", Command: ".claude/skills/review", Source: ".claude/skills"},
 	}}
 	title, body := trustConfirmText(subject, inv, "x")
-	if title != "Load this branch's skills during the review?" || !strings.Contains(body, "uses your profile's config") {
+	if title != "Load this branch's skills during the review?" || !strings.Contains(body, "uses your profile's config") || strings.Contains(body, "Pi") {
 		t.Fatalf("title/body = %q / %q", title, body)
+	}
+	inv.IsolatedAgents = []string{"claude-code", "pi"}
+	if _, body := trustConfirmText(subject, inv, "x"); !strings.Contains(body, "Pi settings") {
+		t.Errorf("isolated Pi reviewer, body doesn't mention Pi settings: %q", body)
 	}
 	if title, body := trustConfirmText(subject, TrustInventory{Isolated: true}, "x"); title != "Review this branch?" || !strings.Contains(body, "uses your profile's config") || strings.Contains(body, "nothing from it runs") {
 		t.Fatalf("empty isolated title/body = %q / %q", title, body)
