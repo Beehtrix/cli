@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 )
 
 const (
@@ -22,7 +23,9 @@ var (
 	// ErrInsecureRedirect identifies a redirect that would leave HTTPS.
 	ErrInsecureRedirect = fmt.Errorf("%w: refusing redirect from HTTPS to an insecure scheme", ErrRedirectPolicy)
 	// ErrTooManyRedirects identifies a redirect chain exceeding the hop limit.
-	ErrTooManyRedirects = fmt.Errorf("%w: stopped after %d redirects", ErrRedirectPolicy, maxRedirects)
+	// A loop is an availability failure, not a security rejection, so it does
+	// not match ErrRequestPolicy: callers treat it like any other node failure.
+	ErrTooManyRedirects = errors.New("stopped after " + strconv.Itoa(maxRedirects) + " redirects")
 )
 
 // CheckSecureRedirect is a CheckRedirect policy that limits redirect chains and

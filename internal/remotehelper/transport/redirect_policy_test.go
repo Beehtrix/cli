@@ -78,11 +78,14 @@ func TestProxy_PolicyRejectionTriesRemainingReplicas(t *testing.T) {
 func TestProxy_RedirectRejectionPreservesReplicaHealth(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name       string
-		cold, loop bool
+		name      string
+		cold      bool
+		wantCalls int
 	}{
-		{"warm downgrade", false, false}, {"cold downgrade", true, false},
-		{"warm redirect loop", false, true}, {"cold redirect loop", true, true},
+		// Warm: the cached node is refused, then the entry URL re-advertises it
+		// and it is refused again. Neither path follows the server's Location.
+		{"warm downgrade", false, 3},
+		{"cold downgrade", true, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -99,9 +102,6 @@ func TestProxy_RedirectRejectionPreservesReplicaHealth(t *testing.T) {
 				calls++
 				h := make(http.Header)
 				h.Set("Location", "http://n.cluster.example/repo")
-				if tc.loop {
-					h.Set("Location", node+"/repo")
-				}
 				if req.URL.Host == "cluster.example" {
 					h.Set("X-Entire-Replicas", node)
 					h.Set("Location", node+"/repo")
@@ -111,21 +111,59 @@ func TestProxy_RedirectRejectionPreservesReplicaHealth(t *testing.T) {
 			p.client.Transport = rt
 			p.discoveryTransport = rt
 			_, err := p.InfoRefs(t.Context(), "git-upload-pack")
-			wantErr := httpclient.ErrInsecureRedirect
-			if tc.loop {
-				wantErr = httpclient.ErrTooManyRedirects
-			}
-			require.ErrorIs(t, err, wantErr)
+			require.ErrorIs(t, err, httpclient.ErrInsecureRedirect)
 			require.Empty(t, failed, "policy failures must not invoke the production cache-invalidation hook")
 			require.Equal(t, []string{node}, p.nodes)
-			wantCalls := 1
-			if tc.loop {
-				wantCalls = 10
-			}
-			if tc.cold {
-				wantCalls++
-			}
-			require.Equal(t, wantCalls, calls, "policy failures must not trigger entry/Location fallback")
+			require.Equal(t, tc.wantCalls, calls, "a policy failure must not trigger the Location fallback")
+		})
+	}
+}
+
+// A misbehaving cached replica must not block fetches until the replica cache
+// expires: the warm path falls back to the entry URL, including after a policy
+// rejection, and a redirect loop is an ordinary node failure.
+func TestProxy_WarmPathFailureFallsBackToEntry(t *testing.T) {
+	t.Parallel()
+	const entry = "https://cluster.example"
+	const looping = "https://loop.cluster.example"
+	const downgrading = "https://down.cluster.example"
+	const unavailable = "https://five.cluster.example"
+	for _, tc := range []struct {
+		name       string
+		nodes      []string
+		wantFailed []string
+	}{
+		{"redirect loop", []string{looping}, []string{looping}},
+		{"downgrade and unavailable replica", []string{downgrading, unavailable}, []string{unavailable}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var failed []string
+			p := New(Config{Nodes: replicas.NodeConfig{EntryURL: entry, ClusterHost: "cluster.example", InitialNodes: tc.nodes}, OnNodeFailed: func(node string) { failed = append(failed, node) }})
+			entryHits := 0
+			rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				h := make(http.Header)
+				status := http.StatusTemporaryRedirect
+				switch req.URL.Scheme + "://" + req.URL.Host {
+				case entry:
+					entryHits++
+					status = http.StatusOK
+				case looping:
+					h.Set("Location", looping+"/repo")
+				case downgrading:
+					h.Set("Location", "http://down.cluster.example/repo")
+				default:
+					status = http.StatusServiceUnavailable
+				}
+				return &http.Response{StatusCode: status, Header: h, Body: io.NopCloser(strings.NewReader("refs")), Request: req}, nil
+			})
+			p.client.Transport = rt
+			p.discoveryTransport = rt
+			body, err := p.InfoRefs(t.Context(), "git-upload-pack")
+			require.NoError(t, err)
+			require.NoError(t, body.Close())
+			require.Equal(t, 1, entryHits)
+			require.Equal(t, tc.wantFailed, failed)
 		})
 	}
 }

@@ -60,7 +60,11 @@ func (p *Proxy) infoRefs(ctx context.Context, label, suffix string, setHeaders f
 		if err == nil {
 			return p.handleInfoRefsResponse(resp)
 		}
-		if p.entryURL == "" || errors.Is(err, httpclient.ErrRequestPolicy) {
+		// Fall back even after a policy rejection: the entry URL is HTTPS,
+		// derived from the user's remote, and every hop from it passes the
+		// same redirect policy. Refusing would pin a stale cached replica
+		// until the cache expires.
+		if p.entryURL == "" {
 			return nil, fmt.Errorf("fetching %s: %w", label, err)
 		}
 		warmErr = err
