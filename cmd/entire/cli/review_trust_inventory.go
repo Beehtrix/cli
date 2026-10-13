@@ -96,16 +96,15 @@ func inspectReviewTrust(ctx context.Context, source cliReview.TrustSource, agent
 
 func buildTrustInventory(files trustFiles, agents []cliReview.TrustAgent) (cliReview.TrustInventory, error) {
 	var inv cliReview.TrustInventory
-	inv.Isolated = len(agents) > 0
+	// Isolated holds when every agent that runs is isolated; agents with no
+	// reviewer runner don't count either way.
+	inv.Isolated = true
+	ran := false
 	for _, a := range agents {
 		var (
 			entries []cliReview.TrustEntry
 			err     error
 		)
-		inv.Isolated = inv.Isolated && a.Isolated
-		if a.Isolated {
-			inv.IsolatedAgents = append(inv.IsolatedAgents, a.Name)
-		}
 		switch {
 		case a.Name == string(agent.AgentNameClaudeCode) && a.Isolated:
 			// The profile's config replaces the checkout's settings and MCP
@@ -135,6 +134,11 @@ func buildTrustInventory(files trustFiles, agents []cliReview.TrustAgent) (cliRe
 		if err != nil {
 			return cliReview.TrustInventory{}, err
 		}
+		ran = true
+		inv.Isolated = inv.Isolated && a.Isolated
+		if a.Isolated {
+			inv.IsolatedAgents = append(inv.IsolatedAgents, a.Name)
+		}
 		// Name-based hiding misses secrets in positional arguments, hook
 		// commands, and innocuously named keys, so everything displayed also
 		// goes through content-based redaction, which replaces only the
@@ -145,6 +149,7 @@ func buildTrustInventory(files trustFiles, agents []cliReview.TrustAgent) (cliRe
 		}
 		inv.Entries = append(inv.Entries, entries...)
 	}
+	inv.Isolated = inv.Isolated && ran
 	for _, rel := range []string{trustClaudeMD, "CLAUDE.local.md", ".claude/" + trustClaudeMD, trustAgentsMD, "AGENTS.override.md"} {
 		k, err := files.kind(rel)
 		if err != nil {

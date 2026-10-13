@@ -516,7 +516,8 @@ func TestTrustInventory_IsolatedAgentsListOnlyWhatStillLoads(t *testing.T) {
 		".pi/settings.json":              `{"packages":["npm:evil"]}`,
 	})
 	head := gitOutputInDir(t, dir, "rev-parse", "HEAD")
-	agents := []cliReview.TrustAgent{{Name: "claude-code", Isolated: true}, {Name: "pi", Isolated: true}}
+	// cursor has no reviewer runner, so it doesn't count against isolation.
+	agents := []cliReview.TrustAgent{{Name: "claude-code", Isolated: true}, {Name: "pi", Isolated: true}, {Name: "cursor"}}
 	inv, err := inspectReviewTrust(t.Context(), cliReview.TrustSource{RepoRoot: dir, Commit: head}, agents)
 	if err != nil {
 		t.Fatal(err)
