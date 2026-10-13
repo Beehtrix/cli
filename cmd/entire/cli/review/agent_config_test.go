@@ -35,6 +35,8 @@ func TestValidateAgentConfig(t *testing.T) {
 		{"project dir variable", "claude-code", reviewtypes.AgentConfig{Settings: hook(`$CLAUDE_PROJECT_DIR/x.sh`)}, "project directory"},
 		{"project launcher", "claude-code", reviewtypes.AgentConfig{Settings: hook("npx some-tool")}, "resolves tools from the reviewed project"},
 		{"argument into checkout", "claude-code", reviewtypes.AgentConfig{Settings: hook("/usr/bin/node ./tools/x.js")}, "relative path"},
+		{"statusLine into checkout", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`{"statusLine":{"type":"command","command":"/repo/bin/status"}}`)}, "inside a checkout"},
+		{"fileSuggestion relative", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`{"fileSuggestion":{"type":"command","command":"./suggest.sh"}}`)}, "relative path"},
 		{"apiKeyHelper relative", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`{"apiKeyHelper":"bin/key"}`)}, "relative path"},
 		{"chained command", "claude-code", reviewtypes.AgentConfig{Settings: hook("/usr/bin/true; node_modules/.bin/x")}, "shell syntax"},
 		{"and-chained launcher", "claude-code", reviewtypes.AgentConfig{Settings: hook("/usr/bin/true && npx x")}, "shell syntax"},

@@ -160,6 +160,18 @@ func validateClaudeSettings(raw json.RawMessage, forbiddenRoots []string) error 
 			}
 		}
 	}
+	// Settings such as statusLine and fileSuggestion run {"command": ...};
+	// any top-level object with a command is checked, so new ones are too.
+	for _, key := range sortedStringKeys(settingsObj) {
+		var obj struct {
+			Command string `json:"command"`
+		}
+		if json.Unmarshal(settingsObj[key], &obj) == nil && obj.Command != "" {
+			if err := validateCommand(obj.Command, forbiddenRoots); err != nil {
+				return fmt.Errorf("settings %s: %w", key, err)
+			}
+		}
+	}
 	var events map[string][]struct {
 		Hooks []struct {
 			Command string `json:"command"`
