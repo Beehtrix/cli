@@ -239,7 +239,7 @@ func TestRepoMirrorDetach_DryRun(t *testing.T) {
 	assert.Contains(t, stdout, "single-placement")
 	assert.NotContains(t, stdout, "01TEAM")
 	assert.NotContains(t, stdout, "01ALICE")
-	assert.Contains(t, stdout, "Eligible. After the detach, only the target project grants access.")
+	assert.Contains(t, stdout, "Eligible. After the detach, only the target project grants member access.")
 }
 
 // --json on a dry run is the wire plan, so a script reads `eligible` and the
@@ -379,7 +379,7 @@ func TestRenderDetachResult_Stalled(t *testing.T) {
 func TestDetachConfirmTitle(t *testing.T) {
 	t.Parallel()
 	ref := mirrorRepoRef{forge: mirrorCloneForge, owner: "o", repo: "r"}
-	assert.Equal(t, "Detach /gh/o/r into /et/p/r? Writes freeze until the rewire finishes, and afterwards only the target project grants access.",
+	assert.Equal(t, "Detach /gh/o/r into /et/p/r? Writes freeze until the rewire finishes, and afterwards only the target project grants member access.",
 		detachConfirmTitle(ref, "/et/p/r"))
 }
 
@@ -480,7 +480,7 @@ func TestDetachConfirmed_PlanFollowsThePrompt(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, proceed)
 	assert.Contains(t, terminal.String(), "single-placement", "the plan is shown where the question is asked")
-	assert.Contains(t, terminal.String(), "afterwards only the target project grants access")
+	assert.Contains(t, terminal.String(), "afterwards only the target project grants member access")
 	assert.Empty(t, stdout.String())
 }
 

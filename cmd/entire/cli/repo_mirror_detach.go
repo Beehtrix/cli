@@ -43,9 +43,10 @@ func newRepoMirrorDetachCmd() *cobra.Command {
 			"and the GitHub repository itself stays live and is no longer synced.\n\n" +
 			"Every run first asks the server for a plan: each precondition the " +
 			"detach needs. --dry-run prints the plan and changes nothing.\n\n" +
-			"After the detach, only the --into project grants access to the " +
+			"After the detach, only the --into project grants member access to the " +
 			"repository: access through GitHub and grants on the mirror are removed. " +
-			"Add everyone who still needs access to the project first.\n\n" +
+			"Add everyone who still needs access to the project first. A public " +
+			"repository stays public.\n\n" +
 			"A real detach freezes writes, waits for the mirror to match GitHub, " +
 			"and rewires the repository. It asks for confirmation first; pass " +
 			"--yes to skip it, which a non-interactive run must. When the rewire " +
@@ -346,7 +347,7 @@ var detachConfirmed = func(cmd *cobra.Command, ref mirrorRepoRef, target string,
 }
 
 func detachConfirmTitle(ref mirrorRepoRef, target string) string {
-	return fmt.Sprintf("Detach %s into %s? Writes freeze until the rewire finishes, and afterwards only the target project grants access.", ref.qualified(), target)
+	return fmt.Sprintf("Detach %s into %s? Writes freeze until the rewire finishes, and afterwards only the target project grants member access.", ref.qualified(), target)
 }
 
 func failedDetachPreconditions(plan *coreapi.DetachRepoResult) []string {
@@ -377,7 +378,7 @@ func writeDetachPlan(w io.Writer, ref mirrorRepoRef, target string, plan *coreap
 	}
 	fmt.Fprintln(w)
 	if plan.Eligible {
-		fmt.Fprintln(w, "Eligible. After the detach, only the target project grants access.")
+		fmt.Fprintln(w, "Eligible. After the detach, only the target project grants member access.")
 		return nil
 	}
 	failed := failedDetachPreconditions(plan)
