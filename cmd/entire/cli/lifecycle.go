@@ -146,6 +146,31 @@ func DispatchLifecycleEvent(ctx context.Context, ag agent.Agent, event *agent.Ev
 const retiredDenyRuleWarning = "\n  A retired Entire permission rule in this repo is causing repeated" +
 	"\n  approval prompts. Run 'entire doctor' to remove it."
 
+// hookDriftIsReliable reports whether an agent's drift check is safe to raise
+// in-session. Claude Code's check is positive — a hook this CLI needs is
+// missing — so it holds for every teammate. OpenCode, Pi and Copilot compare
+// the whole generated file, so a teammate on an older or newer CLI reads as
+// outdated; status and doctor still report those, the banner does not.
+func hookDriftIsReliable(name types.AgentName) bool {
+	return name == agent.AgentNameClaudeCode
+}
+
+// outdatedHooksBannerSuffix is appended to the session-start banner when this
+// agent's Entire hooks in the repo are out of date, so the features a newer CLI
+// added hooks for silently record nothing. Like retiredDenyRuleWarning, it
+// reports and points at the fix; it never rewrites the tracked config.
+func outdatedHooksBannerSuffix(ctx context.Context, ag agent.Agent) string {
+	if !hookDriftIsReliable(ag.Name()) {
+		return ""
+	}
+	hf, ok := agent.AsHookFreshness(ag)
+	if !ok || hf.CheckHookConfig(ctx) != agent.HooksOutdated {
+		return ""
+	}
+	return fmt.Sprintf("\n  Entire's %s hooks in this repo are out of date, so some activity isn't recorded."+
+		"\n  Run '%s' to update them.", ag.Type(), refreshAgentHooksCommand(ag.Name()))
+}
+
 // handleLifecycleSessionStart handles session start: shows banner, checks concurrent sessions,
 // fires state machine transition.
 func handleLifecycleSessionStart(ctx context.Context, ag agent.Agent, event *agent.Event) error {
@@ -231,6 +256,10 @@ func handleLifecycleSessionStart(ctx context.Context, ag agent.Agent, event *age
 	if agent.HasRetiredMetadataDenyRule(ctx, ag) {
 		message += retiredDenyRuleWarning
 	}
+	// A CLI upgrade never rewrites the repo's agent config, so hooks it added
+	// stay missing until the user refreshes them. A second small settings read
+	// per SessionStart; shown once per session via ClaimSessionStartBanner.
+	message += outdatedHooksBannerSuffix(ctx, ag)
 
 	// Output informational message if the agent supports hook responses.
 	// Claude Code reads JSON from stdout; agents that don't implement

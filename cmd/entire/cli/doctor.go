@@ -63,7 +63,7 @@ Checks performed:
   4. Hook config: warn when the installed hooks no longer match what this
      CLI writes (e.g. an older release wrote Claude Code tool matchers that
      no longer fire, or a committed Pi/OpenCode extension has gone stale).
-     Fix by re-running 'entire enable --force'.
+     Fix by running 'entire agent add <agent> --force'.
 
   5. Retired Gemini CLI hooks: remove Entire hook entries left in
      .gemini/settings.json. Gemini CLI support was removed; the entries now do
@@ -1330,8 +1330,8 @@ func checkLogSink(cmd *cobra.Command) {
 // checkHookDrift warns when an installed agent's Entire hook config is out of
 // date — an older release wrote Claude Code tool matchers that no longer fire,
 // or a repo committed a Pi/OpenCode extension that the template has since moved
-// past. Read-only; the fix is `entire enable --force`. Stays silent for agents
-// that aren't installed here or don't implement a drift check.
+// past. Read-only; the fix is `entire agent add <agent> --force`. Stays silent
+// for agents that aren't installed here or don't implement a drift check.
 func checkHookDrift(cmd *cobra.Command) {
 	ctx := cmd.Context()
 	w := cmd.OutOrStdout()
@@ -1357,7 +1357,7 @@ func checkHookDrift(cmd *cobra.Command) {
 			fmt.Fprintf(w, "%s hooks: OUT OF DATE\n", displayName)
 			fmt.Fprintln(w, "  The installed hook config no longer matches what this CLI writes,")
 			fmt.Fprintln(w, "  so some or all hooks may silently not fire.")
-			fmt.Fprintln(w, "  Run `entire enable --force` to update it.")
+			fmt.Fprintf(w, "  Run `%s` to update it.\n", refreshAgentHooksCommand(name))
 		}
 	}
 }
@@ -1617,7 +1617,7 @@ func checkCodexHookTrust(cmd *cobra.Command) {
 		if diagnostics.PathsDiffer() {
 			writeCodexPrimaryCheckoutRemedy(w)
 		} else {
-			fmt.Fprintln(w, "  Run `entire enable --force` from this worktree to refresh it.")
+			fmt.Fprintf(w, "  Run `%s` from this worktree to refresh it.\n", refreshAgentHooksCommand(agent.AgentNameCodex))
 		}
 	case codexHookStateTrustReview:
 		writeCodexInstalledAndTrust(w, diagnostics)
@@ -1779,7 +1779,7 @@ func writeCodexWorktreeInspectionWarning(w io.Writer, worktreePath string, state
 		fmt.Fprintf(w, "  Current-worktree hooks: %s\n", worktreePath)
 	}
 	fmt.Fprintf(w, "  Error: %v\n", err)
-	fmt.Fprintln(w, "  Fix the current-worktree .codex path or hooks.json file, then run `entire enable --force`.")
+	fmt.Fprintf(w, "  Fix the current-worktree .codex path or hooks.json file, then run `%s`.\n", refreshAgentHooksCommand(agent.AgentNameCodex))
 	fmt.Fprintln(w, "  This may not be the file Codex reads. If Codex discovers another project root, apply/merge the generated .codex/hooks.json change there too.")
 	fmt.Fprintln(w, "  .codex/hooks.json is tracked — commit it and make sure the discovered project root has it too.")
 }

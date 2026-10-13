@@ -48,7 +48,8 @@ const (
 //
 // Configs written by older CLI versions used the outdated matchers "Task" and
 // "TodoWrite", where the hooks silently never fired. Those are not rewritten in
-// place on a normal `entire enable`; run with --force to strip and reinstall.
+// place on a normal `entire enable`; run `entire agent add claude-code --force`
+// to strip and reinstall.
 const (
 	subagentToolMatcher = "Agent"
 	// skillToolMatcher routes Skill calls to post-task, which records the agent
@@ -561,7 +562,7 @@ const (
 	// HooksCurrent means the installed hooks match the current config.
 	HooksCurrent = agent.HooksCurrent
 	// HooksOutdated means the installed hooks are stale.
-	// Fix: `entire enable --force`.
+	// Fix: `entire agent add claude-code --force`.
 	HooksOutdated = agent.HooksOutdated
 )
 

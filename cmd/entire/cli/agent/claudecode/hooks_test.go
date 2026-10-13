@@ -1159,7 +1159,7 @@ func TestInstallHooks_SubagentStop_UpgradeInPlace(t *testing.T) {
 // TestCheckHookConfig_Outdated_MissingTurnHook pins CheckHookConfig's drift
 // detection for hooks added after the first install: a config that predates
 // SubagentStart, SubagentStop or StopFailure (everything else current) must read as outdated
-// so `entire doctor`/`entire enable --force` picks it up, not silently stay
+// so `entire doctor`/`entire agent add claude-code --force` picks it up, not silently stay
 // HooksCurrent forever.
 func TestCheckHookConfig_Outdated_MissingTurnHook(t *testing.T) {
 	for _, hookType := range []string{"SubagentStart", "SubagentStop", "StopFailure"} {

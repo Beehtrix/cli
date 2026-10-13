@@ -409,9 +409,6 @@ entire enable --agent claude-code
 # Re-enable a disabled repo
 entire enable
 
-# Re-enable and refresh hooks
-entire enable --force
-
 # Save settings locally (not committed to git)
 entire enable --local
 ```
@@ -452,6 +449,7 @@ Adding or removing an agent lives under `entire agent`:
 
 ```bash
 entire agent add claude-code
+entire agent add claude-code --force  # refresh outdated hooks after a CLI upgrade
 entire agent remove claude-code
 ```
 
@@ -696,7 +694,7 @@ entire clean --force
 entire clean --all --force
 
 # Disable and re-enable
-entire disable && entire enable --force
+entire disable && entire enable
 ```
 
 ### Accessibility

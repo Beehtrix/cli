@@ -45,6 +45,7 @@ Every agent must implement all 19 methods on the `Agent` interface:
 | Interface | Methods | When to implement |
 |-----------|---------|-------------------|
 | `HookSupport` | `InstallHooks`, `UninstallHooks`, `AreHooksInstalled` | Agent uses a config file for hook registration (e.g., `settings.json`) |
+| `HookFreshness` | `CheckHookConfig` | Agent can tell whether its installed hook config still matches what this CLI writes (read-only). `entire status` and `entire doctor` report drift; Claude Code, whose check is a positive "required hook missing" test, also gets a SessionStart banner warning. Exact-match checks (OpenCode, Pi, Copilot) stay out of the banner because teammates on other CLI versions would read as outdated. The printed remedy is `entire agent add <agent> --force`. |
 | `HookHandler` | `GetHookNames` | **Required for CLI hook registration** — `entire hooks <agent> <verb>` subcommands are only created for agents implementing this interface. Typically delegates to `HookNames()`. |
 | `TranscriptAnalyzer` | `GetTranscriptPosition`, `ExtractModifiedFilesFromOffset` | You want richer checkpoints with transcript-derived file lists |
 | `TranscriptPreparer` | `PrepareTranscript` | Agent writes transcripts asynchronously and needs a flush/sync step |

@@ -249,7 +249,7 @@ func formatSettingsStatusShort(ctx context.Context, s *EntireSettings, sty statu
 			}
 			b.WriteString("\n")
 			b.WriteString(sty.render(sty.yellow, "  ! "+string(ag.Type())+" hooks out of date"))
-			b.WriteString(sty.render(sty.dim, " · run 'entire enable --force'"))
+			b.WriteString(sty.render(sty.dim, " · run '"+refreshAgentHooksCommand(name)+"'"))
 		}
 		if warning := codexStatusWarning(inspectCodexHookIssue(ctx)); warning != "" {
 			b.WriteString("\n")
@@ -1103,7 +1103,7 @@ type statusJSON struct {
 	// success path (mirrors writeAgentHelpHint, which only renders when set up).
 	AgentHelp string `json:"agent_help,omitempty"`
 	// HooksOutdated lists agents whose installed hook config is out of date and
-	// should be refreshed with `entire enable --force`.
+	// should be refreshed with `entire agent add <agent> --force`.
 	HooksOutdated []string `json:"hooks_outdated,omitempty"`
 	// LegacyShadowBranches counts the strict-shape entire/<commit>-<worktree>
 	// shadow branches older versions left behind; `entire doctor` reports and
