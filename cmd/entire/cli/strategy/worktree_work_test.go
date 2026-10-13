@@ -153,3 +153,27 @@ func TestPrepareCommitMsg_SessionFromAnotherWorktreeNeedsItsFiles(t *testing.T) 
 	assert.NotContains(t, commit("other.go"), "Entire-Checkpoint", "a commit without the session's files in this worktree must not link it")
 	assert.Contains(t, commit("a.go"), "Entire-Checkpoint", "a commit of the session's file in this worktree should link it")
 }
+
+// An ACTIVE session linked only by its record of a worktree isn't stamped on
+// the no-TTY fast path by a commit there that lacks its files: a script or GUI
+// client committing in that worktree mid-turn must not take its trailer.
+func TestFastPath_SessionFromAnotherWorktreeNeedsItsFiles(t *testing.T) {
+	mainDir, linkedDir := twoWorktrees(t)
+	homedWithEntry(t, mainDir, linkedDir)
+	require.NoError(t, MutateSessionState(context.Background(), "from-main", func(st *SessionState) error {
+		st.Phase = session.PhaseActive
+		st.Owner = nil // not the committing process's ancestor
+		return nil
+	}))
+
+	t.Chdir(linkedDir)
+	clearSessionMatchCaches()
+	msg := filepath.Join(t.TempDir(), "COMMIT_EDITMSG")
+	require.NoError(t, os.WriteFile(msg, []byte("unrelated\n"), 0o600))
+	testutil.WriteFile(t, linkedDir, "other.go", "package other\n")
+	testutil.GitAdd(t, linkedDir, "other.go")
+	require.NoError(t, (&ManualCommitStrategy{}).PrepareCommitMsg(context.Background(), msg, "message"))
+	data, err := os.ReadFile(msg)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "Entire-Checkpoint")
+}

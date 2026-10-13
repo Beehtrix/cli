@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"context"
 	"path/filepath"
 
 	"github.com/entireio/cli/cmd/entire/cli/paths"
@@ -97,4 +98,51 @@ func overlapsFiles(files []string, set map[string]struct{}) bool {
 		}
 	}
 	return false
+}
+
+// homedAt reports whether root is state's home worktree. A state with no
+// recorded home is treated as homed wherever it is asked about, as before
+// homes were recorded.
+func homedAt(state *SessionState, root string) bool {
+	return state.WorktreePath == "" || isSessionHomeWorktree(root, state) || sameDir(root, state.WorktreePath)
+}
+
+// enterStepWorktree is enterWorktreeView for a turn-end step recorded in
+// root, creating root's entry when the session has none yet. A session with
+// no recorded home is first homed in the hook's worktree, so a step elsewhere
+// can't make that worktree its home by default.
+func enterStepWorktree(ctx context.Context, state *SessionState, root string) (leave func(), ok bool) {
+	if state.WorktreePath == "" {
+		hookRoot, err := paths.WorktreeRoot(ctx)
+		if err != nil {
+			return nil, false
+		}
+		state.WorktreePath = hookRoot
+		if worktreeID, err := paths.GetWorktreeID(hookRoot); err == nil {
+			state.WorktreeID = worktreeID
+		}
+	}
+	if homedAt(state, root) {
+		return nil, false
+	}
+	worktreeID, err := paths.GetWorktreeID(root)
+	if err != nil {
+		return nil, false
+	}
+	key := session.WorktreeKey(worktreeID)
+	if state.OtherWorktrees == nil {
+		state.OtherWorktrees = map[string]*session.WorktreeWork{}
+	}
+	created := state.OtherWorktrees[key] == nil
+	if created {
+		state.OtherWorktrees[key] = &session.WorktreeWork{Path: root}
+	}
+	leave, ok = enterWorktreeView(state, root)
+	if !ok && created {
+		delete(state.OtherWorktrees, key)
+		if len(state.OtherWorktrees) == 0 {
+			state.OtherWorktrees = nil
+		}
+	}
+	return leave, ok
 }

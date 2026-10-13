@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -785,17 +786,17 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 	}
 	prepareSpan.End()
 
-	// Where this turn's work is. An agent launched in one worktree fires its
-	// hooks there even when it edits another by absolute path; measure the
-	// turn where its edits are, and move the session there first so the stored
-	// copy written below lands in its home (strategy.SettleTurnWorktree).
+	// An agent launched in one worktree fires its hooks there even when it
+	// edits another by absolute path. Those edits are recorded against the
+	// worktree they are in (strategy.SplitEditsByWorktree), so a commit there
+	// links them; the hook's own worktree is handled below as always.
 	hookRoot, err := paths.WorktreeRoot(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get worktree root: %w", err)
 	}
-	workRoot := hookRoot
+	var elsewhere map[string][]string
 	if sessionID != unknownSessionID {
-		workRoot = strategy.SettleTurnWorktree(ctx, sessionID, hookRoot, turnEditedPaths(logCtx, ag, transcriptRef, sessionID))
+		elsewhere = uncommittedEditsElsewhere(ctx, strategy.SplitEditsByWorktree(ctx, hookRoot, turnEditedPaths(logCtx, ag, transcriptRef, sessionID)))
 	}
 
 	// Create session metadata directory
@@ -945,7 +946,7 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 
 	// Get worktree root for path normalization
 	_, detectSpan := perf.Start(ctx, "detect_file_changes")
-	repoRoot := workRoot
+	repoRoot := hookRoot
 
 	var preUntrackedFiles []string
 	if preState != nil {
@@ -958,23 +959,10 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 	// status scan feeding this turn breached its budget, so the marker
 	// persisted at turn end reflects the whole turn, not just this walk.
 	captureDegraded := preState != nil && preState.UntrackedScanSkipped
-	var changes *FileChanges
-	if repoRoot == hookRoot {
-		changes, err = DetectFileChanges(ctx, preUntrackedFiles)
-		if err != nil {
-			captureDegraded = captureDegraded || errors.Is(err, gitrepo.ErrStatusBudgetExceeded)
-			logStatusDegrade(logCtx, "failed to compute file changes", err)
-		}
-	} else {
-		// The turn's work is in another worktree: its status there, without
-		// new files (this hook's pre-prompt baseline doesn't describe that
-		// worktree's untracked files; files the agent wrote are in the
-		// transcript).
-		changes, err = DetectFileChangesAt(ctx, repoRoot)
-		if err != nil {
-			captureDegraded = captureDegraded || errors.Is(err, gitrepo.ErrStatusBudgetExceeded)
-			logStatusDegrade(logCtx, "failed to compute file changes in the turn's worktree", err)
-		}
+	changes, err := DetectFileChanges(ctx, preUntrackedFiles)
+	if err != nil {
+		captureDegraded = captureDegraded || errors.Is(err, gitrepo.ErrStatusBudgetExceeded)
+		logStatusDegrade(logCtx, "failed to compute file changes", err)
 	}
 	if changes != nil && preState != nil && preState.UntrackedScanSkipped {
 		// The turn-start untracked scan was skipped (e.g. status-walk budget
@@ -1033,7 +1021,7 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 
 	// Check if there are any changes
 	totalChanges := len(relModifiedFiles) + len(relNewFiles) + len(relDeletedFiles)
-	if totalChanges == 0 {
+	if totalChanges == 0 && len(elsewhere) == 0 {
 		logging.Info(logCtx, "no files modified during session, skipping checkpoint")
 		// A turn that only removed an untracked file the agent created
 		// earlier changes nothing git can see; record that deletion anyway.
@@ -1140,7 +1128,6 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 	// Build fully-populated step context and delegate to strategy
 	stepCtx := strategy.StepContext{
 		SessionID:                sessionID,
-		WorktreeRoot:             stepWorktreeRoot(repoRoot, hookRoot),
 		ModifiedFiles:            relModifiedFiles,
 		NewFiles:                 relNewFiles,
 		DeletedFiles:             relDeletedFiles,
@@ -1156,9 +1143,28 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 		SubagentLedgerVersion:    codexLedgerVersion,
 	}
 
-	if err := strat.SaveStep(ctx, stepCtx); err != nil {
-		return fmt.Errorf("failed to save step: %w", err)
+	// The hook's worktree, then each other worktree the turn edited: one
+	// step, counted once and carrying the turn's tokens once.
+	counted := false
+	if totalChanges > 0 {
+		if err := strat.SaveStep(ctx, stepCtx); err != nil {
+			return fmt.Errorf("failed to save step: %w", err)
+		}
+		counted = true
 	}
+	for _, root := range slices.Sorted(maps.Keys(elsewhere)) {
+		step := stepCtx
+		step.WorktreeRoot = root
+		step.ModifiedFiles, step.NewFiles, step.DeletedFiles = elsewhere[root], nil, nil
+		if counted {
+			step.SameTurn, step.TokenUsage = true, nil
+		}
+		if err := strat.SaveStep(ctx, step); err != nil {
+			return fmt.Errorf("failed to save step for %s: %w", root, err)
+		}
+		counted = true
+	}
+	strategy.PruneRemovedWorktrees(ctx, sessionID, hookRoot)
 
 	// The LastPrompt backfill must come after SaveStep because SaveStep may
 	// reinitialize session state, which would overwrite an earlier LastPrompt
@@ -2813,19 +2819,10 @@ func adoptInvestigateEnv(ctx context.Context, state *session.State, expectedAgen
 	})
 }
 
-// stepWorktreeRoot is the StepContext.WorktreeRoot for a turn measured in
-// repoRoot: empty when that is the hook's own worktree.
-func stepWorktreeRoot(repoRoot, hookRoot string) string {
-	if repoRoot == hookRoot {
-		return ""
-	}
-	return repoRoot
-}
-
 // turnEditedPaths returns the files this turn's main transcript says the
 // agent edited, as recorded (usually absolute). Subagent transcripts are left
-// out: a subagent's edits in its own throwaway worktree must not move the
-// parent session (see strategy.SettleTurnWorktree). Failures yield none.
+// out: a subagent's edits in its own throwaway worktree belong to its task
+// record (see strategy.SplitEditsByWorktree). Failures yield none.
 func turnEditedPaths(ctx context.Context, ag agent.Agent, transcriptRef, sessionID string) []string {
 	analyzer, ok := agent.AsTranscriptAnalyzer(ag)
 	if !ok {
@@ -2840,4 +2837,21 @@ func turnEditedPaths(ctx context.Context, ag agent.Agent, transcriptRef, session
 		return nil
 	}
 	return files
+}
+
+// uncommittedEditsElsewhere keeps, of a turn's edits grouped by worktree, the
+// files that still differ from that worktree's HEAD: the agent may already
+// have committed them there mid-turn.
+func uncommittedEditsElsewhere(ctx context.Context, byWorktree map[string][]string) map[string][]string {
+	for root, rels := range byWorktree {
+		if kept := filterToUncommittedFiles(ctx, rels, root); len(kept) > 0 {
+			byWorktree[root] = kept
+		} else {
+			delete(byWorktree, root)
+		}
+	}
+	if len(byWorktree) == 0 {
+		return nil
+	}
+	return byWorktree
 }

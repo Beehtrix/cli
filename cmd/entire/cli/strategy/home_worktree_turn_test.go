@@ -65,10 +65,10 @@ func mustLoad(t *testing.T, s *ManualCommitStrategy, sessionID string) *SessionS
 	return state
 }
 
-// Case 1: a turn ending in the linked worktree must not read the home's
-// untracked file as deleted (it isn't in that tree), nor move the session's
-// base to that tree's HEAD. The turn's own file is still recorded.
-func TestGuestTurnEnd_LeavesHomeFilesAndBaseAlone(t *testing.T) {
+// Case 1: a turn ending in the linked worktree records its own file against
+// that worktree, never as the home's: the home's untracked file isn't read as
+// deleted (it isn't in that tree), and the home's base doesn't move.
+func TestGuestTurnEnd_RecordsAgainstItsOwnWorktree(t *testing.T) {
 	s, mainDir, linkedDir := homedSession(t, "guest-turn-end")
 	before := mustLoad(t, s, "guest-turn-end")
 	require.NotEqual(t, touchedFileDeleted, before.TouchedFileHashes["home.go"])
@@ -81,34 +81,34 @@ func TestGuestTurnEnd_LeavesHomeFilesAndBaseAlone(t *testing.T) {
 
 	after := mustLoad(t, s, "guest-turn-end")
 	assert.Equal(t, before.TouchedFileHashes["home.go"], after.TouchedFileHashes["home.go"], "the home's untracked file was recorded as deleted from another tree")
-	assert.Contains(t, after.FilesTouched, "home.go")
-	assert.Contains(t, after.FilesTouched, "guest.go")
-	assert.NotEmpty(t, after.TouchedFileHashes["guest.go"], "the guest turn's own new file should be hashed")
+	assert.Equal(t, []string{"home.go"}, after.FilesTouched, "the home's record should hold only the home's files")
 	assert.Equal(t, before.BaseCommit, after.BaseCommit, "the base moved to another tree's HEAD")
 	assert.True(t, isSessionHomeWorktree(mustEvalSymlinks(t, mainDir), after), "the session left its home: %s", after.WorktreePath)
+
+	linked := after.OtherWorktrees[linkedKey(t, linkedDir)]
+	require.NotNil(t, linked, "the linked worktree's file wasn't recorded for it")
+	assert.Equal(t, []string{"guest.go"}, linked.FilesTouched)
+	assert.NotEmpty(t, linked.TouchedFileHashes["guest.go"])
+	assert.Equal(t, testutil.GetHeadHash(t, linkedDir), linked.BaseCommit)
 }
 
-// The same path edited at home and then in the linked worktree keeps no hash,
-// so a commit of either tree's content still links by name; a guest deletion
-// leaves the home's record alone.
-func TestGuestTurnEnd_SamePathKeepsNoHash(t *testing.T) {
+// The same path edited at home and in the linked worktree is two records,
+// each with its own tree's content.
+func TestGuestTurnEnd_SamePathIsRecordedPerWorktree(t *testing.T) {
 	s, _, linkedDir := homedSession(t, "guest-same-path")
-	require.NotEmpty(t, mustLoad(t, s, "guest-same-path").TouchedFileHashes["home.go"])
+	homeHash := mustLoad(t, s, "guest-same-path").TouchedFileHashes["home.go"]
+	require.NotEmpty(t, homeHash)
 
 	chdirWorktree(t, linkedDir)
 	testutil.WriteFile(t, linkedDir, "home.go", "package home // the linked tree's version")
 	saveStepIn(t, s, "guest-same-path", []string{"home.go"}, nil)
 
 	state := mustLoad(t, s, "guest-same-path")
-	_, hashed := state.TouchedFileHashes["home.go"]
-	assert.False(t, hashed, "one tree's hash would stop the other tree's commit from linking")
-	assert.Contains(t, state.FilesTouched, "home.go")
-	assert.Empty(t, guestDeletions(state, []string{"home.go"}), "a guest deletion of a home path must not be recorded")
-}
-
-func guestDeletions(state *SessionState, deleted []string) []string {
-	_, kept := guestStepHashes(state, nil, deleted)
-	return kept
+	assert.Equal(t, homeHash, state.TouchedFileHashes["home.go"], "the home's hash was overwritten by another tree's content")
+	linked := state.OtherWorktrees[linkedKey(t, linkedDir)]
+	require.NotNil(t, linked)
+	assert.NotEmpty(t, linked.TouchedFileHashes["home.go"])
+	assert.NotEqual(t, homeHash, linked.TouchedFileHashes["home.go"])
 }
 
 // Case 3: the commit-time content gate, prompts and preview read the stored
