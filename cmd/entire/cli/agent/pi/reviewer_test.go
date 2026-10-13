@@ -314,6 +314,14 @@ func TestPiReviewer_ParseEndsWithoutAgentEnd(t *testing.T) {
 	if _, ok := finished(errored); ok {
 		t.Error("stream ending on an error turn counted as success")
 	}
+	retrying := errored + `{"type":"auto_retry_start"}` + "\n"
+	if _, ok := finished(retrying); ok {
+		t.Error("stream cut off during a retry counted as success")
+	}
+	cutOff := stopped + `{"type":"turn_start"}` + "\n"
+	if _, ok := finished(cutOff); ok {
+		t.Error("stream cut off mid-turn counted as success")
+	}
 	toolUse := `{"type":"turn_end","message":{"role":"assistant","stopReason":"toolUse"}}` + "\n"
 	if _, ok := finished(toolUse); ok {
 		t.Error("stream cut after a tool-use turn counted as success")
