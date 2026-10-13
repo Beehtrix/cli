@@ -906,7 +906,13 @@ func filterFilesTouched(sessionData *ExtractedSessionData, committedFiles map[st
 			}
 		}
 		sessionData.FilesTouched = filtered
-		return
+		// A record of another worktree that shares nothing with a commit made
+		// there is not this commit's work: the session was linked otherwise
+		// (its agent made the commit, say from a shell edit), so treat it as
+		// having recorded nothing, as it would without that record.
+		if len(filtered) > 0 || state == nil || !state.InWorktreeView {
+			return
+		}
 	}
 	if !sessionHasEvidenceOfWork(sessionData, state) {
 		return

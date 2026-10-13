@@ -1577,7 +1577,7 @@ func (s *ManualCommitStrategy) hasMidTurnClaimant(ctx context.Context, sessions 
 			continue
 		}
 		prepareTranscriptForState(ctx, state)
-		for _, f := range s.extractModifiedFilesFromLiveTranscript(ctx, state, state.CheckpointTranscriptStart) {
+		for _, f := range s.extractModifiedFilesFromLiveTranscript(ctx, state, uncheckpointedTranscriptStart(state)) {
 			if _, ok := committedFileSet[f]; ok {
 				return true
 			}
@@ -2275,7 +2275,7 @@ func (s *ManualCommitStrategy) sessionHasNewContentFromLiveTranscript(ctx contex
 	// resolveFilesTouched (which would prepare again) and extract directly.
 	modifiedFiles := state.FilesTouched
 	if len(modifiedFiles) == 0 {
-		modifiedFiles = s.extractModifiedFilesFromLiveTranscript(ctx, state, state.CheckpointTranscriptStart)
+		modifiedFiles = s.extractModifiedFilesFromLiveTranscript(ctx, state, uncheckpointedTranscriptStart(state))
 	}
 	if len(modifiedFiles) == 0 {
 		return false, nil
@@ -2300,6 +2300,16 @@ func (s *ManualCommitStrategy) sessionHasNewContentFromLiveTranscript(ctx contex
 	}
 
 	return true, nil
+}
+
+// uncheckpointedTranscriptStart is where the transcript's edits not yet in
+// any checkpoint begin, for deciding whether a commit holds the session's new
+// work. Carry-forward moves CheckpointTranscriptStart back to 0 so the next
+// checkpoint shows the whole conversation (as when commits in two worktrees
+// split a session's work), but edits before TokenStart are already in a
+// checkpoint and must not claim a later commit of the same paths.
+func uncheckpointedTranscriptStart(state *SessionState) int {
+	return max(state.CheckpointTranscriptStart, state.TokenStart())
 }
 
 // resolveFilesTouched returns the file list for a session.
