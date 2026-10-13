@@ -5,14 +5,21 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/auth"
+	"github.com/entireio/cli/cmd/entire/cli/testutil/gitenv"
 )
 
 func TestInfoFlagText(t *testing.T) {
@@ -83,6 +90,94 @@ func TestParseProtocolVersion(t *testing.T) {
 				t.Errorf("expected no warning, got %q", buf.String())
 			case tc.wantWarn != "" && !strings.Contains(buf.String(), tc.wantWarn):
 				t.Errorf("expected warning containing %q, got %q", tc.wantWarn, buf.String())
+			}
+		})
+	}
+}
+
+// fakeEnv builds a LookupEnv stand-in; nil means the variable is unset.
+func fakeEnv(vars map[string]string) func(string) (string, bool) {
+	return func(key string) (string, bool) {
+		v, ok := vars[key]
+		return v, ok
+	}
+}
+
+func TestResolveHTTPUserAgent(t *testing.T) {
+	t.Parallel()
+	const def = "git-remote-entire/1.2.3"
+	tests := []struct {
+		name    string
+		env     map[string]string
+		want    string
+		wantErr string
+	}{
+		{"unset_keeps_default", nil, def, ""},
+		{"set_replaces_verbatim", map[string]string{"GIT_HTTP_USER_AGENT": "git-remote-entire/abc1234 entire-runners/0.1.0"}, "git-remote-entire/abc1234 entire-runners/0.1.0", ""},
+		{"set_any_shape", map[string]string{"GIT_HTTP_USER_AGENT": "Mozilla/4.0"}, "Mozilla/4.0", ""},
+		{"empty_sends_nothing", map[string]string{"GIT_HTTP_USER_AGENT": ""}, "", ""},
+		{"other_vars_ignored", map[string]string{"HTTP_USER_AGENT": "x/1"}, def, ""},
+		{"crlf_names_the_variable", map[string]string{"GIT_HTTP_USER_AGENT": "x/1\r\nX-Injected: y"}, "", "GIT_HTTP_USER_AGENT holds an invalid header character"},
+		{"nul_names_the_variable", map[string]string{"GIT_HTTP_USER_AGENT": "x/1\x00"}, "", "GIT_HTTP_USER_AGENT holds an invalid header character"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := resolveHTTPUserAgent(def, fakeEnv(tc.env))
+			if got != tc.want {
+				t.Errorf("resolveHTTPUserAgent(%v) = %q, want %q", tc.env, got, tc.want)
+			}
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Errorf("unexpected error: %v", err)
+			case tc.wantErr != "" && (err == nil || err.Error() != tc.wantErr):
+				t.Errorf("error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// Uses the auth-path client run() ships and checks what the server
+// receives: the override verbatim, or no header at all for "".
+func TestHTTPUserAgent_ReachesServer(t *testing.T) {
+	t.Parallel()
+	const def = "git-remote-entire/1.2.3"
+	tests := []struct {
+		name string
+		env  map[string]string
+		want []string // nil means no User-Agent header at all
+	}{
+		{"default", nil, []string{def}},
+		{"override", map[string]string{"GIT_HTTP_USER_AGENT": "git-remote-entire/test entire-runners/0.1.0"}, []string{"git-remote-entire/test entire-runners/0.1.0"}},
+		{"empty", map[string]string{"GIT_HTTP_USER_AGENT": ""}, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var got []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = r.Header.Values("User-Agent")
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(server.Close)
+
+			ua, err := resolveHTTPUserAgent(def, fakeEnv(tc.env))
+			if err != nil {
+				t.Fatalf("resolveHTTPUserAgent: %v", err)
+			}
+			client := newAuthHTTPClient(false, ua)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+"/.well-known/entire-cluster.json", nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			_ = resp.Body.Close()
+
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("server saw User-Agent %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -336,8 +431,8 @@ func TestResolveEnvTokenCreds_TrustedAudSucceeds(t *testing.T) {
 	client, clusterHost := wellKnownServer(t, []string{core}, audience, core)
 	envToken := makeTestJWT(t, core)
 
-	creds, _, err := resolveEnvTokenCreds(
-		t.Context(), envToken, clusterHost, t.TempDir(), client,
+	creds, _, err := resolveTokenCreds(
+		t.Context(), envToken, auth.EnvTokenVar, clusterHost, t.TempDir(), client,
 	)
 	if err != nil {
 		t.Fatalf("expected trusted aud to succeed, got: %v", err)
@@ -360,8 +455,8 @@ func TestResolveEnvTokenCreds_CrossJurisdictionTokenUsesBearer(t *testing.T) {
 	client, clusterHost := wellKnownServer(t, []string{tokenCore, jurisdictionCore}, "https://us.entire.io", jurisdictionCore)
 	envToken := makeTestJWT(t, tokenCore)
 
-	creds, _, err := resolveEnvTokenCreds(
-		t.Context(), envToken, clusterHost, t.TempDir(), client,
+	creds, _, err := resolveTokenCreds(
+		t.Context(), envToken, auth.EnvTokenVar, clusterHost, t.TempDir(), client,
 	)
 	if err != nil {
 		t.Fatalf("cross-jurisdiction token must resolve, got: %v", err)
@@ -381,8 +476,8 @@ func TestResolveEnvTokenCreds_DoesNotRequireJurisdictionAudience(t *testing.T) {
 	client, clusterHost := wellKnownServer(t, []string{core}, "", "")
 	envToken := makeTestJWT(t, core)
 
-	creds, _, err := resolveEnvTokenCreds(
-		t.Context(), envToken, clusterHost, t.TempDir(), client,
+	creds, _, err := resolveTokenCreds(
+		t.Context(), envToken, auth.EnvTokenVar, clusterHost, t.TempDir(), client,
 	)
 	if err != nil {
 		t.Fatalf("resolve direct bearer without jurisdiction audience: %v", err)
@@ -393,6 +488,187 @@ func TestResolveEnvTokenCreds_DoesNotRequireJurisdictionAudience(t *testing.T) {
 	}
 	if got != envToken {
 		t.Errorf("creds = %q, want ENTIRE_TOKEN verbatim", got)
+	}
+}
+
+func TestResolveCreds_GitCredentialHelper(t *testing.T) {
+	const core = "https://core.us.entire.io"
+	for _, tc := range []struct {
+		name        string
+		env         string
+		helper      string
+		username    string
+		urlUsername string
+		noFallback  string
+		wantErr     string
+	}{
+		{name: "credential helper", helper: core},
+		{name: "configured username", helper: core, username: "buildkite"},
+		{name: "URL username wins", helper: core, username: "buildkite", urlUsername: "url-user"},
+		{name: "environment wins", env: core, helper: "https://untrusted.example"},
+		{name: "untrusted credential", helper: "https://untrusted.example", wantErr: "not a trusted login server"},
+		{name: "malformed credential", helper: "malformed", wantErr: "git credential helper token"},
+		{name: "invalid credential audience", helper: "http://core.us.entire.io", wantErr: "git credential helper token aud"},
+		{name: "missing credential audience", helper: "entire-cli", wantErr: "git credential helper token must be"},
+		{name: "untrusted environment token", env: "https://untrusted.example", wantErr: "ENTIRE_TOKEN aud"},
+		{name: "helper refuses", helper: "quit", wantErr: "git credential lookup failed"},
+		{name: "broken Git config", helper: "bad-config", wantErr: "git credential lookup failed"},
+		{name: "no credential falls back to login", wantErr: "no auth context"},
+		{name: "fallback explicitly allowed", noFallback: "false", wantErr: "no auth context"},
+		{name: "fallback disabled without credential", noFallback: "true", wantErr: "saved-login fallback is disabled"},
+		{name: "fallback disabled on silent failure", helper: "silent-failure", noFallback: "1", wantErr: "saved-login fallback is disabled"},
+		{name: "fallback disabled on partial credential", helper: "password-only", noFallback: "true", wantErr: "saved-login fallback is disabled"},
+		{name: "fallback disabled on expired credential", helper: "expired", noFallback: "true", wantErr: "saved-login fallback is disabled"},
+		{name: "helper works with fallback disabled", helper: core, noFallback: "true"},
+		{name: "environment wins with fallback disabled", env: core, helper: "quit", noFallback: "true"},
+		{name: "invalid fallback setting fails closed", noFallback: "typo", wantErr: "ENTIRE_GIT_NO_LOGIN_FALLBACK must be a boolean"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gitenv.IsolateRepository(t)
+			t.Chdir(t.TempDir())
+			t.Setenv("ENTIRE_CONFIG_DIR", t.TempDir())
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			t.Setenv("ENTIRE_GIT_NO_LOGIN_FALLBACK", tc.noFallback)
+			if tc.noFallback == "" {
+				if err := os.Unsetenv("ENTIRE_GIT_NO_LOGIN_FALLBACK"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv(auth.EnvTokenVar, "")
+			if err := os.Unsetenv(auth.EnvTokenVar); err != nil {
+				t.Fatal(err)
+			}
+			client, host := wellKnownServer(t, []string{core}, "", "")
+			token := makeTestJWT(t, tc.helper)
+			if tc.helper == "malformed" {
+				token = "not-a-jwt"
+			}
+			t.Setenv("TEST_GIT_CREDENTIAL", token)
+			t.Setenv("GIT_CONFIG_COUNT", "1")
+			t.Setenv("GIT_CONFIG_KEY_0", "credential.helper")
+			t.Setenv("GIT_CONFIG_VALUE_0", `!f() {
+protocol= host= path= username=
+while IFS= read -r line; do
+  case "$line" in
+    protocol=*) protocol=${line#protocol=} ;;
+    host=*) host=${line#host=} ;;
+    path=*) path=${line#path=} ;;
+    username=*) username=${line#username=} ;;
+  esac
+done
+if test "$protocol" = entire && test "$host" = cluster.entire.io && test "$path" = et/acme/api && test "$username" = "$TEST_GIT_USERNAME"; then
+  printf 'username=x-access-token\npassword=%s\n' "$TEST_GIT_CREDENTIAL"
+fi
+}; f`)
+			t.Setenv("TEST_GIT_USERNAME", "")
+			if tc.username != "" {
+				t.Setenv("GIT_CONFIG_COUNT", "2")
+				t.Setenv("GIT_CONFIG_KEY_1", "credential.entire://cluster.entire.io.username")
+				t.Setenv("GIT_CONFIG_VALUE_1", tc.username)
+				t.Setenv("TEST_GIT_USERNAME", tc.username)
+			}
+			if tc.urlUsername != "" {
+				t.Setenv("TEST_GIT_USERNAME", tc.urlUsername)
+			}
+			if tc.helper == "" {
+				t.Setenv("GIT_CONFIG_VALUE_0", "")
+			}
+			if tc.helper == "quit" {
+				t.Setenv("GIT_CONFIG_VALUE_0", `!f() { cat >/dev/null; printf 'quit=true\n'; }; f`)
+			}
+			if tc.helper == "bad-config" {
+				t.Setenv("GIT_CONFIG_COUNT", "invalid")
+			}
+			switch tc.helper {
+			case "silent-failure":
+				t.Setenv("GIT_CONFIG_VALUE_0", `!f() { cat >/dev/null; exit 1; }; f`)
+			case "password-only":
+				t.Setenv("GIT_CONFIG_VALUE_0", `!f() { cat >/dev/null; printf 'password=%s\n' "$TEST_GIT_CREDENTIAL"; }; f`)
+			case "expired":
+				t.Setenv("GIT_CONFIG_VALUE_0", `!f() { cat >/dev/null; printf 'username=ci\npassword=%s\npassword_expiry_utc=1\n' "$TEST_GIT_CREDENTIAL"; }; f`)
+			}
+			want := token
+			if tc.env != "" {
+				want = makeTestJWT(t, tc.env)
+				t.Setenv(auth.EnvTokenVar, want)
+			}
+			repoURL := &url.URL{Scheme: "entire", Host: host, Path: "/et/acme/api"}
+			if tc.urlUsername != "" {
+				repoURL.User = url.User(tc.urlUsername)
+			}
+			creds, _, err := resolveCreds(t.Context(), repoURL, false, client)
+			if tc.wantErr != "" {
+				if err == nil || creds != nil {
+					t.Fatal("invalid helper token must fail closed")
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("expected %q, got %v", tc.wantErr, err)
+				}
+				if tc.env == "" && strings.Contains(err.Error(), auth.EnvTokenVar) {
+					t.Fatalf("credential-helper error incorrectly attributes token to environment: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://replica.entire.io/et/acme/api/info/refs?service=git-upload-pack", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := setAuthWithProvider(creds)(req); err != nil {
+				t.Fatal(err)
+			}
+			if got := req.Header.Get("Authorization"); got != "Bearer "+want {
+				t.Fatal("git request did not receive the selected bearer")
+			}
+		})
+	}
+}
+
+func TestResolveCreds_CancelsCredentialHelper(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows retains direct-child cancellation; descendant termination is outside this change")
+	}
+	gitenv.IsolateRepository(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("ENTIRE_CONFIG_DIR", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv(auth.EnvTokenVar, "")
+	if err := os.Unsetenv(auth.EnvTokenVar); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(t.TempDir(), "ready")
+	t.Setenv("TEST_CREDENTIAL_READY", ready)
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "credential.helper")
+	t.Setenv("GIT_CONFIG_VALUE_0", `!f() { cat >/dev/null; sleep 60 & printf ready > "$TEST_CREDENTIAL_READY"; wait; }; f`)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := resolveCreds(ctx, &url.URL{Scheme: "entire", Host: "cluster.entire.io", Path: "/et/acme/api"}, false, http.DefaultClient)
+		done <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("credential helper did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected cancellation, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		// Less than WaitDelay: its pipe closure must not hide live descendants.
+		t.Fatal("credential helper descendants kept lookup alive after cancellation")
 	}
 }
 
@@ -494,8 +770,8 @@ func TestResolveEnvTokenCreds_UntrustedAudAborts(t *testing.T) {
 	// The gate must abort before building creds (i.e. before any exchange).
 	client, clusterHost := wellKnownServer(t, []string{"https://core.us.entire.io"}, "https://us.entire.io", "https://core.us.entire.io")
 
-	creds, _, err := resolveEnvTokenCreds(
-		t.Context(), makeTestJWT(t, "https://attacker.example.com"), clusterHost, t.TempDir(), client,
+	creds, _, err := resolveTokenCreds(
+		t.Context(), makeTestJWT(t, "https://attacker.example.com"), auth.EnvTokenVar, clusterHost, t.TempDir(), client,
 	)
 	if err == nil {
 		t.Fatal("expected untrusted aud to be rejected")
@@ -514,8 +790,8 @@ func TestResolveEnvTokenCreds_EmptyAdvertisedCoresAborts(t *testing.T) {
 	// trust, the gate must fail closed rather than trusting the token's aud.
 	client, clusterHost := wellKnownServer(t, []string{}, "https://us.entire.io", "https://core.us.entire.io")
 
-	creds, _, err := resolveEnvTokenCreds(
-		t.Context(), makeTestJWT(t, "https://core.us.entire.io"), clusterHost, t.TempDir(), client,
+	creds, _, err := resolveTokenCreds(
+		t.Context(), makeTestJWT(t, "https://core.us.entire.io"), auth.EnvTokenVar, clusterHost, t.TempDir(), client,
 	)
 	if err == nil {
 		t.Fatal("expected empty advertised core set to be rejected")
@@ -534,8 +810,8 @@ func TestResolveEnvTokenCreds_CrossSiteCoresAbort(t *testing.T) {
 	const foreignCore = "https://core.us.evil.example"
 	client, clusterHost := wellKnownServer(t, []string{foreignCore}, "https://us.entire.io", foreignCore)
 
-	creds, _, err := resolveEnvTokenCreds(
-		t.Context(), makeTestJWT(t, foreignCore), clusterHost, t.TempDir(), client,
+	creds, _, err := resolveTokenCreds(
+		t.Context(), makeTestJWT(t, foreignCore), auth.EnvTokenVar, clusterHost, t.TempDir(), client,
 	)
 	if err == nil {
 		t.Fatal("expected a cross-site core to be refused")
@@ -566,8 +842,8 @@ func TestResolveEnvTokenCreds_DiscoveryFailureAborts(t *testing.T) {
 		t.Fatalf("parse server URL: %v", err)
 	}
 
-	creds, _, err := resolveEnvTokenCreds(
-		t.Context(), makeTestJWT(t, "https://core.us.entire.io"), u.Host, t.TempDir(), srv.Client(),
+	creds, _, err := resolveTokenCreds(
+		t.Context(), makeTestJWT(t, "https://core.us.entire.io"), auth.EnvTokenVar, u.Host, t.TempDir(), srv.Client(),
 	)
 	if err == nil {
 		t.Fatal("expected discovery failure to abort")
@@ -581,8 +857,8 @@ func TestResolveEnvTokenCreds_MalformedTokenAborts(t *testing.T) {
 	t.Parallel()
 	// A malformed aud must fail at the parse/validate step, before any network
 	// discovery happens — so a nil httpClient is safe here.
-	creds, _, err := resolveEnvTokenCreds(
-		t.Context(), makeTestJWT(t, "http://core.us.entire.io"), "cluster.example.com", t.TempDir(), nil,
+	creds, _, err := resolveTokenCreds(
+		t.Context(), makeTestJWT(t, "http://core.us.entire.io"), auth.EnvTokenVar, "cluster.example.com", t.TempDir(), nil,
 	)
 	if err == nil {
 		t.Fatal("expected http aud to be rejected before discovery")
