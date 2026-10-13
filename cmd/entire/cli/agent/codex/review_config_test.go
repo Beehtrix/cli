@@ -69,3 +69,26 @@ func TestPrepareCodexReviewConfigRefusesUnsupported(t *testing.T) {
 		}
 	}
 }
+
+// Entire's hooks are passed as session flags, since the untrusted checkout's
+// hooks.json isn't loaded, and run without persisted trust.
+func TestEntireHookOverrides(t *testing.T) {
+	t.Parallel()
+	args := strings.Join(entireHookOverrides(false), "\n")
+	for _, want := range []string{`hooks.SessionStart=[{hooks=[{type="command",command=`, "entire hooks codex session-start", "hooks.Stop="} {
+		if !strings.Contains(args, want) {
+			t.Errorf("overrides missing %q:\n%s", want, args)
+		}
+	}
+}
+
+func TestCodexMCPOverridesPassApprovalMode(t *testing.T) {
+	t.Parallel()
+	args, err := codexMCPOverrides(map[string]json.RawMessage{"docs": json.RawMessage(`{"command":"/opt/docs","default_tools_approval_mode":"approve"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(args, `mcp_servers.docs.default_tools_approval_mode="approve"`) {
+		t.Fatalf("args = %v", args)
+	}
+}

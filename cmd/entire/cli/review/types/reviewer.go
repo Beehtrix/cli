@@ -249,6 +249,17 @@ type RunError struct {
 
 func (RunError) isEvent() {}
 
+// ToolsBlocked reports tools the agent tried to call but its permission
+// settings denied. The review still completes; the run reports them so the
+// user can allow them.
+type ToolsBlocked struct {
+	Names []string
+	// Allow says how to allow them in this agent's settings.
+	Allow string
+}
+
+func (ToolsBlocked) isEvent() {}
+
 // AgentConfig is a reviewer's own agent config from a review profile, in each
 // agent's native shape. It mirrors settings.ReviewAgentConfig.
 type AgentConfig struct {

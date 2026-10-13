@@ -164,7 +164,7 @@ own config with nothing extra, or load a JSON file) or
 | Agent | Checkout config dropped | Profile config applied | Still loaded from the checkout |
 |---|---|---|---|
 | Claude Code | `--setting-sources user`, `--strict-mcp-config` | `settings` (with Entire's tracking hooks added) via `--settings`; `mcp_servers` via `--mcp-config` | CLAUDE.md; `.claude/skills` and `.claude/commands`, copied from the committed tree as the `project` plugin (`/review` becomes `/project:review`) |
-| Codex | checkout and main repo marked untrusted for the run (project config, hooks, rules) | `mcp_servers` via `-c` (no literal `env` values yet) | AGENTS.md; skills |
+| Codex | checkout and main repo marked untrusted for the run (project config, hooks, rules) | `mcp_servers` via `-c` (no literal `env` values yet; `default_tools_approval_mode` passes through); Entire's tracking hooks via `-c` with `--dangerously-bypass-hook-trust`, which also runs the user's own untrusted hooks | AGENTS.md; skills |
 | Pi | `--no-extensions` | `extensions` via `--extension`, plus Entire's own | AGENTS.md/CLAUDE.md, skills, prompt templates, `.pi/settings.json` |
 
 Rules:
@@ -186,6 +186,15 @@ Rules:
   `$CLAUDE_PROJECT_DIR` gets a warning at save time and before each run, since
   it is usually a copy-paste mistake. Prompts never say nothing runs when the
   profile configures hooks or MCP servers.
+- **Permissions come from the loaded settings.** Reviewers run headless, so a
+  tool call not allowed by the settings the reviewer loads is denied. With a
+  profile config those are the user's own settings plus the profile's
+  `settings`; the project's `.claude/settings.json` allows no longer apply.
+  Allow a profile MCP tool in the profile's `settings.permissions.allow`
+  (e.g. `mcp__docs__search`) for Claude, or with
+  `"default_tools_approval_mode": "approve"` on the server for Codex, whose
+  exec mode can't ask. Both report blocked calls, and the run prints them
+  after the reviewer finishes with where to allow them.
 - **Fail, don't fall back.** An agent that can't apply a field (Codex
   `settings`, Pi `mcp_servers`, …) fails the review with an explanation.
 - **Gate.** Skills and commands can run their own commands, so reviewing

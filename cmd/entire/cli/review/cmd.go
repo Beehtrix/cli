@@ -997,6 +997,30 @@ func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverri
 	return reviewProfileSelection{name: profileName, profile: profile, installed: installed}, nil
 }
 
+// printBlockedTools reports tools a reviewer tried to call but its permission
+// settings denied, and where to allow them. The review itself completed.
+func printBlockedTools(w io.Writer, profileName string, summary reviewtypes.RunSummary) {
+	for _, run := range summary.AgentRuns {
+		var names []string
+		allow := ""
+		for _, ev := range run.Buffer {
+			if blocked, ok := ev.(reviewtypes.ToolsBlocked); ok {
+				for _, name := range blocked.Names {
+					if !slices.Contains(names, name) {
+						names = append(names, name)
+					}
+				}
+				allow = blocked.Allow
+			}
+		}
+		if len(names) == 0 {
+			continue
+		}
+		fmt.Fprintf(w, "%s: its permission settings blocked %s.\n", run.Name, strings.Join(names, ", "))
+		fmt.Fprintf(w, "  To allow them, %s; update the profile config with entire review --configure %s --set-config <reviewer>=<file>.\n", allow, profileName)
+	}
+}
+
 // unverifiedReviewerConfig returns the first of the unverified (dropped)
 // config fields that belongs to a reviewer of profileName that will run.
 func unverifiedReviewerConfig(unverified []string, profileName string, profile settings.ReviewProfileConfig, agentOverride string) (string, bool) {
@@ -1280,6 +1304,7 @@ func runSingleAgentPath(
 	}
 
 	summary, waitErr := Run(runCtx, reviewer, runCfg, sinks)
+	printBlockedTools(cmd.ErrOrStderr(), profileName, summary)
 	writePostReviewManifest(ctx, out, worktreeRoot, headSHA, summary, "")
 	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, summary, "")
 	if waitErr != nil && runCtx.Err() == nil && ctx.Err() == nil {
@@ -1465,6 +1490,7 @@ func runMultiAgentPath(
 	runMultiCfg.EnrichAgentRun = reviewAgentRunTokenEnricherForRuns(worktreeRoot, headSHA, plannedAgentRunsForReviewers(reviewers, runMultiCfg))
 	runMultiCfg.EnrichSummary = reviewSummaryTokenEnricher(worktreeRoot, headSHA)
 	summary, waitErr := RunMulti(runCtx, reviewers, runMultiCfg, sinks)
+	printBlockedTools(cmd.ErrOrStderr(), profileName, summary)
 	if shouldAbortMultiReview(summary, waitErr) && runCtx.Err() == nil && ctx.Err() == nil {
 		// Operational failure, not a usage error — don't dump the command help.
 		cmd.SilenceUsage = true

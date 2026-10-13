@@ -168,3 +168,17 @@ func TestUnverifiedReviewerConfig(t *testing.T) {
 		t.Error("profile a was stopped by profile a.b's config")
 	}
 }
+
+func TestPrintBlockedTools(t *testing.T) {
+	t.Parallel()
+
+	var b strings.Builder
+	printBlockedTools(&b, "general", reviewtypes.RunSummary{AgentRuns: []reviewtypes.AgentRun{
+		{Name: "claude-code", Buffer: []reviewtypes.Event{reviewtypes.ToolsBlocked{Names: []string{"mcp__docs__search"}}}},
+		{Name: "codex"},
+	}})
+	out := b.String()
+	if !strings.Contains(out, "claude-code: its permission settings blocked mcp__docs__search") || !strings.Contains(out, "--configure general --set-config") || strings.Contains(out, "codex") {
+		t.Fatalf("output:\n%s", out)
+	}
+}

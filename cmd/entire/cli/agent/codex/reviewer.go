@@ -207,6 +207,9 @@ func parseCodexOutputBuf(r io.Reader, maxBuf int) <-chan reviewtypes.Event {
 				if env.Item.Type == itemTypeAgentMessage && env.Item.Text != "" {
 					out <- reviewtypes.AssistantText{Text: env.Item.Text}
 				}
+				if blockedForApproval(env.Item) {
+					out <- reviewtypes.ToolsBlocked{Names: []string{env.Item.Server + "." + env.Item.Tool}, Allow: codexAllowHint}
+				}
 				// command_execution completion is intentionally swallowed —
 				// item.started already announced it. aggregated_output is the
 				// tool's stdout, not the model's narrative.
@@ -313,9 +316,21 @@ func firstNonEmptyString(values ...string) string {
 }
 
 type codexItem struct {
-	Type    string `json:"type"`
-	Command string `json:"command"`
-	Text    string `json:"text"`
+	Type    string          `json:"type"`
+	Command string          `json:"command"`
+	Text    string          `json:"text"`
+	Server  string          `json:"server"`
+	Tool    string          `json:"tool"`
+	Status  string          `json:"status"`
+	Error   codexErrorField `json:"error"`
+}
+
+const codexAllowHint = `set default_tools_approval_mode = "approve" on the MCP server (in its review profile config, or ~/.codex/config.toml)`
+
+// blockedForApproval reports an MCP tool call Codex refused because exec mode
+// can't ask for approval.
+func blockedForApproval(item codexItem) bool {
+	return item.Type == "mcp_tool_call" && item.Status == "failed" && strings.Contains(item.Error.Message, "requires approval")
 }
 
 type codexUsage struct {

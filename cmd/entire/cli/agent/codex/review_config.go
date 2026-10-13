@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/review"
 	reviewtypes "github.com/entireio/cli/cmd/entire/cli/review/types"
 )
@@ -42,6 +43,12 @@ func prepareCodexReviewConfig(ctx context.Context, cfg reviewtypes.RunConfig) (r
 		return cfg, nil, err
 	}
 	cfg.ExtraArgs = append(cfg.ExtraArgs, servers...)
+	// The untrusted checkout's hooks.json, Entire's own hooks included, isn't
+	// loaded, so Entire's hooks are passed as session flags. Codex runs
+	// session-flag hooks only with persisted trust or this bypass; it does
+	// not load the checkout's hooks, which stay untrusted.
+	cfg.ExtraArgs = append(cfg.ExtraArgs, entireHookOverrides(agent.UseWindowsProductionHooks(ctx))...)
+	cfg.ExtraArgs = append(cfg.ExtraArgs, "--dangerously-bypass-hook-trust")
 	cfg.WorkDir = run.CheckoutRoot
 	return cfg, nil, nil
 }
@@ -73,10 +80,11 @@ func codexMCPOverrides(servers map[string]json.RawMessage) ([]string, error) {
 	var args []string
 	for _, name := range names {
 		var server struct {
-			Command string            `json:"command"`
-			Args    []string          `json:"args"`
-			URL     string            `json:"url"`
-			Env     map[string]string `json:"env"`
+			Command      string            `json:"command"`
+			Args         []string          `json:"args"`
+			URL          string            `json:"url"`
+			Env          map[string]string `json:"env"`
+			ApprovalMode string            `json:"default_tools_approval_mode"`
 		}
 		if err := json.Unmarshal(servers[name], &server); err != nil {
 			return nil, fmt.Errorf("MCP server %q: %w", name, err)
@@ -101,9 +109,26 @@ func codexMCPOverrides(servers map[string]json.RawMessage) ([]string, error) {
 		} else {
 			err = set("url", server.URL)
 		}
+		if err == nil && server.ApprovalMode != "" {
+			err = set("default_tools_approval_mode", server.ApprovalMode)
+		}
 		if err != nil {
 			return nil, err
 		}
 	}
 	return args, nil
+}
+
+// entireHookOverrides returns -c overrides that register Entire's managed
+// Codex hooks, the same commands `entire enable` writes to hooks.json.
+func entireHookOverrides(windows bool) []string {
+	var args []string
+	for _, h := range managedHooks {
+		command, err := json.Marshal(h.wrap("entire hooks codex "+h.verb, windows))
+		if err != nil {
+			continue
+		}
+		args = append(args, "-c", fmt.Sprintf(`hooks.%s=[{hooks=[{type="command",command=%s,timeout=%d}]}]`, h.event, command, h.timeout))
+	}
+	return args
 }
