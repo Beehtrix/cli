@@ -273,6 +273,7 @@ var readModelOptionalFields = map[string][]string{
 	"CreatedOrg":          {"capabilities"},
 	"CreatedProject":      {"capabilities"},
 	"CreatedRepo":         {"capabilities", "provider"},
+	"DetachRepoResult":    {"access"},
 	"ListReposOutputBody": {"candidatesIncomplete"},
 	"Org":                 {"capabilities"},
 	"Project":             {"capabilities"},
@@ -285,8 +286,7 @@ var readModelOptionalFields = map[string][]string{
 //
 // ResourcePerson.directGrant is null for anyone without a direct grant (every
 // GitHub-synced collaborator), so without this no repo or project people
-// listing decodes; `repo mirror detach` reads one to name the accounts it
-// shows.
+// listing decodes.
 var readModelNullableFields = map[string][]string{
 	"ResourcePerson": {"directGrant"},
 }

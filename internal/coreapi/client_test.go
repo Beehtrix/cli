@@ -501,6 +501,23 @@ func TestDetachRepo_UnknownEnumValuesPassThrough(t *testing.T) {
 	}
 }
 
+// TestDetachRepo_UnsentAccessDecodes: the CLI no longer shows the detach's
+// access list, and core drops it after this release, so a result without
+// `access` must decode.
+func TestDetachRepo_UnsentAccessDecodes(t *testing.T) {
+	t.Parallel()
+
+	c := rawJSONClient(t, `{"dryRun":true,"eligible":true,"requestedBy":"01H0000000000000000000000A","targetProject":"01H000000000000000000000P1","name":"web","preconditions":[{"precondition":"single-placement","passed":true}]}`)
+
+	out, err := c.DetachRepo(context.Background(), &DetachRepoBody{TargetProject: "01H000000000000000000000P1"}, DetachRepoParams{RepoId: "01H0000000000000000000000R"})
+	if err != nil {
+		t.Fatalf("DetachRepo without access must decode, got: %v", err)
+	}
+	if !out.Eligible {
+		t.Errorf("Eligible = false, want true")
+	}
+}
+
 // TestGetRepoDetach_UnknownStatusPassesThrough is the same contract for the
 // state the detach wait polls.
 func TestGetRepoDetach_UnknownStatusPassesThrough(t *testing.T) {
