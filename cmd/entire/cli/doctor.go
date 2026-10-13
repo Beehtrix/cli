@@ -338,7 +338,7 @@ func classifySession(state *strategy.SessionState, now time.Time) *stuckSession 
 			State:             state,
 			Reason:            reason,
 			CheckpointCount:   state.StepCount + len(state.TaskRecords),
-			FilesTouchedCount: len(state.FilesTouched),
+			FilesTouchedCount: state.PendingFileCount(),
 		}
 	}
 

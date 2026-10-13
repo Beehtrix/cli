@@ -263,6 +263,22 @@ type State struct {
 	// read, and records no content.
 	TouchedFileHashes map[string]string `json:"touched_file_hashes,omitempty"`
 
+	// OtherWorktrees records the session's edits in worktrees of the
+	// repository other than its home (WorktreePath), keyed by WorktreeKey of
+	// each worktree's git ID. FilesTouched and TouchedFileHashes above are the
+	// home's; a commit in another worktree matches and clears only that
+	// worktree's entry, so work in two worktrees never mixes. An agent
+	// launched in one worktree that edits another by absolute path records
+	// here. An older CLI that rewrites this state drops the map (those edits
+	// then simply aren't linked).
+	OtherWorktrees map[string]*WorktreeWork `json:"other_worktrees,omitempty"`
+
+	// LinkedByWorktreeEntry is set in memory, never stored, on a session that
+	// a commit's linking set holds only because it has an OtherWorktrees entry
+	// for the committing worktree: it links only a commit containing that
+	// entry's files.
+	LinkedByWorktreeEntry bool `json:"-"`
+
 	// LastCheckpointID is the checkpoint ID from the most recent condensation.
 	// Used to restore the Entire-Checkpoint trailer on amend and to identify
 	// sessions that have been condensed at least once. Cleared on new prompt.
@@ -778,7 +794,58 @@ func (s *State) HasTaskContent() bool {
 // ENDED classification, the zombie sweep, IsCondensableEndedSession — check
 // FullyCondensed themselves, as they always have.
 func (s *State) HasPendingWork() bool {
-	return s.StepCount > 0 || len(s.FilesTouched) > 0 || s.HasTaskContent()
+	return s.StepCount > 0 || s.HasPendingFiles() || s.HasTaskContent()
+}
+
+// HasPendingFiles reports whether files await a commit in any worktree: the
+// home's FilesTouched or any OtherWorktrees entry's.
+func (s *State) HasPendingFiles() bool {
+	if len(s.FilesTouched) > 0 {
+		return true
+	}
+	for _, work := range s.OtherWorktrees {
+		if work != nil && len(work.FilesTouched) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// PendingFileCount is the number of files awaiting a commit across every
+// worktree (see HasPendingFiles).
+func (s *State) PendingFileCount() int {
+	n := len(s.FilesTouched)
+	for _, work := range s.OtherWorktrees {
+		if work != nil {
+			n += len(work.FilesTouched)
+		}
+	}
+	return n
+}
+
+// WorktreeWork is a session's record of edits in one worktree other than its
+// home: the same pair the home keeps in FilesTouched and TouchedFileHashes,
+// plus that worktree's HEAD when they were recorded, which stands in for the
+// home's BaseCommit.
+type WorktreeWork struct {
+	// Path is the worktree's root as git reports it from inside the worktree
+	// (rev-parse --show-toplevel), for logs and display; the map key is
+	// authoritative because it survives `git worktree move`.
+	Path              string            `json:"path,omitempty"`
+	BaseCommit        string            `json:"base_commit,omitempty"`
+	FilesTouched      []string          `json:"files_touched,omitempty"`
+	TouchedFileHashes map[string]string `json:"touched_file_hashes,omitempty"`
+}
+
+// WorktreeKey is the OtherWorktrees key for the worktree with git ID
+// worktreeID (paths.GetWorktreeID): the ID itself for a linked worktree, and
+// "/" — which no worktree ID can contain — for the main worktree, whose ID is
+// empty.
+func WorktreeKey(worktreeID string) string {
+	if worktreeID == "" {
+		return "/"
+	}
+	return worktreeID
 }
 
 // LiveTaskRecords returns the records not yet completed (CompletedAt zero) —

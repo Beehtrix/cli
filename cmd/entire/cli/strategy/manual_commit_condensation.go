@@ -2005,7 +2005,7 @@ func ensureCondensationAttemptID(ctx context.Context, state *SessionState) (id.C
 // sessions or marks empty ENDED sessions fully condensed. File-bearing sessions
 // remain eligible for PostCommit.
 func PrepareSessionEndCondensation(ctx context.Context, state *SessionState) error {
-	if state.Phase != session.PhaseEnded || len(state.FilesTouched) > 0 {
+	if state.Phase != session.PhaseEnded || state.HasPendingFiles() {
 		return nil
 	}
 	if !state.HasPendingWork() {
@@ -2022,7 +2022,7 @@ func reserveDoctorCondensationAttempt(ctx context.Context, state *SessionState) 
 	if err != nil {
 		return id.EmptyCheckpointID, err
 	}
-	if created && state.Phase == session.PhaseEnded && len(state.FilesTouched) == 0 {
+	if created && state.Phase == session.PhaseEnded && !state.HasPendingFiles() {
 		state.RequireCondensationRecovery()
 	}
 	return checkpointID, nil
@@ -2129,6 +2129,7 @@ func (s *ManualCommitStrategy) CondenseSessionByID(ctx context.Context, sessionI
 		// and a resumed turn starts a fresh window.
 		state.FilesTouched = nil
 		state.TouchedFileHashes = nil
+		state.OtherWorktrees = nil
 		release = &storedCopyRelease{root: storedRoot, worktreePath: state.WorktreePath}
 		return nil
 	}, func() {
@@ -2171,7 +2172,7 @@ func (s *ManualCommitStrategy) CondenseSessionByID(ctx context.Context, sessionI
 // carry-forward path, and a session with no pending work is simply marked
 // fully condensed.
 func prepareEagerCondensation(state *SessionState) (shouldCondense bool, err error) {
-	if len(state.FilesTouched) > 0 {
+	if state.HasPendingFiles() {
 		return false, ErrMutationSkip
 	}
 	if !state.HasPendingWork() {
@@ -2220,7 +2221,7 @@ func (s *ManualCommitStrategy) CondenseAndMarkFullyCondensed(ctx context.Context
 	}
 	// Files waiting for a commit belong to PostCommit; a fully condensed
 	// session proceeds only for work that arrived after its condensation.
-	if len(reservedState.FilesTouched) > 0 || (reservedState.FullyCondensed && !reservedState.HasPendingWork()) {
+	if reservedState.HasPendingFiles() || (reservedState.FullyCondensed && !reservedState.HasPendingWork()) {
 		return nil
 	}
 	checkpointID = reservedState.PendingCondensationID()

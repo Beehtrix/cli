@@ -3094,7 +3094,7 @@ func (s *ManualCommitStrategy) HandleTurnEnd(ctx context.Context, state *Session
 	// Skip this when carry-forward is active. carryForwardRemainingFiles
 	// intentionally resets CheckpointTranscriptStart to 0 so the next checkpoint
 	// remains self-contained with the full transcript.
-	if hadMidTurnCommits && state.TranscriptPath != "" && len(state.FilesTouched) == 0 {
+	if hadMidTurnCommits && state.TranscriptPath != "" && !state.HasPendingFiles() {
 		advanceCheckpointTranscriptStartToTurnEnd(ctx, state)
 	}
 
