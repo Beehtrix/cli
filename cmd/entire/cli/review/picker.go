@@ -803,17 +803,9 @@ func RunReviewProfileConfigPicker(ctx context.Context, out io.Writer, getInstall
 	// log at Warn so users debugging "my saved skills aren't pre-checked" can
 	// see why, but keep going with an empty prefill — runReview already
 	// surfaces the same error distinctly when it's the first load.
-	existing := map[string]settings.ReviewConfig{}
-	existingJudge := ""
-	if s, err := settings.Load(ctx); err != nil {
-		logging.Warn(ctx, "settings.Load failed when pre-filling picker", slog.String("error", err.Error()))
-	} else if s != nil {
-		if profile, ok := s.ReviewProfiles[profileName]; ok {
-			existing = profile.Agents
-			if j, jok := profileJudge(profile); jok {
-				existingJudge = j.agent
-			}
-		}
+	existing, existingJudge, err := pickerPrefill(ctx, profileName)
+	if err != nil {
+		return err
 	}
 
 	// Up-front header: make the order and count obvious so users can spot
@@ -1414,4 +1406,30 @@ func promptReviewAgentConfig(ctx context.Context, out io.Writer, agentName strin
 		return nil, false, fmt.Errorf("agent config for %s: %w", agentName, err)
 	}
 	return cfg, true, nil
+}
+
+// pickerPrefill returns the saved reviewers and judge for profileName. It
+// refuses a profile whose prompts or configs Load dropped as unverified: the
+// picker would show them blank and saving would erase them from the file.
+func pickerPrefill(ctx context.Context, profileName string) (map[string]settings.ReviewConfig, string, error) {
+	s, err := settings.Load(ctx)
+	if err != nil {
+		logging.Warn(ctx, "settings.Load failed when pre-filling picker", slog.String("error", err.Error()))
+		return map[string]settings.ReviewConfig{}, "", nil
+	}
+	if s == nil {
+		return map[string]settings.ReviewConfig{}, "", nil
+	}
+	profile, ok := s.ReviewProfiles[profileName]
+	if !ok {
+		return map[string]settings.ReviewConfig{}, "", nil
+	}
+	if profileHasUnverifiedFields(s, profileName, profile) {
+		return nil, "", fmt.Errorf("review profile %q is in .entire/settings.local.json, which could not be verified as untracked, so its prompts and reviewer configs aren't loaded and saving would erase them; untrack it (git rm --cached .entire/settings.local.json) and run --edit again", profileName)
+	}
+	judge := ""
+	if j, jok := profileJudge(profile); jok {
+		judge = j.agent
+	}
+	return profile.Agents, judge, nil
 }

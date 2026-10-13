@@ -104,19 +104,11 @@ func saveReviewAgentConfigs(ctx context.Context, profileName string, configs map
 	if !ok {
 		return "", fmt.Errorf("review profile %q not found", profileName)
 	}
-	agents := make(map[string]settings.ReviewConfig, len(profile.Agents))
-	for worker, cfg := range profile.Agents {
-		agents[worker] = cfg
-	}
-	for worker, cfg := range configs {
-		existing, ok := agents[worker]
-		if !ok {
+	for worker := range configs {
+		if _, ok := profile.Agents[worker]; !ok {
 			return "", fmt.Errorf("review profile %q has no reviewer %q", profileName, worker)
 		}
-		existing.Config = cfg
-		agents[worker] = existing
 	}
-	profile.Agents = agents
 
 	_, localRaw, err := loadReviewSettingsRaw(ctx, reviewScopeLocal)
 	if err != nil {
@@ -126,8 +118,21 @@ func saveReviewAgentConfigs(ctx context.Context, profileName string, configs map
 	if err != nil {
 		return "", err
 	}
-	if _, localOwns := localProfiles[profileName]; localOwns {
-		if err := saveReviewProfile(ctx, profileName, profile, false, reviewScopeLocal); err != nil {
+	if localProfile, localOwns := localProfiles[profileName]; localOwns {
+		// Edit the profile as stored, not the loaded view: Load drops fields
+		// it can't trust (an unverified local file's prompts and configs),
+		// and writing that view back would erase them.
+		agents := make(map[string]settings.ReviewConfig, len(localProfile.Agents))
+		for worker, cfg := range localProfile.Agents {
+			agents[worker] = cfg
+		}
+		for worker, cfg := range configs {
+			existing := agents[worker]
+			existing.Config = cfg
+			agents[worker] = existing
+		}
+		localProfile.Agents = agents
+		if err := saveReviewProfile(ctx, profileName, localProfile, false, reviewScopeLocal); err != nil {
 			return "", err
 		}
 		return reviewScopeLocal.file(), nil

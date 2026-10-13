@@ -1021,6 +1021,23 @@ func printBlockedTools(w io.Writer, profileName string, summary reviewtypes.RunS
 	}
 }
 
+// profileHasUnverifiedFields reports whether Load dropped any of profileName's
+// prompts or reviewer configs because the local file holding them could not be
+// verified.
+func profileHasUnverifiedFields(s *settings.EntireSettings, profileName string, profile settings.ReviewProfileConfig) bool {
+	prefix := "review_profiles." + profileName + "."
+	fields := []string{prefix + "task", prefix + "judge.prompt"}
+	for worker := range profile.Agents {
+		fields = append(fields, prefix+"agents."+worker+".prompt", prefix+"agents."+worker+".config")
+	}
+	for _, rej := range s.AgentPromptRejections() {
+		if settings.RejectionUnverified(rej) && slices.Contains(fields, rej.Field) {
+			return true
+		}
+	}
+	return false
+}
+
 // unverifiedReviewerConfig returns the first of the unverified (dropped)
 // config fields that belongs to a reviewer of profileName that will run.
 func unverifiedReviewerConfig(unverified []string, profileName string, profile settings.ReviewProfileConfig, agentOverride string) (string, bool) {

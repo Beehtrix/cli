@@ -37,6 +37,13 @@ func AgentConfigRejectionUnverified(rej AgentPromptRejection) bool {
 	return strings.HasSuffix(rej.Field, ".config") && rej.Reason == agentPromptRejectionUnverified
 }
 
+// RejectionUnverified reports whether rej dropped a field because the local
+// settings file holding it could not be verified as untracked. The field is
+// still in the file, so writing back the loaded view would erase it.
+func RejectionUnverified(rej AgentPromptRejection) bool {
+	return rej.Reason == agentPromptRejectionUnverified
+}
+
 // AgentPromptRejections reports the agent instruction fields Load dropped as
 // untrusted. Consumers that would have applied a dropped field (review) should
 // surface these on stderr, because it is the only signal that an instruction

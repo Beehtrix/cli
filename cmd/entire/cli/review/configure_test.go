@@ -3,6 +3,7 @@ package review
 import (
 	"bytes"
 	"context"
+	"io"
 	"strings"
 	"testing"
 
@@ -866,5 +867,53 @@ func TestSaveReviewAgentConfigs(t *testing.T) {
 	}
 	if _, err := saveReviewAgentConfigs(ctx, "shared", map[string]*settings.ReviewAgentConfig{"codex": cfg}); err == nil {
 		t.Error("config for a reviewer the profile doesn't have was saved")
+	}
+}
+
+// Saving one reviewer's config into the local file edits that file as stored.
+// The loaded view drops an unverified file's prompts and configs (here the
+// file is still in HEAD), and writing it back would erase them.
+func TestSaveReviewAgentConfigsKeepsUnverifiedLocalFields(t *testing.T) {
+	tmp := t.TempDir()
+	testutil.InitRepo(t, tmp)
+	t.Chdir(tmp)
+	ctx := context.Background()
+
+	profile := settings.ReviewProfileConfig{Agents: map[string]settings.ReviewConfig{
+		tAgentClaude: {Agent: tAgentClaude, Prompt: "Focus on auth.", Config: &settings.ReviewAgentConfig{Extensions: []string{"/opt/x.ts"}}},
+		tAgentCodex:  {Agent: tAgentCodex},
+	}}
+	if err := saveReviewProfile(ctx, "mine", profile, true, reviewScopeLocal); err != nil {
+		t.Fatal(err)
+	}
+	testutil.RunGit(t, tmp, "add", "-f", ".entire/settings.local.json")
+	testutil.RunGit(t, tmp, "commit", "-q", "-m", "local settings")
+	testutil.RunGit(t, tmp, "rm", "-q", "--cached", ".entire/settings.local.json")
+	settings.ClearVersionedPathCache()
+	t.Cleanup(settings.ClearVersionedPathCache)
+
+	if _, err := saveReviewAgentConfigs(ctx, "mine", map[string]*settings.ReviewAgentConfig{tAgentCodex: {}}); err != nil {
+		t.Fatal(err)
+	}
+	_, raw, err := loadReviewSettingsRaw(ctx, reviewScopeLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := decodeRawReviewProfiles(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claude := stored["mine"].Agents[tAgentClaude]
+	if claude.Prompt != "Focus on auth." || claude.Config == nil {
+		t.Fatalf("claude-code reviewer lost its stored fields: %+v", claude)
+	}
+	if stored["mine"].Agents[tAgentCodex].Config == nil {
+		t.Fatal("codex config not saved")
+	}
+
+	// --edit would pre-fill from the same loaded view, so it refuses.
+	installed := func(context.Context) []agenttypes.AgentName { return []agenttypes.AgentName{tAgentClaude, tAgentCodex} }
+	if err := RunReviewProfileConfigPicker(ctx, io.Discard, installed, "mine"); err == nil || !strings.Contains(err.Error(), "git rm --cached") {
+		t.Fatalf("--edit on an unverified local profile: err = %v", err)
 	}
 }
