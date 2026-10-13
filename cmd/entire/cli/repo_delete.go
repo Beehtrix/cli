@@ -180,10 +180,17 @@ func mirrorsSuffix(ctx context.Context, c *coreapi.Client, repoID string) string
 	}
 }
 
+// mirrorsExistDetail is the server's whole detail for its mirrors-exist 409
+// on a repo delete. It is matched exactly, not by substring: other 409s also
+// speak of native mirrors ("native mirror is being deleted; retry later"),
+// and rewording one of those as this refusal would misstate the remedy.
+const mirrorsExistDetail = "delete native mirrors before deleting their primary"
+
 // explainMirrorConflict rewords the one refusal whose remedy is a flag of this
 // command: the server declines to delete a repo while its mirrors exist. The
 // server's detail speaks of native mirrors and primaries, so the CLI says it
-// in its own words. Under --cascade the same refusal means the server did not
+// in its own words. Any other detail, even one about mirrors, stays the
+// server's. Under --cascade the same refusal means the server did not
 // take the cascade (one deployed before it existed answers this way).
 // The message rides on a plain error: renderCoreError replaces a wrapped
 // *ErrorModelStatusCode with the server's detail alone, which would drop it
@@ -193,7 +200,7 @@ func explainMirrorConflict(err error, label string, cascade bool) error {
 	if !errors.As(err, &problem) || problem.StatusCode != http.StatusConflict {
 		return err
 	}
-	if !strings.Contains(strings.ToLower(coreapi.APIError(err)), "native mirror") {
+	if !strings.EqualFold(strings.TrimSpace(coreapi.APIError(err)), mirrorsExistDetail) {
 		return err
 	}
 	if cascade {

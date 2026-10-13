@@ -224,7 +224,7 @@ func TestRepoDelete_Cascade(t *testing.T) {
 //
 // Not parallel: swaps the package-level activeCoreClient seam.
 func TestRepoDelete_MirrorConflictHint(t *testing.T) {
-	const detail = "delete native mirrors before deleting their primary"
+	const detail = mirrorsExistDetail
 
 	run := func(t *testing.T, detail string, args ...string) error {
 		t.Helper()
@@ -248,6 +248,12 @@ func TestRepoDelete_MirrorConflictHint(t *testing.T) {
 	t.Run("other conflicts keep the server's words", func(t *testing.T) {
 		err := run(t, "repo is locked")
 		require.EqualError(t, err, "repo is locked")
+	})
+
+	t.Run("another native-mirror conflict keeps the server's words", func(t *testing.T) {
+		const draining = "native mirror is being deleted; retry later"
+		require.EqualError(t, run(t, draining), draining)
+		require.EqualError(t, run(t, draining, "--cascade"), draining)
 	})
 }
 
