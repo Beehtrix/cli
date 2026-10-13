@@ -33,7 +33,6 @@ func newRepoWhereamiCmd() *cobra.Command {
 			if !jsonRequested(cmd) {
 				return errors.New("only --json output is supported")
 			}
-			cmd.SilenceUsage = true
 			ctx := cmd.Context()
 			forge, owner, repo, err := gitremote.ResolveRemoteRepo(ctx, "origin")
 			if err != nil {
