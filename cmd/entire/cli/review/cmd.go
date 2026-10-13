@@ -1039,10 +1039,16 @@ func runReview(ctx context.Context, cmd *cobra.Command, agentOverride, modelOver
 		}
 		return err
 	}
-	for _, worker := range sortedMapKeys(nonZeroAgentConfigs(profile.Agents)) {
-		if profile.Agents[worker].Config != nil {
+	running := nonZeroAgentConfigs(profile.Agents)
+	if agentOverride != "" {
+		if worker, cfg, err := selectProfileWorker(profile, agentOverride); err == nil {
+			running = map[string]settings.ReviewConfig{worker: cfg}
+		}
+	}
+	for _, worker := range sortedMapKeys(running) {
+		if running[worker].Config != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "%s: using your profile's agent config; this checkout's hooks, MCP servers and extensions are not loaded.\n", worker)
-			warnAgentConfig(ctx, cmd.ErrOrStderr(), worker, profile.Agents[worker].Config)
+			warnAgentConfig(ctx, cmd.ErrOrStderr(), worker, running[worker].Config)
 		}
 	}
 

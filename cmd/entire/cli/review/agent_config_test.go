@@ -35,6 +35,7 @@ func TestValidateAgentConfig(t *testing.T) {
 		{"settings not an object", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`[]`)}, "settings"},
 		{"codex settings unsupported", "codex", reviewtypes.AgentConfig{Settings: json.RawMessage(`{}`)}, `does not support "settings"`},
 		{"pi MCP unsupported", "pi", reviewtypes.AgentConfig{MCPServers: mcp(`{"url":"x"}`)}, `does not support "mcp_servers"`},
+		{"pi extension relative", "pi", reviewtypes.AgentConfig{Extensions: []string{".pi/ext.ts"}}, "absolute path"},
 		{"pi extension", "pi", reviewtypes.AgentConfig{Extensions: []string{"/opt/ext.ts"}}, ""},
 		{"unknown agent", "cursor", reviewtypes.AgentConfig{}, "does not support a review profile config"},
 	}

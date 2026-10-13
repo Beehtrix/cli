@@ -81,6 +81,13 @@ func ValidateAgentConfig(agentName string, cfg *reviewtypes.AgentConfig) error {
 			return fmt.Errorf("MCP server %q: env values aren't supported for Codex in a review profile yet", name)
 		}
 	}
+	// A relative extension would load from the reviewed checkout, the one
+	// thing a profile config promises not to do.
+	for _, ext := range cfg.Extensions {
+		if !filepath.IsAbs(ext) {
+			return fmt.Errorf("extension %q: use an absolute path", ext)
+		}
+	}
 	return nil
 }
 
