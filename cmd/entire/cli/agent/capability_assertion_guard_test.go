@@ -41,8 +41,9 @@ var nonCapabilityInterfaces = map[string]string{
 // that wraps onto a second line are both seen. Naming the package-agent
 // interface is not the only way to reach one, so an asserted type is also
 // followed through aliases, defined types, interface literals, and interfaces
-// declared in any repository package, and matched by the capability methods or
-// embedded capability interfaces it reaches.
+// declared in any repository package or inside the asserting function, through
+// generic instantiations and dot imports, and matched by the capability methods
+// or embedded capability interfaces it reaches.
 func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 	t.Parallel()
 
@@ -87,12 +88,14 @@ func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 	// The staleness check counts the files it scans that import package agent
 	// rather than matched assertions, so routing the last allowed assertion
 	// through a helper does not read as broken detection.
-	importingFiles := 0
+	importingFiles, assertionCount := 0, 0
 	for _, f := range files {
 		if f.qualifier != "-" && f.dir != agentPackageDir {
 			importingFiles++
 		}
-		for _, expr := range assertedTypes(f.ast) {
+		for _, a := range fileAssertions(f.ast) {
+			assertionCount++
+			expr := a.typ
 			pos := fset.Position(expr.Pos())
 			if name, ok := agentInterfaceName(expr, f.qualifier, interfaces); ok {
 				if _, allowed := nonCapabilityInterfaces[name]; !allowed {
@@ -101,7 +104,7 @@ func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 				}
 				continue
 			}
-			if capability, via, found := resolver.reach(expr, f, map[ast.Expr]bool{}); found {
+			if capability, via, found := resolver.reach(expr, f, a.locals, map[ast.Expr]bool{}); found {
 				t.Errorf("%s:%d: asserts to %s, which reaches capability %s through %s; if the value is an agent, %s",
 					f.rel, pos.Line, types.ExprString(expr), capability, via, helperAdvice(capability, helpers))
 			}
@@ -109,6 +112,9 @@ func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 	}
 	if importingFiles == 0 {
 		t.Fatalf("no file outside package agent imports %s — the guard's import detection has gone stale", agentImportPath)
+	}
+	if assertionCount == 0 {
+		t.Fatal("no type assertions found in any scanned file — the guard's assertion detection has gone stale")
 	}
 
 	for name := range nonCapabilityInterfaces {
@@ -132,6 +138,7 @@ type sourceFile struct {
 	ast       *ast.File
 	qualifier string            // see agentImportName
 	imports   map[string]string // local package name to directory, for repository packages
+	dotDirs   []string          // directories of dot-imported repository packages
 }
 
 func newSourceFile(rel string, file *ast.File) *sourceFile {
@@ -152,6 +159,10 @@ func newSourceFile(rel string, file *ast.File) *sourceFile {
 		name := path.Base(dir)
 		if imp.Name != nil {
 			name = imp.Name.Name
+		}
+		if name == "." {
+			f.dotDirs = append(f.dotDirs, dir)
+			continue
 		}
 		f.imports[name] = dir
 	}
@@ -196,8 +207,10 @@ func (r *assertionResolver) addDecls(file *sourceFile) {
 
 // reach reports the capability typ, as written in file, reaches: by naming a
 // package-agent capability interface, declaring one of its methods, or naming
-// or embedding a type that does. via describes the step that reached it.
-func (r *assertionResolver) reach(typ ast.Expr, file *sourceFile, seen map[ast.Expr]bool) (string, string, bool) {
+// or embedding a type that does. locals holds the types declared inside the
+// function typ appears in; it is nil outside one. via describes the step that
+// reached it.
+func (r *assertionResolver) reach(typ ast.Expr, file *sourceFile, locals map[string][]ast.Expr, seen map[ast.Expr]bool) (string, string, bool) {
 	if seen[typ] {
 		return "", "", false
 	}
@@ -210,7 +223,11 @@ func (r *assertionResolver) reach(typ ast.Expr, file *sourceFile, seen map[ast.E
 	}
 	switch t := typ.(type) {
 	case *ast.ParenExpr:
-		return r.reach(t.X, file, seen)
+		return r.reach(t.X, file, locals, seen)
+	case *ast.IndexExpr:
+		return r.reach(t.X, file, locals, seen)
+	case *ast.IndexListExpr:
+		return r.reach(t.X, file, locals, seen)
 	case *ast.InterfaceType:
 		for _, field := range t.Methods.List {
 			for _, name := range field.Names {
@@ -219,13 +236,22 @@ func (r *assertionResolver) reach(typ ast.Expr, file *sourceFile, seen map[ast.E
 				}
 			}
 			if len(field.Names) == 0 {
-				if capability, via, ok := r.reach(field.Type, file, seen); ok {
+				if capability, via, ok := r.reach(field.Type, file, locals, seen); ok {
 					return capability, via, true
 				}
 			}
 		}
 	case *ast.Ident:
-		return r.reachDecls(file.dir, t.Name, seen)
+		for _, local := range locals[t.Name] {
+			if capability, via, ok := r.reach(local, file, locals, seen); ok {
+				return capability, via, true
+			}
+		}
+		for _, dir := range append([]string{file.dir}, file.dotDirs...) {
+			if capability, via, ok := r.reachDecls(dir, t.Name, seen); ok {
+				return capability, via, true
+			}
+		}
 	case *ast.SelectorExpr:
 		if pkg, ok := t.X.(*ast.Ident); ok {
 			if dir, ok := file.imports[pkg.Name]; ok {
@@ -238,7 +264,7 @@ func (r *assertionResolver) reach(typ ast.Expr, file *sourceFile, seen map[ast.E
 
 func (r *assertionResolver) reachDecls(dir, name string, seen map[ast.Expr]bool) (string, string, bool) {
 	for _, decl := range r.decls[dir][name] {
-		if capability, via, ok := r.reach(decl.typ, decl.file, seen); ok {
+		if capability, via, ok := r.reach(decl.typ, decl.file, nil, seen); ok {
 			return capability, via, true
 		}
 	}
@@ -366,11 +392,52 @@ func agentInterfaceName(expr ast.Expr, qualifier string, interfaces map[string]*
 	return name, ok
 }
 
-// assertedTypes returns every type expression file asserts a value to: the
+// assertion is a type expression a value is asserted to, with the types
+// declared inside the top-level declaration it appears in.
+type assertion struct {
+	typ    ast.Expr
+	locals map[string][]ast.Expr
+}
+
+// fileAssertions returns every assertion in file. Local types are collected per
+// top-level declaration rather than per block, so a local type name shadowed in
+// a sibling block can be over-matched; that only risks a false report.
+func fileAssertions(file *ast.File) []assertion {
+	var assertions []assertion
+	for _, decl := range file.Decls {
+		locals := localTypes(decl)
+		for _, typ := range assertedTypes(decl) {
+			assertions = append(assertions, assertion{typ, locals})
+		}
+	}
+	return assertions
+}
+
+// localTypes returns the types declared inside decl's function bodies, by name.
+func localTypes(decl ast.Decl) map[string][]ast.Expr {
+	locals := map[string][]ast.Expr{}
+	ast.Inspect(decl, func(n ast.Node) bool {
+		stmt, ok := n.(*ast.DeclStmt)
+		if !ok {
+			return true
+		}
+		if gen, ok := stmt.Decl.(*ast.GenDecl); ok && gen.Tok == token.TYPE {
+			for _, spec := range gen.Specs {
+				if typeSpec, ok := spec.(*ast.TypeSpec); ok {
+					locals[typeSpec.Name.Name] = append(locals[typeSpec.Name.Name], typeSpec.Type)
+				}
+			}
+		}
+		return true
+	})
+	return locals
+}
+
+// assertedTypes returns every type expression node asserts a value to: the
 // X in v.(X) and in each case of a switch v.(type).
-func assertedTypes(file *ast.File) []ast.Expr {
+func assertedTypes(node ast.Node) []ast.Expr {
 	var types []ast.Expr
-	ast.Inspect(file, func(n ast.Node) bool {
+	ast.Inspect(node, func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.TypeAssertExpr:
 			if n.Type != nil {

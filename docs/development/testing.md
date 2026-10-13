@@ -284,10 +284,12 @@ across lines, so it parses files instead of grepping them. It lists files with
 the same untracked-file and repo-selector protections, restricts the pathspec
 to `*.go`, and fails when no scanned file outside package `agent` imports it.
 It counts importing files rather than matched assertions, so removing the last
-allowed assertion does not look like broken detection. An asserted type is
-followed through aliases, defined types, interface literals, and interfaces
-declared in any repository package, and is flagged when it reaches a capability
-interface or one of its methods. A tracked file missing from the working tree
+allowed assertion does not look like broken detection, and separately fails
+when it finds no type assertions at all. An asserted type is followed through
+aliases, defined types, generic instantiations, interface literals, interfaces
+declared inside the asserting function or in any repository package, and dot
+imports, and is flagged when it reaches a capability interface or one of its
+methods. A tracked file missing from the working tree
 is skipped, and any other read error fails the guard.
 
 ### Code Duplication Prevention
