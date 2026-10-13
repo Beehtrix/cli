@@ -294,7 +294,7 @@ func TestPiReviewer_ParseErrorWithoutMessage(t *testing.T) {
 }
 
 // Some Pi versions end the stream after the final turn without agent_end; a
-// turn the model stopped on still finishes the review, while a stream cut
+// turn that was not waiting on tool results still finishes the review, while a stream cut
 // after a tool-use turn does not.
 func TestPiReviewer_ParseEndsWithoutAgentEnd(t *testing.T) {
 	t.Parallel()
@@ -306,9 +306,15 @@ func TestPiReviewer_ParseEndsWithoutAgentEnd(t *testing.T) {
 		}
 		return false, false
 	}
-	stopped := `{"type":"turn_end","message":{"role":"assistant","stopReason":"stop"}}` + "\n"
-	if seen, ok := finished(stopped); !seen || !ok {
-		t.Errorf("final stop turn: finished=%v success=%v, want a successful finish", seen, ok)
+	for _, reason := range []string{"stop", "length"} {
+		turn := `{"type":"turn_end","message":{"role":"assistant","stopReason":"` + reason + `"}}` + "\n"
+		if seen, ok := finished(turn); !seen || !ok {
+			t.Errorf("final %s turn: finished=%v success=%v, want a successful finish", reason, seen, ok)
+		}
+	}
+	errored := `{"type":"turn_end","message":{"role":"assistant","stopReason":"error","errorMessage":"boom"}}` + "\n"
+	if _, ok := finished(errored); ok {
+		t.Error("stream ending on an error turn counted as success")
 	}
 	toolUse := `{"type":"turn_end","message":{"role":"assistant","stopReason":"toolUse"}}` + "\n"
 	if _, ok := finished(toolUse); ok {

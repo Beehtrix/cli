@@ -143,10 +143,10 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 			return
 		}
 		if !finished {
-			// A stream that ends right after a turn the model stopped on
-			// finished the review; anything else (a turn waiting on tool
-			// results, an error) was cut short.
-			if lastTurnStop == "stop" && success {
+			// A stream that ends right after a turn that wasn't waiting on
+			// tool results finished the review, as agent_end would have;
+			// errors and aborts already cleared success.
+			if lastTurnStop != "" && lastTurnStop != "toolUse" && success {
 				out <- reviewtypes.Finished{Success: true}
 				return
 			}
