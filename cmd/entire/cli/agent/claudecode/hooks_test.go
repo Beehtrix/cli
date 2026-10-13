@@ -1324,8 +1324,9 @@ func TestCheckHookConfig_SupersetMatchersAreCurrent(t *testing.T) {
 
 // TestInstallHooks_Force_ReinstallsStaleToolMatchers verifies that `--force`
 // strips Entire hooks left under the outdated "Task"/"TodoWrite" matchers by
-// older CLI versions and reinstalls them under the current matchers. (A normal
-// enable does not rewrite existing hook config; --force is the fix path.)
+// older CLI versions and reinstalls them under the current matchers. (A plain
+// install adds the current matchers but keeps an Entire entry under the dead
+// "Task" matcher if its command is current; --force strips those too.)
 func TestInstallHooks_Force_ReinstallsStaleToolMatchers(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Chdir(tempDir)

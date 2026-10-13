@@ -386,7 +386,7 @@ These are visible in developer and nightly builds and hidden in stable releases,
 | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `--agent <name>`                            | Agent to set up hooks for: `antigravity`, `claude-code`, `codex`, `copilot-cli`, `cursor`, `factoryai-droid`, `opencode`, `pi` (external agents on `$PATH` also work). Enables non-interactive mode |
 | `--yes`, `-y`                               | Accept all defaults without prompting                                                                             |
-| `--force`, `-f`                             | Force reinstall hooks (removes existing Entire hooks first)                                                       |
+| `--force`, `-f`                             | Reinstall the Entire git hook                                                                                     |
 | `--checkpoint-remote <provider:owner/repo>` | Push checkpoint data to a separate repo; providers `github`, `gitlab` (e.g., `github:org/checkpoints-repo`)      |
 | `--checkpoint-push-remote <name>`           | Select an existing Git remote for checkpoints; always saves to this clone's `.entire/settings.local.json`, even with `--project` |
 | `--skip-push-sessions`                      | Disable automatic pushing of checkpoint data on git push                                                           |
@@ -692,9 +692,6 @@ entire clean --force
 
 # Clean all orphaned data across the repository
 entire clean --all --force
-
-# Disable and re-enable
-entire disable && entire enable
 ```
 
 ### Accessibility

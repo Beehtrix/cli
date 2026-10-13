@@ -47,9 +47,10 @@ const (
 //   - https://code.claude.com/docs/en/hooks.md (matcher evaluation rules)
 //
 // Configs written by older CLI versions used the outdated matchers "Task" and
-// "TodoWrite", where the hooks silently never fired. Those are not rewritten in
-// place on a normal `entire enable`; run `entire agent add claude-code --force`
-// to strip and reinstall.
+// "TodoWrite", where the hooks silently never fired. A plain install adds the
+// hooks under the current matchers (clearing drift) but keeps an Entire entry
+// under the dead "Task" matcher if its command is current;
+// `entire agent add claude-code --force` strips those too.
 const (
 	subagentToolMatcher = "Agent"
 	// skillToolMatcher routes Skill calls to post-task, which records the agent

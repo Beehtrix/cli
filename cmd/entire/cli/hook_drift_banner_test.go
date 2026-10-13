@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
@@ -31,20 +32,6 @@ func writeStaleClaudeHookSettings(t *testing.T, repoDir string) {
 	claudeDir := filepath.Join(repoDir, claudeDirName)
 	require.NoError(t, os.MkdirAll(claudeDir, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, claudecode.ClaudeSettingsFileName), []byte(staleClaudeHookSettings), 0o600))
-}
-
-// The remedy names the registry name, which is what `entire agent add` takes,
-// not the display name.
-func TestRefreshAgentHooksCommand(t *testing.T) {
-	t.Parallel()
-
-	for name, want := range map[types.AgentName]string{
-		agent.AgentNameClaudeCode: "entire agent add claude-code --force",
-		agent.AgentNameCodex:      "entire agent add codex --force",
-		agent.AgentNameOpenCode:   "entire agent add opencode --force",
-	} {
-		require.Equal(t, want, refreshAgentHooksCommand(name))
-	}
 }
 
 func mustGetAgent(t *testing.T, name types.AgentName) agent.Agent {
@@ -105,4 +92,25 @@ func TestOutdatedHooksBannerSuffix_OpenCodeOutdatedStaysSilent(t *testing.T) {
 	require.Equal(t, agent.HooksOutdated, hf.CheckHookConfig(ctx), "fixture must read as outdated")
 
 	require.Empty(t, outdatedHooksBannerSuffix(ctx, ag))
+}
+
+// outdatedHookResponseAgent is a banner-writing Claude Code stand-in whose
+// hooks always read as outdated, so the SessionStart wiring is tested on its own.
+type outdatedHookResponseAgent struct {
+	mockHookResponseAgent
+}
+
+func (*outdatedHookResponseAgent) CheckHookConfig(context.Context) agent.HookConfigState {
+	return agent.HooksOutdated
+}
+
+func TestHandleLifecycleSessionStart_OutdatedHooksWarning(t *testing.T) {
+	t.Chdir(setupGitRepoForPhaseTest(t))
+	ag := &outdatedHookResponseAgent{*newMockHookResponseAgent()}
+	ag.name = agent.AgentNameClaudeCode
+
+	require.NoError(t, handleLifecycleSessionStart(context.Background(), ag, &agent.Event{
+		Type: agent.SessionStart, SessionID: "test-outdated-hooks-warning", Timestamp: time.Now(),
+	}))
+	require.Contains(t, ag.lastMessage, "Run 'entire agent add claude-code --force' to update them.")
 }
