@@ -479,8 +479,9 @@ func rawJSONClient(t *testing.T, body string) *Client {
 }
 
 // TestDetachRepo_UnknownEnumValuesPassThrough: the detach result's precondition
-// slugs, access source/subject type, and status are documented as growing sets
-// that `entire repo mirror detach` prints, so a new value must decode.
+// slugs and status are documented as growing sets that `entire repo mirror
+// detach` prints, so a new value must decode. Access source and subject type
+// must decode too: an older core still sends them, and `--json` prints them.
 func TestDetachRepo_UnknownEnumValuesPassThrough(t *testing.T) {
 	t.Parallel()
 
