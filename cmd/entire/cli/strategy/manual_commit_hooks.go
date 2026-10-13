@@ -54,6 +54,47 @@ const (
 	ttyResultLinkAlways                  // Link and remember: add trailer + save "always" preference
 )
 
+// CommitLinkingPromptLogMsg is logged when prepare-commit-msg shows the
+// commit-linking prompt. E2E fails any test whose logs contain it: every E2E
+// commit comes from an agent or the harness, and neither can answer.
+const CommitLinkingPromptLogMsg = "prepare-commit-msg: prompting to link commit"
+
+// confirmPromptTimeout bounds how long askConfirmTTY waits for an answer. The
+// prompt runs inside git's prepare-commit-msg hook, so an unanswered prompt
+// hangs the commit itself; a terminal can pass the probe yet be one nobody can
+// see (a hidden console behind a Windows desktop app). Someone at the terminal
+// answers a yes/no question well within this, and the default it falls back to
+// is the one Enter selects.
+const confirmPromptTimeout = 15 * time.Second
+
+// errPromptTimedOut reports that readPromptAnswer gave up waiting.
+var errPromptTimedOut = errors.New("no answer before the prompt timed out")
+
+// readPromptAnswer reads one line from r, giving up after timeout. A read
+// still blocked when it gives up is left behind: the caller's terminal Close
+// releases it (see interactive.PromptTTY.Close), and the hook process exits
+// right after.
+func readPromptAnswer(r io.Reader, timeout time.Duration) (string, error) {
+	type answer struct {
+		line string
+		err  error
+	}
+	answered := make(chan answer, 1)
+	go func() {
+		line, err := bufio.NewReader(r).ReadString('\n')
+		answered <- answer{line: line, err: err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case a := <-answered:
+		return a.line, a.err
+	case <-timer.C:
+		return "", errPromptTimedOut
+	}
+}
+
 // askConfirmTTY prompts via the controlling terminal whether to link a commit
 // to session context.
 // This requires a controlling terminal — callers must check
@@ -96,9 +137,10 @@ func askConfirmTTY(header string, details []string, prompt string, defaultYes bo
 		fmt.Fprint(tty, "  [y]es / [N]o / [a]lways (remember my choice): ")
 	}
 
-	// Read response
-	reader := bufio.NewReader(tty)
-	response, err := reader.ReadString('\n')
+	response, err := readPromptAnswer(tty, confirmPromptTimeout)
+	if errors.Is(err, errPromptTimedOut) {
+		fmt.Fprintf(tty, "\nNo answer within %s; using the default.\n", confirmPromptTimeout)
+	}
 	if err != nil {
 		return defaultResult
 	}
@@ -533,6 +575,10 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 				details = append(details, "Last prompt: "+displayPrompt)
 			}
 
+			logging.Info(logCtx, CommitLinkingPromptLogMsg,
+				slog.String("strategy", "manual-commit"),
+				slog.String("source", source),
+			)
 			result := askConfirmTTY(header, details, "Link this commit to session context?", true)
 			if result == ttyResultSkip {
 				logging.Debug(logCtx, "prepare-commit-msg: user declined trailer",
