@@ -727,12 +727,23 @@ func TestString_BareSKKeys(t *testing.T) {
 			input: `first line\n` + issueKey,
 			want:  `first line\nREDACTED`,
 		},
-		{
-			name:  "preceded by a literal JSON unicode escape",
-			input: `quote"` + issueKey,
-			want:  `quote"REDACTED`,
-		},
 	})
+}
+
+// TestDetectProviderTokens_BareSKKeyAfterJSONEscape pins the escape boundaries
+// on the provider layer alone: through String, the entropy layer can swallow
+// an escape's hex digits together with the key and mask a missing boundary.
+func TestDetectProviderTokens_BareSKKeyAfterJSONEscape(t *testing.T) {
+	t.Parallel()
+
+	key := bareSKPrefix() + "Qm4Wn8Rt_bVcXzLkJhGfDs"
+	for _, prefix := range []string{`first line\n`, `quote\u0022`} {
+		input := prefix + key
+		regions := detectProviderTokens(input)
+		if len(regions) != 1 || input[regions[0].start:regions[0].end] != key {
+			t.Errorf("detectProviderTokens(%q) = %v, want exactly the key", input, regions)
+		}
+	}
 }
 
 // TestString_BareSKKeyOverRedactionGuards pins the two guards that keep the
