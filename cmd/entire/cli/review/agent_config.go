@@ -67,14 +67,18 @@ func ValidateAgentConfig(agentName string, cfg *reviewtypes.AgentConfig) error {
 			return fmt.Errorf("MCP server name %q: use letters, digits, '-' and '_'", name)
 		}
 		var server struct {
-			Command string `json:"command"`
-			URL     string `json:"url"`
+			Command string            `json:"command"`
+			URL     string            `json:"url"`
+			Env     map[string]string `json:"env"`
 		}
 		if err := json.Unmarshal(cfg.MCPServers[name], &server); err != nil {
 			return fmt.Errorf("MCP server %q: %w", name, err)
 		}
 		if server.Command == "" && server.URL == "" {
 			return fmt.Errorf("MCP server %q needs a command or a url", name)
+		}
+		if agentName == "codex" && len(server.Env) > 0 {
+			return fmt.Errorf("MCP server %q: env values aren't supported for Codex in a review profile yet", name)
 		}
 	}
 	return nil

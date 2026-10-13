@@ -853,7 +853,7 @@ type reviewProfileSelection struct {
 }
 
 // resolveReviewProfile selects the profile, running setup or the chooser if needed.
-func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverride string, deps Deps) (reviewProfileSelection, error) {
+func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverride, agentOverride string, deps Deps) (reviewProfileSelection, error) {
 	out := cmd.OutOrStdout()
 	silentErr := deps.NewSilentError
 
@@ -980,17 +980,39 @@ func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverri
 	// A reviewer config the user set locally but that can't be honored must
 	// stop the review: running it with the checkout's config instead would
 	// silently undo the isolation they asked for.
+	var unverified []string
 	for _, rej := range s.AgentPromptRejections() {
-		if strings.HasPrefix(rej.Field, "review_profiles."+profileName+".") && settings.AgentConfigRejectionUnverified(rej) {
-			cmd.SilenceUsage = true
-			err := fmt.Errorf("%s can't be applied: .entire/settings.local.json could not be verified as untracked; move the profile to clone-local preferences (entire review --configure --set-config)", rej.Field)
-			fmt.Fprintln(cmd.ErrOrStderr(), "Not run: "+err.Error())
-			return reviewProfileSelection{}, silentErr(err)
+		if settings.AgentConfigRejectionUnverified(rej) {
+			unverified = append(unverified, rej.Field)
 		}
+	}
+	if field, ok := unverifiedReviewerConfig(unverified, profileName, profile, agentOverride); ok {
+		cmd.SilenceUsage = true
+		err := fmt.Errorf("%s can't be applied: .entire/settings.local.json could not be verified as untracked; untrack it (git rm --cached .entire/settings.local.json) or remove the profile from it, then set the config again with entire review --configure %s --set-config", field, profileName)
+		fmt.Fprintln(cmd.ErrOrStderr(), "Not run: "+err.Error())
+		return reviewProfileSelection{}, silentErr(err)
 	}
 	profile.Task = profileTask(profileName, profile)
 	profile.Agents = nonZeroAgentConfigs(profile.Agents)
 	return reviewProfileSelection{name: profileName, profile: profile, installed: installed}, nil
+}
+
+// unverifiedReviewerConfig returns the first of the unverified (dropped)
+// config fields that belongs to a reviewer of profileName that will run.
+func unverifiedReviewerConfig(unverified []string, profileName string, profile settings.ReviewProfileConfig, agentOverride string) (string, bool) {
+	workers := sortedStringKeys(profile.Agents)
+	if agentOverride != "" {
+		if worker, _, err := selectProfileWorker(profile, agentOverride); err == nil {
+			workers = []string{worker}
+		}
+	}
+	for _, worker := range workers {
+		field := "review_profiles." + profileName + ".agents." + worker + ".config"
+		if slices.Contains(unverified, field) {
+			return field, true
+		}
+	}
+	return "", false
 }
 
 // runReview executes the main review flow.
@@ -1004,7 +1026,7 @@ func runReview(ctx context.Context, cmd *cobra.Command, agentOverride, modelOver
 	if gateOpts.ShowConfig {
 		return runReviewShowConfig(ctx, cmd, profileOverride, gateOpts, deps)
 	}
-	selection, err := resolveReviewProfile(ctx, cmd, profileOverride, deps)
+	selection, err := resolveReviewProfile(ctx, cmd, profileOverride, agentOverride, deps)
 	if err != nil || selection.done {
 		return err
 	}

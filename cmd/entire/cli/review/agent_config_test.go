@@ -29,6 +29,8 @@ func TestValidateAgentConfig(t *testing.T) {
 		{"MCP command", "codex", reviewtypes.AgentConfig{MCPServers: mcp(`{"command":"npx","args":["server"]}`)}, ""},
 		{"MCP url", "claude-code", reviewtypes.AgentConfig{MCPServers: mcp(`{"url":"https://mcp.example"}`)}, ""},
 		{"MCP without command or url", "claude-code", reviewtypes.AgentConfig{MCPServers: mcp(`{"args":["x"]}`)}, "needs a command or a url"},
+		{"codex MCP env", "codex", reviewtypes.AgentConfig{MCPServers: mcp(`{"command":"/opt/mcp","env":{"TOKEN":"x"}}`)}, "env values aren't supported for Codex"},
+		{"claude MCP env", "claude-code", reviewtypes.AgentConfig{MCPServers: mcp(`{"command":"/opt/mcp","env":{"TOKEN":"x"}}`)}, ""},
 		{"MCP bad name", "codex", reviewtypes.AgentConfig{MCPServers: map[string]json.RawMessage{"a.b": json.RawMessage(`{"url":"x"}`)}}, "letters, digits"},
 		{"settings not an object", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`[]`)}, "settings"},
 		{"codex settings unsupported", "codex", reviewtypes.AgentConfig{Settings: json.RawMessage(`{}`)}, `does not support "settings"`},
@@ -140,5 +142,24 @@ func TestTrustConfirmTextForProfileConfig(t *testing.T) {
 	}
 	if title, body := trustConfirmText(subject, TrustInventory{Isolated: true}, "x"); title != "Review this branch?" || !strings.Contains(body, "uses your profile's config") || strings.Contains(body, "nothing from it runs") {
 		t.Fatalf("empty isolated title/body = %q / %q", title, body)
+	}
+}
+
+// Only a reviewer that will run, in exactly this profile, stops the review.
+func TestUnverifiedReviewerConfig(t *testing.T) {
+	t.Parallel()
+
+	profile := settings.ReviewProfileConfig{Agents: map[string]settings.ReviewConfig{
+		"claude-code": {Agent: "claude-code"}, "codex": {Agent: "codex"},
+	}}
+	unverified := []string{"review_profiles.a.b.agents.claude-code.config", "review_profiles.a.agents.claude-code.config"}
+	if field, ok := unverifiedReviewerConfig(unverified, "a", profile, ""); !ok || field != unverified[1] {
+		t.Errorf("all reviewers: got %q, %v", field, ok)
+	}
+	if _, ok := unverifiedReviewerConfig(unverified, "a", profile, "codex"); ok {
+		t.Error("--agent codex was stopped by claude-code's config")
+	}
+	if _, ok := unverifiedReviewerConfig(unverified[:1], "a", profile, ""); ok {
+		t.Error("profile a was stopped by profile a.b's config")
 	}
 }

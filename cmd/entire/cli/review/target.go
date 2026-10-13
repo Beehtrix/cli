@@ -81,7 +81,7 @@ func runTargetReview(ctx context.Context, cmd *cobra.Command, req targetReviewRe
 	} else {
 		// Resolve the profile in the user's checkout, never the branch's worktree;
 		// the gate also needs its agents.
-		selection, selErr := resolveReviewProfile(ctx, cmd, profileName, deps)
+		selection, selErr := resolveReviewProfile(ctx, cmd, profileName, req.Gate.AgentOverride, deps)
 		if selErr != nil || selection.done {
 			return selErr
 		}
