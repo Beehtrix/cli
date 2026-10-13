@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
+	"testing"
 )
 
 // ErrKeyringUnavailable is returned instead of ErrNotFound when the OS keyring
@@ -36,8 +37,13 @@ var keyringReachable = sync.OnceValue(probeKeyringReachable)
 // or does not finish proves nothing, so it leaves ErrNotFound as reported.
 // Other platforms' keyrings return a distinct error when unreachable, so they
 // need no probe.
+//
+// Under `go test` it never runs: keyring.MockInit fakes go-keyring but not this
+// subprocess, so a test reaching keyringStore would otherwise query the real
+// Keychain. testing.Testing() is the same signal testdirs uses to keep tests
+// off the real credential store.
 func probeKeyringReachable() bool {
-	if runtime.GOOS != "darwin" {
+	if runtime.GOOS != "darwin" || testing.Testing() {
 		return true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), keyringTimeout())

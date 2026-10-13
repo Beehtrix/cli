@@ -88,3 +88,12 @@ func TestExitedNonZero(t *testing.T) {
 		}
 	})
 }
+
+// The probe must never shell out to the real Keychain from a test.
+func TestProbeKeyringReachable_NoProbeUnderTest(t *testing.T) {
+	t.Parallel()
+
+	if !probeKeyringReachable() {
+		t.Fatal("probeKeyringReachable under go test = false; it must not probe the real keyring")
+	}
+}
