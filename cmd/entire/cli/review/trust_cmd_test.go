@@ -220,4 +220,15 @@ func TestConfigure_SetConfigSavesToClonePreferences(t *testing.T) {
 	if !strings.Contains(stderr.String(), "inside the checkout") {
 		t.Errorf("no warning for a checkout path; stderr:\n%s", stderr.String())
 	}
+
+	// none removes the reviewer's config, so it uses the checkout's again.
+	if err := run("--configure", "general", "--set-config", "claude-code=none"); err != nil {
+		t.Fatalf("--set-config none: %v", err)
+	}
+	if s, err = settings.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := s.ReviewProfiles["general"].Agents["claude-code"].Config; cfg != nil {
+		t.Fatalf("config still set after none: %+v", cfg)
+	}
 }

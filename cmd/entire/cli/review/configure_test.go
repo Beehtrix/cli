@@ -816,3 +816,55 @@ func TestSaveReviewProfileConfigKeepsLocalAgentConfig(t *testing.T) {
 		}
 	}
 }
+
+// A reviewer config goes to the local file when it defines the profile,
+// otherwise to clone-local preferences, and a nil config removes it there.
+func TestSaveReviewAgentConfigs(t *testing.T) {
+	tmp := t.TempDir()
+	testutil.InitRepo(t, tmp)
+	t.Chdir(tmp)
+	ctx := context.Background()
+
+	profile := settings.ReviewProfileConfig{Agents: map[string]settings.ReviewConfig{tAgentClaude: {Agent: tAgentClaude}}}
+	if err := saveReviewProfile(ctx, "shared", profile, true, reviewScopeProject); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveReviewProfile(ctx, "mine", profile, false, reviewScopeLocal); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &settings.ReviewAgentConfig{Extensions: []string{"/opt/x.ts"}}
+
+	where, err := saveReviewAgentConfigs(ctx, "shared", map[string]*settings.ReviewAgentConfig{tAgentClaude: cfg})
+	if err != nil || where != "clone-local review preferences" {
+		t.Fatalf("shared profile: where=%q err=%v", where, err)
+	}
+	if where, err := saveReviewAgentConfigs(ctx, "mine", map[string]*settings.ReviewAgentConfig{tAgentClaude: cfg}); err != nil || where != reviewScopeLocal.file() {
+		t.Fatalf("local profile: where=%q err=%v", where, err)
+	}
+	s, err := settings.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"shared", "mine"} {
+		if s.ReviewProfiles[name].Agents[tAgentClaude].Config == nil {
+			t.Errorf("%s: config not applied", name)
+		}
+	}
+	if _, raw, err := loadReviewSettingsRaw(ctx, reviewScopeProject); err != nil || strings.Contains(string(raw["review_profiles"]), "config") {
+		t.Fatalf("config reached the shared settings file: %s (err %v)", raw["review_profiles"], err)
+	}
+
+	if _, err := saveReviewAgentConfigs(ctx, "shared", map[string]*settings.ReviewAgentConfig{tAgentClaude: nil}); err != nil {
+		t.Fatal(err)
+	}
+	prefs, err := settings.LoadClonePreferences(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := prefs.ReviewAgentConfigs["shared"]; ok {
+		t.Errorf("removed config left behind: %+v", prefs.ReviewAgentConfigs)
+	}
+	if _, err := saveReviewAgentConfigs(ctx, "shared", map[string]*settings.ReviewAgentConfig{"codex": cfg}); err == nil {
+		t.Error("config for a reviewer the profile doesn't have was saved")
+	}
+}
