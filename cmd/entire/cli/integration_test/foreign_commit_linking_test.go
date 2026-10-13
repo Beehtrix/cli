@@ -63,7 +63,7 @@ func TestForeignCommit_NoTTYUnrelatedFileIsNotLinked(t *testing.T) {
 	foreignActiveSession(t, env)
 
 	env.WriteFile("other_file.txt", "from a hookless agent")
-	env.GitCommitWithShadowHooksAsAgent("hookless agent commit", "other_file.txt")
+	env.GitCommitWithHooksAsAgent("hookless agent commit", "other_file.txt")
 
 	require.Empty(t, headCheckpointID(t, env), "a commit of a file the session never touched, made outside its agent, must not carry its trailer")
 }
@@ -73,7 +73,7 @@ func TestForeignCommit_NoTTYWithSessionFileIsLinked(t *testing.T) {
 	env := NewFeatureBranchEnv(t)
 	foreignActiveSession(t, env)
 
-	env.GitCommitWithShadowHooksAsAgent("commit the agent's file", "claude_file.txt")
+	env.GitCommitWithHooksAsAgent("commit the agent's file", "claude_file.txt")
 
 	require.NotEmpty(t, headCheckpointID(t, env), "a commit containing the session's work still links through content detection")
 }
@@ -86,7 +86,7 @@ func TestForeignCommit_InFlightTaskDoesNotLinkUnrelatedFile(t *testing.T) {
 	makeOwnerForeign(t, env, session.ID) // the task hook re-resolves state; keep the owner foreign
 
 	env.WriteFile("other_file.txt", "from a hookless agent")
-	env.GitCommitWithShadowHooksAsAgent("hookless agent commit", "other_file.txt")
+	env.GitCommitWithHooksAsAgent("hookless agent commit", "other_file.txt")
 
 	require.Empty(t, headCheckpointID(t, env), "an in-flight task record is not evidence the session made this commit")
 }
@@ -98,7 +98,7 @@ func TestForeignCommit_AlwaysLinkingAtTerminalIsNotLinked(t *testing.T) {
 	foreignActiveSession(t, env)
 
 	env.WriteFile("other_file.txt", "typed by a person")
-	env.GitCommitWithShadowHooks("terminal commit", "other_file.txt")
+	env.GitCommitWithHooks("terminal commit", "other_file.txt")
 
 	require.Empty(t, headCheckpointID(t, env), "commit_linking=always skips the prompt, not the evidence that the commit is the session's")
 }
@@ -112,7 +112,7 @@ func TestForeignCommit_CallerSessionClaimKeepsFastPath(t *testing.T) {
 	env.ExtraEnv = append(env.ExtraEnv, "CLAUDE_CODE_SESSION_ID="+session.ID)
 
 	env.WriteFile("shell_edit.txt", "written by the agent through its shell")
-	env.GitCommitWithShadowHooksAsAgent("agent commit", "shell_edit.txt")
+	env.GitCommitWithHooksAsAgent("agent commit", "shell_edit.txt")
 
 	require.NotEmpty(t, headCheckpointID(t, env), "a caller-session claim is positive evidence the commit is the agent's own")
 }
@@ -128,7 +128,7 @@ func TestForeignCommit_OwnAgentNoTTYCommitStillLinks(t *testing.T) {
 	// the agent committing a file it changed through its shell.
 
 	env.WriteFile("shell_edit.txt", "written by the agent through its shell")
-	env.GitCommitWithShadowHooksAsAgent("agent commit", "shell_edit.txt")
+	env.GitCommitWithHooksAsAgent("agent commit", "shell_edit.txt")
 
 	require.NotEmpty(t, headCheckpointID(t, env), "an agent's own no-TTY commit keeps the fast path")
 }
@@ -143,7 +143,7 @@ func TestForeignCommit_PostCommitDoesNotCondenseForeignSession(t *testing.T) {
 	env.WriteFile("committer_file.txt", "content from the committing agent")
 	committer.CreateTranscript("Create another file", []FileChange{{Path: "committer_file.txt", Content: "content from the committing agent"}})
 
-	env.GitCommitWithShadowHooksAsAgent("committing agent's commit", "committer_file.txt")
+	env.GitCommitWithHooksAsAgent("committing agent's commit", "committer_file.txt")
 	cpID := headCheckpointID(t, env)
 	require.NotEmpty(t, cpID, "the committing agent's own commit links")
 
