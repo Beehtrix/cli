@@ -17,7 +17,40 @@ var reviewVerdictQualifiers = map[string]bool{
 	"once": true, "after": true, "pending": true, "unless": true,
 	"if": true, "provided": true, "assuming": true, "when": true,
 	"until": true, "suggestion": true, "suggestions": true, "minor": true,
-	"consider": true, "should": true,
+	"consider": true, "should": true, "though": true, "although": true,
+	"except": true,
+}
+
+// reviewNoIssueNouns complete a "no ..." reason that says nothing needs fixing,
+// such as "no actionable findings" or "no blocking issues".
+var reviewNoIssueNouns = map[string]bool{
+	"finding": true, "findings": true, "issue": true, "issues": true,
+	"defect": true, "defects": true, "problem": true, "problems": true,
+	"concern": true, "concerns": true,
+}
+
+// isNoIssueReason reports whether an approve reason states that nothing needs
+// fixing. Any other reason may be feedback, so it is posted.
+func isNoIssueReason(words []string) bool {
+	if len(words) > 0 && words[0] == "with" {
+		words = words[1:]
+	}
+	if len(words) == 0 {
+		return false
+	}
+	switch words[0] {
+	case "nothing", "lgtm":
+		return true
+	case "looks", "all":
+		return len(words) > 1 && words[1] == "good"
+	case "no":
+		for _, word := range words[1:min(len(words), 4)] {
+			if reviewNoIssueNouns[word] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // allReviewNarrativesClean reports whether every usable reviewer approved
@@ -56,10 +89,11 @@ func isCleanReviewVerdict(text string) bool {
 }
 
 // parseReviewVerdictLine classifies one line. An approve (or approved) is
-// clean only when nothing follows it, or when a separator introduces a reason
-// free of qualifiers. A word directly after "approve" ("approve if", "approve
-// with suggestions") is a condition, so unknown phrasings are posted, not
-// dropped. A labelled or bulleted verdict ("Verdict: approve", "- approve") is
+// clean only when nothing follows it, or when its reason says nothing needs
+// fixing ("no actionable findings", "looks good") and carries no qualifier.
+// A word directly after "approve" other than "with no"/"with nothing"
+// ("approve if", "approve with suggestions") is a condition, and any other
+// reason may be feedback, so unknown phrasings are posted, not dropped. A labelled or bulleted verdict ("Verdict: approve", "- approve") is
 // not recognized and is posted too.
 func parseReviewVerdictLine(line string) (clean, isVerdict bool) {
 	line = strings.ToLower(line)
@@ -86,13 +120,17 @@ func parseReviewVerdictLine(line string) (clean, isVerdict bool) {
 	if rest == "" {
 		return true, true
 	}
-	if first, _ := utf8.DecodeRuneInString(rest); unicode.IsLetter(first) && !strings.HasPrefix(rest, "with no") {
+	words := strings.FieldsFunc(rest, func(r rune) bool { return !unicode.IsLetter(r) })
+	if len(words) == 0 {
+		return true, true
+	}
+	if first, _ := utf8.DecodeRuneInString(rest); unicode.IsLetter(first) && words[0] != "with" {
 		return false, true
 	}
-	for _, word := range strings.FieldsFunc(rest, func(r rune) bool { return !unicode.IsLetter(r) }) {
+	for _, word := range words {
 		if reviewVerdictQualifiers[word] {
 			return false, true
 		}
 	}
-	return true, true
+	return isNoIssueReason(words), true
 }
