@@ -247,12 +247,20 @@ func contextUnreachableError(c *contexts.Context, coreURL string, err error) err
 		return nil
 	}
 	const switchHint = "run `entire login` to sign in again, or `entire auth switch <context>` to switch to another login"
-	advice := switchHint
-	if hint := netcause.Hint(err); hint != "" {
+	// Denied is decided apart from Hint: Hint is empty when the transport
+	// already explained the cause, and a denial must still drop switchHint.
+	hint := netcause.Hint(err)
+	var advice string
+	switch {
+	case netcause.Denied(err):
 		advice = hint
-		if !netcause.Denied(err) {
-			advice += "; if this login server no longer exists, " + switchHint
-		}
+	case hint != "":
+		advice = hint + "; if this login server no longer exists, " + switchHint
+	default:
+		advice = switchHint
+	}
+	if advice == "" {
+		return fmt.Errorf("cannot reach the login server for %q (%s): %w", c.Name, coreURL, urlErr.Err)
 	}
 	return fmt.Errorf("cannot reach the login server for %q (%s): %w; %s", c.Name, coreURL, urlErr.Err, advice)
 }

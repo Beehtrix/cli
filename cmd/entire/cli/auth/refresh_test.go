@@ -277,9 +277,18 @@ func TestNewRefreshingLoginProvider_NetworkHintNotRepeated(t *testing.T) {
 	if err == nil {
 		t.Fatal("denied network: want an error")
 	}
+	got := err.Error()
 	const hint = "not allowed to open network connections"
-	if got := strings.Count(err.Error(), hint); got != 1 {
-		t.Errorf("error %q names the denied network %d times, want 1", err, got)
+	if n := strings.Count(got, hint); n != 1 {
+		t.Errorf("error %q names the denied network %d times, want 1", got, n)
+	}
+	// Hint is empty here (the transport already explained it), and the
+	// denial must still drop the login advice.
+	if strings.Contains(got, "entire login") || strings.Contains(got, "entire auth switch") {
+		t.Errorf("error %q suggests a login change for a network denial", got)
+	}
+	if strings.HasSuffix(strings.TrimSpace(got), ";") {
+		t.Errorf("error %q ends with a dangling separator", got)
 	}
 }
 
