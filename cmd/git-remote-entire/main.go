@@ -20,19 +20,23 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/auth"
+	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/gitremote"
 	"github.com/entireio/cli/cmd/entire/cli/versioninfo"
 	"github.com/entireio/cli/internal/entireclient/clusterdiscovery"
@@ -44,6 +48,7 @@ import (
 	"github.com/entireio/cli/internal/remotehelper/httpdebug"
 	"github.com/entireio/cli/internal/remotehelper/replicas"
 	"github.com/entireio/cli/internal/remotehelper/transport"
+	"golang.org/x/net/http/httpguts"
 )
 
 func main() {
@@ -68,16 +73,26 @@ func run(args []string) int {
 	}
 
 	// Build info drives the identifier the helper advertises upstream.
-	// One string covers both surfaces:
+	// One default string covers both surfaces:
 	//   - githelper.Agent rides in the git protocol pkt-line agent=
 	//     capability appended to upload-pack / receive-pack / v2 requests.
 	//   - httpUserAgent rides in the HTTP User-Agent header on every
 	//     outbound request so server access logs can attribute traffic.
-	// Using the same value keeps the two log surfaces correlatable.
+	// They differ only when the user overrides the HTTP header through
+	// git's own GIT_HTTP_USER_AGENT (resolveHTTPUserAgent). The pkt-line
+	// agent is never overridable: the protocol allows one token with no
+	// whitespace, so a free-form user string would corrupt the capability.
 	versioninfo.Load()
 	helperAgent := remotehelper.BinaryName + "/" + versioninfo.Version
 	githelper.Agent = helperAgent
-	httpUserAgent := helperAgent
+	httpUserAgent, err := resolveHTTPUserAgent(helperAgent, os.LookupEnv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		return 128
+	}
+	if httpUserAgent != helperAgent {
+		debuglog.Printf("http user-agent set from %s", httpUserAgentEnvVar)
+	}
 
 	rawURL := args[2]
 	parsedURL, err := url.Parse(rawURL)
@@ -102,22 +117,7 @@ func run(args []string) int {
 
 	nodeCfg := replicas.Resolve(parsedURL)
 
-	// This client drives the auth path only: cluster /.well-known discovery
-	// and the token exchange. Both talk to a single control-plane host with no
-	// failover to fall back on, so they get the patient discovery dial budget
-	// (DiscoveryDialTimeout, i.e. DefaultDiscoveryDialTimeout unless
-	// ENTIRE_CONNECT_TIMEOUT_SECONDS overrides it) rather than the short failover
-	// one — a slow cold connect here would otherwise fail the whole clone/fetch.
-	httpClient := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &httpclient.UserAgentTransport{
-			Next: &httpdebug.TimingRoundTripper{
-				Next:  httpclient.NewDiscoveryTransport(skipTLS),
-				Label: "auth",
-			},
-			UA: httpUserAgent,
-		},
-	}
+	httpClient := newAuthHTTPClient(skipTLS, httpUserAgent)
 
 	creds, onUnauthorized, err := resolveCreds(ctx, parsedURL, skipTLS, httpClient)
 	if err != nil {
@@ -284,6 +284,57 @@ func infoFlagText(flag, version string) (string, bool) {
 	return "", false
 }
 
+// httpUserAgentEnvVar is git's own override for the HTTP User-Agent
+// header (git-config(1), http.userAgent: "Can be overridden by the
+// GIT_HTTP_USER_AGENT environment variable"). Git passes its environment
+// through to remote helpers, so the same knob reaches us.
+const httpUserAgentEnvVar = "GIT_HTTP_USER_AGENT"
+
+// newAuthHTTPClient builds the client that drives the auth path only:
+// cluster /.well-known discovery and the token exchange. Both talk to a
+// single control-plane host with no failover to fall back on, so they get
+// the patient discovery dial budget (DiscoveryDialTimeout, i.e.
+// DefaultDiscoveryDialTimeout unless ENTIRE_CONNECT_TIMEOUT_SECONDS
+// overrides it) rather than the short failover one — a slow cold connect
+// here would otherwise fail the whole clone/fetch. Split out of run() so
+// tests exercise the same chain the helper ships.
+func newAuthHTTPClient(skipTLS bool, ua string) *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &httpclient.UserAgentTransport{
+			Next: &httpdebug.TimingRoundTripper{
+				Next:  httpclient.NewDiscoveryTransport(skipTLS),
+				Label: "auth",
+			},
+			UA: ua,
+		},
+	}
+}
+
+// resolveHTTPUserAgent returns the HTTP User-Agent to send, matching
+// git's handling of GIT_HTTP_USER_AGENT: a set value replaces defaultUA
+// verbatim, and a set-but-empty value sends no User-Agent header at all
+// (verified against git 2.55.0: curl drops the header for an empty
+// CURLOPT_USERAGENT; Go's net/http does the same for an empty header
+// value). Unset keeps defaultUA. The http.userAgent config key is not
+// read — the helper never shells out to `git config`, and git only
+// forwards -c values, not .gitconfig, in GIT_CONFIG_PARAMETERS.
+//
+// A value net/http would refuse (CR, LF, NUL, …) fails here, naming the
+// variable; otherwise every request dies later with an error that doesn't.
+//
+// lookup is os.LookupEnv in production; injected so tests stay parallel.
+func resolveHTTPUserAgent(defaultUA string, lookup func(string) (string, bool)) (string, error) {
+	ua, ok := lookup(httpUserAgentEnvVar)
+	if !ok {
+		return defaultUA, nil
+	}
+	if !httpguts.ValidHeaderFieldValue(ua) {
+		return "", fmt.Errorf("%s holds an invalid header character", httpUserAgentEnvVar)
+	}
+	return ua, nil
+}
+
 // resolveProtocolVersion reads the effective protocol.version from
 // the GIT_PROTOCOL environment variable. The value is a colon-
 // separated list of key=value pairs (e.g. "version=2"). We accept
@@ -319,8 +370,10 @@ func parseProtocolVersion(raw string, warn io.Writer) int {
 //   - ENTIRE_TOKEN set: use the env JWT verbatim. Skips contexts.json and the
 //     keyring entirely — the CI / workload path. A non-URL aud is a hard error,
 //     never a silent fallback to context resolution.
+//   - Git credential helper: use its password as the bearer, with the same
+//     cluster trust checks. Lookup uses the original entire:// repository URL.
 //   - otherwise: resolve the login context for this cluster from contexts.json
-//     and use its refreshed login JWT.
+//     and use its refreshed login JWT, unless ENTIRE_GIT_NO_LOGIN_FALLBACK is true.
 func resolveCreds(ctx context.Context, parsedURL *url.URL, skipTLS bool, httpClient *http.Client) (credentialProvider, func(), error) {
 	// Presence of ENTIRE_TOKEN is the signal: if it's set at all (LookupEnv,
 	// not Getenv, so we can tell set-empty from unset), we commit to the
@@ -335,7 +388,29 @@ func resolveCreds(ctx context.Context, parsedURL *url.URL, skipTLS bool, httpCli
 		if envToken == "" {
 			return nil, nil, fmt.Errorf("%s is set but blank", auth.EnvTokenVar)
 		}
-		return resolveEnvTokenCreds(ctx, envToken, parsedURL.Host, userdirs.Cache(), httpClient)
+		return resolveTokenCreds(ctx, envToken, auth.EnvTokenVar, parsedURL.Host, userdirs.Cache(), httpClient)
+	}
+
+	// Git cannot distinguish an absent credential from some broken helpers.
+	// CI can disable saved-login fallback to avoid substituting a personal identity.
+	noLoginFallback := false
+	if raw, ok := os.LookupEnv("ENTIRE_GIT_NO_LOGIN_FALLBACK"); ok {
+		var err error
+		noLoginFallback, err = strconv.ParseBool(raw)
+		if err != nil {
+			return nil, nil, errors.New("ENTIRE_GIT_NO_LOGIN_FALLBACK must be a boolean (true or false)")
+		}
+	}
+
+	token, err := gitCredentialToken(ctx, parsedURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	if token != "" {
+		return resolveTokenCreds(ctx, token, "git credential helper token", parsedURL.Host, userdirs.Cache(), httpClient)
+	}
+	if noLoginFallback {
+		return nil, nil, errors.New("git credential lookup returned no usable credential; saved-login fallback is disabled by ENTIRE_GIT_NO_LOGIN_FALLBACK")
 	}
 
 	// Resolve which login context authenticates this cluster: the cluster's
@@ -362,13 +437,66 @@ func resolveCreds(ctx context.Context, parsedURL *url.URL, skipTLS bool, httpCli
 	return provider, onUnauthorized, nil
 }
 
-// resolveEnvTokenCreds returns a fixed ENTIRE_TOKEN provider after validating
+func gitCredentialToken(ctx context.Context, repoURL *url.URL) (string, error) {
+	username := ""
+	if repoURL.User != nil {
+		username = repoURL.User.Username()
+	}
+	for _, value := range []string{repoURL.Host, repoURL.Path, username} {
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return "", errors.New("invalid control character in Git credential lookup")
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := execx.NonInteractive(ctx, "git", "-c", "core.askPass=", "credential", "fill")
+	execx.TerminateOnCancel(cmd)
+	// Git uses the same exit status for unavailable credentials and explicit
+	// refusal. Pin its diagnostic language so only the non-interactive prompt
+	// failure permits saved-login fallback. Never expose helper stderr: it may
+	// contain tokens or the configured helper command.
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=", "SSH_ASKPASS=", "LC_ALL=C")
+	input := fmt.Sprintf("protocol=entire\nhost=%s\npath=%s\n", repoURL.Host, strings.TrimPrefix(repoURL.Path, "/"))
+	if repoURL.User != nil {
+		input += "username=" + username + "\n"
+	}
+	cmd.Stdin = strings.NewReader(input + "\n")
+	output, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("git credential lookup: %w", ctx.Err())
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			diagnostic := strings.TrimSpace(string(exitErr.Stderr))
+			if (strings.HasPrefix(diagnostic, "fatal: could not read Username for '") ||
+				strings.HasPrefix(diagnostic, "fatal: could not read Password for '")) &&
+				strings.HasSuffix(diagnostic, "': terminal prompts disabled") && !strings.ContainsAny(diagnostic, "\r\n") {
+				debuglog.Printf("Git credential lookup returned no credential")
+				return "", nil
+			}
+			return "", fmt.Errorf("git credential lookup failed (exit %d)", exitErr.ExitCode())
+		}
+		return "", fmt.Errorf("run Git credential lookup: %w", err)
+	}
+	for line := range strings.SplitSeq(string(output), "\n") {
+		if token, ok := strings.CutPrefix(line, "password="); ok {
+			if token == "" || strings.ContainsAny(token, "\r\x00") {
+				return "", errors.New("git credential helper returned an invalid token")
+			}
+			return token, nil
+		}
+	}
+	return "", errors.New("git credential helper returned no password")
+}
+
+// resolveTokenCreds returns a fixed token provider after validating
 // its control-plane audience against the target cluster. Split out of
 // resolveCreds with explicit clusterHost/cacheDir params (no os.Getenv /
 // userdirs.Cache globals) so the trust gate below is unit-testable against a
 // fake well-known server.
 //
-// SECURITY: coreURL is derived from the env token's *unverified* aud claim, and
+// SECURITY: coreURL is derived from the token's *unverified* aud claim, and
 // we confirm the core is one the target cluster actually advertises — anchored
 // to the clone URL's host the user typed (TLS to its
 // /.well-known/entire-cluster.json), not to the token's own claims.
@@ -378,10 +506,10 @@ func resolveCreds(ctx context.Context, parsedURL *url.URL, skipTLS bool, httpCli
 // is no longer authenticated, so a MITM could advertise an attacker host as a
 // trusted core. Do not combine ENTIRE_TOKEN with ENTIRE_TLS_SKIP_VERIFY in
 // CI / workload environments.
-func resolveEnvTokenCreds(ctx context.Context, envToken, clusterHost, cacheDir string, httpClient *http.Client) (credentialProvider, func(), error) {
-	coreURL, err := auth.CoreURLFromEnvToken(envToken)
+func resolveTokenCreds(ctx context.Context, token, source, clusterHost, cacheDir string, httpClient *http.Client) (credentialProvider, func(), error) {
+	coreURL, err := auth.CoreURLFromToken(token, source)
 	if err != nil {
-		return nil, nil, err //nolint:wrapcheck // CoreURLFromEnvToken already returns a user-facing, ENTIRE_TOKEN-prefixed error
+		return nil, nil, err //nolint:wrapcheck // CoreURLFromToken already identifies the token source in its user-facing error
 	}
 	cluster, err := clusterdiscovery.ResolveClusterCores(ctx, cacheDir, clusterHost, httpClient, debuglog.Printf)
 	if err != nil {
@@ -389,12 +517,12 @@ func resolveEnvTokenCreds(ctx context.Context, envToken, clusterHost, cacheDir s
 	}
 	if !coreTrusted(coreURL, cluster.CoreURLs) {
 		return nil, nil, fmt.Errorf("%s aud %q is not a trusted login server for cluster %s (advertised: %s); the token belongs to a different cluster",
-			auth.EnvTokenVar, coreURL, clusterHost, strings.Join(cluster.CoreURLs, ", "))
+			source, coreURL, clusterHost, strings.Join(cluster.CoreURLs, ", "))
 	}
-	debuglog.Printf("auth: %s bearer (core=%s)", auth.EnvTokenVar, coreURL)
-	provider := func(context.Context) (string, error) { return envToken, nil }
+	debuglog.Printf("auth: %s bearer (core=%s)", source, coreURL)
+	provider := func(context.Context) (string, error) { return token, nil }
 	onUnauthorized := func() {
-		debuglog.Printf("data plane rejected static %s bearer; transport will retry once with the configured token", auth.EnvTokenVar)
+		debuglog.Printf("data plane rejected static %s bearer; transport will retry once with the configured token", source)
 	}
 	return provider, onUnauthorized, nil
 }

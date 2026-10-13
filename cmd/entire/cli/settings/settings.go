@@ -353,7 +353,10 @@ type RedactionSettings struct {
 	CustomRedactions map[string]string `json:"custom_redactions,omitempty"`
 
 	// OpenAIPrivacyFilter is the optional 8th redaction layer (opt-in).
-	// See docs/security-and-privacy.md.
+	//
+	// Deprecated: the OpenAI Privacy Filter will be removed in a future
+	// release. Existing configurations keep working until then; do not build
+	// new behavior on it.
 	OpenAIPrivacyFilter *OPFSettings `json:"openai_privacy_filter,omitempty"`
 
 	// ExternalizeImages opts into lifting inline base64 images out of transcripts
@@ -823,26 +826,6 @@ func LoadProjectRaw(ctx context.Context) (path string, raw map[string]json.RawMe
 // unrelated keys in the per-developer override file.
 func LoadLocalRaw(ctx context.Context) (path string, raw map[string]json.RawMessage, exists bool, err error) {
 	return loadRaw(ctx, EntireSettingsLocalFile, "local")
-}
-
-// LoadLocalBytes reads .entire/settings.local.json's raw bytes through the
-// shared .entire root, returning nil when the file does not exist. It exists so
-// callers that decode the local layer themselves (they need LoadFromBytes'
-// no-defaults semantics, not loadFromFile's Enabled: true) still read the file
-// through this package rather than reaching for os.ReadFile on a joined path.
-func LoadLocalBytes(ctx context.Context) ([]byte, error) {
-	filePath, err := entiredir.PathTo(ctx, EntireSettingsLocalFile)
-	if err != nil {
-		return nil, fmt.Errorf("resolve local settings path: %w", err)
-	}
-	data, err := readConfined(filePath)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("reading local settings: %w", err)
-	}
-	return data, nil
 }
 
 // loadRaw reads a settings file as a generic JSON object. label ("project" or
@@ -1849,16 +1832,6 @@ func IsFilteredFetchesEnabled(ctx context.Context) bool {
 // themselves (telemetry.IsEnvOptedOut).
 func (s *EntireSettings) IsTelemetryEnabled() bool {
 	return s != nil && s.Telemetry != nil && *s.Telemetry
-}
-
-// IsTelemetryEnabled loads settings and reports the telemetry opt-in. Returns
-// false when settings cannot be loaded — telemetry never fails open.
-func IsTelemetryEnabled(ctx context.Context) bool {
-	s, err := Load(ctx)
-	if err != nil {
-		return false
-	}
-	return s.IsTelemetryEnabled()
 }
 
 // IsSummarizeEnabled checks if auto-summarize is enabled in settings.
