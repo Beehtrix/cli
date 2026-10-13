@@ -306,11 +306,9 @@ func TestPiReviewer_ParseEndsWithoutAgentEnd(t *testing.T) {
 		}
 		return false, false
 	}
-	for _, reason := range []string{"stop", "length"} {
-		turn := `{"type":"turn_end","message":{"role":"assistant","stopReason":"` + reason + `"}}` + "\n"
-		if seen, ok := finished(turn); !seen || !ok {
-			t.Errorf("final %s turn: finished=%v success=%v, want a successful finish", reason, seen, ok)
-		}
+	stopped := `{"type":"turn_end","message":{"role":"assistant","stopReason":"stop"}}` + "\n"
+	if seen, ok := finished(stopped); !seen || !ok {
+		t.Errorf("final stop turn: finished=%v success=%v, want a successful finish", seen, ok)
 	}
 	errored := `{"type":"turn_end","message":{"role":"assistant","stopReason":"error","errorMessage":"boom"}}` + "\n"
 	if _, ok := finished(errored); ok {
@@ -319,5 +317,27 @@ func TestPiReviewer_ParseEndsWithoutAgentEnd(t *testing.T) {
 	toolUse := `{"type":"turn_end","message":{"role":"assistant","stopReason":"toolUse"}}` + "\n"
 	if _, ok := finished(toolUse); ok {
 		t.Error("stream cut after a tool-use turn counted as success")
+	}
+}
+
+// A turn cut off at the output token limit is a truncated review, with or
+// without agent_end, and says so.
+func TestPiReviewer_ParseLengthStopFails(t *testing.T) {
+	t.Parallel()
+	turn := `{"type":"turn_end","message":{"role":"assistant","stopReason":"length"}}` + "\n"
+	for _, input := range []string{turn, turn + `{"type":"agent_end"}` + "\n"} {
+		var errs []string
+		success := true
+		for _, ev := range collectPiReviewEvents(input) {
+			switch e := ev.(type) {
+			case reviewtypes.RunError:
+				errs = append(errs, e.Err.Error())
+			case reviewtypes.Finished:
+				success = e.Success
+			}
+		}
+		if success || len(errs) != 1 || !strings.Contains(errs[0], "output token limit") {
+			t.Errorf("success=%v errs=%q, want a token-limit failure", success, errs)
+		}
 	}
 }
