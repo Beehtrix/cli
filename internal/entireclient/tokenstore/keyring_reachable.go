@@ -43,8 +43,15 @@ func probeKeyringReachable() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), keyringTimeout())
 	defer cancel()
 	err := exec.CommandContext(ctx, securityPath, "list-keychains").Run()
+	return ctx.Err() != nil || !exitedNonZero(err)
+}
+
+// exitedNonZero reports whether err is a process that exited on its own with a
+// non-zero status. A child killed by a signal is also an *exec.ExitError, but
+// its ExitCode is -1, and being killed says nothing about the keyring.
+func exitedNonZero(err error) bool {
 	var exitErr *exec.ExitError
-	return !errors.As(err, &exitErr) || ctx.Err() != nil
+	return errors.As(err, &exitErr) && exitErr.ExitCode() > 0
 }
 
 // checkNotFound turns a keyring "not found" into ErrKeyringUnavailable when

@@ -2,6 +2,8 @@ package tokenstore
 
 import (
 	"errors"
+	"os/exec"
+	"runtime"
 	"testing"
 )
 
@@ -48,4 +50,41 @@ func TestCheckNotFound(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Only a probe that exited on its own with a failure status proves the keyring
+// unreachable; one killed by a signal (or that never started) is inconclusive.
+func TestExitedNonZero(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == goosWindows {
+		t.Skip("uses a POSIX shell; the probe only runs on macOS")
+	}
+
+	tests := []struct {
+		name   string
+		script string
+		want   bool
+	}{
+		{name: "non-zero exit", script: "exit 1", want: true},
+		{name: "killed by signal", script: "kill -KILL $$", want: false},
+		{name: "success", script: "exit 0", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := exec.CommandContext(t.Context(), "/bin/sh", "-c", tt.script).Run()
+			if got := exitedNonZero(err); got != tt.want {
+				t.Errorf("exitedNonZero(%v) = %v, want %v", err, got, tt.want)
+			}
+		})
+	}
+
+	t.Run("did not start", func(t *testing.T) {
+		t.Parallel()
+
+		if exitedNonZero(exec.ErrNotFound) {
+			t.Error("a probe that never started must not count as unreachable")
+		}
+	})
 }
