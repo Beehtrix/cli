@@ -96,7 +96,7 @@ func (m *mockFullAgent) GenerateText(context.Context, string, string) (string, e
 }
 
 // OutOfBandTokenSource (mockFullAgent is a CapabilityDeclarer, so AsOutOfBandTokenSource
-// must still exclude it — verifies the built-in-only gate).
+// must still exclude it — verifies the nonDeclarerCapability refusal).
 func (m *mockFullAgent) SnapshotTokenBaseline(context.Context, string) (json.RawMessage, error) {
 	return nil, nil
 }
@@ -105,7 +105,7 @@ func (m *mockFullAgent) CalculateTokenUsageSince(context.Context, string, json.R
 }
 
 // LateTranscriptWriter (mockFullAgent is a CapabilityDeclarer, so AsLateTranscriptWriter
-// must still exclude it — verifies the built-in-only gate).
+// must still exclude it — verifies the nonDeclarerCapability refusal).
 func (m *mockFullAgent) CountTranscriptPosition([]byte) int             { return 0 }
 func (m *mockFullAgent) SliceTranscriptFromPosition([]byte, int) []byte { return nil }
 

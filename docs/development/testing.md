@@ -246,7 +246,7 @@ invariants the compiler cannot. Examples include `TestRootBasesAreTrusted` (root
 `TestGitStatusCallSitesPassNoOptionalLocks`, and
 `TestAllHookConfigRelPaths_CoversEveryWorktreeConfigAgent`.
 
-**They all go through `testutil.GitGrepGuard`, which owns three flags.** Each was
+**Grep-based guards go through `testutil.GitGrepGuard`, which owns three flags.** Each was
 missing from at least one guard, and the same one was missing from three:
 
 - `--untracked`. `git grep` searches the INDEX. Every one of these guards has
@@ -276,6 +276,13 @@ Two rules for writing one:
 - **Fail on zero matches.** A detection pattern that goes stale otherwise passes
   forever. `GitGrepGuard` does this itself; the `checked == 0` tallies are the
   second half of the same idea.
+
+The one exception is `TestCapabilitiesAreOnlyReachedThroughHelpers`, which must
+see type assertions under any import alias and type-switch cases that wrap
+across lines, so it parses files instead of grepping them. It lists files with
+`git ls-files -z --cached --others` and `testutil.GuardGitEnv()`, which keeps
+the same untracked-file and repo-selector protections, restricts the pathspec
+to `*.go`, and fails when it checks no assertions.
 
 ### Code Duplication Prevention
 

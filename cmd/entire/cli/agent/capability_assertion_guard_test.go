@@ -157,11 +157,12 @@ func assertedTypes(file *ast.File) []ast.Expr {
 
 // productionGoFiles lists the repository's tracked and untracked Go files
 // outside _test.go, slash-separated relative to repoRoot, with the same
-// isolation as testutil.GitGrepGuard.
+// isolation as testutil.GitGrepGuard. -z keeps non-ASCII paths unquoted, since
+// GuardGitEnv drops the caller's core.quotePath setting.
 func productionGoFiles(t *testing.T, repoRoot string) []string {
 	t.Helper()
 
-	cmd := exec.Command("git", "ls-files", "--cached", "--others", "--exclude-standard", "--", "*.go") //nolint:noctx // guard test, no cancellation needed
+	cmd := exec.Command("git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.go") //nolint:noctx // guard test, no cancellation needed
 	cmd.Dir = repoRoot
 	cmd.Env = testutil.GuardGitEnv()
 	out, err := cmd.Output()
@@ -169,9 +170,9 @@ func productionGoFiles(t *testing.T, repoRoot string) []string {
 		t.Fatalf("git ls-files: %v", err)
 	}
 	var files []string
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		if line != "" && !strings.HasSuffix(line, "_test.go") {
-			files = append(files, line)
+	for name := range strings.SplitSeq(string(out), "\x00") {
+		if name != "" && !strings.HasSuffix(name, "_test.go") {
+			files = append(files, name)
 		}
 	}
 	if len(files) == 0 {
