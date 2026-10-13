@@ -63,6 +63,9 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 		tokens := reviewtypes.Tokens{}
 		finished := false
 		success := true
+		// lastTurnStop is the stopReason of the latest turn_end. Some Pi
+		// versions end the stream after a final turn without agent_end.
+		lastTurnStop := ""
 
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -111,6 +114,7 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 				// finding no matches). The agent's stopReason determines review
 				// success/failure.
 			case "turn_end":
+				lastTurnStop = env.Message.StopReason
 				if env.Message.StopReason == "error" || env.Message.StopReason == "aborted" {
 					success = false
 					pendingErr = piReviewFailureReason(env.Message)
@@ -139,6 +143,13 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 			return
 		}
 		if !finished {
+			// A stream that ends right after a turn the model stopped on
+			// finished the review; anything else (a turn waiting on tool
+			// results, an error) was cut short.
+			if lastTurnStop == "stop" && success {
+				out <- reviewtypes.Finished{Success: true}
+				return
+			}
 			if pendingErr != "" {
 				out <- reviewtypes.RunError{Err: errors.New(pendingErr)}
 			}

@@ -292,3 +292,26 @@ func TestPiReviewer_ParseErrorWithoutMessage(t *testing.T) {
 		t.Fatalf("RunErrors = %q, want the stop reason", errs)
 	}
 }
+
+// Some Pi versions end the stream after the final turn without agent_end; a
+// turn the model stopped on still finishes the review, while a stream cut
+// after a tool-use turn does not.
+func TestPiReviewer_ParseEndsWithoutAgentEnd(t *testing.T) {
+	t.Parallel()
+	finished := func(input string) (bool, bool) {
+		for _, ev := range collectPiReviewEvents(input) {
+			if f, ok := ev.(reviewtypes.Finished); ok {
+				return true, f.Success
+			}
+		}
+		return false, false
+	}
+	stopped := `{"type":"turn_end","message":{"role":"assistant","stopReason":"stop"}}` + "\n"
+	if seen, ok := finished(stopped); !seen || !ok {
+		t.Errorf("final stop turn: finished=%v success=%v, want a successful finish", seen, ok)
+	}
+	toolUse := `{"type":"turn_end","message":{"role":"assistant","stopReason":"toolUse"}}` + "\n"
+	if _, ok := finished(toolUse); ok {
+		t.Error("stream cut after a tool-use turn counted as success")
+	}
+}
