@@ -66,15 +66,17 @@ func TestWithSecureRedirects_PreservesClientAndPolicy(t *testing.T) {
 	require.Same(t, original.Transport, guarded.Transport)
 	via := []*http.Request{redirectRequest(t, "https://host/a")}
 	err = guarded.CheckRedirect(redirectRequest(t, "http://host/b"), via)
-	require.Error(t, err)
-	require.Zero(t, called, "mandatory policy runs before a caller's callback")
+	if err != http.ErrUseLastResponse { //nolint:errorlint // net/http requires sentinel identity
+		t.Fatalf("stopping an insecure redirect must preserve ErrUseLastResponse, got %v", err)
+	}
+	require.Equal(t, 1, called)
 	err = guarded.CheckRedirect(redirectRequest(t, "https://host/b"), via)
 	if err != http.ErrUseLastResponse { //nolint:errorlint // net/http requires sentinel identity, not errors.Is
 		t.Fatalf("expected unwrapped ErrUseLastResponse, got %v", err)
 	}
-	require.Equal(t, 1, called)
+	require.Equal(t, 2, called)
 	require.ErrorIs(t, original.CheckRedirect(nil, nil), http.ErrUseLastResponse)
-	require.Equal(t, 2, called, "original policy was not replaced")
+	require.Equal(t, 3, called, "original policy was not replaced")
 }
 
 func TestWithSecureRedirects_HopCap(t *testing.T) {

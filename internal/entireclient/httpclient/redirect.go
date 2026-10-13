@@ -15,8 +15,10 @@ const (
 )
 
 var (
+	// ErrRequestPolicy identifies a request refused for security policy reasons.
+	ErrRequestPolicy = errors.New("request rejected by policy")
 	// ErrRedirectPolicy identifies a redirect rejected by the shared security policy.
-	ErrRedirectPolicy = errors.New("redirect refused")
+	ErrRedirectPolicy = fmt.Errorf("%w: redirect refused", ErrRequestPolicy)
 	// ErrInsecureRedirect identifies a redirect that would leave HTTPS.
 	ErrInsecureRedirect = fmt.Errorf("%w: refusing redirect from HTTPS to an insecure scheme", ErrRedirectPolicy)
 	// ErrTooManyRedirects identifies a redirect chain exceeding the hop limit.
@@ -40,9 +42,10 @@ func CheckSecureRedirect(req *http.Request, via []*http.Request) error {
 }
 
 // WithSecureRedirects returns a copy of client with the shared redirect policy
-// applied before and after its existing callback. A nil client uses
-// http.DefaultClient. Transport, timeout and jar are preserved; neither the
-// supplied client nor the default client is mutated.
+// applied to redirects its callback permits. Callback errors take precedence:
+// ErrUseLastResponse safely exposes a 3xx response without following it. A nil
+// client uses http.DefaultClient. Transport, timeout and jar are preserved;
+// neither the supplied client nor the default client is mutated.
 func WithSecureRedirects(client *http.Client) *http.Client {
 	if client == nil {
 		client = http.DefaultClient
@@ -50,14 +53,17 @@ func WithSecureRedirects(client *http.Client) *http.Client {
 	guarded := *client
 	policy := client.CheckRedirect
 	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if err := CheckSecureRedirect(req, via); err != nil {
-			return err
-		}
+		// Remember the proposed URL before the callback can rewrite it, but
+		// do not reject a redirect the callback declines to follow.
+		proposedErr := CheckSecureRedirect(req, via)
 		if policy != nil {
 			proposedScheme := req.URL.Scheme
 			if err := policy(req, via); err != nil {
 				// net/http compares ErrUseLastResponse by identity; do not wrap.
 				return err
+			}
+			if proposedErr != nil {
+				return proposedErr
 			}
 			// The first HTTPS upgrade is not yet in via. Do not let a
 			// callback undo it, even when every previous hop was HTTP.
@@ -66,7 +72,7 @@ func WithSecureRedirects(client *http.Client) *http.Client {
 			}
 			return CheckSecureRedirect(req, via)
 		}
-		return nil
+		return proposedErr
 	}
 	return &guarded
 }

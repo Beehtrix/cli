@@ -10,7 +10,6 @@ import (
 type Options struct {
 	Transport     http.RoundTripper
 	Timeout       time.Duration
-	Jar           http.CookieJar
 	CheckRedirect func(*http.Request, []*http.Request) error
 }
 
@@ -20,7 +19,6 @@ func New(options Options) *http.Client {
 	return WithSecureRedirects(&http.Client{
 		Transport:     options.Transport,
 		Timeout:       options.Timeout,
-		Jar:           options.Jar,
 		CheckRedirect: options.CheckRedirect,
 	})
 }

@@ -28,6 +28,10 @@ import (
 	"github.com/entireio/cli/internal/remotehelper/replicas"
 )
 
+// ErrInsecureReplica identifies an ordinary request or replica URL that uses
+// an insecure scheme. It matches httpclient.ErrRequestPolicy, not a redirect.
+var ErrInsecureReplica = fmt.Errorf("%w: insecure replica URL (HTTPS required)", httpclient.ErrRequestPolicy)
+
 // SetAuthFunc attaches authentication headers to an outbound request.
 // Errors are surfaced verbatim — they short-circuit failover because
 // they originate at the auth provider, not the data-plane node.
@@ -228,8 +232,8 @@ func (p *Proxy) hostInCluster(host string) bool {
 // the repo-scoped token attached: it must parse and resolve to a host
 // inside the cluster trust domain and use a safe transport scheme. Replica
 // sets arrive from attacker-influenceable sources: the X-Entire-Replicas
-// header, a redirect Location, and the on-disk node cache. A malicious or poisoned
-// entry pointing off-cluster would otherwise receive a core-minted bearer
+// header, a redirect Location, and the on-disk node cache. An unsafe entry
+// pointing off-cluster would otherwise receive a core-minted bearer
 // token. Dropping it here keeps credentials scoped to the cluster the user
 // actually addressed.
 func (p *Proxy) replicaInCluster(rawURL string) bool {
@@ -250,7 +254,7 @@ func (p *Proxy) safeReplicaScheme(u *url.URL) bool {
 // so later manual failover cannot resume HTTP, even in loopback fixtures.
 func (p *Proxy) validateAndRecordReplicaScheme(u *url.URL) error {
 	if !p.safeReplicaScheme(u) {
-		return fmt.Errorf("insecure replica request: %w", httpclient.ErrInsecureRedirect)
+		return ErrInsecureReplica
 	}
 	if u.Scheme == httpclient.SchemeHTTPS {
 		p.requireHTTPS = true
@@ -303,8 +307,8 @@ func (p *Proxy) markNodeFailed(node string) {
 }
 
 // setAuthOrError applies the configured SetAuthFunc (if any) to the
-// request. Policy and auth-provider errors short-circuit failover rather than
-// treating an unsafe target or failed mint as an unhealthy data-plane node.
+// request. Errors here stop request construction without invalidating a node.
+// Redirect-policy failures are handled separately by doWithFailover.
 func (p *Proxy) setAuthOrError(req *http.Request) error {
 	if err := p.validateAndRecordReplicaScheme(req.URL); err != nil {
 		return err
@@ -396,7 +400,8 @@ func (p *Proxy) retryOn401(client *http.Client, resp *http.Response, build func(
 // from a random offset (or the stickyNode if one is set and still in
 // the replica list). Connection errors and 5xx responses trigger
 // failover to the next node. The failed node is removed from the list
-// and OnNodeFailed is called.
+// and OnNodeFailed is called. Redirect-policy errors also try the next eligible
+// node, but leave the rejected node's cache entry intact.
 func (p *Proxy) doWithFailover(ctx context.Context, makeSuffix string, method string, body io.ReadSeeker, setHeaders func(*http.Request)) (*http.Response, error) {
 	nodes := slices.Clone(p.nodes)
 	if len(nodes) == 0 {
@@ -408,7 +413,7 @@ func (p *Proxy) doWithFailover(ctx context.Context, makeSuffix string, method st
 			start = idx
 		}
 	}
-	var lastErr error
+	var lastErr, policyErr error
 	attempted := 0
 	// One auth retry per logical operation, not per replica: a 401 doesn't
 	// trigger failover, so the loop returns the first 401 to the retry — this
@@ -417,8 +422,8 @@ func (p *Proxy) doWithFailover(ctx context.Context, makeSuffix string, method st
 
 	for i := range nodes {
 		node := nodes[(start+i)%len(nodes)]
-		// The TLS floor can rise during this loop, making an HTTP loopback
-		// replica in the snapshot ineligible. Skip it before auth stamping,
+		// Attempting HTTPS makes HTTP loopback replicas in the snapshot
+		// ineligible. Skip it before auth stamping,
 		// without treating it as unhealthy or abandoning later HTTPS nodes.
 		if !p.replicaInCluster(node) {
 			debuglog.Printf("skipping insecure or out-of-cluster replica %q", node)
@@ -459,8 +464,11 @@ func (p *Proxy) doWithFailover(ctx context.Context, makeSuffix string, method st
 
 		resp, err := p.client.Do(req)
 		if err != nil {
-			if errors.Is(err, httpclient.ErrRedirectPolicy) {
-				return nil, fmt.Errorf("replica request rejected: %w", err)
+			if errors.Is(err, httpclient.ErrRequestPolicy) {
+				// The node is reachable but proposes an unsafe hop. Keep its
+				// cache entry and try the remaining eligible replicas.
+				policyErr = err
+				continue
 			}
 			debuglog.Printf("node %s unreachable: %v", node, err)
 			lastErr = err
@@ -518,6 +526,9 @@ func (p *Proxy) doWithFailover(ctx context.Context, makeSuffix string, method st
 	var storage *InsufficientStorageError
 	if errors.As(lastErr, &storage) {
 		return nil, lastErr
+	}
+	if policyErr != nil {
+		return nil, fmt.Errorf("no replica succeeded: %w", errors.Join(policyErr, lastErr))
 	}
 	if attempted == 0 {
 		return nil, errors.New("no eligible replicas available")

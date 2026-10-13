@@ -9,7 +9,8 @@ Repository paths in code spans are relative to the repository root unless stated
 - **Construct clients with `httpclient.New`**
   (`internal/entireclient/httpclient`). It limits redirect chains and refuses
   HTTPS → HTTP, including HTTPS → loopback and HTTP → HTTPS → HTTP. A source
-  guard rejects bare production `http.Client` allocations outside that constructor.
+  guard rejects bare clients, zero-value declarations and package-level HTTP
+  helpers outside documented exceptions.
 - **Preserve stricter policies.** The API client (also used by cloud dispatch)
   refuses cross-host redirects and insecure absolute endpoints. The remote-helper
   proxy restricts bearer forwarding to its cluster. Well-known discovery refuses
@@ -17,16 +18,20 @@ Repository paths in code spans are relative to the repository root unless stated
   Auth-go separately protects OAuth exchanges and 421 routing, not the outer
   control-plane client's ordinary HTTP redirects.
 - **Wrap injected clients with `WithSecureRedirects`.** It copies the supplied
-  client (nil means `http.DefaultClient`) and validates before and after a
-  successful custom callback. A callback cannot undo a proposed HTTPS upgrade,
-  even before the first HTTPS hop is sent. Callback errors, including
-  `http.ErrUseLastResponse`, remain unchanged. Inject a transport via `api.NewClientWithTransport` in tests,
-  not by replacing `http.DefaultTransport`.
+  client (nil means `http.DefaultClient`). Callback errors take precedence and
+  remain unchanged: `http.ErrUseLastResponse` exposes the 3xx without following
+  it, so the cold replica probe can read its headers even with an HTTP Location.
+  If the callback permits following, both the proposed and final URLs must pass
+  validation; the callback cannot undo an HTTPS upgrade. Inject a transport via
+  `api.NewClientWithTransport` in tests, not by replacing `http.DefaultTransport`.
 - **Do not classify policy rejections as node failures.** Shared redirect errors
-  match `httpclient.ErrRedirectPolicy` with `errors.Is`; downgrades additionally
-  match `ErrInsecureRedirect`. The proxy returns these without invalidating the
-  replica cache or trying an entry-domain/Location fallback. Skipped, ineligible
-  replicas do not replace a real server error such as HTTP 507.
+  match `httpclient.ErrRedirectPolicy`; downgrades also match
+  `ErrInsecureRedirect`. Direct insecure replica requests return
+  `transport.ErrInsecureReplica`. Both match `httpclient.ErrRequestPolicy` via
+  `errors.Is`. A rejected hop is never sent and its node is not marked unhealthy;
+  the proxy tries the remaining eligible replicas. If none succeeds, a policy
+  error is returned without entry-domain/Location fallback. A final HTTP 507
+  retains its storage error, and skipped nodes do not replace server errors.
 - **Require HTTPS for production replicas.** Validate cache entries, headers,
   Location targets, response-URL fallback, and requests before attaching auth.
   `replicas.Resolve` always creates an HTTPS entry; `SkipTLS` does not authorize

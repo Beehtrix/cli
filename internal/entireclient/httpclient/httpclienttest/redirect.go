@@ -2,6 +2,7 @@
 package httpclienttest
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -40,7 +41,7 @@ func CheckRejectsDowngrade(t *testing.T, run func(*testing.T, string, http.Round
 						target := *r.URL
 						if r.URL.Scheme == httpclient.SchemeHTTPS {
 							secure = true
-							target.Scheme = "http"
+							target.Scheme = httpclient.SchemeHTTP
 						} else {
 							target.Scheme = httpclient.SchemeHTTPS
 						}
@@ -49,8 +50,8 @@ func CheckRejectsDowngrade(t *testing.T, run func(*testing.T, string, http.Round
 					return &http.Response{StatusCode: code, Header: header, Body: io.NopCloser(strings.NewReader("{}")), Request: r}, nil
 				})
 				err := run(t, start, rt)
-				if err == nil {
-					t.Error("expected redirect rejection")
+				if !errors.Is(err, httpclient.ErrInsecureRedirect) {
+					t.Errorf("expected ErrInsecureRedirect, got %v", err)
 				}
 				if leaks != 0 {
 					t.Errorf("plaintext destination received %d requests", leaks)

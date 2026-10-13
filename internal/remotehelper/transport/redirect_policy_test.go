@@ -1,8 +1,11 @@
 package transport
 
 import (
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -10,6 +13,67 @@ import (
 	"github.com/entireio/cli/internal/entireclient/httpclient"
 	"github.com/entireio/cli/internal/remotehelper/replicas"
 )
+
+func TestProxy_ColdProbeUsesHTTPSReplicasDespiteHTTPLocation(t *testing.T) {
+	t.Parallel()
+	var plaintextHits atomic.Int32
+	plaintext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		plaintextHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(plaintext.Close)
+	replica := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := io.WriteString(w, "refs"); err != nil {
+			t.Error(err)
+		}
+	}))
+	t.Cleanup(replica.Close)
+	entry := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Entire-Replicas", replica.URL)
+		http.Redirect(w, r, plaintext.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(entry.Close)
+	p := New(Config{Nodes: replicas.NodeConfig{EntryURL: entry.URL, ClusterHost: mustHost(t, entry.URL)}, SetAuth: func(req *http.Request) error {
+		req.Header.Set("Authorization", "Bearer test-token")
+		return nil
+	}})
+	p.discoveryTransport = entry.Client().Transport
+	p.client.Transport = replica.Client().Transport
+	body, err := p.InfoRefs(t.Context(), "git-upload-pack")
+	require.NoError(t, err)
+	defer body.Close()
+	data, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.Equal(t, "refs", string(data))
+	require.Zero(t, plaintextHits.Load())
+	require.Equal(t, []string{replica.URL}, p.nodes)
+}
+
+func TestProxy_PolicyRejectionTriesRemainingReplicas(t *testing.T) {
+	t.Parallel()
+	const bad = "https://bad.cluster.example"
+	const good = "https://good.cluster.example"
+	var failed, dialed []string
+	p := New(Config{Nodes: replicas.NodeConfig{EntryURL: "https://cluster.example", ClusterHost: "cluster.example", InitialNodes: []string{bad, good}}, OnNodeFailed: func(node string) { failed = append(failed, node) }})
+	p.stickyNode = bad
+	p.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		node := req.URL.Scheme + "://" + req.URL.Host
+		dialed = append(dialed, node)
+		code := http.StatusOK
+		h := make(http.Header)
+		if node == bad {
+			code = http.StatusTemporaryRedirect
+			h.Set("Location", "http://bad.cluster.example/repo")
+		}
+		return &http.Response{StatusCode: code, Header: h, Body: http.NoBody, Request: req}, nil
+	})
+	body, err := p.InfoRefs(t.Context(), "git-upload-pack")
+	require.NoError(t, err)
+	require.NoError(t, body.Close())
+	require.Equal(t, []string{bad, good}, dialed)
+	require.Empty(t, failed)
+	require.Equal(t, []string{bad, good}, p.nodes)
+}
 
 func TestProxy_RedirectRejectionPreservesReplicaHealth(t *testing.T) {
 	t.Parallel()
@@ -79,6 +143,17 @@ func TestProxy_SkippedReplicaPreservesStorageError(t *testing.T) {
 	_, err := p.ServiceRPC(t.Context(), "git-receive-pack", strings.NewReader("push"))
 	var storage *InsufficientStorageError
 	require.ErrorAs(t, err, &storage)
+}
+
+func TestProxy_InsecureReplicaErrorDoesNotClaimRedirect(t *testing.T) {
+	t.Parallel()
+	p := New(Config{Nodes: replicas.NodeConfig{EntryURL: "http://cluster.example"}})
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://cluster.example/repo", nil)
+	require.NoError(t, err)
+	err = p.setAuthOrError(req)
+	require.ErrorIs(t, err, ErrInsecureReplica)
+	require.ErrorIs(t, err, httpclient.ErrRequestPolicy)
+	require.NotContains(t, err.Error(), "redirect")
 }
 
 func TestProxy_ResponseURLFallbackRequiresSafeScheme(t *testing.T) {
