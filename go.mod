@@ -16,7 +16,7 @@ require (
 	github.com/entireio/auth-go v0.5.3-0.20260911082959-f3d099d20e7b
 	github.com/go-faster/errors v0.8.0
 	github.com/go-faster/jx v1.2.0
-	github.com/go-git/go-billy/v6 v6.0.0-alpha.2
+	github.com/go-git/go-billy/v6 v6.0.0-beta.1
 	// Floor, not just a bump: c15a9478 adds plumbing.ValidateBranchName with
 	// native branch-creation rules (including HEAD and @ components). Also
 	// retain go-git#2309 (per-directory ignore Scope): the root-level
@@ -27,7 +27,7 @@ require (
 	// also fix RepackObjects/Prune failing with "object not found" on any
 	// partial clone, including one made by the git binary.
 	// Move to a plain tag once alpha.6 ships.
-	github.com/go-git/go-git/v6 v6.0.0-alpha.5.0.20260917090420-0f3a0a2c2551
+	github.com/go-git/go-git/v6 v6.0.0-beta.1
 	github.com/go-git/x/plugin/objectsigner/auto v0.1.1-0.20260624122410-382b2905c041
 	github.com/go-git/x/plugin/objectsigner/program v0.0.0-20260624122410-382b2905c041
 	github.com/gofrs/flock v0.13.1
@@ -60,7 +60,7 @@ require (
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
-	github.com/ProtonMail/go-crypto v1.4.1 // indirect
+	github.com/ProtonMail/go-crypto v1.5.2 // indirect
 	github.com/STARRY-S/zip v0.2.3 // indirect
 	github.com/alecthomas/chroma/v2 v2.14.0 // indirect
 	github.com/andybalholm/brotli v1.2.2 // indirect
@@ -111,7 +111,6 @@ require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/kevinburke/ssh_config v1.6.0 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
-	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.1 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
@@ -125,7 +124,7 @@ require (
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/nwaples/rardecode/v2 v2.2.2 // indirect
 	github.com/pierrec/lz4/v4 v4.1.26 // indirect
-	github.com/pjbgf/sha1cd v0.6.0 // indirect
+	github.com/pjbgf/sha1cd v0.7.0 // indirect
 	github.com/pkoukk/tiktoken-go v0.1.8 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rrethy/ahocorasick v1.0.0 // indirect
