@@ -116,6 +116,10 @@ func TestTransport(t *testing.T) {
 			} else if tt.wantHint == "" && strings.Contains(got, ";") {
 				t.Errorf("error %q gained a hint for an unnamed cause", got)
 			}
+			// A caller hinting the same error again must add nothing.
+			if again := Hint(err); again != "" {
+				t.Errorf("Hint on an already-hinted error = %q, want empty", again)
+			}
 		})
 	}
 }

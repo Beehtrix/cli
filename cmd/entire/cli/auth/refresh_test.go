@@ -19,6 +19,7 @@ import (
 	authtokenstore "github.com/entireio/auth-go/tokenstore"
 
 	"github.com/entireio/cli/internal/entireclient/contexts"
+	"github.com/entireio/cli/internal/entireclient/netcause"
 	"github.com/entireio/cli/internal/entireclient/tokenstore"
 )
 
@@ -263,6 +264,22 @@ func TestNewRefreshingLoginProvider_NetworkDeniedIsNotALoginProblem(t *testing.T
 	}
 	if !errors.Is(err, syscall.EPERM) {
 		t.Errorf("error %v no longer unwraps to EPERM", err)
+	}
+}
+
+// A refresh over a transport that already names the cause must not repeat it.
+func TestNewRefreshingLoginProvider_NetworkHintNotRepeated(t *testing.T) {
+	denied := netcause.Transport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.EPERM)}
+	}))
+	provider := seedExpiredLogin(t, "alice@core", "https://core.example", denied)
+	_, err := provider(t.Context())
+	if err == nil {
+		t.Fatal("denied network: want an error")
+	}
+	const hint = "not allowed to open network connections"
+	if got := strings.Count(err.Error(), hint); got != 1 {
+		t.Errorf("error %q names the denied network %d times, want 1", err, got)
 	}
 }
 

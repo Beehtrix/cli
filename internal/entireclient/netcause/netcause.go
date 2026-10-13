@@ -23,9 +23,14 @@ func Denied(err error) bool {
 }
 
 // Hint explains a transport failure whose cause can be named, or returns ""
-// when it cannot. A failed DNS lookup is named but not attributed: a blocked
-// resolver and a host that does not exist look the same from here.
+// when it cannot, or when Transport already added the explanation to err. A
+// failed DNS lookup is named but not attributed: a blocked resolver and a host
+// that does not exist look the same from here.
 func Hint(err error) string {
+	var hinted *hintedError
+	if errors.As(err, &hinted) {
+		return ""
+	}
 	if Denied(err) {
 		return "this process is not allowed to open network connections (a sandbox or firewall is blocking them); re-run the command with network access"
 	}
@@ -55,10 +60,21 @@ func (t hintTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.next.RoundTrip(req)
 	if err != nil {
 		if hint := Hint(err); hint != "" {
-			return nil, fmt.Errorf("%w; %s", err, hint)
+			return nil, &hintedError{err: err, hint: hint}
 		}
 		//nolint:wrapcheck // passthrough; the wrapped transport owns the error semantics.
 		return nil, err
 	}
 	return resp, nil
 }
+
+// hintedError is a transport failure carrying its Hint, so a caller that adds
+// hints of its own (an auth error naming the login server) does not add the
+// same explanation twice.
+type hintedError struct {
+	err  error
+	hint string
+}
+
+func (e *hintedError) Error() string { return e.err.Error() + "; " + e.hint }
+func (e *hintedError) Unwrap() error { return e.err }
