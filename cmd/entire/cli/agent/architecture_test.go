@@ -29,13 +29,13 @@ func TestCapabilityHelpersUseStandardResolver(t *testing.T) {
 
 	for _, helper := range helpers {
 		switch helper.resolver {
-		case "builtinCapability", "declaredCapability":
+		case "builtinCapability", "builtinOnlyCapability", "declaredCapability":
 			if helper.capability == "" {
 				t.Errorf("%s: %s must resolve a single named capability type",
 					helper.position, helper.function)
 			}
 		case "":
-			t.Errorf("%s: %s must return builtinCapability[T] or declaredCapability[T]",
+			t.Errorf("%s: %s must return builtinCapability[T], builtinOnlyCapability[T], or declaredCapability[T]",
 				helper.position, helper.function)
 		default:
 			t.Errorf("%s: %s uses unsupported resolver %s",
@@ -49,7 +49,7 @@ func TestDeclaredCapsBuiltinListMatchesCapabilityHelpers(t *testing.T) {
 
 	var resolved []string
 	for _, helper := range discoverCapabilityHelpers(t) {
-		if helper.resolver == "builtinCapability" {
+		if helper.resolver == "builtinCapability" || helper.resolver == "builtinOnlyCapability" {
 			resolved = append(resolved, helper.capability)
 		}
 	}

@@ -104,6 +104,11 @@ func (m *mockFullAgent) CalculateTokenUsageSince(context.Context, string, json.R
 	return nil, nil //nolint:nilnil // test mock
 }
 
+// LateTranscriptWriter (mockFullAgent is a CapabilityDeclarer, so AsLateTranscriptWriter
+// must still exclude it — verifies the built-in-only gate).
+func (m *mockFullAgent) CountTranscriptPosition([]byte) int             { return 0 }
+func (m *mockFullAgent) SliceTranscriptFromPosition([]byte, int) []byte { return nil }
+
 // StreamingTextGenerator
 func (m *mockFullAgent) GenerateTextStreaming(context.Context, string, string, ProgressFn) (string, error) {
 	return "", nil
@@ -154,6 +159,17 @@ func (m *mockBuiltinOOBAgent) SnapshotTokenBaseline(context.Context, string) (js
 }
 func (m *mockBuiltinOOBAgent) CalculateTokenUsageSince(context.Context, string, json.RawMessage) (*TokenUsage, error) {
 	return nil, nil //nolint:nilnil // test mock
+}
+
+// mockBuiltinLateWriterAgent is a built-in agent that implements
+// LateTranscriptWriter but NOT CapabilityDeclarer.
+type mockBuiltinLateWriterAgent struct {
+	mockBaseAgent
+}
+
+func (m *mockBuiltinLateWriterAgent) CountTranscriptPosition([]byte) int { return 0 }
+func (m *mockBuiltinLateWriterAgent) SliceTranscriptFromPosition([]byte, int) []byte {
+	return nil
 }
 
 // --- Tests ---
@@ -518,6 +534,42 @@ func TestAsOutOfBandTokenSource(t *testing.T) {
 		// mockFullAgent implements the interface but is a CapabilityDeclarer
 		// (external agent), so it must be excluded.
 		_, ok := AsOutOfBandTokenSource(&mockFullAgent{})
+		if ok {
+			t.Error("expected false for CapabilityDeclarer agent")
+		}
+	})
+}
+
+func TestAsLateTranscriptWriter(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil agent", func(t *testing.T) {
+		t.Parallel()
+		_, ok := AsLateTranscriptWriter(nil)
+		if ok {
+			t.Error("expected false for nil agent")
+		}
+	})
+
+	t.Run("not implemented", func(t *testing.T) {
+		t.Parallel()
+		_, ok := AsLateTranscriptWriter(&mockBaseAgent{})
+		if ok {
+			t.Error("expected false for agent not implementing LateTranscriptWriter")
+		}
+	})
+
+	t.Run("builtin agent", func(t *testing.T) {
+		t.Parallel()
+		lw, ok := AsLateTranscriptWriter(&mockBuiltinLateWriterAgent{})
+		if !ok || lw == nil {
+			t.Error("expected true for built-in agent implementing LateTranscriptWriter")
+		}
+	})
+
+	t.Run("capability declarer excluded", func(t *testing.T) {
+		t.Parallel()
+		_, ok := AsLateTranscriptWriter(&mockFullAgent{})
 		if ok {
 			t.Error("expected false for CapabilityDeclarer agent")
 		}

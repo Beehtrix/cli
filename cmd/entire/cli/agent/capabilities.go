@@ -22,22 +22,28 @@ type CapabilityDeclarer interface {
 //   - CallerSessionIdentifier
 //   - ContextInjector
 //   - EffectiveHookDiagnostics
+//   - HomeLayoutProvider
 //   - HomeScopedInventoryExtractor
 //   - HookFreshness
 //   - InventoryAwareExtractor
+//   - LateTranscriptWriter
 //   - ModelExtractor
 //   - ModelLister
+//   - OutOfBandTokenSource
 //   - PermissionConfigOwner
 //   - SessionBaseDirProvider
 //   - SessionEndBudgeter
 //   - SidecarImageProvider
 //   - SkillEventExtractor
+//   - StaleHookReporter
 //   - SubagentSessionResolver
+//   - TaskTranscriptMatcher
 //   - ToolInvocationScanner
 //   - TranscriptFetcher
 //   - TranscriptSanitizer
 //
-// Their As* helpers resolve through builtinCapability with no DeclaredCaps gate.
+// Their As* helpers resolve through builtinCapability, or builtinOnlyCapability
+// when external agents must be refused, with no DeclaredCaps gate.
 type DeclaredCaps struct {
 	Hooks                  bool `json:"hooks"`
 	TranscriptAnalyzer     bool `json:"transcript_analyzer"`
@@ -72,6 +78,21 @@ func builtinCapability[T any](ag Agent) (T, bool) {
 	}
 	t, ok := ag.(T)
 	if !ok {
+		return zero, false
+	}
+	return t, true
+}
+
+// builtinOnlyCapability returns the agent as T like builtinCapability, but
+// refuses CapabilityDeclarer agents even when they implement T, for
+// capabilities external agents must never take on.
+func builtinOnlyCapability[T any](ag Agent) (T, bool) {
+	t, ok := builtinCapability[T](ag)
+	if !ok {
+		return t, false
+	}
+	if _, isDeclarer := ag.(CapabilityDeclarer); isDeclarer {
+		var zero T
 		return zero, false
 	}
 	return t, true
@@ -172,17 +193,7 @@ func AsTokenCalculator(ag Agent) (TokenCalculator, bool) {
 // is wire-format knowledge the external protocol does not currently express,
 // and DeclaredCaps has no field for this capability to opt into.
 func AsLateTranscriptWriter(ag Agent) (LateTranscriptWriter, bool) {
-	if ag == nil {
-		return nil, false
-	}
-	lw, ok := ag.(LateTranscriptWriter)
-	if !ok {
-		return nil, false
-	}
-	if _, isDeclarer := ag.(CapabilityDeclarer); isDeclarer {
-		return nil, false
-	}
-	return lw, true
+	return builtinOnlyCapability[LateTranscriptWriter](ag)
 }
 
 // AsOutOfBandTokenSource returns the agent as OutOfBandTokenSource if supported.
@@ -190,17 +201,7 @@ func AsLateTranscriptWriter(ag Agent) (LateTranscriptWriter, bool) {
 // store is fed by a built-in shim subcommand they cannot provide, and
 // DeclaredCaps has no field for this capability to opt into.
 func AsOutOfBandTokenSource(ag Agent) (OutOfBandTokenSource, bool) {
-	if ag == nil {
-		return nil, false
-	}
-	src, ok := ag.(OutOfBandTokenSource)
-	if !ok {
-		return nil, false
-	}
-	if _, isDeclarer := ag.(CapabilityDeclarer); isDeclarer {
-		return nil, false
-	}
-	return src, true
+	return builtinOnlyCapability[OutOfBandTokenSource](ag)
 }
 
 // AsInventoryAwareExtractor returns the agent as InventoryAwareExtractor when
