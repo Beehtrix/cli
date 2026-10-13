@@ -1,6 +1,13 @@
 package claudecode
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"maps"
+	"slices"
+
+	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
+)
 
 // ClaudeSettings represents the .claude/settings.json structure
 type ClaudeSettings struct {
@@ -24,15 +31,87 @@ type ClaudeHooks struct {
 type ClaudeHookMatcher struct {
 	Matcher string            `json:"matcher"`
 	Hooks   []ClaudeHookEntry `json:"hooks"`
+	extra   map[string]json.RawMessage
+}
+
+// claudeHookMatcherFields is ClaudeHookMatcher without its JSON methods.
+type claudeHookMatcherFields ClaudeHookMatcher
+
+func (m *ClaudeHookMatcher) UnmarshalJSON(data []byte) error {
+	extra, err := unmarshalKeepingExtra(data, (*claudeHookMatcherFields)(m), "matcher", "hooks")
+	m.extra = extra
+	return err
+}
+
+func (m ClaudeHookMatcher) MarshalJSON() ([]byte, error) {
+	return marshalWithExtra(claudeHookMatcherFields(m), m.extra)
 }
 
 // ClaudeHookEntry represents a single hook command
 type ClaudeHookEntry struct {
 	Type    string `json:"type"`
-	Command string `json:"command"`
+	Command string `json:"command,omitempty"`
 	// Timeout is the hook's timeout in seconds. Omitted (0) leaves Claude Code's
 	// default in place; set only where a hook needs an explicit budget.
 	Timeout int `json:"timeout,omitempty"`
+	extra   map[string]json.RawMessage
+}
+
+// claudeHookEntryFields is ClaudeHookEntry without its JSON methods.
+type claudeHookEntryFields ClaudeHookEntry
+
+func (e *ClaudeHookEntry) UnmarshalJSON(data []byte) error {
+	extra, err := unmarshalKeepingExtra(data, (*claudeHookEntryFields)(e), "type", "command", "timeout")
+	e.extra = extra
+	return err
+}
+
+func (e ClaudeHookEntry) MarshalJSON() ([]byte, error) {
+	return marshalWithExtra(claudeHookEntryFields(e), e.extra)
+}
+
+// unmarshalKeepingExtra decodes data into known and returns the keys outside
+// knownKeys. Entire rewrites settings.json, which the user and Claude Code own,
+// so every field it does not model must survive the round trip.
+func unmarshalKeepingExtra(data []byte, known any, knownKeys ...string) (map[string]json.RawMessage, error) {
+	if err := json.Unmarshal(data, known); err != nil {
+		return nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
+	}
+	var extra map[string]json.RawMessage
+	if err := json.Unmarshal(data, &extra); err != nil {
+		return nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
+	}
+	for _, k := range knownKeys {
+		delete(extra, k)
+	}
+	return extra, nil
+}
+
+// marshalWithExtra encodes known, then appends extra in key order, so modeled
+// fields keep their usual position and output stays deterministic.
+func marshalWithExtra(known any, extra map[string]json.RawMessage) ([]byte, error) {
+	data, err := jsonutil.MarshalWithNoHTMLEscape(known)
+	if err != nil || len(extra) == 0 {
+		return data, err //nolint:wrapcheck // returned from MarshalJSON; encoding/json adds context
+	}
+	var buf bytes.Buffer
+	buf.Write(data[:len(data)-1])
+	needComma := len(data) > len("{}")
+	for _, k := range slices.Sorted(maps.Keys(extra)) {
+		key, err := jsonutil.MarshalWithNoHTMLEscape(k)
+		if err != nil {
+			return nil, err //nolint:wrapcheck // returned from MarshalJSON; encoding/json adds context
+		}
+		if needComma {
+			buf.WriteByte(',')
+		}
+		needComma = true
+		buf.Write(key)
+		buf.WriteByte(':')
+		buf.Write(extra[k])
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
 }
 
 // sessionInfoRaw is the JSON structure from SessionStart/SessionEnd/Stop hooks.

@@ -167,15 +167,16 @@ type HookFreshness interface {
 }
 
 // StaleHookReporter is implemented by hook-supporting agents whose install
-// also prunes Entire hooks that older CLIs wrote and this one no longer does
-// (for Claude Code, the retired post-todo hook). `entire enable` asks before
-// installing, so it can say it removed them instead of reporting the hooks as
+// also rewrites Entire hooks that older CLIs wrote: pruning ones this CLI no
+// longer writes (for Claude Code, the retired post-todo hook) or updating ones
+// whose shape changed (Claude Code's hook timeouts). `entire enable` asks before
+// installing, so it can say it updated them instead of reporting the hooks as
 // already installed. Implementations must be read-only.
 type StaleHookReporter interface {
 	Agent
 
 	// HasStaleManagedHooks reports whether the agent's hook config holds
-	// Entire hooks the next install will remove.
+	// Entire hooks the next install will remove or update.
 	HasStaleManagedHooks(ctx context.Context) bool
 }
 

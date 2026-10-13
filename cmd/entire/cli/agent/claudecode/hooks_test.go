@@ -13,6 +13,7 @@ import (
 
 	agentpkg "github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/testutil"
+	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 
 	"github.com/stretchr/testify/require"
 )
@@ -580,9 +581,9 @@ func expectedHookTimeouts() []expectedHookTimeout {
 	silent := agentpkg.WrapProductionSilentHookCommand
 	return []expectedHookTimeout{
 		{"SessionStart", "", agentpkg.WrapProductionJSONWarningHookCommand("entire hooks claude-code session-start", agentpkg.WarningFormatMultiLine), 10},
-		{"UserPromptSubmit", "", silent("entire hooks claude-code user-prompt-submit"), 10},
-		{"SubagentStart", workflowAgentMatcher, silent("entire hooks claude-code subagent-start"), 10},
-		{"PreToolUse", subagentToolMatcher, silent("entire hooks claude-code pre-task"), 10},
+		{"UserPromptSubmit", "", silent("entire hooks claude-code user-prompt-submit"), 30},
+		{"SubagentStart", workflowAgentMatcher, silent("entire hooks claude-code subagent-start"), 30},
+		{"PreToolUse", subagentToolMatcher, silent("entire hooks claude-code pre-task"), 30},
 		{"Stop", "", silent("entire hooks claude-code stop"), 60},
 		{"StopFailure", "", silent("entire hooks claude-code stop-failure"), 60},
 		{"SubagentStop", "", silent("entire hooks claude-code subagent-stop"), 60},
@@ -735,6 +736,125 @@ func TestInstallHooks_TimeoutsAreIdempotent(t *testing.T) {
 	}
 	if !info.ModTime().Equal(past) {
 		t.Errorf("settings.json was rewritten by an install that had nothing to change")
+	}
+}
+
+// userStopMatcherJSON is a user-owned Stop matcher carrying fields Entire does
+// not model: a prompt hook, an async command hook, and a matcher-level key.
+const userStopMatcherJSON = `{
+  "matcher": "",
+  "comment": "team notifications",
+  "hooks": [
+    {"type": "prompt", "prompt": "Check the task is done", "timeout": 30},
+    {"type": "command", "command": "./notify.sh > /dev/null && echo ok", "async": true, "statusMessage": "notifying"}
+  ]
+}`
+
+// writeSettingsWithUserStopMatcher seeds an Entire Stop hook without a timeout
+// (as older CLIs wrote it) next to userStopMatcherJSON.
+func writeSettingsWithUserStopMatcher(t *testing.T, dir string) {
+	t.Helper()
+	stopCmd := agentpkg.WrapProductionSilentHookCommand("entire hooks claude-code stop")
+	writeSettingsFile(t, dir, fmt.Sprintf(`{
+  "hooks": {
+    "Stop": [
+      {"matcher": "", "hooks": [{"type": "command", "command": %q}]},
+      %s
+    ]
+  }
+}`, stopCmd, userStopMatcherJSON))
+}
+
+// assertUserStopMatcherIntact fails unless the user's Stop matcher survives
+// byte-for-byte in meaning: every field kept and none added.
+func assertUserStopMatcherIntact(t *testing.T, dir string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("failed to read settings.json: %v", err)
+	}
+	var parsed struct {
+		Hooks struct {
+			Stop []map[string]any `json:"Stop"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("failed to parse settings.json: %v", err)
+	}
+	var want map[string]any
+	if err := json.Unmarshal([]byte(userStopMatcherJSON), &want); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range parsed.Hooks.Stop {
+		if m["comment"] != nil {
+			require.Equal(t, want, m, "user Stop matcher changed")
+			return
+		}
+	}
+	t.Fatalf("user Stop matcher missing:\n%s", raw)
+}
+
+// TestInstallHooks_PreservesUserHookFields covers the upgrade rewrite: a
+// timeout backfill must not strip fields from the user's own hooks.
+func TestInstallHooks_PreservesUserHookFields(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+	writeSettingsWithUserStopMatcher(t, tempDir)
+
+	ag := &ClaudeCodeAgent{}
+	if _, err := ag.InstallHooks(context.Background(), false); err != nil {
+		t.Fatalf("InstallHooks() error = %v", err)
+	}
+
+	assertUserStopMatcherIntact(t, tempDir)
+
+	raw, err := os.ReadFile(filepath.Join(tempDir, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `\u003e`) || strings.Contains(string(raw), `\u0026`) {
+		t.Errorf("settings.json must not HTML-escape commands, got:\n%s", raw)
+	}
+}
+
+func TestUninstallHooks_PreservesUserHookFields(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+	writeSettingsWithUserStopMatcher(t, tempDir)
+
+	ag := &ClaudeCodeAgent{}
+	if err := ag.UninstallHooks(context.Background()); err != nil {
+		t.Fatalf("UninstallHooks() error = %v", err)
+	}
+
+	assertUserStopMatcherIntact(t, tempDir)
+}
+
+// TestHasStaleManagedHooks_MissingTimeout lets enable report a timeout
+// backfill instead of calling the rewritten config "already installed".
+func TestHasStaleManagedHooks_MissingTimeout(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+	writeClaudeStopHooks(t, tempDir, []string{agentpkg.WrapProductionSilentHookCommand("entire hooks claude-code stop")})
+
+	c := &ClaudeCodeAgent{}
+	if !c.HasStaleManagedHooks(context.Background()) {
+		t.Fatal("HasStaleManagedHooks() = false for a hook missing its timeout, want true")
+	}
+	if _, err := c.InstallHooks(context.Background(), false); err != nil {
+		t.Fatalf("InstallHooks() error = %v", err)
+	}
+	if c.HasStaleManagedHooks(context.Background()) {
+		t.Error("HasStaleManagedHooks() = true after install, want false")
+	}
+}
+
+// TestCaptureHookTimeoutExceedsStatusWalkBudget keeps Claude Code from killing
+// a capture hook before its status walk can give up and degrade on its own.
+func TestCaptureHookTimeoutExceedsStatusWalkBudget(t *testing.T) {
+	t.Parallel()
+	if time.Duration(captureHookTimeoutSec)*time.Second <= gitrepo.StatusWalkBudget {
+		t.Errorf("captureHookTimeoutSec = %ds, want more than gitrepo.StatusWalkBudget (%s)", captureHookTimeoutSec, gitrepo.StatusWalkBudget)
 	}
 }
 

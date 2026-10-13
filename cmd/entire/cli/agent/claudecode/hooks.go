@@ -113,7 +113,8 @@ func (c *ClaudeCodeAgent) InstallHooks(ctx context.Context, force bool) (int, er
 
 // HasStaleManagedHooks implements agent.StaleHookReporter: whether a plain
 // install would drop Entire hooks this CLI no longer writes (the retired
-// post-todo hook, or a hook left by an older command shape). Read-only: it
+// post-todo hook, or a hook left by an older command shape) or give an Entire
+// hook the timeout an older CLI wrote it without. Read-only: it
 // runs the install's hook merge on a freshly loaded copy and discards it.
 func (c *ClaudeCodeAgent) HasStaleManagedHooks(ctx context.Context) bool {
 	cfg, err := claudeHookConfig(ctx)
@@ -124,8 +125,8 @@ func (c *ClaudeCodeAgent) HasStaleManagedHooks(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	_, staleDropped, _ := installHookEntries(rawHooks, false)
-	return staleDropped
+	_, staleDropped, timeoutsSet := installHookEntries(rawHooks, false)
+	return staleDropped || timeoutsSet
 }
 
 // claudeHookConfig returns .claude/settings.json for the current worktree,
@@ -196,9 +197,13 @@ func loadRawClaudeSettingsForInstall(cfg *agent.HookConfigFile) (rawSettings, ra
 // before main() never returns on its own, so each hook carries a timeout that
 // lets Claude Code kill it and continue.
 const (
-	// quickHookTimeoutSec bounds hooks that only record state. They finish in
-	// milliseconds, and Claude Code blocks startup and every prompt on them.
+	// quickHookTimeoutSec bounds SessionStart, which only records state and
+	// finishes in milliseconds; Claude Code blocks startup on it.
 	quickHookTimeoutSec = 10
+	// captureHookTimeoutSec bounds hooks that snapshot the worktree before a
+	// prompt or subagent. It must outlast gitrepo.StatusWalkBudget so a slow
+	// walk degrades on its own instead of being killed, losing the snapshot.
+	captureHookTimeoutSec = 30
 	// checkpointHookTimeoutSec bounds hooks that write checkpoint data, whose
 	// cost grows with transcript size; a kill mid-write loses that checkpoint.
 	checkpointHookTimeoutSec = 60
@@ -221,9 +226,9 @@ func entireSimpleHooks() []entireSimpleHook {
 		{"SessionEnd", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code session-end"), 0},
 		{"Stop", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code stop"), checkpointHookTimeoutSec},
 		{"StopFailure", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code stop-failure"), checkpointHookTimeoutSec},
-		{"SubagentStart", workflowAgentMatcher, agent.WrapProductionSilentHookCommand("entire hooks claude-code subagent-start"), quickHookTimeoutSec},
+		{"SubagentStart", workflowAgentMatcher, agent.WrapProductionSilentHookCommand("entire hooks claude-code subagent-start"), captureHookTimeoutSec},
 		{"SubagentStop", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code subagent-stop"), checkpointHookTimeoutSec},
-		{"UserPromptSubmit", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code user-prompt-submit"), quickHookTimeoutSec},
+		{"UserPromptSubmit", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code user-prompt-submit"), captureHookTimeoutSec},
 	}
 }
 
@@ -364,7 +369,7 @@ func installHookEntries(rawHooks map[string]json.RawMessage, force bool) (count 
 			timeoutsSet = true
 		}
 	}
-	if setMissingTimeout(preToolUse, preTaskCmd, quickHookTimeoutSec) {
+	if setMissingTimeout(preToolUse, preTaskCmd, captureHookTimeoutSec) {
 		timeoutsSet = true
 	}
 	if setMissingTimeout(postToolUse, postTaskCmd, checkpointHookTimeoutSec) {
