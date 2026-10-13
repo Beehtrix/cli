@@ -43,10 +43,11 @@ func TestMain(m *testing.M) {
 	testutil.SetRunDir(runDir)
 
 	// The login below stores a real refresh token, and CI uploads
-	// e2e/artifacts/ on every run, so the CLI's config, cache, and token store
-	// live in a temp dir outside the artifact tree. testing.Testing() is false
-	// in the spawned binary, so only these env vars keep it away from the
-	// developer's real ~/.config/entire and OS keychain.
+	// e2e/artifacts/ on every run, so the CLI's config, cache, auth locks, and
+	// token store live in a temp dir outside the artifact tree.
+	// testing.Testing() is false in the spawned binary, so only these env vars
+	// keep it away from the developer's real ~/.config/entire, user cache, and
+	// OS keychain.
 	stateDir, err := os.MkdirTemp("", "e2e-controlplane-")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "preflight: create state dir: %v\n", err)
@@ -66,6 +67,7 @@ func TestMain(m *testing.M) {
 	os.Setenv("ENTIRE_TOKEN_STORE_PATH", filepath.Join(stateDir, "tokens.json"))
 	os.Setenv("ENTIRE_CONFIG_DIR", filepath.Join(stateDir, "entire-config"))
 	os.Setenv("XDG_CACHE_HOME", filepath.Join(stateDir, "entire-cache"))
+	os.Setenv("ENTIRE_AUTH_LOCK_DIR", filepath.Join(stateDir, "auth-locks"))
 	// ENTIRE_TOKEN's presence alone switches the CLI to token mode, and a set
 	// ENTIRE_AUTH_BASE_URL (retired) fails every command.
 	for _, name := range []string{"ENTIRE_TOKEN", "ENTIRE_CONTEXT", "ENTIRE_AUTH_BASE_URL"} {
