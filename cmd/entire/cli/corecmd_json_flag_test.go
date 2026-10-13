@@ -37,6 +37,7 @@ func TestControlPlaneJSONFlag_OnlyOnHonoringCommands(t *testing.T) {
 		"repo create":        true,
 		"repo list":          true,
 		"repo view":          true,
+		"repo whereami":      true,
 		"repo edit":          true,
 		"repo delete":        false,
 		"repo clone":         false,
