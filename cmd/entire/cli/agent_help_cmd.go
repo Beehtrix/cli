@@ -103,6 +103,7 @@ var agentHelpClassification = map[string]agentHelpFacts{
 
 	"checkpoint":         {agentHelpAudienceTaskDriven, true},
 	"checkpoint create":  {agentHelpAudienceUserOwned, false},  // hidden; writes a checkpoint
+	"checkpoint delete":  {agentHelpAudienceUserOwned, false},  // destructive, irreversible on remotes
 	"checkpoint explain": {agentHelpAudienceTaskDriven, false}, // --generate writes a summary
 	"checkpoint list":    {agentHelpAudienceReadOnly, false},
 	"checkpoint search":  {agentHelpAudienceReadOnly, false},
@@ -121,19 +122,22 @@ var agentHelpClassification = map[string]agentHelpFacts{
 	// trail is the highest-traffic family by a wide margin, so its read-only
 	// subcommands must not disappear behind the group's write-capable label.
 	"trail":                 {agentHelpAudienceTaskDriven, true},
-	"trail approvals":       {agentHelpAudienceReadOnly, false},
 	"trail list":            {agentHelpAudienceReadOnly, false},
 	"trail show":            {agentHelpAudienceReadOnly, false},
+	"trail create":          {agentHelpAudienceTaskDriven, false},
+	"trail delete":          {agentHelpAudienceTaskDriven, false},
+	"trail update":          {agentHelpAudienceTaskDriven, false},
+	"trail approvals":       {agentHelpAudienceReadOnly, false},
 	"trail watch":           {agentHelpAudienceReadOnly, false},
 	"trail approve":         {agentHelpAudienceTaskDriven, false},
 	"trail checkout":        {agentHelpAudienceTaskDriven, false},
 	"trail comment":         {agentHelpAudienceTaskDriven, false},
-	"trail create":          {agentHelpAudienceTaskDriven, false},
 	"trail finding":         {agentHelpAudienceTaskDriven, false},
 	"trail merge":           {agentHelpAudienceUserOwned, false},
 	"trail request-changes": {agentHelpAudienceTaskDriven, false},
 	"trail resume":          {agentHelpAudienceTaskDriven, false},
-	"trail update":          {agentHelpAudienceTaskDriven, false},
+	"trail link":            {agentHelpAudienceUserOwned, false},
+	"trail unlink":          {agentHelpAudienceUserOwned, false},
 
 	// ---- Unlisted: real commands, just not the default view. ---------------
 	"activity": {agentHelpAudienceReadOnly, false},
@@ -190,6 +194,14 @@ var agentHelpClassification = map[string]agentHelpFacts{
 // true for both audiences (e.g. "these endpoints are internal and can change")
 // belongs in Long instead, where both see it.
 var agentHelpGuidance = map[string]string{
+	"session attach": "Commits made during a session are linked to it automatically. Use this\n" +
+		"only when one was missed: `entire session attach <session-id> --commit <sha>`\n" +
+		"(default HEAD). Run it without --force first: it prints what it would do\n" +
+		"(rewrite unpushed commits to add the trailer, or record a link to a pushed\n" +
+		"commit and push the session transcript) and exits non-zero without changing\n" +
+		"anything. Show the user that output and ask them; pass --force only after\n" +
+		"they agree to that exact change, never pre-emptively. A link to a pushed\n" +
+		"commit counts only when its author attaches it.",
 	"api": "LAST RESORT. Right in two cases: you are developing against Entire's own\n" +
 		"APIs and want a raw response, or no first-class command covers your need.\n" +
 		"Otherwise prefer the command built for the job (checkpoint, session, trail,\n" +
@@ -223,6 +235,18 @@ var agentHelpGuidance = map[string]string{
 		"so pass it only when the user asked for a summary. To see what subagents\n" +
 		"did, read \"tasks\" in --json, then stream one subagent's transcript with\n" +
 		"--transcript --task <tool_use_id>.",
+
+	// Agent sandboxes commonly block both, and the failure reads like an auth
+	// wall to an agent that does not know what the command needs.
+	"trail": "Trail commands talk to entire.io and read the saved login from the OS\n" +
+		"keyring (the Keychain on macOS), so they need network and keyring access.\n" +
+		"If you run commands in a sandbox, request unsandboxed execution for\n" +
+		"`entire trail` up front. An error saying the Keychain is not accessible or\n" +
+		"the network is not allowed means the sandbox blocked it, not that the user\n" +
+		"is logged out: ask to re-run it unsandboxed, and do not run `entire login`.",
+
+	"checkpoint delete": "Destructive and irreversible on the remote. Never run this unless the user\n" +
+		"explicitly asks to delete that checkpoint; do not pass --force on your own.",
 }
 
 // agentHelpFactsFor classifies one command path, defaulting the unclassified
@@ -241,6 +265,20 @@ func agentHelpFactsFor(path string) agentHelpFacts {
 func agentHelpClassified(path string) (agentHelpFacts, bool) {
 	f, ok := agentHelpClassification[path]
 	return f, ok
+}
+
+// agentHelpGuidanceFor returns the guidance for cmd and every ancestor that has
+// some, outermost first. Inherited so a group-wide fact (trail needs network and
+// keyring access) reaches the leaf an agent actually looks up, e.g.
+// `agent-help trail finding list`, without repeating it on every subcommand.
+func agentHelpGuidanceFor(cmd *cobra.Command) string {
+	var parts []string
+	for c := cmd; c != nil && c != c.Root(); c = c.Parent() {
+		if g := agentHelpGuidance[agentHelpPath(c)]; g != "" {
+			parts = append([]string{g}, parts...)
+		}
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // agentHelpPath is a command's path relative to the root, the key shape used by
@@ -287,11 +325,11 @@ func agentHelpAudienceNote(cmd *cobra.Command, facts agentHelpFacts, trailsEnabl
 		switch cf.audience {
 		case agentHelpAudienceReadOnly:
 			readOnly = append(readOnly, child.Name())
-		case agentHelpAudienceTaskDriven:
+		case agentHelpAudienceTaskDriven, agentHelpAudienceUserOwned:
+			// A user-owned child (`checkpoint delete`) writes too. Its "do not run
+			// this unprompted" rule lives in agentHelpGuidance and the drill-down's
+			// per-subcommand audience; here it only must not read as read-only.
 			writes = append(writes, child.Name())
-		case agentHelpAudienceUserOwned:
-			// A user-owned child inside a listed group would need its own phrasing.
-			// None exists today; the completeness guard surfaces one if it lands.
 		}
 	}
 	switch {
@@ -599,7 +637,7 @@ func renderAgentHelpJSON(rootCmd, target *cobra.Command, repoLine string, trails
 		Command:  target.CommandPath(),
 		Short:    target.Short,
 		Long:     strings.TrimSpace(target.Long),
-		Guidance: agentHelpGuidance[agentHelpPath(target)],
+		Guidance: agentHelpGuidanceFor(target),
 		Example:  strings.TrimSpace(target.Example),
 		Repo:     repoLine,
 	}
@@ -690,7 +728,7 @@ func renderAgentHelpCommand(cmd *cobra.Command, repoLine string, trailsEnabled b
 	}
 	// Before the flags and examples: whether to use the command at all outranks
 	// how to call it.
-	if guidance := agentHelpGuidance[agentHelpPath(cmd)]; guidance != "" {
+	if guidance := agentHelpGuidanceFor(cmd); guidance != "" {
 		b.WriteString("\nWhen to use this:\n")
 		b.WriteString(guidance)
 		b.WriteString("\n")
@@ -701,7 +739,11 @@ func renderAgentHelpCommand(cmd *cobra.Command, repoLine string, trailsEnabled b
 		b.WriteString("\n")
 	}
 	b.WriteString("\n")
-	b.WriteString(agentHelpRepoBlock(repoLine))
+	if agentHelpPath(cmd) == "trail list" && usesProjectTrails(cmd) {
+		b.WriteString("Scope: one project; --project is required, even inside a clone. --repo only filters within that project.\n")
+	} else {
+		b.WriteString(agentHelpRepoBlock(repoLine))
+	}
 
 	// LocalFlags()/InheritedFlags() trigger cobra's persistent-flag merge (plain
 	// Flags() does not without Execute) and skip hidden flags in FlagUsages.
@@ -745,6 +787,9 @@ func renderAgentHelpCommand(cmd *cobra.Command, repoLine string, trailsEnabled b
 func renderAgentHelpTop(rootCmd *cobra.Command, repoLine string, trailsEnabled bool) string {
 	var b strings.Builder
 	b.WriteString(agentHelpOverview)
+	if trailCmd, _, err := rootCmd.Find([]string{"trail"}); err == nil && usesProjectTrails(trailCmd) {
+		b.WriteString("\nProject trails are enabled by ENTIRE_PROJECT_TRAILS=1. Trail listing requires an explicit --project; --repo only filters within it.")
+	}
 	b.WriteString("\n\n")
 	b.WriteString(agentHelpRepoBlock(repoLine))
 

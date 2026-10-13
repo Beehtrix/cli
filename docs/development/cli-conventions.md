@@ -33,7 +33,10 @@ the commands are always runnable in every build.
   `current` and a bare `tokens` answer "which session is running this command?"
   through `strategy.ResolveCallerSession`, not "which state file moved last" —
   see [Resolving the calling session](caller-session-resolution.md#resolving-the-calling-session).
-- `checkpoint` (aliases: `cp`, `checkpoints`): `list`, `explain`, `tokens`, `search`.
+- `checkpoint` (aliases: `cp`, `checkpoints`): `list`, `explain`, `tokens`, `search`, `delete`.
+  `delete` is user-owned in `agent-help` (agents must not run it unprompted) and
+  confirms through `confirmControlPlaneDeletion`; see
+  [Deleting a Checkpoint](../architecture/sessions-and-checkpoints.md#deleting-a-checkpoint).
   `explain` also takes a forge-qualified `--repo` (`gh/<owner>/<name>` or
   `et/<project>/<name>`), the drill-down for a cross-repo `search` hit: it
   reads the checkpoint from that repo's entire-api cell over
@@ -353,12 +356,10 @@ the commands are always runnable in every build.
   by name, its repo is the name the detach is asked to use). It is
   keyed by the placement ID from `/mirrors/placements`, and with several
   placements it sends the first so the server's `single-placement`
-  precondition explains the refusal. Every run asks for the dry-run plan first,
-  and tables show its access split into who loses and who keeps it, in the
-  grant tables' layout, accounts named by handle and display name from one
-  best-effort `GET
-  /repos/{repoId}/people` read before the write (the API names subjects by ID
-  only; `--json` keeps the IDs and skips the read);
+  precondition explains the refusal. Every run asks for the dry-run plan first
+  and shows its preconditions. It shows no access list: after the detach only
+  the target project grants member access, and the plan, the prompt and the
+  help say so. `--json` still prints any `access` an older core sends;
   an ineligible plan stops before the write with the failed precondition slugs
   (under `--json`, after printing the plan). A real detach is confirmed through
   `confirmPrompt` (shared with `grant remove`'s revoke prompt), which writes the
@@ -833,6 +834,13 @@ current flags; `--json` emits structured output. It is the single source of
 truth the first-turn context injection and the `--agent-help-skill` skill point
 agents at, instead of enumerating a surface that goes stale.
 
+When trails are enabled, the first-turn injection introduces a trail as
+project-level intent across repositories and branches. It asks agents to inspect
+the current branch's trail, reuse intent where appropriate, and keep the trail's
+description current. Command details come from `entire agent-help trail`; the
+injection retains auto-detected repository context without listing unrelated
+checkpoint or setup workflows.
+
 #### Where agent-facing text goes
 
 | What you have | Where it goes |
@@ -840,7 +848,7 @@ agents at, instead of enumerating a surface that goes stale.
 | A new command | `agentHelpClassification` in `agent_help_cmd.go` — one entry, keyed by command path, carrying `audience` and `listed` |
 | "When to use this at all" advice for agents | `agentHelpGuidance` — **never** cobra `Short`/`Long` |
 | A fact humans need too (e.g. "this output is not stable") | cobra `Long`. Human help is a reference, not a lecture: whoever typed `--help` already chose the command |
-| A per-task command recommendation | `agent-help`, which is pulled on demand. **Never** the first-turn injection, which carries only invariants true on every turn |
+| A per-task command recommendation | `agent-help`, which is pulled on demand. The first-turn injection stays focused on the project-trail workflow below |
 
 **Flag it; don't decide it.** Whether a command is `listed`, and whether it is
 read-only / task-driven / user-owned, are product judgment calls — they change
