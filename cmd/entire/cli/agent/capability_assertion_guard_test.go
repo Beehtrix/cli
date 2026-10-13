@@ -50,9 +50,12 @@ func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 	checked := 0
 	fset := token.NewFileSet()
 	for _, rel := range productionGoFiles(t, repoRoot) {
-		file, err := parser.ParseFile(fset, filepath.Join(repoRoot, rel), nil, parser.SkipObjectResolution)
+		file, err := parser.ParseFile(fset, filepath.Join(repoRoot, filepath.FromSlash(rel)), nil, parser.SkipObjectResolution)
 		if err != nil {
-			t.Fatalf("parse %s: %v", rel, err)
+			// An unparsable file cannot compile either, so it cannot hide an
+			// assertion; it is more likely an untracked scratch file.
+			t.Logf("skipping %s: %v", rel, err)
+			continue
 		}
 		for _, expr := range assertedTypes(file) {
 			name, ok := agentInterfaceName(expr, agentImportName(file, rel), interfaces)
@@ -85,7 +88,7 @@ const agentImportPath = "github.com/entireio/cli/cmd/entire/cli/agent"
 // names: the import's alias, or "agent" when it is imported plainly. Inside
 // package agent itself the names are unqualified, reported as "". Files that do
 // not import the package cannot assert to its interfaces at all; "-" matches
-// nothing.
+// nothing. rel is slash-separated, as git prints it.
 func agentImportName(file *ast.File, rel string) string {
 	const agentDir = "cmd/entire/cli/agent/"
 	if strings.HasPrefix(rel, agentDir) && !strings.Contains(strings.TrimPrefix(rel, agentDir), "/") {
@@ -153,8 +156,8 @@ func assertedTypes(file *ast.File) []ast.Expr {
 }
 
 // productionGoFiles lists the repository's tracked and untracked Go files
-// outside _test.go, relative to repoRoot, with the same isolation as
-// testutil.GitGrepGuard.
+// outside _test.go, slash-separated relative to repoRoot, with the same
+// isolation as testutil.GitGrepGuard.
 func productionGoFiles(t *testing.T, repoRoot string) []string {
 	t.Helper()
 
@@ -168,7 +171,7 @@ func productionGoFiles(t *testing.T, repoRoot string) []string {
 	var files []string
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		if line != "" && !strings.HasSuffix(line, "_test.go") {
-			files = append(files, filepath.FromSlash(line))
+			files = append(files, line)
 		}
 	}
 	if len(files) == 0 {

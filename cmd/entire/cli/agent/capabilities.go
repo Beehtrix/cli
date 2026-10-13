@@ -22,7 +22,7 @@ type CapabilityDeclarer interface {
 // can deserialize directly into this type.
 //
 // Not every optional interface appears here. These capabilities intentionally
-// have no external-protocol declaration:
+// have no DeclaredCaps field:
 //
 //   - CallerSessionIdentifier
 //   - ContextInjector
