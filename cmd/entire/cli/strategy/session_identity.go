@@ -39,6 +39,22 @@ func (s *ManualCommitStrategy) findSessionsForCommitLinking(ctx context.Context,
 	if guest := s.findSessionByCommitAncestry(ctx, allStates); guest != nil && !linkingSetContains(sessions, guest.SessionID) {
 		sessions = append(sessions, guest)
 	}
+	// A session that edited this worktree from elsewhere (an agent launched
+	// in another worktree writing here by path) recorded those edits for it;
+	// it may link this commit, but only one containing them.
+	for _, state := range allStates {
+		if state.Kind.IsImported() || state.AdoptedIntoWorktreePath != "" || linkingSetContains(sessions, state.SessionID) {
+			continue
+		}
+		if hasWorktreeEntry(state, worktreePath) {
+			state.LinkedByWorktreeEntry = true
+			sessions = append(sessions, state)
+		}
+	}
+	// Every session judges this commit by what it recorded for this worktree.
+	for _, state := range sessions {
+		enterWorktreeView(state, worktreePath)
+	}
 	if ambiguous && len(sessions) == 0 && !isGitSequenceOperation(ctx) {
 		fmt.Fprintln(stderrWriter,
 			"[entire] Agent sessions in several other worktrees could match this commit; none was linked. Run 'entire session adopt' in this worktree to link future commits to your session.")

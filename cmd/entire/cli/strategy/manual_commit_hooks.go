@@ -1317,11 +1317,19 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 		iterCtx, iterSpan := processSessionsLoop.Iteration(loopCtx)
 		var newSkillEvents []agent.SkillEvent
 		var condensedSignal *commitCondensedSignal
+		entryOnly := sess.LinkedByWorktreeEntry
 		mutErr := MutateSessionStateOnSaved(iterCtx, sessionID, func(state *SessionState) error {
+			// The same view of this worktree the linking set judged it by.
+			leave, inView := enterWorktreeView(state, worktreePath)
+			state.LinkedByWorktreeEntry = entryOnly
 			var condensed bool
 			newSkillEvents, condensedSignal, condensed = s.postCommitProcessSessionLocked(iterCtx, repo, state, &transitionCtx, checkpointID,
 				head, commit, newHead, worktreePath, headTree, parentTree,
 				committedFileSet, sessionsWithCommittedFiles, condensedTelemetry)
+			state.LinkedByWorktreeEntry = false
+			if inView {
+				leave()
+			}
 			trailerOwned = trailerOwned || condensed
 			if IsCondensableEndedSession(state) {
 				staleEnded++
@@ -1533,6 +1541,11 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 	condensedTelemetry *commitCondensedEmitter,
 ) (newSkillEvents []agent.SkillEvent, condensedSignal *commitCondensedSignal, condensed bool) {
 	logCtx := logging.WithComponent(ctx, "checkpoint")
+	if state.LinkedByWorktreeEntry && !overlapsFiles(state.FilesTouched, committedFileSet) {
+		// Linked only by its record of this worktree, and the commit holds
+		// none of those files: not this session's commit.
+		return newSkillEvents, condensedSignal, false
+	}
 	reservedCheckpointID := state.PendingCondensationID()
 	if reservedCheckpointID != id.EmptyCheckpointID && reservedCheckpointID != checkpointID {
 		logging.Warn(logCtx, "post-commit: preserving interrupted condensation with a different checkpoint ID",
@@ -1659,7 +1672,9 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 			slog.Any("remaining", remainingFiles),
 			slog.Any("committed_files", committedFileSet),
 		)
-		if len(remainingFiles) > 0 {
+		// Files still waiting here or in another worktree keep the session
+		// pending and the next checkpoint self-contained.
+		if state.HasPendingFiles() {
 			carryForwardRemainingFiles(logCtx, state)
 		}
 
@@ -1667,7 +1682,7 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 		// committed. If carry-forward files remain they must persist, so the
 		// next condensation (triggered by the next commit) can still read them.
 		// Released through the root the condensation read them from.
-		if len(state.FilesTouched) == 0 {
+		if !state.HasPendingFiles() {
 			clearStagedFilesIn(ctx, handler.storedRoot, state.SessionID, state.WorktreePath)
 		}
 	}
@@ -1677,7 +1692,7 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 	// Either we just condensed (no carry-forward remains) or there was never any
 	// new content. PostCommit will skip these on future commits; they persist only
 	// for LastCheckpointID (amend trailer restoration).
-	if state.Phase == session.PhaseEnded && len(state.FilesTouched) == 0 && (handler.condensed || !hasNew) {
+	if state.Phase == session.PhaseEnded && !state.HasPendingFiles() && (handler.condensed || !hasNew) {
 		state.FullyCondensed = true
 	}
 
@@ -1945,6 +1960,12 @@ func (s *ManualCommitStrategy) filterSessionsWithNewContent(ctx context.Context,
 				slog.String("session_id", state.SessionID),
 				slog.String("phase", string(state.Phase)),
 				slog.Int("files_touched", len(state.FilesTouched)),
+			)
+			continue
+		}
+		if state.LinkedByWorktreeEntry && !overlapsFiles(state.FilesTouched, fileSet(stagedFiles)) {
+			logging.Debug(logCtx, "filterSessionsWithNewContent: linked by its record of this worktree, but none of those files is staged",
+				slog.String("session_id", state.SessionID),
 			)
 			continue
 		}
@@ -2401,8 +2422,10 @@ func normalizeTranscriptFilePaths(ctx context.Context, state *SessionState, modi
 		for _, f := range modifiedFiles {
 			if rel := paths.ToRelativePath(f, basePath); rel != "" {
 				normalized = append(normalized, filepath.ToSlash(rel))
-			} else if len(f) > 0 && !filepath.IsAbs(f) && f[0] != '/' {
-				// Already relative — keep as-is
+			} else if len(f) > 0 && !filepath.IsAbs(f) && f[0] != '/' && !state.InWorktreeView {
+				// Already relative — keep as-is. Not in another worktree's
+				// view: a relative path is relative to where the agent runs,
+				// not to the worktree being committed.
 				normalized = append(normalized, filepath.ToSlash(f))
 			}
 			// else: absolute path outside repo — skip. These can't match
@@ -2444,12 +2467,23 @@ func (s *ManualCommitStrategy) tryAgentCommitFastPath(ctx context.Context, commi
 	eligibleSessions := 0
 	emptyEligibleSessions := 0
 	now := time.Now()
+	var staged map[string]struct{}
 	for _, state := range sessions {
 		// ACTIVE, or IDLE with a fresh in-flight task record whose content the
 		// commit's own condensation materializes (see idleWithLiveTaskRecord).
 		eligible := state.Phase.IsActive() || idleWithLiveTaskRecord(state, now)
 		if !eligible {
 			continue
+		}
+		if state.LinkedByWorktreeEntry {
+			// Linked only by its record of this worktree: a commit from
+			// another process (a script, a GUI client) must hold those files.
+			if staged == nil {
+				staged = stagedFileSet(ctx)
+			}
+			if !overlapsFiles(state.FilesTouched, staged) {
+				continue
+			}
 		}
 		eligibleSessions++
 		if sessionLacksCondensableContent(state) {
@@ -3564,4 +3598,22 @@ func getAllChangedFilesBetweenTreesSlow(ctx context.Context, tree1, tree2 *objec
 	}
 
 	return changed, nil
+}
+
+// stagedFileSet is the set of staged paths, empty when they can't be listed.
+func stagedFileSet(ctx context.Context) map[string]struct{} {
+	staged, err := getStagedFiles(ctx)
+	if err != nil {
+		return map[string]struct{}{}
+	}
+	return fileSet(staged)
+}
+
+// fileSet makes a set of repo-relative paths.
+func fileSet(files []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		set[filepath.ToSlash(f)] = struct{}{}
+	}
+	return set
 }

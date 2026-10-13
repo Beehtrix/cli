@@ -279,6 +279,11 @@ type State struct {
 	// entry's files.
 	LinkedByWorktreeEntry bool `json:"-"`
 
+	// InWorktreeView is set in memory, never stored, while the home fields
+	// (FilesTouched, TouchedFileHashes, BaseCommit, WorktreePath) hold another
+	// worktree's entry instead of the home's, for a commit in that worktree.
+	InWorktreeView bool `json:"-"`
+
 	// LastCheckpointID is the checkpoint ID from the most recent condensation.
 	// Used to restore the Entire-Checkpoint trailer on amend and to identify
 	// sessions that have been condensed at least once. Cleared on new prompt.
