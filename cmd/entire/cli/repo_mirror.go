@@ -1321,8 +1321,8 @@ func newRepoMirrorListCmd() *cobra.Command {
 // its access and availability instead of a placements table — though today's
 // control plane only matches onboarded repos in the filter, so that path
 // waits on the server (the not-found error points at `list --available`).
-// --json emits the same repoDirRow shape `list --json` uses, placements
-// nested.
+// --json adds top-level repoId/apiUrl to the directory row; placements stay
+// nested. Coordinates are omitted together when resolution is unavailable.
 //
 // clusterHost is empty for a repository reference, which carries no cluster and
 // so resolves on the active context's core. A clone URL names its cluster, and
@@ -1346,11 +1346,36 @@ func runRepoMirrorViewByName(cmd *cobra.Command, ref, clusterHost string) error 
 		}
 		row := mirrorRepoDetailRow(out.Repos[0], clusterHostBySlug(clusters.Clusters))
 		if jsonRequested(cmd) {
-			return printJSON(cmd.OutOrStdout(), row)
+			view := mirrorRepoViewJSON{repoDirRow: row}
+			view.RepoID, view.APIURL, _ = repoViewCoords(out.Repos[0], clusters.Clusters)
+			return printJSON(cmd.OutOrStdout(), view)
 		}
 		renderRepoDetail(cmd.OutOrStdout(), row)
 		return nil
 	})
+}
+
+// mirrorRepoViewJSON adds the responsible cell's coordinates to the detail
+// view. Both fields are omitted when the processing placement cannot resolve.
+type mirrorRepoViewJSON struct {
+	repoDirRow
+
+	RepoID string `json:"repoId,omitempty"`
+	APIURL string `json:"apiUrl,omitempty"`
+}
+
+// repoViewCoords reuses the routing resolver's selection and catalog join.
+// Missing coordinates must not prevent viewing an unready repo's status.
+func repoViewCoords(entry coreapi.RepoIndexEntry, clusters []coreapi.Cluster) (repoID, apiURL string, ok bool) {
+	placement, err := processingPlacementOfEntry(entry)
+	if err != nil {
+		return "", "", false
+	}
+	target, err := cellTargetForPlacementInCatalog(clusters, placement)
+	if err != nil {
+		return "", "", false
+	}
+	return strings.TrimSpace(placement.ID), target.BaseURL, true
 }
 
 // mirrorRepoDetailRow shapes one directory entry for the record view, reusing the

@@ -130,7 +130,12 @@ func cellTargetForClusterHost(ctx context.Context, c cellCoreClient, clusterHost
 	if err != nil {
 		return nil, fmt.Errorf("list clusters: %w", err)
 	}
-	cluster, ok := matchClusterByHost(clusters.Clusters, clusterHost)
+	return cellTargetForClusterHostInCatalog(clusters.Clusters, clusterHost)
+}
+
+// cellTargetForClusterHostInCatalog also serves callers holding the catalog.
+func cellTargetForClusterHostInCatalog(clusters []coreapi.Cluster, clusterHost string) (*auth.CellTarget, error) {
+	cluster, ok := matchClusterByHost(clusters, clusterHost)
 	if !ok {
 		return nil, fmt.Errorf("no cluster matches host %q", clusterHost)
 	}
@@ -159,9 +164,16 @@ func cellTargetForPlacement(ctx context.Context, c cellCoreClient, placement cor
 	if err != nil {
 		return nil, fmt.Errorf("list clusters: %w", err)
 	}
-	cluster, ok := matchClusterBySlug(clusters.Clusters, placement.ClusterSlug)
+	return cellTargetForPlacementInCatalog(clusters.Clusters, placement)
+}
+
+// cellTargetForPlacementInCatalog is cellTargetForPlacement's join against an
+// already-fetched catalog, for callers (repo view) that hold the clusters list
+// and must not pay a second ListClusters.
+func cellTargetForPlacementInCatalog(clusters []coreapi.Cluster, placement coreapi.RepoPlacement) (*auth.CellTarget, error) {
+	cluster, ok := matchClusterBySlug(clusters, placement.ClusterSlug)
 	if !ok {
-		cluster, ok = matchClusterByCellInURL(clusters.Clusters, placement.Cell)
+		cluster, ok = matchClusterByCellInURL(clusters, placement.Cell)
 	}
 	if !ok {
 		return nil, fmt.Errorf("no cluster matches slug %q or cell %q", placement.ClusterSlug, placement.Cell)
@@ -219,6 +231,12 @@ func resolveProcessingPlacement(ctx context.Context, c cellCoreClient, fullName 
 	if err != nil {
 		return coreapi.RepoPlacement{}, err
 	}
+	return processingPlacementOfEntry(entry)
+}
+
+// processingPlacementOfEntry selects the processing placement from an index
+// entry. Repo view shares this selection without fetching the entry again.
+func processingPlacementOfEntry(entry coreapi.RepoIndexEntry) (coreapi.RepoPlacement, error) {
 	// A Candidate row is a repo that exists on the forge and is visible to the
 	// caller but was never onboarded: no placements or primaries to resolve.
 	//
