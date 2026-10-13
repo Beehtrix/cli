@@ -69,8 +69,9 @@ func declaredCapability[T any](ag Agent, declared func(DeclaredCaps) bool) (T, b
 	return t, true
 }
 
-// builtinCapability returns the agent as T by type assertion alone, for
-// built-in-only capabilities that have no DeclaredCaps gate.
+// builtinCapability returns the agent as T by type assertion alone, with no
+// DeclaredCaps gate. CapabilityDeclarer agents that implement T are not
+// refused; use builtinOnlyCapability when they must be.
 func builtinCapability[T any](ag Agent) (T, bool) {
 	var zero T
 	if ag == nil {
