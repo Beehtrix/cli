@@ -103,15 +103,11 @@ func builtinCapability[T any](ag SessionLocator) (T, bool) {
 // refuses CapabilityDeclarer agents even when they implement T, for
 // capabilities external agents must never take on.
 func nonDeclarerCapability[T any](ag Agent) (T, bool) {
-	t, ok := builtinCapability[T](ag)
-	if !ok {
-		return t, false
-	}
 	if _, isDeclarer := ag.(CapabilityDeclarer); isDeclarer {
 		var zero T
 		return zero, false
 	}
-	return t, true
+	return builtinCapability[T](ag)
 }
 
 // AsHookSupport returns the agent as HookSupport if it both implements the

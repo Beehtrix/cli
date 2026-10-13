@@ -282,7 +282,13 @@ see type assertions under any import alias and type-switch cases that wrap
 across lines, so it parses files instead of grepping them. It lists files with
 `git ls-files -z --cached --others` and `testutil.GuardGitEnv()`, which keeps
 the same untracked-file and repo-selector protections, restricts the pathspec
-to `*.go`, and fails when it checks no assertions.
+to `*.go`, and fails when it checks no assertions outside package `agent`. It
+counts only those, because the resolvers' own `CapabilityDeclarer` assertions
+inside the package would keep a zero-match check from ever firing. Interface
+literals and interfaces declared in the asserting package are matched by the
+capability methods or embedded capability interfaces they contain. A tracked
+file missing from the working tree is skipped, and any other read error fails
+the guard.
 
 ### Code Duplication Prevention
 
