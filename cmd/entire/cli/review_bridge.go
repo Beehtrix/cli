@@ -287,12 +287,12 @@ func splitReviewVerdictFindings(verdict string) []string {
 		}
 	}
 	for _, line := range strings.Split(strings.TrimSpace(verdict), "\n") {
-		if item, ok := topLevelBulletText(line); ok {
+		if item, ok := cliReview.TopLevelBulletText(line); ok {
 			flush()
 			current.WriteString(item)
 			continue
 		}
-		if item, ok := topLevelMarkedFindingText(line); ok {
+		if item, ok := cliReview.TopLevelMarkedFindingText(line); ok {
 			flush()
 			current.WriteString(item)
 			continue
@@ -305,63 +305,6 @@ func splitReviewVerdictFindings(verdict string) []string {
 	}
 	flush()
 	return findings
-}
-
-func topLevelBulletText(line string) (string, bool) {
-	trimmedRight := strings.TrimRight(line, " \t")
-	leading := len(trimmedRight) - len(strings.TrimLeft(trimmedRight, " \t"))
-	if leading != 0 {
-		return "", false
-	}
-	trimmed := strings.TrimSpace(trimmedRight)
-	if len(trimmed) < 3 {
-		return "", false
-	}
-	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") || strings.HasPrefix(trimmed, "+ ") {
-		return strings.TrimSpace(trimmed[2:]), true
-	}
-	for i, r := range trimmed {
-		if r >= '0' && r <= '9' {
-			continue
-		}
-		if r == '.' && i > 0 && i+1 < len(trimmed) && trimmed[i+1] == ' ' {
-			return strings.TrimSpace(trimmed[i+2:]), true
-		}
-		return "", false
-	}
-	return "", false
-}
-
-func topLevelMarkedFindingText(line string) (string, bool) {
-	trimmedRight := strings.TrimRight(line, " \t")
-	leading := len(trimmedRight) - len(strings.TrimLeft(trimmedRight, " \t"))
-	if leading != 0 {
-		return "", false
-	}
-	trimmed := strings.TrimSpace(trimmedRight)
-	if !startsWithReviewSeverityMarker(trimmed) {
-		return "", false
-	}
-	return trimmed, true
-}
-
-func startsWithReviewSeverityMarker(s string) bool {
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "**")
-	s = strings.TrimPrefix(s, "__")
-	s = strings.TrimSpace(s)
-	lower := strings.ToLower(s)
-	for _, marker := range []string{"[critical]", "[high]", "[medium]", "[low]", "[p0]", "[p1]", "[p2]", "[p3]", "[nit]"} {
-		if strings.HasPrefix(lower, marker) {
-			return true
-		}
-	}
-	for _, marker := range []string{"critical", "high", "medium", "low", "p0", "p1", "p2", "p3", "nit"} {
-		if strings.HasPrefix(lower, marker+" —") || strings.HasPrefix(lower, marker+" -") || strings.HasPrefix(lower, marker+":") {
-			return true
-		}
-	}
-	return false
 }
 
 // trailWebURL builds the browser URL for a trail, matching the server's

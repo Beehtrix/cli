@@ -8,11 +8,14 @@ import (
 	reviewtypes "github.com/entireio/cli/cmd/entire/cli/review/types"
 )
 
-// reviewVerdictQualifiers mark an approve that still carries feedback or a
-// condition, so it must be posted rather than treated as clean.
+// reviewVerdictQualifiers mark an approve reason that still carries feedback
+// or a condition, so it must be posted rather than treated as clean.
 var reviewVerdictQualifiers = map[string]bool{
 	"nit": true, "nits": true, "but": true, "however": true,
 	"once": true, "after": true, "pending": true, "unless": true,
+	"if": true, "provided": true, "assuming": true, "when": true,
+	"until": true, "suggestion": true, "suggestions": true, "minor": true,
+	"consider": true, "should": true,
 }
 
 // allReviewNarrativesClean reports whether every usable reviewer approved
@@ -26,15 +29,19 @@ func allReviewNarrativesClean(summary reviewtypes.RunSummary) bool {
 	return true
 }
 
-// isCleanReviewVerdict requires the text to end in an unqualified approve and
-// to contain no other verdict. Prompts put the verdict first, so a trailing
-// approve cannot override an earlier request for changes.
+// isCleanReviewVerdict requires the text to end in an unqualified approve, to
+// contain no other verdict, and to carry no finding-shaped line anywhere. A
+// trailing approve therefore cannot erase an earlier request for changes or
+// an earlier finding bullet.
 func isCleanReviewVerdict(text string) bool {
 	clean, isVerdict := false, false
 	for _, raw := range strings.Split(text, "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
+		}
+		if IsReviewFindingLine(raw) {
+			return false
 		}
 		clean, isVerdict = parseReviewVerdictLine(line)
 		if isVerdict && !clean {
@@ -44,6 +51,10 @@ func isCleanReviewVerdict(text string) bool {
 	return isVerdict && clean
 }
 
+// parseReviewVerdictLine classifies one line. An approve is clean only when
+// nothing follows it, or when a separator introduces a reason free of
+// qualifiers. A word directly after "approve" ("approve if", "approve with
+// suggestions") is a condition, so unknown phrasings are posted, not dropped.
 func parseReviewVerdictLine(line string) (clean, isVerdict bool) {
 	line = strings.ToLower(line)
 	line = strings.TrimSpace(strings.TrimLeft(line, "#>"))
@@ -55,14 +66,21 @@ func parseReviewVerdictLine(line string) (clean, isVerdict bool) {
 	if !ok {
 		return false, false
 	}
-	if rest != "" {
-		first, _ := utf8.DecodeRuneInString(rest)
-		if !unicode.IsSpace(first) && !unicode.IsPunct(first) && !unicode.IsSymbol(first) {
-			return false, false
-		}
+	if rest == "" {
+		return true, true
 	}
-	words := strings.FieldsFunc(rest, func(r rune) bool { return !unicode.IsLetter(r) })
-	for _, word := range words {
+	first, _ := utf8.DecodeRuneInString(rest)
+	if !unicode.IsSpace(first) && !unicode.IsPunct(first) && !unicode.IsSymbol(first) {
+		return false, false
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return true, true
+	}
+	if first, _ := utf8.DecodeRuneInString(rest); unicode.IsLetter(first) && !strings.HasPrefix(rest, "with no") {
+		return false, true
+	}
+	for _, word := range strings.FieldsFunc(rest, func(r rune) bool { return !unicode.IsLetter(r) }) {
 		if reviewVerdictQualifiers[word] {
 			return false, true
 		}

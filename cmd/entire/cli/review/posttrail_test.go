@@ -183,6 +183,8 @@ func TestMaybePostReviewToTrailSkipsCleanVerdicts(t *testing.T) {
 		"bold verdict":          {aggregate: "**approve** — no actionable findings."},
 		"punctuation boundary":  {aggregate: "approve! looks good."},
 		"heading verdict":       {aggregate: "## approve"},
+		"bare verdict":          {aggregate: "approve"},
+		"nothing to report":     {aggregate: "approve with nothing to report"},
 		"reviewer preamble":     {narratives: []string{"I checked the scoped diff and all call sites.\napprove — no actionable defects found."}},
 		"every reviewer clean": {narratives: []string{
 			"approve - no actionable findings.",
@@ -207,14 +209,22 @@ func TestMaybePostReviewToTrailPostsNonCleanVerdicts(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]postTrailVerdictCase{
-		"request changes":              {aggregate: "REQUEST CHANGES - missing input validation."},
-		"approve with nits":            {aggregate: "APPROVE WITH NITS - rename the confusing variable."},
-		"punctuated approve nits":      {aggregate: "APPROVE: WITH NITS - rename the confusing variable."},
-		"non-verdict approve word":     {aggregate: "APPROVED pending another review."},
-		"trailing conditional approve": {aggregate: "request changes - retry.go:42 never stops on cancel.\n\nApprove once that is fixed."},
-		"reworded nits":                {aggregate: "approve with minor nits - rename x."},
-		"parenthesized nits":           {aggregate: "approve (nits: rename x)"},
-		"qualified approve":            {aggregate: "approve, but tighten the error in foo.go:12."},
+		"request changes":               {aggregate: "REQUEST CHANGES - missing input validation."},
+		"approve with nits":             {aggregate: "APPROVE WITH NITS - rename the confusing variable."},
+		"punctuated approve nits":       {aggregate: "APPROVE: WITH NITS - rename the confusing variable."},
+		"non-verdict approve word":      {aggregate: "APPROVED pending another review."},
+		"trailing conditional approve":  {aggregate: "request changes - retry.go:42 never stops on cancel.\n\nApprove once that is fixed."},
+		"reworded nits":                 {aggregate: "approve with minor nits - rename x."},
+		"parenthesized nits":            {aggregate: "approve (nits: rename x)"},
+		"qualified approve":             {aggregate: "approve, but tighten the error in foo.go:12."},
+		"conditional approve":           {aggregate: "approve if retry.go:42 releases the lock on error."},
+		"provided approve":              {aggregate: "approve provided the retry loop stops on cancel."},
+		"approve with suggestions":      {aggregate: "approve with suggestions - see retry.go:42."},
+		"finding before approve":        {aggregate: "- [low] retry.go:42 — the lock leaks on error; release it in a defer.\n\napprove"},
+		"marked finding before approve": {aggregate: "[medium] retry.go:42 — the lock leaks on error.\napprove - otherwise fine."},
+		"reviewer finding before approve": {narratives: []string{
+			"Let me inspect the diff.\n1. retry.go:42 never releases the lock on error.\napprove",
+		}},
 		"one reviewer requests": {narratives: []string{
 			"request changes - foo.go:10 leaks the lock on error.",
 			"approve - no actionable findings.",
