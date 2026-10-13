@@ -5,7 +5,8 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
-	"regexp"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -29,6 +30,10 @@ var nonCapabilityInterfaces = map[string]string{
 // agent that implements the method but did not declare the capability is used
 // anyway. It also hides the capability from the DeclaredCaps doc list, which is
 // derived from the helpers.
+//
+// The check parses every production Go file rather than grepping it, so an
+// import under another name (agentpkg, cliagent) and a type-switch case list
+// that wraps onto a second line are both seen.
 func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 	t.Parallel()
 
@@ -37,54 +42,139 @@ func TestCapabilitiesAreOnlyReachedThroughHelpers(t *testing.T) {
 		return
 	}
 
-	interfaces := agentPackageInterfaces(t)
-	names := strings.Join(interfaces, "|")
-	// A type assertion `.(X)` or a type-switch case naming X, qualified as
-	// agent.X outside package agent. Non-capability interfaces are matched too,
-	// so the resolvers' own CapabilityDeclarer assertion keeps the grep from
-	// coming back empty. git grep's ERE has no \b, so the case half is loose and
-	// the Go regexp below does the precise matching.
-	pattern := `\.\((agent\.)?(` + names + `)\)|case .*(` + names + `)[ ,:]`
-	out := testutil.GitGrepGuard(t, repoRoot, "-n", "-E", "-e", pattern,
-		"--", ":(glob)**/*.go", ":(exclude,glob)**/*_test.go")
-
-	assertion := regexp.MustCompile(`(?:\.\(|case |, )(agent\.)?(` + names + `)\b`)
-	const agentDir = "cmd/entire/cli/agent/"
+	interfaces := map[string]struct{}{}
+	for _, name := range agentPackageInterfaces(t) {
+		interfaces[name] = struct{}{}
+	}
 
 	checked := 0
-	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
-		path, rest, ok := strings.Cut(line, ":")
-		if !ok || !strings.HasSuffix(path, ".go") {
-			t.Fatalf("cannot parse git grep output; expected path:line:text, got:\n  %s\n"+
-				"Check whether git is colorizing into a pipe (color.ui or color.grep set to `always`).", line)
+	fset := token.NewFileSet()
+	for _, rel := range productionGoFiles(t, repoRoot) {
+		file, err := parser.ParseFile(fset, filepath.Join(repoRoot, rel), nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", rel, err)
 		}
-		checked++
-
-		// Unqualified names refer to package agent only inside package agent
-		// itself; elsewhere they are some other package's types.
-		inAgentPackage := strings.HasPrefix(path, agentDir) &&
-			!strings.Contains(strings.TrimPrefix(path, agentDir), "/")
-		for _, m := range assertion.FindAllStringSubmatch(rest, -1) {
-			qualified, name := m[1] != "", m[2]
-			if !qualified && !inAgentPackage {
+		for _, expr := range assertedTypes(file) {
+			name, ok := agentInterfaceName(expr, agentImportName(file, rel), interfaces)
+			if !ok {
 				continue
 			}
+			checked++
 			if _, allowed := nonCapabilityInterfaces[name]; allowed {
 				continue
 			}
-			t.Errorf("%s:%s: asserts an agent to capability %s directly; call As%s so its DeclaredCaps gate applies",
-				path, rest, name, name)
+			pos := fset.Position(expr.Pos())
+			t.Errorf("%s:%d: asserts an agent to capability %s directly; call As%s so its DeclaredCaps gate applies",
+				rel, pos.Line, name, name)
 		}
 	}
 	if checked == 0 {
-		t.Fatal("no assertions checked — the guard's detection pattern has gone stale")
+		t.Fatal("no assertions checked — the guard's detection has gone stale")
 	}
 
 	for name := range nonCapabilityInterfaces {
-		if !slices.Contains(interfaces, name) {
+		if _, ok := interfaces[name]; !ok {
 			t.Errorf("nonCapabilityInterfaces lists %s, which is no longer an interface in package agent", name)
 		}
 	}
+}
+
+const agentImportPath = "github.com/entireio/cli/cmd/entire/cli/agent"
+
+// agentImportName returns the identifier file uses to qualify package agent's
+// names: the import's alias, or "agent" when it is imported plainly. Inside
+// package agent itself the names are unqualified, reported as "". Files that do
+// not import the package cannot assert to its interfaces at all; "-" matches
+// nothing.
+func agentImportName(file *ast.File, rel string) string {
+	const agentDir = "cmd/entire/cli/agent/"
+	if strings.HasPrefix(rel, agentDir) && !strings.Contains(strings.TrimPrefix(rel, agentDir), "/") {
+		return ""
+	}
+	for _, imp := range file.Imports {
+		if strings.Trim(imp.Path.Value, `"`) != agentImportPath {
+			continue
+		}
+		if imp.Name == nil {
+			return "agent"
+		}
+		if imp.Name.Name == "." {
+			return ""
+		}
+		return imp.Name.Name
+	}
+	return "-"
+}
+
+// agentInterfaceName reports which package-agent interface expr names, if any:
+// qualifier.X for files that import the package, or a bare X where qualifier
+// is "" (package agent and dot imports).
+func agentInterfaceName(expr ast.Expr, qualifier string, interfaces map[string]struct{}) (string, bool) {
+	var name string
+	switch e := expr.(type) {
+	case *ast.SelectorExpr:
+		pkg, ok := e.X.(*ast.Ident)
+		if !ok || pkg.Name != qualifier {
+			return "", false
+		}
+		name = e.Sel.Name
+	case *ast.Ident:
+		if qualifier != "" {
+			return "", false
+		}
+		name = e.Name
+	default:
+		return "", false
+	}
+	_, ok := interfaces[name]
+	return name, ok
+}
+
+// assertedTypes returns every type expression file asserts a value to: the
+// X in v.(X) and in each case of a switch v.(type).
+func assertedTypes(file *ast.File) []ast.Expr {
+	var types []ast.Expr
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.TypeAssertExpr:
+			if n.Type != nil {
+				types = append(types, n.Type)
+			}
+		case *ast.TypeSwitchStmt:
+			for _, stmt := range n.Body.List {
+				if clause, ok := stmt.(*ast.CaseClause); ok {
+					types = append(types, clause.List...)
+				}
+			}
+		}
+		return true
+	})
+	return types
+}
+
+// productionGoFiles lists the repository's tracked and untracked Go files
+// outside _test.go, relative to repoRoot, with the same isolation as
+// testutil.GitGrepGuard.
+func productionGoFiles(t *testing.T, repoRoot string) []string {
+	t.Helper()
+
+	cmd := exec.Command("git", "ls-files", "--cached", "--others", "--exclude-standard", "--", "*.go") //nolint:noctx // guard test, no cancellation needed
+	cmd.Dir = repoRoot
+	cmd.Env = testutil.GuardGitEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git ls-files: %v", err)
+	}
+	var files []string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		if line != "" && !strings.HasSuffix(line, "_test.go") {
+			files = append(files, filepath.FromSlash(line))
+		}
+	}
+	if len(files) == 0 {
+		t.Fatal("git ls-files found no Go files — the guard's file discovery has gone stale")
+	}
+	return files
 }
 
 // agentPackageInterfaces returns the names of the interfaces declared in the

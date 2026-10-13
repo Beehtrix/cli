@@ -83,9 +83,11 @@ func declaredCapability[T any](ag Agent, declared func(DeclaredCaps) bool) (T, b
 
 // builtinCapability returns the agent as T by type assertion alone, with no
 // DeclaredCaps gate. CapabilityDeclarer agents that implement T are not
-// refused; use nonDeclarerCapability when they must be. ag is an any so a
-// helper can resolve a narrower view of an agent, such as a SessionLocator.
-func builtinCapability[T any](ag any) (T, bool) {
+// refused; use nonDeclarerCapability when they must be. ag is a SessionLocator,
+// the narrowest view of an agent a helper resolves from, so every Agent and a
+// SessionStore's locator both fit while unrelated values are rejected at
+// compile time.
+func builtinCapability[T any](ag SessionLocator) (T, bool) {
 	var zero T
 	if ag == nil {
 		return zero, false
@@ -175,8 +177,9 @@ func AsRestoredSessionPathResolver(ag Agent) (RestoredSessionPathResolver, bool)
 }
 
 // AsSkillDiscoverer returns the agent as SkillDiscoverer if it implements the
-// interface. Discovery only feeds the review skill picker, so there is no
-// DeclaredCaps gate.
+// interface. The review skill picker and configured-skill validation both use
+// it. The external protocol has no skill discovery, so there is no DeclaredCaps
+// gate.
 func AsSkillDiscoverer(ag Agent) (SkillDiscoverer, bool) {
 	return builtinCapability[SkillDiscoverer](ag)
 }
