@@ -76,3 +76,20 @@ func TestAgentConfigTrust_JudgeAndLegacyConfigAreRejected(t *testing.T) {
 	assert.True(t, fields["review_profiles.general.judge.config"])
 	assert.True(t, fields["review.pi.config"])
 }
+
+// A local file that defines the profile replaces it whole; the clone-local
+// config still applies on top unless the local file sets its own.
+func TestAgentConfigTrust_ClonePreferencesConfigSurvivesLocalProfile(t *testing.T) {
+	t.Parallel()
+	_, project, local := newOPFRepo(t)
+	writeSettingsFile(t, project, `{"enabled":true}`)
+	writeSettingsFile(t, local, `{"review_profiles":{"general":{"agents":{"claude-code":{"model":"sonnet"}}}}}`)
+	prefs := writePreferences(t, `{"review_agent_configs":{"general":{"claude-code":`+configWithHook+`}}}`)
+
+	s := loadedForPromptTrust(t, project, prefs, local)
+	worker := s.ReviewProfiles["general"].Agents["claude-code"]
+	require.NotNil(t, worker.Config)
+	assert.Contains(t, string(worker.Config.Settings), "/usr/bin/true")
+	assert.Equal(t, "sonnet", worker.Model)
+	assert.Empty(t, s.AgentPromptRejections())
+}

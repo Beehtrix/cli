@@ -789,6 +789,7 @@ func loadMergedSettings(ctx context.Context, settingsFileAbs, preferencesFileAbs
 	// and the deprecated `investigate` key left in settings is not read.
 	enforceOPFCommandTrust(ctx, settings, localSettingsFileAbs, localData)
 	enforceExternalAgentsTrust(ctx, settings, localSettingsFileAbs, localData)
+	applyClonePreferenceAgentConfigs(settings, preferences, localData)
 	enforceAgentPromptTrust(ctx, settings, localSettingsFileAbs, localData, preferences)
 	// allow_symlinked_agent_dirs decides where Entire writes an agent's hook
 	// config, so it gets the same gate, and then installs the surviving set as
@@ -1284,12 +1285,17 @@ func clonePreferencesRoot(filePath string) (*os.Root, string, error) {
 	return root, name, nil
 }
 
-func applyClonePreferences(settings *EntireSettings, prefs *ClonePreferences) {
+// applyClonePreferenceAgentConfigs overlays clone-local reviewer configs on
+// the effective profiles. It runs after the local file is merged, since that
+// file replaces a profile it defines; a config the local file sets itself
+// wins.
+func applyClonePreferenceAgentConfigs(settings *EntireSettings, prefs *ClonePreferences, localData []byte) {
 	if prefs == nil {
 		return
 	}
-	if prefs.ReviewProfiles != nil {
-		settings.ReviewProfiles = mergeReviewProfiles(settings.ReviewProfiles, prefs.ReviewProfiles)
+	var localRaw map[string]json.RawMessage
+	if len(localData) > 0 && json.Unmarshal(localData, &localRaw) != nil {
+		localRaw = nil
 	}
 	for name, workers := range prefs.ReviewAgentConfigs {
 		profile, ok := settings.ReviewProfiles[name]
@@ -1298,13 +1304,22 @@ func applyClonePreferences(settings *EntireSettings, prefs *ClonePreferences) {
 		}
 		agents := make(map[string]ReviewConfig, len(profile.Agents))
 		for worker, cfg := range profile.Agents {
-			if agentCfg, ok := workers[worker]; ok {
+			if agentCfg, ok := workers[worker]; ok && !rawHasKey(localRaw, "review_profiles", name, "agents", worker, "config") {
 				cfg.Config = agentCfg
 			}
 			agents[worker] = cfg
 		}
 		profile.Agents = agents
 		settings.ReviewProfiles[name] = profile
+	}
+}
+
+func applyClonePreferences(settings *EntireSettings, prefs *ClonePreferences) {
+	if prefs == nil {
+		return
+	}
+	if prefs.ReviewProfiles != nil {
+		settings.ReviewProfiles = mergeReviewProfiles(settings.ReviewProfiles, prefs.ReviewProfiles)
 	}
 	if prefs.ReviewDefaultProfile != "" {
 		settings.ReviewDefaultProfile = prefs.ReviewDefaultProfile
