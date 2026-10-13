@@ -27,6 +27,7 @@ type repoDeleteFake struct {
 	deleteDetail    string // problem detail for a 4xx deleteStatus
 	readsBeforeGone int    // 200s the repo read serves before it answers 404
 	rejectReads     bool   // a repo read is a test failure (--no-wait)
+	unnamed         bool   // the resolution carries no FullName
 
 	mu      sync.Mutex
 	deletes []url.Values
@@ -42,7 +43,11 @@ func (f *repoDeleteFake) handler(t *testing.T) http.Handler {
 		defer f.mu.Unlock()
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/resolve":
-			writeJSONResponse(t, w, http.StatusOK, nativeResolution(testDeletePath, testDeleteULID))
+			res := nativeResolution(testDeletePath, testDeleteULID)
+			if f.unnamed {
+				res.Resolutions[0].FullName = coreapi.OptString{}
+			}
+			writeJSONResponse(t, w, http.StatusOK, res)
 		case r.Method == http.MethodGet && r.URL.Path == repoPath+"/native-mirrors":
 			f.listed++
 			if f.mirrorsStatus != 0 {
@@ -183,6 +188,18 @@ func TestRepoDelete_Cascade(t *testing.T) {
 		require.Contains(t, stderr, "The server is still deleting repo /et/"+testDeletePath+" and its 2 mirrors.")
 		require.Contains(t, stderr, "Check with: entire repo view /et/"+testDeletePath+"\n")
 		require.NotContains(t, out+stderr, testDeleteULID, "the ULID stays internal")
+	})
+
+	t.Run("a resolution without a name keeps the ULID and suggests nothing", func(t *testing.T) {
+		fake := &repoDeleteFake{mirrors: twoMirrors(), deleteStatus: http.StatusAccepted, readsBeforeGone: 1 << 30, unnamed: true}
+		srv := httptest.NewServer(fake.handler(t))
+		t.Cleanup(srv.Close)
+		out, stderr, err := runCoreCmd(t, newRepoDeleteCmd, srv.URL, "/et/"+testDeletePath, "--force", "--cascade", "--wait-timeout", "20ms")
+		require.Error(t, err)
+		label := "repo /et/" + testDeletePath + " (" + testDeleteULID + ")"
+		require.Contains(t, out, "Deleting "+label+" and its 2 mirrors…", "the typed ref is not a confirmed path; the ULID shows what resolved")
+		require.Contains(t, stderr, "The server is still deleting "+label+" and its 2 mirrors.")
+		require.NotContains(t, stderr, "Check with", "no server path to suggest; the typed ref is unconfirmed")
 	})
 
 	t.Run("an already-gone repo is idempotent under --cascade", func(t *testing.T) {
@@ -334,8 +351,7 @@ func TestReportUnfinishedDelete(t *testing.T) {
 func TestRepoCheckCommand(t *testing.T) {
 	t.Parallel()
 	require.Equal(t, "entire repo view /et/acme/web", repoCheckCommand("/et/acme/web"))
-	require.Equal(t, "entire repo view /et/acme/web", repoCheckCommand("et/acme/web"), "the canonical spelling, whatever was typed")
-	require.Empty(t, repoCheckCommand(testDeleteULID), "repo view takes only paths")
+	require.Empty(t, repoCheckCommand(""), "no server path, no suggestion")
 }
 
 // TestRepoDelete_TakesPathsOnly pins the grammar `repo delete` accepts: the

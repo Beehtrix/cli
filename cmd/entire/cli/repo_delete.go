@@ -68,8 +68,7 @@ func runRepoDelete(cmd *cobra.Command, ref string, opts repoDeleteOptions) error
 		if err != nil {
 			return err
 		}
-		name := repoDeleteName(ref, resolved)
-		label := "repo " + name
+		label := "repo " + repoDeleteName(ref, resolved)
 		mirrors := ""
 		if opts.cascade {
 			mirrors = mirrorsSuffix(ctx, c, resolved.ID)
@@ -102,7 +101,7 @@ func runRepoDelete(cmd *cobra.Command, ref string, opts repoDeleteOptions) error
 		waitCtx, cancel := context.WithTimeout(ctx, opts.waitTimeout)
 		defer cancel()
 		if err := awaitRepoDeleted(waitCtx, c, resolved.ID); err != nil {
-			return reportUnfinishedDelete(cmd.ErrOrStderr(), label+mirrors, repoCheckCommand(name), opts.waitTimeout, err)
+			return reportUnfinishedDelete(cmd.ErrOrStderr(), label+mirrors, repoCheckCommand(resolved.Name), opts.waitTimeout, err)
 		}
 		fmt.Fprintf(out, "✓ Deleted %s\n", label)
 		return nil
@@ -122,13 +121,14 @@ func resolveRepoDeleteRef(ctx context.Context, c repoRefClient, ref string) (res
 }
 
 // repoDeleteName is how `repo delete` names the repo: the path the server
-// resolved, else the ref as typed. Unlike resolvedRefLabel it never appends
-// the ULID; a repo is addressed publicly by its path.
+// resolved, alone, since a repo is addressed publicly by its path. Without a
+// server name it is resolvedRefLabel's `ref (id)`: the ref as typed is not a
+// path the server confirmed, so the ULID shows which repo resolved (COR-1892).
 func repoDeleteName(ref string, r resolvedRef) string {
 	if r.Name != "" {
 		return r.Name
 	}
-	return strings.TrimSpace(ref)
+	return resolvedRefLabel(strings.TrimSpace(ref), r)
 }
 
 // reportUnfinishedDelete explains a wait that ended early. check is empty
@@ -145,16 +145,14 @@ func reportUnfinishedDelete(w io.Writer, what, check string, timeout time.Durati
 }
 
 // repoCheckCommand suggests `repo view` to follow a delete the wait stopped
-// watching. name is a path (the server's, or the ref as typed when the server
-// echoed none, possibly without its leading slash), so it is reparsed into
-// the canonical spelling `repo view` takes. Only a ULID ref has no path and
-// gets no suggestion.
-func repoCheckCommand(name string) string {
-	project, repo, err := parseNativeCloneRef(name)
-	if err != nil {
+// watching. serverName is the path the server resolved; without one there is
+// no confirmed path to suggest (a ref rebuilt from what the user typed could
+// name a different repo, COR-1892), so there is no suggestion.
+func repoCheckCommand(serverName string) string {
+	if serverName == "" {
 		return ""
 	}
-	return "entire repo view " + nativeRepoPath(project+"/"+repo)
+	return "entire repo view " + serverName
 }
 
 // mirrorsSuffix names the mirrors a cascade removes, for the prompt and the
