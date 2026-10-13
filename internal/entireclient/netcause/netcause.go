@@ -42,13 +42,10 @@ func canceled(err error) bool {
 
 // Transport returns next wrapped so a transport failure whose cause Hint can
 // name carries that explanation in its message; the original error stays in
-// the chain for errors.Is. A nil next means Go's default transport. Wrap at
-// the base of a client's chain, so requests a higher transport synthesizes
-// itself (token exchange, discovery) are covered too.
+// the chain for errors.Is. Wrap at the base of a client's chain, so requests
+// a higher transport synthesizes itself (token exchange, discovery) are
+// covered too.
 func Transport(next http.RoundTripper) http.RoundTripper {
-	if next == nil {
-		next = http.DefaultTransport
-	}
 	return hintTransport{next: next}
 }
 
