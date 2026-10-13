@@ -2,11 +2,10 @@ package cli
 
 import (
 	"bytes"
-	"context"
-	"os/exec"
 	"strings"
 	"testing"
 
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/entireio/cli/internal/coreapi"
 )
 
@@ -16,20 +15,11 @@ import (
 func initWhereamiRepo(t *testing.T, originURL string) {
 	t.Helper()
 	dir := t.TempDir()
-	runWhereamiGit(t, dir, "init", "-q")
+	testutil.InitRepo(t, dir)
 	if originURL != "" {
-		runWhereamiGit(t, dir, "remote", "add", "origin", originURL)
+		testutil.AddRemote(t, dir, "origin", originURL)
 	}
 	t.Chdir(dir)
-}
-
-func runWhereamiGit(t *testing.T, dir string, args ...string) {
-	t.Helper()
-	cmd := exec.CommandContext(context.Background(), "git", args...)
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, out)
-	}
 }
 
 // runWhereami keeps stdout separate from stderr so the purity assertions
@@ -89,6 +79,35 @@ func TestWhereamiJSONOutput_NativeRepo(t *testing.T) {
 	want := `{"repo_id":"` + nativeID + `","api_url":"` + euCellAPIURL + `","jurisdiction":"eu"}` + "\n"
 	if stdout != want {
 		t.Fatalf("stdout = %q, want exactly %q", stdout, want)
+	}
+}
+
+// whereami inherits the repo group's persistent --insecure-http-auth and must
+// apply it before resolution, like runCoreClient does — the token manager
+// freezes the setting on first use.
+func TestWhereamiInsecureHTTPFlagApplied(t *testing.T) {
+	initWhereamiRepo(t, "https://github.com/acme/widget.git")
+	withFakeCellCore(t, &fakeCellCore{
+		repos: reposOutput(repoIndexFixture("acme/widget", "mirror-eu",
+			placementFixture{id: "mirror-eu", slug: euClusterSlug})),
+		clusters: clustersWithSlugs(),
+	})
+	var enabled bool
+	prev := whereamiEnableInsecureHTTP
+	whereamiEnableInsecureHTTP = func() { enabled = true }
+	t.Cleanup(func() { whereamiEnableInsecureHTTP = prev })
+
+	if _, err := runWhereami(t, "--json"); err != nil {
+		t.Fatalf("execute without flag: %v", err)
+	}
+	if enabled {
+		t.Fatal("HTTPS guard relaxed without --insecure-http-auth")
+	}
+	if _, err := runWhereami(t, "--json", "--insecure-http-auth"); err != nil {
+		t.Fatalf("execute with flag: %v", err)
+	}
+	if !enabled {
+		t.Fatal("--insecure-http-auth did not relax the HTTPS guard")
 	}
 }
 

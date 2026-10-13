@@ -7,8 +7,13 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/entireio/cli/cmd/entire/cli/auth"
 	"github.com/entireio/cli/cmd/entire/cli/gitremote"
 )
+
+// whereamiEnableInsecureHTTP is a seam for tests; the override it flips is
+// process-global and has no reset.
+var whereamiEnableInsecureHTTP = auth.EnableInsecureHTTP
 
 // whereamiOutput is the contract entire-brain's `connect` decodes; the JSON
 // tags are lockstep with that consumer (COR-2030). repo_id is the region-local
@@ -33,6 +38,12 @@ func newRepoWhereamiCmd() *cobra.Command {
 			if !jsonRequested(cmd) {
 				return errors.New("only --json output is supported")
 			}
+			// Same ordering contract as runCoreClient: relax the HTTPS guard
+			// before any client exists — the token manager freezes the
+			// setting on first use.
+			if insecureHTTPRequested(cmd) {
+				whereamiEnableInsecureHTTP()
+			}
 			ctx := cmd.Context()
 			forge, owner, repo, err := gitremote.ResolveRemoteRepo(ctx, "origin")
 			if err != nil {
@@ -47,11 +58,16 @@ func newRepoWhereamiCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return json.NewEncoder(cmd.OutOrStdout()).Encode(whereamiOutput{
+			// Compact, not printJSON's indented form: the envelope is a
+			// machine contract pinned byte-exact by the tests.
+			if err := json.NewEncoder(cmd.OutOrStdout()).Encode(whereamiOutput{
 				RepoID:       placement.RepoID,
 				APIURL:       placement.Target.BaseURL,
 				Jurisdiction: placement.Target.Jurisdiction,
-			})
+			}); err != nil {
+				return fmt.Errorf("encode output: %w", err)
+			}
+			return nil
 		},
 	}
 	addJSONFlag(cmd)

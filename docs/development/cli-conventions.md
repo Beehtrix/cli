@@ -397,7 +397,10 @@ the commands are always runnable in every build.
   the previous design, and its failure mode was a name collision that reported
   a clean ✓ over a URL that had left git config for good.
   There is no URL-printing verb: `repo view` already lists a clone URL per
-  cluster for both forges, in a table and in `--json`.
+  cluster for both forges, in a table and in `--json`. The hidden
+  `repo whereami --json` is not that verb: it autodetects the current repo
+  from `origin` and prints a fixed machine envelope (repo ULID, cell API URL,
+  jurisdiction) for plugins such as entire-brain's `connect` — not a clone URL.
   `remote add` and `clone` choose a placement through the shared
   `selectPlacement` picker, each passing its own `placementPicker` wording. The
   picker matches on the cluster host, which is what `--cluster` takes, and both
