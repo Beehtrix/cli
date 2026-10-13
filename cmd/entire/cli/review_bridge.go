@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -228,10 +227,8 @@ func lastNonEmptyLine(s string) string {
 	return ""
 }
 
-var reviewTrailLocationPattern = regexp.MustCompile("(?:^|[\\s(`])([A-Za-z0-9_./-]+\\.[A-Za-z0-9_+-]+):(\\d+)")
-
 func inferReviewTrailLocation(body string) (api.TrailReviewLocationCreateRequest, bool) {
-	match := reviewTrailLocationPattern.FindStringSubmatch(body)
+	match := cliReview.LocationPointerPattern.FindStringSubmatch(body)
 	if len(match) != 3 {
 		return api.TrailReviewLocationCreateRequest{}, false
 	}

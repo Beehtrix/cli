@@ -83,7 +83,7 @@ The profile-level `task` is the shared work item. Each `agents` map entry is a w
 
 - Reviewers run the profile task.
 - Multi-reviewer profiles run reviewers concurrently, then run one judge.
-- Results are printed and saved locally; `output: "trail"` also posts findings to the branch trail.
+- Results are printed and saved locally; `output: "trail"` also posts findings to the branch trail. A clean, unqualified approve is not posted.
 - A bare non-interactive `entire review` does not auto-run a profile. Automation should pass a profile name.
 - Profile selection is positional/`--profile` → `review_default_profile` → `general` → the only configured profile.
 

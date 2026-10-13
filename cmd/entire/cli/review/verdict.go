@@ -9,7 +9,9 @@ import (
 )
 
 // reviewVerdictQualifiers mark an approve reason that still carries feedback
-// or a condition, so it must be posted rather than treated as clean.
+// or a condition, so it must be posted rather than treated as clean. The list
+// is deliberately broad: a clean reason that happens to use one of these words
+// is posted, which only restores the previous behavior.
 var reviewVerdictQualifiers = map[string]bool{
 	"nit": true, "nits": true, "but": true, "however": true,
 	"once": true, "after": true, "pending": true, "unless": true,
@@ -30,9 +32,11 @@ func allReviewNarrativesClean(summary reviewtypes.RunSummary) bool {
 }
 
 // isCleanReviewVerdict requires the text to end in an unqualified approve, to
-// contain no other verdict, and to carry no finding-shaped line anywhere. A
-// trailing approve therefore cannot erase an earlier request for changes or
-// an earlier finding bullet.
+// contain no other verdict, and to carry no finding-shaped line or file:line
+// pointer anywhere. A trailing approve therefore cannot erase an earlier
+// request for changes, finding bullet, or prose finding that cites a location.
+// Prose after the verdict line is posted rather than dropped, since it could
+// be a finding stated without a bullet.
 func isCleanReviewVerdict(text string) bool {
 	clean, isVerdict := false, false
 	for _, raw := range strings.Split(text, "\n") {
@@ -40,7 +44,7 @@ func isCleanReviewVerdict(text string) bool {
 		if line == "" {
 			continue
 		}
-		if IsReviewFindingLine(raw) {
+		if isFindingShapedLine(line) || LocationPointerPattern.MatchString(line) {
 			return false
 		}
 		clean, isVerdict = parseReviewVerdictLine(line)
@@ -51,10 +55,12 @@ func isCleanReviewVerdict(text string) bool {
 	return isVerdict && clean
 }
 
-// parseReviewVerdictLine classifies one line. An approve is clean only when
-// nothing follows it, or when a separator introduces a reason free of
-// qualifiers. A word directly after "approve" ("approve if", "approve with
-// suggestions") is a condition, so unknown phrasings are posted, not dropped.
+// parseReviewVerdictLine classifies one line. An approve (or approved) is
+// clean only when nothing follows it, or when a separator introduces a reason
+// free of qualifiers. A word directly after "approve" ("approve if", "approve
+// with suggestions") is a condition, so unknown phrasings are posted, not
+// dropped. A labelled or bulleted verdict ("Verdict: approve", "- approve") is
+// not recognized and is posted too.
 func parseReviewVerdictLine(line string) (clean, isVerdict bool) {
 	line = strings.ToLower(line)
 	line = strings.TrimSpace(strings.TrimLeft(line, "#>"))
@@ -62,7 +68,10 @@ func parseReviewVerdictLine(line string) (clean, isVerdict bool) {
 	if strings.HasPrefix(line, "request changes") {
 		return false, true
 	}
-	rest, ok := strings.CutPrefix(line, "approve")
+	rest, ok := strings.CutPrefix(line, "approved")
+	if !ok {
+		rest, ok = strings.CutPrefix(line, "approve")
+	}
 	if !ok {
 		return false, false
 	}

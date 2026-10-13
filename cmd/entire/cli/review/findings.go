@@ -1,12 +1,26 @@
 package review
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
+
+// LocationPointerPattern matches a file:line pointer such as "retry.go:42",
+// the shape the reviewer prompts ask for in every finding.
+var LocationPointerPattern = regexp.MustCompile("(?:^|[\\s(`])([A-Za-z0-9_./-]+\\.[A-Za-z0-9_+-]+):(\\d+)")
 
 // TopLevelBulletText returns the text of a top-level Markdown bullet or
 // numbered item. Indented lines are continuations, not new findings.
 func TopLevelBulletText(line string) (string, bool) {
 	trimmed, ok := topLevelLine(line)
-	if !ok || len(trimmed) < 3 {
+	if !ok {
+		return "", false
+	}
+	return bulletText(trimmed)
+}
+
+func bulletText(trimmed string) (string, bool) {
+	if len(trimmed) < 3 {
 		return "", false
 	}
 	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") || strings.HasPrefix(trimmed, "+ ") {
@@ -28,20 +42,22 @@ func TopLevelBulletText(line string) (string, bool) {
 // severity marker, such as "[high] file:line — ..." without a leading bullet.
 func TopLevelMarkedFindingText(line string) (string, bool) {
 	trimmed, ok := topLevelLine(line)
-	if !ok || !StartsWithReviewSeverityMarker(trimmed) {
+	if !ok || !startsWithReviewSeverityMarker(trimmed) {
 		return "", false
 	}
 	return trimmed, true
 }
 
-// IsReviewFindingLine reports whether a line has the shape the reviewer
-// prompts mandate for a finding: a top-level bullet or a severity marker.
-func IsReviewFindingLine(line string) bool {
-	if _, ok := TopLevelBulletText(line); ok {
+// isFindingShapedLine reports whether a line at any indentation looks like a
+// finding: a bullet, a numbered item, or a severity marker. Unlike the
+// splitter, the clean-verdict check must not read an indented finding as a
+// continuation, or a trailing approve would hide it.
+func isFindingShapedLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if _, ok := bulletText(trimmed); ok {
 		return true
 	}
-	_, ok := TopLevelMarkedFindingText(line)
-	return ok
+	return startsWithReviewSeverityMarker(trimmed)
 }
 
 func topLevelLine(line string) (string, bool) {
@@ -52,9 +68,9 @@ func topLevelLine(line string) (string, bool) {
 	return strings.TrimSpace(trimmedRight), true
 }
 
-// StartsWithReviewSeverityMarker reports whether s opens with a severity tag
+// startsWithReviewSeverityMarker reports whether s opens with a severity tag
 // in either the bracketed ("[high]") or delimited ("high —", "P2:") form.
-func StartsWithReviewSeverityMarker(s string) bool {
+func startsWithReviewSeverityMarker(s string) bool {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "**")
 	s = strings.TrimPrefix(s, "__")
