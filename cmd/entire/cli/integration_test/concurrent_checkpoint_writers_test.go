@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
@@ -35,6 +36,25 @@ func stopHookCmd(env *TestEnv, sessionID, transcriptPath string) *exec.Cmd {
 	cmd.Env = append(cmd.Env, env.ExtraEnv...)
 	cmd.Env = append(cmd.Env, env.checkpointStoreEnv()...)
 	return cmd
+}
+
+// checkpointBlob reads a path inside a stored checkpoint, resolving the storage
+// topology per backend: a subtree of the shared v1 branch (git-branch) or the
+// root tree of the checkpoint's own ref (git-refs).
+func checkpointBlob(env *TestEnv, checkpointID, relPath string) (string, bool) {
+	env.T.Helper()
+	spec := paths.MetadataBranchName + ":" + id.CheckpointID(checkpointID).Path() + "/" + relPath
+	if env.usingGitRefs() {
+		spec = checkpointRefName(checkpointID) + ":" + relPath
+	}
+	cmd := exec.CommandContext(env.T.Context(), "git", "show", spec)
+	cmd.Dir = env.RepoDir
+	cmd.Env = testutil.GitIsolatedEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
 }
 
 // TestConcurrent_TwoStopHooks_SameCheckpoint covers two agents working in one
@@ -95,7 +115,7 @@ func runTwoStopHooksScenario(t *testing.T, backend string, concurrent bool) {
 	sessB.CreateTranscript("write file b", []FileChange{{Path: "agent_b.go", Content: contentB}})
 
 	// One commit, condensing both sessions into a single checkpoint.
-	env.GitCommitWithShadowHooksAsAgent("add agent files", "agent_a.go", "agent_b.go")
+	env.GitCommitWithHooksAsAgent("add agent files", "agent_a.go", "agent_b.go")
 
 	checkpointID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
 	if checkpointID == "" {
