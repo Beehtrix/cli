@@ -834,19 +834,15 @@ func (s *State) HasPendingFiles() bool {
 }
 
 // PendingFileCount is the number of files awaiting a commit across every
-// worktree (see HasPendingFiles).
+// worktree: len(PendingFiles()).
 func (s *State) PendingFileCount() int {
-	n := len(s.FilesTouched)
-	for _, work := range s.OtherWorktrees {
-		if work != nil {
-			n += len(work.FilesTouched)
-		}
-	}
-	return n
+	return len(s.PendingFiles())
 }
 
-// PendingFiles is the files awaiting a commit across every worktree (see
-// HasPendingFiles), sorted, each worktree-relative name once.
+// PendingFiles is the repository paths awaiting a commit across every
+// worktree (see HasPendingFiles), sorted. A path pending in two worktrees is
+// listed once: a checkpoint records the paths it touched, as a set of
+// repository paths, not per worktree.
 func (s *State) PendingFiles() []string {
 	files := slices.Clone(s.FilesTouched)
 	for _, work := range s.OtherWorktrees {

@@ -54,6 +54,12 @@ func TestStateHasPendingFiles(t *testing.T) {
 	assert.Equal(t, 3, both.PendingFileCount())
 	assert.Equal(t, []string{"a.go", "b.go", "h.go"}, both.PendingFiles())
 	assert.Equal(t, []string{"a.go"}, onlyElsewhere.PendingFiles(), "files only in another worktree are pending files")
+
+	// A path pending in two worktrees is one repository path, in the list and
+	// the count alike.
+	sameName := State{FilesTouched: []string{"README.md"}, OtherWorktrees: map[string]*WorktreeWork{"wt": {FilesTouched: []string{"README.md", "c.go"}}}}
+	assert.Equal(t, []string{"README.md", "c.go"}, sameName.PendingFiles())
+	assert.Equal(t, 2, sameName.PendingFileCount(), "the count disagrees with the list")
 }
 
 func TestWorktreeKey(t *testing.T) {
