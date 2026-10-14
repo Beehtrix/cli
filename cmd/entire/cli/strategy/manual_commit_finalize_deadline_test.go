@@ -177,7 +177,9 @@ func TestFinalizeAllTurnCheckpoints_Deadline(t *testing.T) {
 		{name: "future_deadline", deadline: func() time.Time { return time.Now().Add(time.Minute) }, fetch: immediate, finalized: 3, fetches: 3},
 		{name: "slow_fetches_without_deadline", deadline: noFinalizeDeadline, fetch: slow, finalized: 3, fetches: 3},
 		{name: "deadline_passed_before_network", deadline: func() time.Time { return time.Now().Add(-time.Second) }, fetch: immediate, finalized: 0, fetches: 0, degraded: true},
-		{name: "deadline_expires_mid_loop", deadline: func() time.Time { return time.Now().Add(time.Second) }, fetch: stallOnSecond, finalized: 1, fetches: 2, degraded: true},
+		// The deadline also covers transcript preparation and the store open,
+		// so it leaves room for a slow runner to reach the first fetch.
+		{name: "deadline_expires_mid_loop", deadline: func() time.Time { return time.Now().Add(3 * time.Second) }, fetch: stallOnSecond, finalized: 1, fetches: 2, degraded: true},
 		{name: "context_ends_mid_loop", deadline: noFinalizeDeadline, fetch: cancelOnSecond, finalized: 1, fetches: 2, degraded: true},
 		{name: "parent_canceled_before_start", deadline: noFinalizeDeadline, cancelBefore: true, fetch: immediate, finalized: 0, fetches: 0, degraded: true},
 	} {

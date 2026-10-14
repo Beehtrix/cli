@@ -3486,6 +3486,12 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 		)
 		return 1 // Count as error - all checkpoints will be skipped
 	}
+	// The deadline can pass while Open runs; precompute would then hash the
+	// whole transcript for writes that never start.
+	if networkCtx.Err() != nil {
+		abandonInterruptedFinalize(logCtx, state, networkCtx.Err())
+		return 0
+	}
 	store := stores.Persistent
 
 	precomputed := precomputeTranscriptBlobsForFinalize(logCtx, repo, redactedTranscript, state)
@@ -3540,6 +3546,12 @@ func finalizeTurnCheckpointWrites(
 		updateOpts.CheckpointID = cpID
 		if err := store.Write(ctx, checkpoint.SessionTranscript(updateOpts)); err != nil {
 			if ctx.Err() != nil {
+				// Counted as an interruption, but the write may have failed for
+				// another reason as the deadline passed; keep that error visible.
+				logging.Warn(logCtx, "finalize: checkpoint write failed as the context ended",
+					slog.String("checkpoint_id", cpIDStr),
+					slog.String("error", err.Error()),
+				)
 				return errCount, len(state.TurnCheckpointIDs) - checkpointIndex
 			}
 			logging.Warn(logCtx, "finalize: failed to update checkpoint",
