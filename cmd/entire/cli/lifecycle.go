@@ -1796,6 +1796,16 @@ func handleSubagentStopFinal(logCtx context.Context, ag agent.Agent, event *agen
 	if keyedByAgentID {
 		event.ToolUseID, newExecution = taskRecordKeyForStop(state, event)
 	}
+	if event.CompletionWithoutLaunch {
+		if key := completionRecordKey(state, event); key != event.ToolUseID {
+			logging.Info(logCtx, "subagent-stop reuses another call's tool_use_id; recording it under its own key",
+				slog.String("session_id", event.SessionID),
+				slog.String("tool_use_id", event.ToolUseID),
+				slog.String("task_key", key),
+				slog.String("agent_id", event.SubagentID))
+			event.ToolUseID = key
+		}
+	}
 
 	marker := state.FindTaskRecord(event.ToolUseID)
 	if event.CompletionWithoutLaunch && state.IsEnded() {

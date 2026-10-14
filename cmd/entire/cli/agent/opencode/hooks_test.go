@@ -484,11 +484,12 @@ func TestInstallHooks_SubagentHooksFireFromParentTaskSignals(t *testing.T) {
 	}
 	content := string(data)
 	for _, want := range []string{
-		// start: a task part, running, with the child ID bound, once per callID
+		// start: a task part, running, with the child ID bound, once per call key
 		`part?.type === "tool" && part.tool === "task"`,
 		`part.state?.status === "running"`,
 		`part.state?.metadata?.sessionId`,
-		`announcedTasks.has(part.callID)`,
+		`announcedTasks.has(key)`,
+		`const key = callKey(sessionID, part.callID)`,
 		// the child is learned here too, so a subagent-start we never saw
 		// session.created for is still suppressed
 		`trackChild(part.state.metadata.sessionId, sessionID)`,
@@ -516,8 +517,8 @@ func TestInstallHooks_SubagentHooksFireFromParentTaskSignals(t *testing.T) {
 		// call start: recorded before the child exists, sent on both hooks so a
 		// resumed child's export can be cut to this call
 		`"tool.execute.before": async (input) => {`,
-		`taskStartedAt.set(input.callID, Date.now())`,
-		`taskStartedAt.get(part.callID) ?? taskStartedAt.get(part.id) ?? part.state?.time?.start ?? 0`,
+		`taskStartedAt.set(callKey(input.sessionID, input.callID), Date.now())`,
+		`taskStartedAt.get(key) ?? taskStartedAt.get(partKey) ?? part.state?.time?.start ?? 0`,
 		`started_at: startedAt`,
 		// a background result injected as a synthetic user part is not a prompt
 		`prompt: part.synthetic === true ? "" : (part.text ?? "")`,

@@ -115,7 +115,12 @@ func before(sessionID, hookKey string) map[string]any {
 // after fires the top-level session's tool.execute.after; an empty childID
 // passes no output, as a failed command subtask does.
 func after(hookKey, childID string, background bool) map[string]any {
-	step := map[string]any{"input": map[string]any{"tool": "task", "sessionID": "ses_parent", "callID": hookKey, "args": map[string]any{}}}
+	return afterIn("ses_parent", hookKey, childID, background)
+}
+
+// afterIn is after for a task call made by sessionID.
+func afterIn(sessionID, hookKey, childID string, background bool) map[string]any {
+	step := map[string]any{"input": map[string]any{"tool": "task", "sessionID": sessionID, "callID": hookKey, "args": map[string]any{}}}
 	if childID != "" {
 		step["output"] = map[string]any{"metadata": map[string]any{"sessionId": childID, "background": background}}
 	}
@@ -470,6 +475,33 @@ func TestPlugin_ReusedCallIDStillStops(t *testing.T) {
 		got = append(got, h.key()+"@"+h.ChildID)
 	}
 	want := "subagent-start:functions.task:0@ses_child,subagent-stop:functions.task:0@ses_child,subagent-stop:functions.task:0@ses_child2"
+	if strings.Join(got, ",") != want {
+		t.Errorf("hooks = %v, want %s", got, want)
+	}
+}
+
+// TestPlugin_NestedCallSharingCallIDKeepsItsOwnTask pins that a child's own
+// task call reusing a callID its parent's running call holds (providers that
+// number calls per conversation do) is a task of its own: it is announced, and
+// neither stop takes the other call's payload.
+func TestPlugin_NestedCallSharingCallIDKeepsItsOwnTask(t *testing.T) {
+	t.Parallel()
+	hooks := runPluginTaskScenario(t, []map[string]any{
+		before("ses_parent", "functions.task:0"),
+		taskPart("ses_parent", "p1", "functions.task:0", "ses_child", "running"),
+		before("ses_child", "functions.task:0"),
+		taskPart("ses_child", "p2", "functions.task:0", "ses_grandchild", "running"),
+		afterIn("ses_child", "functions.task:0", "ses_grandchild", false),
+		after("functions.task:0", "ses_child", false),
+	})
+	var got []string
+	for _, h := range hooks {
+		got = append(got, h.key()+"@"+h.ChildID+"@"+h.SessionID)
+	}
+	want := "subagent-start:functions.task:0@ses_child@ses_parent," +
+		"subagent-start:functions.task:0@ses_grandchild@ses_parent," +
+		"subagent-stop:functions.task:0@ses_grandchild@ses_parent," +
+		"subagent-stop:functions.task:0@ses_child@ses_parent"
 	if strings.Join(got, ",") != want {
 		t.Errorf("hooks = %v, want %s", got, want)
 	}

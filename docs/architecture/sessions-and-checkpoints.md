@@ -392,7 +392,13 @@ commit has already condensed and removed the record is not captured.
   the top-level session. The SessionEnd sweep's capture of a task still in
   flight fetches the same way, so that record keeps its files and tokens; a
   failed fetch completes it transcript-unavailable and condensation tries
-  again.
+  again. The record key is the task part's `callID`, mapped to a path-safe
+  key when it is not one. Some providers number calls per conversation, so a
+  later call can reuse a `callID` whose start the plugin then deduplicates:
+  its stop is matched to the records under that `callID` by child and call
+  start (`completionRecordKey`), and a new call gets a key of its own,
+  `<callID>-<child>[-<started_at ms>]`, rather than being skipped as a
+  duplicate (see the OpenCode `AGENT.md`).
 
 **Exactly-once completion.** Completion goes through
 `strategy.CompleteTaskRecord`: one `MutateSessionState` closure marks

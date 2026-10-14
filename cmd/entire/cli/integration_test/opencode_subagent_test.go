@@ -291,3 +291,71 @@ func TestOpenCodeSubagentJoinedCallDoesNotTakeTheLaterCallsWork(t *testing.T) {
 	require.NotNil(t, first.TokenUsage)
 	require.Equal(t, 150, first.TokenUsage.InputTokens, "only the earlier call's one assistant message counts")
 }
+
+// TestOpenCodeSubagentReusedCallIDRecordsEachCall covers providers that number
+// tool calls per conversation, so a later task call reuses an earlier one's
+// callID. The plugin deduplicates the later call's start, so only its stop
+// arrives; it must still be materialized as its own task, with its own
+// transcript, under "<callID>-<child>". A callID the checkpoint path validator
+// rejects ("functions.task:0") is mapped to a safe key first.
+func TestOpenCodeSubagentReusedCallIDRecordsEachCall(t *testing.T) {
+	t.Parallel()
+	for _, callID := range []string{"call_0", "functions.task:0"} {
+		t.Run(callID, func(t *testing.T) {
+			t.Parallel()
+			env := NewFeatureBranchEnv(t)
+			env.InitEntireWithAgent(agent.AgentNameOpenCode)
+
+			parent := env.NewOpenCodeSession()
+			child1 := env.NewOpenCodeSession()
+			child2 := env.NewOpenCodeSession()
+			// CreateOpenCodeTranscript stamps each child's prompt at 1708300001;
+			// the export is cut to messages from the call's start on.
+			const callStart = int64(1708300001)
+
+			require.NoError(t, env.SimulateOpenCodeSessionStart(parent.ID, parent.TranscriptPath))
+			require.NoError(t, env.SimulateOpenCodeTurnStart(parent.ID, parent.TranscriptPath, "red, then blue, with two subagents"))
+
+			require.NoError(t, env.SimulateOpenCodeSubagentStartAt(parent.ID, callID, child1.ID, "general", "Create docs/red.md", callStart))
+			env.WriteFile("docs/red.md", "red\n")
+			env.CopyTranscriptToEntireTmp(child1.ID, child1.CreateOpenCodeTranscript("Create docs/red.md", []FileChange{{Path: "docs/red.md", Content: "red\n"}}))
+			require.NoError(t, env.SimulateOpenCodeSubagentStopAt(parent.ID, callID, child1.ID, "general", "Create docs/red.md", callStart))
+
+			env.WriteFile("docs/blue.md", "blue\n")
+			env.CopyTranscriptToEntireTmp(child2.ID, child2.CreateOpenCodeTranscript("Create docs/blue.md", []FileChange{{Path: "docs/blue.md", Content: "blue\n"}}))
+			require.NoError(t, env.SimulateOpenCodeSubagentStopAt(parent.ID, callID, child2.ID, "general", "Create docs/blue.md", callStart))
+			// A repeated stop of the second call adds nothing.
+			require.NoError(t, env.SimulateOpenCodeSubagentStopAt(parent.ID, callID, child2.ID, "general", "Create docs/blue.md", callStart))
+
+			state, err := env.GetSessionState(parent.ID)
+			require.NoError(t, err)
+			require.Len(t, state.TaskRecords, 2)
+			first, second := state.TaskRecords[0], state.TaskRecords[1]
+			require.Equal(t, child1.ID, first.AgentID)
+			require.Equal(t, child2.ID, second.AgentID)
+			if callID == "call_0" {
+				require.Equal(t, callID, first.ToolUseID)
+			} else {
+				require.Regexp(t, `^functions_task_0-[0-9a-f]{12}$`, first.ToolUseID)
+			}
+			require.Equal(t, first.ToolUseID+"-"+child2.ID, second.ToolUseID)
+			require.Equal(t, []string{"docs/red.md"}, first.Files)
+			require.Equal(t, []string{"docs/blue.md"}, second.Files)
+
+			parent.CreateOpenCodeTranscript("red, then blue, with two subagents", nil)
+			require.NoError(t, env.SimulateOpenCodeTurnEnd(parent.ID, parent.TranscriptPath))
+			env.GitCommitWithHooks("Add red and blue", "docs/red.md", "docs/blue.md")
+			checkpointID := env.TryGetLatestCheckpointID()
+			require.NotEmpty(t, checkpointID)
+
+			storedFirst, ok := env.ReadFileFromBranch(paths.MetadataBranchName, CheckpointTaskFilePath(checkpointID, first.ToolUseID, paths.AgentTranscriptFileName(child1.ID)))
+			require.True(t, ok, "the first call's transcript must be materialized")
+			require.Contains(t, storedFirst, "docs/red.md")
+			require.NotContains(t, storedFirst, "docs/blue.md")
+			storedSecond, ok := env.ReadFileFromBranch(paths.MetadataBranchName, CheckpointTaskFilePath(checkpointID, second.ToolUseID, paths.AgentTranscriptFileName(child2.ID)))
+			require.True(t, ok, "the reused callID's second call must be materialized as its own task")
+			require.Contains(t, storedSecond, "docs/blue.md")
+			require.NotContains(t, storedSecond, "docs/red.md")
+		})
+	}
+}

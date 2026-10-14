@@ -36,27 +36,31 @@ export const EntirePlugin: Plugin = async ({ directory }) => {
   // child session ID -> the session that launched it, so aborting a session
   // can end the background calls it launched.
   const parentOf = new Map<string, string>()
-  // task callIDs already announced via subagent-start (the running part
-  // update repeats). Never pruned, so a late running update cannot announce a
-  // task again after its stop.
+  // The per-call maps and sets below are keyed by callKey: the calling
+  // session plus the hook key. A callID is unique only within one session
+  // (some providers number calls per conversation), so a child's own task
+  // call can share one with its parent's running call.
+  // Call keys already announced via subagent-start (the running part update
+  // repeats). Never pruned, so a late running update cannot announce a task
+  // again after its stop.
   const announcedTasks = new Set<string>()
-  // Hook key -> Date.now() at tool.execute.before, sent as started_at. A
+  // Call key -> Date.now() at tool.execute.before, sent as started_at. A
   // child resumed via `task_id` holds every earlier call's messages too; this
   // is what lets the CLI keep only the ones this call produced. The hook key
   // is the part's callID, except for a command subtask (`subtask: true`),
   // whose before/after hooks carry the task part's own id instead.
   const taskStartedAt = new Map<string, number>()
-  // Announced tasks not yet stopped: callID -> its subagent-stop payload.
+  // Announced tasks not yet stopped: call key -> its subagent-stop payload.
   // Every stop path takes the entry out, so a task stops at most once.
   const liveTasks = new Map<string, Record<string, unknown>>()
-  // task part id -> callID, to map a command subtask's hook key to the
-  // callID its subagent-start used.
+  // Call key of a task part id -> call key of its callID, to map a command
+  // subtask's hook key to the callID its subagent-start used.
   const partCallID = new Map<string, string>()
-  // Hook keys whose stop fired before their running part was announced. The
+  // Call keys whose stop fired before their running part was announced. The
   // late announcement is then skipped rather than opening a task that would
   // never stop.
   const stoppedBeforeStart = new Set<string>()
-  // Hook keys of tasks stopped from their error part, so a
+  // Call keys of tasks stopped from their error part, so a
   // tool.execute.after that still arrives does not stop them again.
   const stoppedOnError = new Set<string>()
   // Background children (OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS, or a
@@ -175,6 +179,12 @@ export const EntirePlugin: Plugin = async ({ directory }) => {
     if (!parentOf.has(childID)) parentOf.set(childID, parentID)
   }
 
+  // callKey scopes a hook key (a callID or a task part id) to the session
+  // that made the call.
+  function callKey(sessionID: string, hookKey: string): string {
+    return sessionID + "\0" + hookKey
+  }
+
   // topLevelSession maps a session to the top-level session it belongs to.
   function topLevelSession(sessionID: string): string {
     return rootOf.get(sessionID) ?? sessionID
@@ -184,21 +194,23 @@ export const EntirePlugin: Plugin = async ({ directory }) => {
   // with its child bound (state.metadata.sessionId). tool.execute.before fires
   // earlier but has no child ID yet, and session.created for the child can
   // interleave with a sibling's, so neither is a safe join. The running update
-  // repeats, hence once per callID. Called for task parts in child sessions
+  // repeats, hence once per call key. Called for task parts in child sessions
   // too, so a nested subagent is announced on the top-level session.
   function announceTask(part: any) {
     if (!(part?.type === "tool" && part.tool === "task" && part.callID &&
           part.state?.status === "running" && part.state?.metadata?.sessionId)) return
-    if (announcedTasks.has(part.callID)) return
     const sessionID = part.sessionID ?? currentSessionID
     if (!sessionID) return
-    announcedTasks.add(part.callID)
+    const key = callKey(sessionID, part.callID)
+    const partKey = callKey(sessionID, part.id)
+    if (announcedTasks.has(key)) return
+    announcedTasks.add(key)
     trackChild(part.state.metadata.sessionId, sessionID)
     // Without the before hook (the plugin loaded mid-call), the part's own
     // start, OpenCode's clock before the child's prompt, still bounds it.
-    const startedAt = taskStartedAt.get(part.callID) ?? taskStartedAt.get(part.id) ?? part.state?.time?.start ?? 0
-    if (stoppedBeforeStart.delete(part.callID) || stoppedBeforeStart.delete(part.id)) {
-      forgetTaskKeys(part)
+    const startedAt = taskStartedAt.get(key) ?? taskStartedAt.get(partKey) ?? part.state?.time?.start ?? 0
+    if (stoppedBeforeStart.delete(key) || stoppedBeforeStart.delete(partKey)) {
+      forgetTaskKeys(part, sessionID)
       return
     }
     const payload = {
@@ -209,29 +221,29 @@ export const EntirePlugin: Plugin = async ({ directory }) => {
       task_description: part.state?.input?.description ?? "",
       started_at: startedAt,
     }
-    liveTasks.set(part.callID, payload)
-    if (part.id) partCallID.set(part.id, part.callID)
+    liveTasks.set(key, payload)
+    if (part.id) partCallID.set(partKey, key)
     callHookSync("subagent-start", payload)
   }
 
-  // taskCallID maps a hook key to the callID the task was announced under.
-  function taskCallID(hookKey: string): string {
-    return partCallID.get(hookKey) ?? hookKey
+  // announcedKey maps a call key to the call key the task was announced under.
+  function announcedKey(key: string): string {
+    return partCallID.get(key) ?? key
   }
 
   // takeLiveTask removes and returns the announced, not yet stopped task a
-  // hook key belongs to.
-  function takeLiveTask(hookKey: string): Record<string, unknown> | undefined {
-    const callID = taskCallID(hookKey)
-    partCallID.delete(hookKey)
-    const payload = liveTasks.get(callID)
-    liveTasks.delete(callID)
+  // call key belongs to.
+  function takeLiveTask(key: string): Record<string, unknown> | undefined {
+    const announced = announcedKey(key)
+    partCallID.delete(key)
+    const payload = liveTasks.get(announced)
+    liveTasks.delete(announced)
     return payload
   }
 
-  function forgetTaskKeys(part: any) {
-    taskStartedAt.delete(part.callID)
-    if (part.id) taskStartedAt.delete(part.id)
+  function forgetTaskKeys(part: any, sessionID: string) {
+    taskStartedAt.delete(callKey(sessionID, part.callID))
+    if (part.id) taskStartedAt.delete(callKey(sessionID, part.id))
   }
 
   // stopFailedTask fires subagent-stop for an announced task whose part
@@ -242,16 +254,19 @@ export const EntirePlugin: Plugin = async ({ directory }) => {
   function stopFailedTask(part: any) {
     if (!(part?.type === "tool" && part.tool === "task" && part.callID &&
           part.state?.status === "error")) return
-    const payload = takeLiveTask(part.callID)
-    forgetTaskKeys(part)
-    stoppedBeforeStart.delete(part.callID)
+    const sessionID = part.sessionID ?? currentSessionID ?? ""
+    const key = callKey(sessionID, part.callID)
+    const partKey = callKey(sessionID, part.id)
+    const payload = takeLiveTask(key)
+    forgetTaskKeys(part, sessionID)
+    stoppedBeforeStart.delete(key)
     if (part.id) {
-      partCallID.delete(part.id)
-      stoppedBeforeStart.delete(part.id)
+      partCallID.delete(partKey)
+      stoppedBeforeStart.delete(partKey)
     }
     if (!payload) return
-    stoppedOnError.add(part.callID)
-    if (part.id) stoppedOnError.add(part.id)
+    stoppedOnError.add(key)
+    if (part.id) stoppedOnError.add(partKey)
     callHookSync("subagent-stop", payload)
   }
 
@@ -324,7 +339,7 @@ export const EntirePlugin: Plugin = async ({ directory }) => {
     "tool.execute.before": async (input) => {
       try {
         if (input.tool !== "task") return
-        taskStartedAt.set(input.callID, Date.now())
+        taskStartedAt.set(callKey(input.sessionID, input.callID), Date.now())
       } catch {
         // Silently ignore — plugin failures must not crash OpenCode
       }
@@ -338,23 +353,24 @@ export const EntirePlugin: Plugin = async ({ directory }) => {
     "tool.execute.after": async (input, output) => {
       try {
         if (input.tool !== "task") return
-        const announced = takeLiveTask(input.callID)
-        if (stoppedOnError.delete(input.callID) && !announced) {
+        const key = callKey(input.sessionID, input.callID)
+        const announced = takeLiveTask(key)
+        if (stoppedOnError.delete(key) && !announced) {
           // Already stopped: its part ended in error first.
-          taskStartedAt.delete(input.callID)
+          taskStartedAt.delete(key)
           return
         }
         // A failed command subtask fires this hook with no output; its
         // announced child still ends here.
         const childID = output?.metadata?.sessionId ?? announced?.subagent_id
         if (!childID) {
-          taskStartedAt.delete(input.callID)
+          taskStartedAt.delete(key)
           return
         }
         trackChild(childID, input.sessionID)
-        const startedAt = taskStartedAt.get(input.callID) ?? 0
-        taskStartedAt.delete(input.callID)
-        if (!announced) stoppedBeforeStart.add(input.callID)
+        const startedAt = taskStartedAt.get(key) ?? 0
+        taskStartedAt.delete(key)
+        if (!announced) stoppedBeforeStart.add(key)
         // A child's own task call (subagent_depth > 1) is recorded on the
         // top-level session: the child has no Entire session of its own.
         const payload = announced ?? {

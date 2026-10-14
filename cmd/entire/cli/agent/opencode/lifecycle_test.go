@@ -13,6 +13,7 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/validation"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -290,6 +291,34 @@ func TestParseHookEvent_SubagentStart_RejectsUnsafeIDs(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+// TestSafeToolUseID pins the mapping of callIDs the checkpoint path validator
+// rejects (some providers send e.g. "functions.task:0"): deterministic, path
+// safe, and distinct for IDs that sanitize to the same text.
+func TestSafeToolUseID(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "call_red-1", safeToolUseID("call_red-1"), "a path-safe ID is kept as is")
+
+	mapped := safeToolUseID("functions.task:0")
+	require.NoError(t, validation.ValidateToolUseID(mapped))
+	assert.Regexp(t, `^functions_task_0-[0-9a-f]{12}$`, mapped)
+	assert.Equal(t, mapped, safeToolUseID("functions.task:0"), "start and stop must map alike")
+	assert.NotEqual(t, mapped, safeToolUseID("functions_task:0"), "the hash keeps colliding sanitizations apart")
+}
+
+// TestParseHookEvent_SubagentStartAndStop_MapUnsafeCallID pins that a start
+// and its stop with an unsafe callID parse to the same mapped ToolUseID.
+func TestParseHookEvent_SubagentStartAndStop_MapUnsafeCallID(t *testing.T) {
+	t.Parallel()
+	ag := &OpenCodeAgent{}
+	input := `{"session_id":"ses_parent","tool_use_id":"functions.task:0","subagent_id":"ses_child","started_at":5000}`
+	start, err := ag.ParseHookEvent(context.Background(), HookNameSubagentStart, strings.NewReader(input))
+	require.NoError(t, err)
+	stop, err := ag.ParseHookEvent(context.Background(), HookNameSubagentStop, strings.NewReader(input))
+	require.NoError(t, err)
+	assert.Equal(t, safeToolUseID("functions.task:0"), start.ToolUseID)
+	assert.Equal(t, start.ToolUseID, stop.ToolUseID)
 }
 
 const childExportFixture = `{"info":{"id":"ses_child","parentID":"ses_parent","agent":"general"},"messages":[` +

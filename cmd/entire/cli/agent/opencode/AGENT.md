@@ -21,7 +21,17 @@ probe script that is not kept in the repo.
 - Join keys: `ToolUseID` = the task part's `callID`; `SubagentID` = the child
   session ID (`ses_…`, also the export key); the parent is the child's
   `info.parentID`. `callID` is model-generated and unique only within the
-  parent.
+  calling session; some providers number calls per conversation, so a later
+  call can reuse one (the plugin keys its per-call state by session + `callID`).
+- Record key (`tasks/<key>/`): a `callID` outside `[A-Za-z0-9_-]` is mapped
+  to `<callID, unsafe chars as _>-<12 hex of its SHA-256>`
+  (`functions.task:0` → `functions_task_0-…`). A stop reusing a recorded
+  `callID` for another call is keyed `<callID>-<child>`, or
+  `<callID>-<child>-<started_at ms>` for a later call on the same child
+  (12 hex of a SHA-256 suffix if that is not path-safe). To join a record to
+  its task part without a call field, apply the same mapping to `callID`, or
+  match `agent_id` to the part's `state.metadata.sessionId`, then
+  `started_at` to the call start when one child served several calls.
 - `task_id` resumes an existing child, so one child can back several calls.
 - Child sessions are suppressed plugin-side (`childSessions`, learned from
   `parentID` and task metadata): no `session-start`, `turn-start` or
@@ -82,5 +92,5 @@ text, so prompt extraction and the summary skip it.
 - `opencode run` aborts a running background child at exit, and its teardown instance can leave the parent ACTIVE until the exited-owner sweep; the TUI is unaffected.
 - Two calls in one message that resume the same child: the queued call ends at the first run's idle, so its own work lands in no record.
 - A call whose start the plugin never saw (restart mid-task) declares the child's full export.
-- `callID` is opaque and not globally unique; the child session ID is the cross-process key.
+- entire.io joins task records to task calls on exact `tool_use_id`, so mapped or re-keyed records show as unmatched until its subagent view joins as above.
 - A running background child's edits reach the parent's files only at its stop. Until then, an IDLE parent with no tracked files of its own is left out of a commit that another session also claims; otherwise it condenses and stores the child's export so far.

@@ -2,6 +2,8 @@ package opencode
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -214,12 +216,34 @@ func validateSubagentIdentity(parentID, toolUseID, childID string) error {
 	return nil
 }
 
+// safeToolUseID maps a callID the checkpoint path validator rejects to one it
+// accepts. The callID is model-generated: some providers send IDs such as
+// "functions.task:0". Characters outside [A-Za-z0-9_-] become "_", and 12 hex
+// of the raw ID's SHA-256 keep IDs that sanitize alike apart. Deterministic, so
+// a call's start and stop agree; a path-safe ID is returned unchanged.
+func safeToolUseID(callID string) string {
+	if validation.ValidateToolUseID(callID) == nil {
+		return callID
+	}
+	sanitized := strings.Map(func(r rune) rune {
+		if r == '_' || r == '-' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return '_'
+	}, callID)
+	sum := sha256.Sum256([]byte(callID))
+	return sanitized + "-" + hex.EncodeToString(sum[:])[:12]
+}
+
 // parseSubagentPayload reads a subagent-start or subagent-stop payload,
 // validates its identity fields, and resolves the parent's transcript path.
 func (a *OpenCodeAgent) parseSubagentPayload(ctx context.Context, stdin io.Reader) (*subagentRaw, string, error) {
 	raw, err := agent.ReadAndParseHookInput[subagentRaw](stdin)
 	if err != nil {
 		return nil, "", err
+	}
+	if raw.ToolUseID != "" {
+		raw.ToolUseID = safeToolUseID(raw.ToolUseID)
 	}
 	if err := validateSubagentIdentity(raw.SessionID, raw.ToolUseID, raw.SubagentID); err != nil {
 		return nil, "", err
