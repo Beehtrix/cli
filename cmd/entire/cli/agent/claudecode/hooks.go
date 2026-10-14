@@ -683,7 +683,7 @@ const (
 	// HooksCurrent means the installed hooks match the current config.
 	HooksCurrent = agent.HooksCurrent
 	// HooksOutdated means the installed hooks are stale.
-	// Fix: `entire agent add claude-code --force`.
+	// Fix: `entire agent add claude-code`; add --force if that does not fix it.
 	HooksOutdated = agent.HooksOutdated
 )
 
@@ -714,19 +714,31 @@ func CheckHookConfig(ctx context.Context) HookConfigState {
 	if err != nil || !hasEntireHook(settings.Hooks.Stop) {
 		return HooksAbsent
 	}
+	if missingRequiredHooks(settings) || (&ClaudeCodeAgent{}).HasStaleManagedHooks(ctx) {
+		return HooksOutdated
+	}
+	return HooksCurrent
+}
+
+// MissingRequiredHooks reports whether Entire is installed in this repo's
+// Claude Code settings but a hook this CLI needs is missing: the half of
+// CheckHookConfig that says nothing about commands or timeouts it would
+// rewrite. A config a newer CLI wrote still has every hook this one requires,
+// so unlike the full check it does not misfire across teammates' CLI versions.
+// Read-only; an unreadable file reports false.
+func MissingRequiredHooks(ctx context.Context) bool {
+	settings, err := loadClaudeSettings(ctx)
+	return err == nil && hasEntireHook(settings.Hooks.Stop) && missingRequiredHooks(settings)
+}
+
+func missingRequiredHooks(settings ClaudeSettings) bool {
 	subagentTools := splitMatcherTools(subagentToolMatcher)
-	if !hasEntireHookCoveringTools(settings.Hooks.PreToolUse, subagentTools) ||
+	return !hasEntireHookCoveringTools(settings.Hooks.PreToolUse, subagentTools) ||
 		!hasEntireHookCoveringTools(settings.Hooks.PostToolUse, subagentTools) ||
 		!hasEntireHookCoveringTools(settings.Hooks.PostToolUse, []string{skillToolMatcher}) ||
 		!hasEntireHookCoveringTools(settings.Hooks.SubagentStart, []string{workflowAgentMatcher}) ||
 		!hasEntireHook(settings.Hooks.SubagentStop) ||
-		!hasEntireHook(settings.Hooks.StopFailure) {
-		return HooksOutdated
-	}
-	if (&ClaudeCodeAgent{}).HasStaleManagedHooks(ctx) {
-		return HooksOutdated
-	}
-	return HooksCurrent
+		!hasEntireHook(settings.Hooks.StopFailure)
 }
 
 // Helper functions for hook management

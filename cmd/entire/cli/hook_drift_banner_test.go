@@ -2,8 +2,11 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,26 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// staleClaudeHookSettings is a Claude Code config an older CLI wrote: Entire is
-// installed (Stop hook present) but the tool-use hooks sit under the
-// non-firing Task/TodoWrite matchers, so CheckHookConfig reads it as outdated.
-const staleClaudeHookSettings = `{
-  "hooks": {
-    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "entire hooks claude-code stop"}]}],
-    "PreToolUse": [{"matcher": "Task", "hooks": [{"type": "command", "command": "entire hooks claude-code pre-task"}]}],
-    "PostToolUse": [
-      {"matcher": "Task", "hooks": [{"type": "command", "command": "entire hooks claude-code post-task"}]},
-      {"matcher": "TodoWrite", "hooks": [{"type": "command", "command": "entire hooks claude-code post-todo"}]}
-    ]
-  }
-}`
-
-func writeStaleClaudeHookSettings(t *testing.T, repoDir string) {
-	t.Helper()
-	claudeDir := filepath.Join(repoDir, claudeDirName)
-	require.NoError(t, os.MkdirAll(claudeDir, 0o750))
-	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, claudecode.ClaudeSettingsFileName), []byte(staleClaudeHookSettings), 0o600))
-}
+// These change directory (t.Chdir), so they cannot run in parallel.
 
 func mustGetAgent(t *testing.T, name types.AgentName) agent.Agent {
 	t.Helper()
@@ -41,39 +25,64 @@ func mustGetAgent(t *testing.T, name types.AgentName) agent.Agent {
 	return ag
 }
 
-// The rest change directory (t.Chdir), so they cannot run in parallel.
-
-func TestOutdatedHooksBannerSuffix_ClaudeCodeOutdated(t *testing.T) {
-	dir := setupGitRepoForPhaseTest(t)
-	t.Chdir(dir)
-	writeStaleClaudeHookSettings(t, dir)
-
-	got := outdatedHooksBannerSuffix(context.Background(), mustGetAgent(t, agent.AgentNameClaudeCode))
-	require.Contains(t, got, "Entire's Claude Code hooks in this repo are out of date")
-	require.Contains(t, got, "Run 'entire agent add claude-code --force' to update them.")
-}
-
-func TestOutdatedHooksBannerSuffix_ClaudeCodeCurrent(t *testing.T) {
-	dir := setupGitRepoForPhaseTest(t)
-	t.Chdir(dir)
-	ag := mustGetAgent(t, agent.AgentNameClaudeCode)
-	hs, ok := agent.AsHookSupport(ag)
-	require.True(t, ok)
-	_, err := hs.InstallHooks(context.Background(), false)
+// installCurrentClaudeHooks installs today's Claude Code hooks in the current
+// repo and returns the settings file path.
+func installCurrentClaudeHooks(t *testing.T, dir string) string {
+	t.Helper()
+	_, err := (&claudecode.ClaudeCodeAgent{}).InstallHooks(context.Background(), false)
 	require.NoError(t, err)
-
-	require.Empty(t, outdatedHooksBannerSuffix(context.Background(), ag))
+	return filepath.Join(dir, claudeDirName, claudecode.ClaudeSettingsFileName)
 }
 
-func TestOutdatedHooksBannerSuffix_ClaudeCodeAbsent(t *testing.T) {
-	t.Chdir(setupGitRepoForPhaseTest(t))
+func TestMissingHooksBannerSuffix_MissingSkillHook(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
+	settingsPath := installCurrentClaudeHooks(t, dir)
 
-	require.Empty(t, outdatedHooksBannerSuffix(context.Background(), mustGetAgent(t, agent.AgentNameClaudeCode)))
+	data, err := os.ReadFile(settingsPath)
+	require.NoError(t, err)
+	var settings map[string]map[string][]map[string]any
+	require.NoError(t, json.Unmarshal(data, &settings))
+	settings["hooks"]["PostToolUse"] = slices.DeleteFunc(settings["hooks"]["PostToolUse"], func(m map[string]any) bool {
+		return m["matcher"] == "Skill"
+	})
+	data, err = json.Marshal(settings)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(settingsPath, data, 0o600))
+
+	require.Equal(t, missingHooksWarning, missingHooksBannerSuffix(context.Background(), mustGetAgent(t, agent.AgentNameClaudeCode)))
+}
+
+// A command shape this CLI does not write (as a newer CLI might) makes status
+// report the hooks outdated, but must not reach the banner: following it would
+// rewrite the teammate's newer config back to this CLI's shape.
+func TestMissingHooksBannerSuffix_StaleCommandStaysSilent(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
+	settingsPath := installCurrentClaudeHooks(t, dir)
+
+	data, err := os.ReadFile(settingsPath)
+	require.NoError(t, err)
+	newer := strings.Replace(string(data), "claude-code stop'", "claude-code stop --newer-flag'", 1)
+	require.NotEqual(t, string(data), newer, "fixture should have changed the Stop command")
+	require.NoError(t, os.WriteFile(settingsPath, []byte(newer), 0o600))
+
+	ctx := context.Background()
+	require.Contains(t, OutdatedHookAgents(ctx), agent.AgentNameClaudeCode, "status should still report it")
+	require.Empty(t, missingHooksBannerSuffix(ctx, mustGetAgent(t, agent.AgentNameClaudeCode)))
+}
+
+func TestMissingHooksBannerSuffix_Current(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
+	installCurrentClaudeHooks(t, dir)
+
+	require.Empty(t, missingHooksBannerSuffix(context.Background(), mustGetAgent(t, agent.AgentNameClaudeCode)))
 }
 
 // OpenCode's check compares the whole generated plugin, so a teammate on a
 // different CLI version reads as outdated. It must not reach the banner.
-func TestOutdatedHooksBannerSuffix_OpenCodeOutdatedStaysSilent(t *testing.T) {
+func TestMissingHooksBannerSuffix_OpenCodeOutdatedStaysSilent(t *testing.T) {
 	dir := setupGitRepoForPhaseTest(t)
 	t.Chdir(dir)
 	ctx := context.Background()
@@ -87,30 +96,19 @@ func TestOutdatedHooksBannerSuffix_OpenCodeOutdatedStaysSilent(t *testing.T) {
 	data, err := os.ReadFile(plugin)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(plugin, append(data, "// edited by another CLI version\n"...), 0o600))
-	hf, ok := agent.AsHookFreshness(ag)
-	require.True(t, ok)
-	require.Equal(t, agent.HooksOutdated, hf.CheckHookConfig(ctx), "fixture must read as outdated")
+	require.Contains(t, OutdatedHookAgents(ctx), agent.AgentNameOpenCode, "fixture must read as outdated")
 
-	require.Empty(t, outdatedHooksBannerSuffix(ctx, ag))
+	require.Empty(t, missingHooksBannerSuffix(ctx, ag))
 }
 
-// outdatedHookResponseAgent is a banner-writing Claude Code stand-in whose
-// hooks always read as outdated, so the SessionStart wiring is tested on its own.
-type outdatedHookResponseAgent struct {
-	mockHookResponseAgent
-}
-
-func (*outdatedHookResponseAgent) CheckHookConfig(context.Context) agent.HookConfigState {
-	return agent.HooksOutdated
-}
-
-func TestHandleLifecycleSessionStart_OutdatedHooksWarning(t *testing.T) {
+func TestHandleLifecycleSessionStart_MissingHooksWarning(t *testing.T) {
 	t.Chdir(setupGitRepoForPhaseTest(t))
-	ag := &outdatedHookResponseAgent{*newMockHookResponseAgent()}
+	writeOutdatedClaudeHooks(t)
+	ag := newMockHookResponseAgent()
 	ag.name = agent.AgentNameClaudeCode
 
 	require.NoError(t, handleLifecycleSessionStart(context.Background(), ag, &agent.Event{
-		Type: agent.SessionStart, SessionID: "test-outdated-hooks-warning", Timestamp: time.Now(),
+		Type: agent.SessionStart, SessionID: "test-missing-hooks-warning", Timestamp: time.Now(),
 	}))
-	require.Contains(t, ag.lastMessage, "Run 'entire agent add claude-code --force' to update them.")
+	require.Contains(t, ag.lastMessage, "Run 'entire agent add claude-code' to add them.")
 }

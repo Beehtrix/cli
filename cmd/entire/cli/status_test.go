@@ -1998,24 +1998,6 @@ func writeOutdatedClaudeHooks(t *testing.T) {
 	}
 }
 
-// TestRunStatus_HooksOutdatedNamesAgentAdd — the text warning points at
-// `entire agent add <agent> --force`; `entire enable --force` on an enabled
-// repo opens the agent picker and reinstalls nothing non-interactively.
-func TestRunStatus_HooksOutdatedNamesAgentAdd(t *testing.T) {
-	dir := setupTestRepo(t)
-	writeSettings(t, testSettingsEnabled)
-	writeStaleClaudeHookSettings(t, dir)
-
-	var stdout bytes.Buffer
-	if err := runStatus(context.Background(), &stdout, false, false); err != nil {
-		t.Fatalf("runStatus() error = %v", err)
-	}
-	out := stdout.String()
-	if !strings.Contains(out, "Claude Code hooks out of date · run 'entire agent add claude-code --force'") {
-		t.Errorf("expected the agent add remedy in status output, got:\n%s", out)
-	}
-}
-
 func TestRunStatusJSON_CodexLinkedWorktreeHooksReportInactiveDiscovery(t *testing.T) {
 	setupTestRepo(t)
 	repoRoot, err := paths.WorktreeRoot(context.Background())

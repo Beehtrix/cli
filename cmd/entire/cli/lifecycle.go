@@ -22,6 +22,7 @@ import (
 	"unicode"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/entiredir"
 	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
@@ -146,29 +147,24 @@ func DispatchLifecycleEvent(ctx context.Context, ag agent.Agent, event *agent.Ev
 const retiredDenyRuleWarning = "\n  A retired Entire permission rule in this repo is causing repeated" +
 	"\n  approval prompts. Run 'entire doctor' to remove it."
 
-// hookDriftIsReliable reports whether an agent's drift check is safe to raise
-// in-session. Claude Code's check is positive — a hook this CLI needs is
-// missing — so it holds for every teammate. OpenCode, Pi and Copilot compare
-// the whole generated file, so a teammate on an older or newer CLI reads as
-// outdated; status and doctor still report those, the banner does not.
-func hookDriftIsReliable(name types.AgentName) bool {
-	return name == agent.AgentNameClaudeCode
-}
+// missingHooksWarning is appended to the Claude Code session-start banner
+// when the repo's Entire hooks lack one this CLI needs, so whatever a newer
+// CLI added hooks for silently records nothing. Like retiredDenyRuleWarning,
+// it reports and points at the fix; it never rewrites the tracked config.
+const missingHooksWarning = "\n  Entire's Claude Code hooks in this repo are missing hooks this CLI needs," +
+	"\n  so some activity isn't recorded. Run 'entire agent add claude-code' to add them."
 
-// outdatedHooksBannerSuffix is appended to the session-start banner when this
-// agent's Entire hooks in the repo are out of date, so the features a newer CLI
-// added hooks for silently record nothing. Like retiredDenyRuleWarning, it
-// reports and points at the fix; it never rewrites the tracked config.
-func outdatedHooksBannerSuffix(ctx context.Context, ag agent.Agent) string {
-	if !hookDriftIsReliable(ag.Name()) {
+// missingHooksBannerSuffix returns missingHooksWarning when it applies to ag.
+// Only Claude Code, and only its missing-required-hook check: the rest of
+// CheckHookConfig (commands or timeouts an install would rewrite) and the
+// exact-match checks of OpenCode, Pi and Copilot also fire when a teammate's
+// newer CLI wrote the config, and would tell them to downgrade it. Those
+// stay with `entire status` and `entire doctor`.
+func missingHooksBannerSuffix(ctx context.Context, ag agent.Agent) string {
+	if ag.Name() != agent.AgentNameClaudeCode || !claudecode.MissingRequiredHooks(ctx) {
 		return ""
 	}
-	hf, ok := agent.AsHookFreshness(ag)
-	if !ok || hf.CheckHookConfig(ctx) != agent.HooksOutdated {
-		return ""
-	}
-	return fmt.Sprintf("\n  Entire's %s hooks in this repo are out of date, so some activity isn't recorded."+
-		"\n  Run '%s' to update them.", ag.Type(), refreshAgentHooksCommand(ag.Name()))
+	return missingHooksWarning
 }
 
 // handleLifecycleSessionStart handles session start: shows banner, checks concurrent sessions,
@@ -256,10 +252,6 @@ func handleLifecycleSessionStart(ctx context.Context, ag agent.Agent, event *age
 	if agent.HasRetiredMetadataDenyRule(ctx, ag) {
 		message += retiredDenyRuleWarning
 	}
-	// A CLI upgrade never rewrites the repo's agent config, so hooks it added
-	// stay missing until the user refreshes them. A second small settings read
-	// per SessionStart; shown once per session via ClaimSessionStartBanner.
-	message += outdatedHooksBannerSuffix(ctx, ag)
 
 	// Output informational message if the agent supports hook responses.
 	// Claude Code reads JSON from stdout; agents that don't implement
@@ -284,6 +276,11 @@ func handleLifecycleSessionStart(ctx context.Context, ag agent.Agent, event *age
 			bannerFirst = true
 		}
 		if bannerFirst {
+			// Checked only for a banner that is shown: it reads the agent's
+			// settings file, which resume/compact/clear SessionStarts would
+			// throw away. Appended after any agent-help pointer, which only
+			// Factory AI Droid gets, so for Claude Code it ends the banner.
+			message += missingHooksBannerSuffix(ctx, ag)
 			if err := writer.WriteHookResponse(message); err != nil {
 				hookResponseSpan.RecordError(err)
 				hookResponseSpan.End()

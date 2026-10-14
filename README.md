@@ -386,7 +386,7 @@ These are visible in developer and nightly builds and hidden in stable releases,
 | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `--agent <name>`                            | Agent to set up hooks for: `antigravity`, `claude-code`, `codex`, `copilot-cli`, `cursor`, `factoryai-droid`, `opencode`, `pi` (external agents on `$PATH` also work). Enables non-interactive mode |
 | `--yes`, `-y`                               | Accept all defaults without prompting                                                                             |
-| `--force`, `-f`                             | Reinstall the Entire git hook                                                                                     |
+| `--force`, `-f`                             | Force reinstall hooks (removes existing Entire hooks first)                                                       |
 | `--checkpoint-remote <provider:owner/repo>` | Push checkpoint data to a separate repo; providers `github`, `gitlab` (e.g., `github:org/checkpoints-repo`)      |
 | `--checkpoint-push-remote <name>`           | Select an existing Git remote for checkpoints; always saves to this clone's `.entire/settings.local.json`, even with `--project` |
 | `--skip-push-sessions`                      | Disable automatic pushing of checkpoint data on git push                                                           |
@@ -448,8 +448,8 @@ entire configure --summarize-provider claude-code
 Adding or removing an agent lives under `entire agent`:
 
 ```bash
-entire agent add claude-code
-entire agent add claude-code --force  # refresh outdated hooks after a CLI upgrade
+entire agent add claude-code          # also refreshes outdated hooks after a CLI upgrade
+entire agent add claude-code --force  # rebuilds Entire's hooks if that does not fix them
 entire agent remove claude-code
 ```
 

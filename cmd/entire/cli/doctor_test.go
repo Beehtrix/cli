@@ -1145,12 +1145,24 @@ func TestCheckHookDrift_ClaudeCodeOKWhenCurrent(t *testing.T) {
 
 // TestCheckHookDrift_ClaudeCodeWarnsWhenOutdated — a Claude Code config left by
 // an older CLI (hooks under the stale Task/TodoWrite matchers) is reported OUT
-// OF DATE with the `entire agent add claude-code --force` fix hint.
+// OF DATE with the --force fix hint.
 func TestCheckHookDrift_ClaudeCodeWarnsWhenOutdated(t *testing.T) {
 	dir := setupGitRepoForPhaseTest(t)
 	t.Chdir(dir)
 
-	writeStaleClaudeHookSettings(t, dir)
+	claudeDir := filepath.Join(dir, claudeDirName)
+	require.NoError(t, os.MkdirAll(claudeDir, 0o750))
+	stale := `{
+  "hooks": {
+    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "entire hooks claude-code stop"}]}],
+    "PreToolUse": [{"matcher": "Task", "hooks": [{"type": "command", "command": "entire hooks claude-code pre-task"}]}],
+    "PostToolUse": [
+      {"matcher": "Task", "hooks": [{"type": "command", "command": "entire hooks claude-code post-task"}]},
+      {"matcher": "TodoWrite", "hooks": [{"type": "command", "command": "entire hooks claude-code post-todo"}]}
+    ]
+  }
+}`
+	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, claudecode.ClaudeSettingsFileName), []byte(stale), 0o600))
 
 	cmd, stdout := newTestCmd(t)
 	checkHookDrift(cmd)
@@ -1204,7 +1216,7 @@ func TestCheckHookTimeouts_RestoresWhatEnableWrites(t *testing.T) {
 // TestCheckCodexHookTrust_FlagsStaleHooksFile — user enabled Codex on
 // an older release that didn't ship PostToolUse. Their hooks.json has
 // only the three legacy events. Doctor must surface the gap and tell
-// them to run `entire agent add codex --force`.
+// them to run `entire agent add codex`.
 func TestCheckCodexHookTrust_FlagsStaleHooksFile(t *testing.T) {
 	dir := setupGitRepoForPhaseTest(t)
 	t.Chdir(dir)
@@ -1244,7 +1256,7 @@ trusted_hash = "sha256:ccc"
 	require.Contains(t, out, "Codex hooks: OUT OF DATE")
 	require.Contains(t, out, "- session_end")
 	require.Contains(t, out, "- post_tool_use")
-	require.Contains(t, out, "entire agent add codex --force")
+	require.Contains(t, out, "Run `entire agent add codex` from this worktree")
 	// Trust stays quiet: every event the stale file actually declares is trusted,
 	// so only the out-of-date finding should fire.
 	require.NotContains(t, out, "Codex hook trust: REVIEW NEEDED")

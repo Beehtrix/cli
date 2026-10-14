@@ -274,14 +274,6 @@ func OutdatedHookAgents(ctx context.Context) []types.AgentName {
 	return outdated
 }
 
-// refreshAgentHooksCommand is the command a user runs to rewrite one agent's
-// outdated Entire hooks. Not `entire enable --force`: on a repo that is
-// already set up, that routes to the agent picker, which reinstalls nothing
-// non-interactively.
-func refreshAgentHooksCommand(name types.AgentName) string {
-	return "entire agent add " + string(name) + " --force"
-}
-
 // agentDisplayNames maps agent names to their user-facing display names,
 // skipping names that aren't registered.
 func agentDisplayNames(names []types.AgentName) []string {
