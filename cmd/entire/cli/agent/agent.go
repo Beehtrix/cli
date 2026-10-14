@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"os/exec"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
@@ -142,7 +141,7 @@ const (
 	HooksCurrent
 	// HooksOutdated means Entire hooks are installed but stale — an older CLI
 	// wrote a config that no longer matches the current one. Fix:
-	// `entire enable --force`.
+	// `entire agent add <agent>`; add --force if that does not fix it.
 	HooksOutdated
 )
 
@@ -165,6 +164,33 @@ type HookFreshness interface {
 	// CheckHookConfig reports whether this agent's Entire hook config is
 	// absent, current, or outdated in the current repo.
 	CheckHookConfig(ctx context.Context) HookConfigState
+}
+
+// StaleHookReporter is implemented by hook-supporting agents whose install
+// also rewrites Entire hooks that older CLIs wrote: pruning ones this CLI no
+// longer writes (for Claude Code, the retired post-todo hook) or updating ones
+// whose shape changed (Claude Code's hook timeouts). `entire enable` asks before
+// installing, so it can say it updated them instead of reporting the hooks as
+// already installed. Implementations must be read-only.
+type StaleHookReporter interface {
+	Agent
+
+	// HasStaleManagedHooks reports whether the agent's hook config holds
+	// Entire hooks the next install will remove or update.
+	HasStaleManagedHooks(ctx context.Context) bool
+}
+
+// HookTimeoutRepairer is implemented by agents whose Entire hooks carry
+// timeouts that configs written by older CLIs lack. `entire doctor` runs the
+// repair without asking, because a user who already enabled Entire has no
+// reason to run enable again. The repair must only give Entire's own hooks a
+// missing timeout and leave everything the user chose as it is.
+type HookTimeoutRepairer interface {
+	Agent
+
+	// RepairHookTimeouts adds the missing timeouts and reports whether it
+	// rewrote the hook config. An absent config is not an error.
+	RepairHookTimeouts(ctx context.Context) (bool, error)
 }
 
 // EffectiveHookDiagnostics marks agents whose effective hook state is reported
@@ -233,7 +259,8 @@ type PromptExtractor interface {
 
 // TranscriptPromptExtractor extracts user prompts from transcript CONTENT the
 // caller already holds. Condensation reads the transcript once — from the live
-// path, or from the shadow-branch copy when the live path cannot be read — and
+// path, or from the copy stored at the last Stop when the live path cannot be
+// read — and
 // stores those bytes in the checkpoint; the prompts it records must come from
 // the same bytes, not from a second read of the path that can see a different
 // (missing, shorter, or later) file. Optional: agents that only implement
@@ -409,6 +436,19 @@ type InventoryAwareExtractor interface {
 	ExtractWithSubagentInventory(ctx context.Context, parent []byte, fromOffset int, refs []SubagentReference) (InventoryExtraction, error)
 }
 
+// HomeScopedInventoryExtractor is implemented by InventoryAwareExtractors that
+// can look up child transcripts in the session stores beneath a given agent
+// home instead of the active home.
+type HomeScopedInventoryExtractor interface {
+	InventoryAwareExtractor
+
+	// ExtractWithSubagentInventoryUnderHome is like
+	// ExtractWithSubagentInventory but looks up child transcripts in the
+	// stores beneath home. home must have passed ResolveTrustedHome; the
+	// method does not check it.
+	ExtractWithSubagentInventoryUnderHome(ctx context.Context, parent []byte, fromOffset int, refs []SubagentReference, home string) (InventoryExtraction, error)
+}
+
 // ModelExtractor extracts the LLM model identifier from a transcript for agents
 // that do not report the model through lifecycle hooks. Pi, for example, records
 // the model on every assistant message (message.model) but its hook events carry
@@ -556,20 +596,6 @@ type RestoredSessionPathResolver interface {
 type TestOnly interface {
 	Agent
 	IsTestOnly() bool
-}
-
-// Launcher is implemented by agents that `entire` can subprocess-spawn.
-// This is used by `entire review` to start an agent with a pre-composed
-// initial prompt; other commands may use it later.
-//
-// Contract:
-//   - LaunchCmd builds an *exec.Cmd with stdin/stdout/stderr wired to the
-//     caller's TTY. The agent runs in the foreground and the call blocks.
-//   - The returned cmd is ready to Run() or Start(); it must NOT be modified
-//     by the caller except to set environment variables or working dir.
-//   - initialPrompt is the first user message to send to the agent.
-type Launcher interface {
-	LaunchCmd(ctx context.Context, initialPrompt string) (*exec.Cmd, error)
 }
 
 // DiscoveredSkill describes one review-adjacent skill found on disk by a

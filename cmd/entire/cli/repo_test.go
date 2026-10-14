@@ -283,6 +283,11 @@ func serveRepoCreateWith(t *testing.T, created *coreapi.Repo) <-chan []byte {
 			bodyCh <- raw
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/projects/"):
+			// The one lookup made when nothing else names the new repo.
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"id":%q,"name":"acme","ownerType":"org","ownerId":"o","region":"us","createdAt":"2026-01-01T00:00:00Z","capabilities":{"canCreateRepository":true,"canDelete":false,"canManageAccess":false,"canManageTrails":false}}`, strings.TrimPrefix(r.URL.Path, "/api/v1/projects/"))
+			return
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/"+created.ID && r.URL.Query().Get("authoritative") == "true":
 			w.Header().Set("Content-Type", "application/json")
 		default:
@@ -871,12 +876,12 @@ func TestRepoProjectFlagRedundancyWarning(t *testing.T) {
 		// warning rides on bindRepoProjectFlag so it cannot be wired for some
 		// and missed for others. Asserting the PreRunE exists is what pins
 		// that, without standing up a server per command.
-		// `repo view` is deliberately absent: it takes the /et/<project>/<repo>
-		// path and nothing else, so there is no bare name for --project to
-		// scope and no flag to warn about.
+		// `repo view` and `repo delete` are deliberately absent: they take the
+		// /et/<project>/<repo> path (delete also an unadvertised ULID), so
+		// there is no bare name for --project to scope and no flag to warn
+		// about.
 		for name, newCmd := range map[string]func() *cobra.Command{
 			"repo edit":              newRepoEditCmd,
-			"repo delete":            newRepoDeleteCmd,
 			"repo visibility get":    newRepoVisibilityGetCmd,
 			"repo protection list":   newRepoProtectionListCmd,
 			"repo protection add":    newRepoProtectionAddCmd,
@@ -1013,6 +1018,6 @@ func TestRepoDelete_GitSuffixResolvesToTheSuffixFreeRepo(t *testing.T) {
 	require.Equal(t, victimName, askedName, "the suffix must be dropped before the server is asked")
 	require.Equal(t, victimID, deletedID, "the ULID deleted must be the suffix-free repo's")
 	require.Contains(t, stdout, victimPath, "the confirmation names what the server resolved")
-	require.Contains(t, stdout, victimID)
+	require.NotContains(t, stdout, victimID, "the path names the repo; its ULID stays internal")
 	require.NotContains(t, stdout, strangerID)
 }

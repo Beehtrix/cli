@@ -155,6 +155,28 @@ worktree than the install still cleans up, including the legacy local-dev
 - Global `settings.json`: only the `title` key is touched; user title commands
   are wrapped, restored on uninstall, and anything unrecognized is left alone.
 
+## Summary Generation Isolation
+
+Summary runs use an empty working directory and a separate temporary HOME/XDG
+home so agy's global title commands, hooks, MCP servers, skills, and workspace
+trust settings are not loaded. Only authentication is carried over: the macOS
+login keychain file, a regular OAuth file token, ADC credentials, and the
+allowlisted `modelProvider: "gemini"` setting for API-key mode. This is
+configuration isolation, not a filesystem sandbox; agy still has tools and its
+own approval behavior.
+
+`resolveTextGenerationAuth` is the only generation-side discovery of ambient
+home/config/ADC sources. Home preparation takes those sources explicitly.
+When no ADC file is selected, preparation explicitly clears
+`GOOGLE_APPLICATION_CREDENTIALS` in the child environment so ambient inheritance
+cannot bypass the selected sources; Windows default ADC still uses APPDATA.
+Generation unit tests use `newTestTextGenerator` with temporary authentication
+fixtures; replacing `CommandRunner` alone does **not** isolate credential
+preparation. Tests of the production resolver must override HOME/USERPROFILE,
+agy's config directory, and the ADC credential variable before calling it.
+Credential-carryover tests inspect prepared homes directly rather than launching
+agy or touching the developer's keychain.
+
 ## Gaps & Limitations (Preview)
 
 - **Silent tracking** in the agy UI (no SessionStart surface); `entire status`
@@ -189,10 +211,14 @@ worktree than the install still cleans up, including the legacy local-dev
   `ExtractModifiedFilesFromOffset` logs a WARN per dropped call instead of
   silently skipping; live PreToolUse stdin is never truncated, so normal turns
   are unaffected — only the late-flush / first-turn mid-turn fallbacks are.
-- **Headless prompt goes in argv**: agy ≥ 1.2.x ignores stdin in print mode
-  (`-p " "` → "Error: empty prompt"; `-p -` is answered as the literal message
-  "-"), so `GenerateText` (summaries, `dispatch --local`) passes the prompt as
-  the `-p` value. The summarizer condenses agy step JSONL through
+- **Headless prompt goes on stdin as stream-json**: agy ≥ 1.2.x ignores stdin
+  in text print mode (`-p " "` → "Error: empty prompt"; `-p -` is answered as
+  the literal message "-"), and argv would expose the transcript-bearing prompt
+  to other local users through the process table. So `GenerateText`
+  (summaries, `dispatch --local`) runs `agy --input-format stream-json
+  --output-format stream-json --print=` (agy ≥ 1.1.15), writes one
+  `{"event":"user","message":{"role":"user","content":…}}` line to stdin, and
+  reads the reply from the final `result` event. The summarizer condenses agy step JSONL through
   `antigravity.CondenseTranscript` (USER_INPUT, PLANNER_RESPONSE text and tool
   calls; GENERIC/SYSTEM_MESSAGE skipped) — without it agy transcripts fell
   through to the Claude parser and summarized to nothing.
