@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -516,10 +517,7 @@ echo pre-commit >> `+log+"\n")
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second) // a recursive chain never ends
 	defer cancel()
-	cmd := exec.CommandContext(ctx, filepath.Join(f.dir, "commit-msg"), filepath.Join(t.TempDir(), "MSG"))
-	cmd.WaitDelay = time.Second
-	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := runHook(ctx, bin, filepath.Join(f.dir, "commit-msg"), filepath.Join(t.TempDir(), "MSG")); err != nil {
 		t.Fatalf("hook failed: %v\n%s", err, out)
 	}
 	data, err := os.ReadFile(log)
@@ -559,9 +557,7 @@ func TestChainedPrePush_EntireFailureAbortsPush(t *testing.T) {
 			f.write("pre-push", generateChainedContent(spec.content, spec.name))
 			f.write("pre-push"+backupSuffix, "#!/bin/sh\necho user >> "+log+"\nexit "+tc.backupExit+"\n")
 
-			cmd := exec.CommandContext(t.Context(), filepath.Join(f.dir, "pre-push"), "origin", "url")
-			cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-			err := cmd.Run()
+			_, err := runHook(t.Context(), bin, filepath.Join(f.dir, "pre-push"), "origin", "url")
 			code := 0
 			var exitErr *exec.ExitError
 			if errors.As(err, &exitErr) {
@@ -580,6 +576,26 @@ func TestChainedPrePush_EntireFailureAbortsPush(t *testing.T) {
 				t.Errorf("ran %s, want %s", got, tc.wantLog)
 			}
 		})
+	}
+}
+
+// runHook runs a hook the test has just written, with bin ahead of PATH.
+//
+// Start is retried on ETXTBSY (golang/go#22315): a parallel test that forks
+// while this process still has the hook open for writing - written by the test
+// or by installHooks - leaves the child holding the write descriptor, and
+// the kernel refuses to exec the file until that child execs. os/exec does not
+// retry, so without this the race reads as a failed hook.
+func runHook(ctx context.Context, bin, hook string, args ...string) ([]byte, error) {
+	for attempt := 1; ; attempt++ {
+		cmd := exec.CommandContext(ctx, hook, args...)
+		cmd.WaitDelay = time.Second
+		cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+		out, err := cmd.CombinedOutput()
+		if !errors.Is(err, syscall.ETXTBSY) || attempt == 5 {
+			return out, err
+		}
+		time.Sleep(time.Duration(attempt) * 20 * time.Millisecond)
 	}
 }
 
@@ -892,10 +908,7 @@ func TestInstallHooks_ForeignWrapperOverEntireDoesNotRecurse(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second) // a recursive chain never ends
 	defer cancel()
-	cmd := exec.CommandContext(ctx, filepath.Join(f.dir, "commit-msg"), filepath.Join(t.TempDir(), "MSG"))
-	cmd.WaitDelay = time.Second
-	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := runHook(ctx, bin, filepath.Join(f.dir, "commit-msg"), filepath.Join(t.TempDir(), "MSG")); err != nil {
 		t.Fatalf("hook failed: %v\n%s", err, out)
 	}
 	data, err := os.ReadFile(log)
@@ -936,10 +949,7 @@ fi
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second) // a recursive chain never ends
 	defer cancel()
-	cmd := exec.CommandContext(ctx, filepath.Join(f.dir, "commit-msg"), filepath.Join(t.TempDir(), "MSG"))
-	cmd.WaitDelay = time.Second
-	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := runHook(ctx, bin, filepath.Join(f.dir, "commit-msg"), filepath.Join(t.TempDir(), "MSG")); err != nil {
 		data, readErr := os.ReadFile(log)
 		t.Fatalf("hook failed: %v (Entire's hook ran %d times; log: %v)\n%s", err, strings.Count(string(data), "entire\n"), readErr, out)
 	}
