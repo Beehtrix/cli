@@ -266,23 +266,11 @@ func topLevelBulletText(line string) (string, bool) {
 	if leading != 0 {
 		return "", false
 	}
-	trimmed := strings.TrimSpace(trimmedRight)
-	if len(trimmed) < 3 {
+	item, ok := cliReview.ListItemText(strings.TrimSpace(trimmedRight))
+	if !ok || item == "" {
 		return "", false
 	}
-	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") || strings.HasPrefix(trimmed, "+ ") {
-		return strings.TrimSpace(trimmed[2:]), true
-	}
-	for i, r := range trimmed {
-		if r >= '0' && r <= '9' {
-			continue
-		}
-		if r == '.' && i > 0 && i+1 < len(trimmed) && trimmed[i+1] == ' ' {
-			return strings.TrimSpace(trimmed[i+2:]), true
-		}
-		return "", false
-	}
-	return "", false
+	return item, true
 }
 
 func topLevelMarkedFindingText(line string) (string, bool) {
@@ -292,29 +280,10 @@ func topLevelMarkedFindingText(line string) (string, bool) {
 		return "", false
 	}
 	trimmed := strings.TrimSpace(trimmedRight)
-	if !startsWithReviewSeverityMarker(trimmed) {
+	if !cliReview.StartsWithSeverityMarker(trimmed) {
 		return "", false
 	}
 	return trimmed, true
-}
-
-func startsWithReviewSeverityMarker(s string) bool {
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "**")
-	s = strings.TrimPrefix(s, "__")
-	s = strings.TrimSpace(s)
-	lower := strings.ToLower(s)
-	for _, marker := range []string{"[critical]", "[high]", "[medium]", "[low]", "[p0]", "[p1]", "[p2]", "[p3]", "[nit]"} {
-		if strings.HasPrefix(lower, marker) {
-			return true
-		}
-	}
-	for _, marker := range []string{"critical", "high", "medium", "low", "p0", "p1", "p2", "p3", "nit"} {
-		if strings.HasPrefix(lower, marker+" —") || strings.HasPrefix(lower, marker+" -") || strings.HasPrefix(lower, marker+":") {
-			return true
-		}
-	}
-	return false
 }
 
 // trailWebURL builds the browser URL for a trail, matching the server's

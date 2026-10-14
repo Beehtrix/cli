@@ -50,12 +50,13 @@ type TrailReport struct {
 // trailReportFor decides what a trail-mode run posts. It returns post=false
 // only when the JSON contract reports no findings and nothing in the prose
 // contradicts that; every malformed or contradictory case posts, so a
-// misbehaving model costs an extra finding rather than a lost one. When a
-// judge ran, its verdict decides: it is asked to drop unsupported claims.
+// misbehaving model costs an extra finding rather than a lost one. A posted
+// report is empty only when the output had nothing readable. When a judge
+// ran, its verdict decides: it is asked to drop unsupported claims.
 func trailReportFor(summary reviewtypes.RunSummary, aggregateOutput string) (TrailReport, bool) {
 	if verdict := strings.TrimSpace(aggregateOutput); verdict != "" {
 		prose, comments, ok := splitTrailJSON(verdict)
-		if !ok || (len(comments) == 0 && proseReportsFindings(prose)) {
+		if !contractCoversProse(prose, comments, ok) {
 			if prose == "" {
 				// A JSON-only reply without a summary has no prose of its own.
 				prose = combinedReviewNarratives(usableAgentRuns(summary))
@@ -68,7 +69,7 @@ func trailReportFor(summary reviewtypes.RunSummary, aggregateOutput string) (Tra
 	var unstructured []reviewtypes.AgentRun
 	for _, run := range usableAgentRuns(summary) {
 		prose, comments, ok := splitTrailJSON(reportText(run.Buffer))
-		if !ok || (len(comments) == 0 && proseReportsFindings(prose)) {
+		if !contractCoversProse(prose, comments, ok) {
 			unstructured = append(unstructured, run)
 			continue
 		}
@@ -76,6 +77,36 @@ func trailReportFor(summary reviewtypes.RunSummary, aggregateOutput string) (Tra
 	}
 	report := TrailReport{Comments: merged, Prose: combinedReviewNarratives(unstructured)}
 	return report, len(merged) > 0 || len(unstructured) > 0
+}
+
+// contractCoversProse reports whether a valid contract can be posted in place
+// of its prose: the prose reports no finding the comments leave out. The
+// prose normally repeats every comment, so it is posted instead of, not
+// alongside, an incomplete contract.
+func contractCoversProse(prose string, comments []TrailComment, ok bool) bool {
+	if !ok {
+		return false
+	}
+	if len(comments) == 0 {
+		return !proseReportsFindings(prose)
+	}
+	return markedFindingCount(prose) <= len(comments)
+}
+
+// markedFindingCount counts the lines, list items included, that open with a
+// severity marker: the finding shape the output format asks for.
+func markedFindingCount(prose string) int {
+	count := 0
+	for _, line := range strings.Split(prose, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if item, ok := ListItemText(trimmed); ok {
+			trimmed = item
+		}
+		if StartsWithSeverityMarker(trimmed) {
+			count++
+		}
+	}
+	return count
 }
 
 // reportText returns a reviewer's report: the last stretch of text between
@@ -191,17 +222,21 @@ func stripTrailJSON(text string) string {
 func proseReportsFindings(prose string) bool {
 	for _, line := range strings.Split(prose, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if isListItem(trimmed) {
+		if _, ok := ListItemText(trimmed); ok {
 			return true
 		}
 		lower := strings.ToLower(trimMarkdownEmphasis(trimmed))
 		if after, found := strings.CutPrefix(lower, "verdict"); found {
 			lower = trimMarkdownEmphasis(strings.TrimLeft(after, ":-—– "))
 		}
-		if startsWithSeverityMarker(lower) {
+		if StartsWithSeverityMarker(lower) {
 			return true
 		}
-		for _, prefix := range []string{"request changes", "request_changes", "changes requested", "approve with nits", "nits:", "issues:", "concerns:", "suggestions:"} {
+		for _, prefix := range []string{
+			"request changes", "request_changes", "changes requested", "approve with nits",
+			"needs changes", "needs work", "changes needed",
+			"nits:", "issues:", "concerns:", "suggestions:", "findings:", "problems:", "blocking:",
+		} {
 			if strings.HasPrefix(lower, prefix) {
 				return true
 			}
@@ -214,15 +249,25 @@ func trimMarkdownEmphasis(s string) string {
 	return strings.TrimLeft(s, "#>*_` ")
 }
 
-// startsWithSeverityMarker reports whether lower opens with a severity tag in
-// the bracketed ("[high]") or delimited ("high —", "p2:") form.
-func startsWithSeverityMarker(lower string) bool {
+// StartsWithSeverityMarker reports whether line, after leading Markdown
+// emphasis, opens with a severity tag: bracketed ("[high]"), delimited
+// ("high —", "p2:"), closed by emphasis ("**High** ..."), or alone (a "### High"
+// heading). A word that merely starts with a marker ("Highlights") is not one.
+func StartsWithSeverityMarker(line string) bool {
+	lower := strings.ToLower(trimMarkdownEmphasis(strings.TrimSpace(line)))
 	for _, marker := range []string{"critical", "high", "medium", "low", "p0", "p1", "p2", "p3", "nit"} {
 		if strings.HasPrefix(lower, "["+marker+"]") {
 			return true
 		}
-		for _, suffix := range []string{" —", " -", ":"} {
-			if strings.HasPrefix(lower, marker+suffix) {
+		rest, found := strings.CutPrefix(lower, marker)
+		if !found {
+			continue
+		}
+		if strings.TrimSpace(rest) == "" {
+			return true
+		}
+		for _, suffix := range []string{" —", " –", " -", ":", "*", "_"} {
+			if strings.HasPrefix(rest, suffix) {
 				return true
 			}
 		}
@@ -230,11 +275,23 @@ func startsWithSeverityMarker(lower string) bool {
 	return false
 }
 
-func isListItem(trimmed string) bool {
-	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") || strings.HasPrefix(trimmed, "+ ") {
-		return true
+// ListItemText returns the text of a Markdown list item ("- ", "* ", "+ ",
+// "• ", "1. ", "1) ") and whether trimmed, a line without surrounding space,
+// is one.
+func ListItemText(trimmed string) (string, bool) {
+	for _, bullet := range []string{"- ", "* ", "+ ", "• "} {
+		if item, found := strings.CutPrefix(trimmed, bullet); found {
+			return strings.TrimSpace(item), true
+		}
 	}
 	digits := len(trimmed) - len(strings.TrimLeft(trimmed, "0123456789"))
-	rest := trimmed[digits:]
-	return digits > 0 && (strings.HasPrefix(rest, ". ") || strings.HasPrefix(rest, ") "))
+	if digits == 0 {
+		return "", false
+	}
+	for _, delim := range []string{". ", ") "} {
+		if item, found := strings.CutPrefix(trimmed[digits:], delim); found {
+			return strings.TrimSpace(item), true
+		}
+	}
+	return "", false
 }

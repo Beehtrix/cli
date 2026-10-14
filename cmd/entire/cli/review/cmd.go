@@ -1610,6 +1610,10 @@ func maybePostReviewToTrail(
 		fmt.Fprintln(out, "Nothing to report, so nothing was posted to the trail.")
 		return
 	}
+	if len(report.Comments) == 0 && strings.TrimSpace(report.Prose) == "" {
+		fmt.Fprintln(out, "The review produced no readable report, so nothing was posted to the trail.")
+		return
+	}
 	if deps.PostReviewToTrail == nil {
 		fmt.Fprintln(out, "Trail output is not available here; the review was kept local.")
 		return
@@ -1632,12 +1636,18 @@ func userMessageAlreadyPrinted(err error) bool {
 }
 
 // combinedReviewNarratives joins the given reviewers' narratives into one
-// document, the trail-posting body for reviewers that did not honor the JSON
-// contract.
+// document, the trail-posting body for reviewers whose JSON contract cannot
+// be posted. A reviewer that ended its report with a contract line
+// contributes only that report, so exploration narration is not posted as
+// findings; any other reviewer contributes its whole narrative.
 func combinedReviewNarratives(runs []reviewtypes.AgentRun) string {
 	var b strings.Builder
 	for _, run := range runs {
-		narrative, _, _ := splitTrailJSON(joinAssistantText(run.Buffer))
+		text := reportText(run.Buffer)
+		if text == "" {
+			text = joinAssistantText(run.Buffer)
+		}
+		narrative, _, _ := splitTrailJSON(text)
 		if narrative == "" {
 			continue
 		}

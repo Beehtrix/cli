@@ -144,6 +144,18 @@ func TestReviewTrailFindingInputsMapsStructuredComments(t *testing.T) {
 	}
 }
 
+func TestReviewTrailFindingInputsSplitsUnicodeBulletsAndBoldSeverity(t *testing.T) {
+	verdict := "request changes\n\n• [high] a.go:1 — A.\n**High** b.go:2 — B."
+
+	inputs := reviewTrailFindingInputs("general", cliReview.TrailReport{Prose: verdict})
+	if len(inputs) != 2 {
+		t.Fatalf("inputs = %d, want 2", len(inputs))
+	}
+	if !strings.Contains(*inputs[0].Body, "a.go:1") || !strings.Contains(*inputs[1].Body, "b.go:2") {
+		t.Fatalf("findings were not split cleanly: %q, %q", *inputs[0].Body, *inputs[1].Body)
+	}
+}
+
 func TestReviewTrailFindingInputsSingleVerdictUnchanged(t *testing.T) {
 	inputs := reviewTrailFindingInputs("general", cliReview.TrailReport{Prose: "APPROVE - no actionable findings."})
 	if len(inputs) != 1 {
