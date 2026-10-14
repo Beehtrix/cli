@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sync"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
@@ -83,7 +84,7 @@ func linkingSetContains(states []*SessionState, id string) bool {
 // file per session in the shared store, so a per-candidate walk would repeat
 // the hostname/boot/proc reads dozens of times per commit.
 func (s *ManualCommitStrategy) findSessionByCommitAncestry(ctx context.Context, states []*SessionState) *SessionState {
-	ancestry, ok := proclive.CurrentAncestry()
+	ancestry, ok := commitAncestry(ctx)
 	if !ok {
 		return nil
 	}
@@ -196,7 +197,7 @@ type commitProvenance struct {
 // else (no owner, a dead or unverifiable owner, a truncated walk, a platform
 // that cannot introspect processes) keeps today's linking.
 func newCommitProvenance(ctx context.Context, states []*SessionState) commitProvenance {
-	ancestry, ok := proclive.CurrentAncestry()
+	ancestry, ok := commitAncestry(ctx)
 	if !ok || !ancestry.Complete() {
 		return commitProvenance{}
 	}
@@ -248,4 +249,39 @@ func (p commitProvenance) withoutForeign(sessions []*SessionState) []*SessionSta
 		}
 	}
 	return kept
+}
+
+// currentAncestry walks this process's ancestry; a variable so tests can
+// count the walks.
+var currentAncestry = proclive.CurrentAncestry
+
+// commitAncestryKey holds a commit hook's ancestry snapshot (withCommitAncestry).
+type commitAncestryKey struct{}
+
+type commitAncestrySnapshot struct {
+	once     sync.Once
+	ancestry proclive.Ancestry
+	ok       bool
+}
+
+// withCommitAncestry gives a commit hook one ancestry snapshot for every
+// identity decision it makes (findSessionByCommitAncestry, newCommitProvenance):
+// the walk reads the hostname, boot ID and up to maxAncestryDepth processes,
+// and each decision describes the same process tree.
+func withCommitAncestry(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(commitAncestryKey{}).(*commitAncestrySnapshot); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, commitAncestryKey{}, &commitAncestrySnapshot{})
+}
+
+// commitAncestry returns the hook's snapshot, walking on first use; without
+// one (a caller outside a commit hook) it walks every time.
+func commitAncestry(ctx context.Context) (proclive.Ancestry, bool) {
+	snap, ok := ctx.Value(commitAncestryKey{}).(*commitAncestrySnapshot)
+	if !ok {
+		return currentAncestry()
+	}
+	snap.once.Do(func() { snap.ancestry, snap.ok = currentAncestry() })
+	return snap.ancestry, snap.ok
 }
