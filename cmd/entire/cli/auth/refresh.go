@@ -148,7 +148,8 @@ func newContextTokenManager(c *contexts.Context, transport http.RoundTripper, al
 
 // Spawned binaries need an inherited override because testing.Testing is false
 // there, and macOS's os.UserCacheDir ignores XDG_CACHE_HOME. In-process tests
-// use testdirs; production without an override keeps auth-go's default.
+// without the override use testdirs; production without an override keeps
+// auth-go's default.
 func tokenManagerLockDir() (string, error) {
 	if dir := os.Getenv(authLockDirEnvVar); dir != "" {
 		if err := userdirs.RequireAbsoluteOverride(authLockDirEnvVar, dir); err != nil {
