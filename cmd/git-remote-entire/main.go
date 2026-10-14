@@ -20,23 +20,19 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/auth"
-	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/gitremote"
 	"github.com/entireio/cli/cmd/entire/cli/versioninfo"
 	"github.com/entireio/cli/internal/entireclient/clusterdiscovery"
@@ -370,10 +366,8 @@ func parseProtocolVersion(raw string, warn io.Writer) int {
 //   - ENTIRE_TOKEN set: use the env JWT verbatim. Skips contexts.json and the
 //     keyring entirely — the CI / workload path. A non-URL aud is a hard error,
 //     never a silent fallback to context resolution.
-//   - Git credential helper: use its password as the bearer, with the same
-//     cluster trust checks. Lookup uses the original entire:// repository URL.
 //   - otherwise: resolve the login context for this cluster from contexts.json
-//     and use its refreshed login JWT, unless ENTIRE_GIT_NO_LOGIN_FALLBACK is true.
+//     and use its refreshed login JWT.
 func resolveCreds(ctx context.Context, parsedURL *url.URL, skipTLS bool, httpClient *http.Client) (credentialProvider, func(), error) {
 	// Presence of ENTIRE_TOKEN is the signal: if it's set at all (LookupEnv,
 	// not Getenv, so we can tell set-empty from unset), we commit to the
@@ -388,29 +382,7 @@ func resolveCreds(ctx context.Context, parsedURL *url.URL, skipTLS bool, httpCli
 		if envToken == "" {
 			return nil, nil, fmt.Errorf("%s is set but blank", auth.EnvTokenVar)
 		}
-		return resolveTokenCreds(ctx, envToken, auth.EnvTokenVar, parsedURL.Host, userdirs.Cache(), httpClient)
-	}
-
-	// Git cannot distinguish an absent credential from some broken helpers.
-	// CI can disable saved-login fallback to avoid substituting a personal identity.
-	noLoginFallback := false
-	if raw, ok := os.LookupEnv("ENTIRE_GIT_NO_LOGIN_FALLBACK"); ok {
-		var err error
-		noLoginFallback, err = strconv.ParseBool(raw)
-		if err != nil {
-			return nil, nil, errors.New("ENTIRE_GIT_NO_LOGIN_FALLBACK must be a boolean (true or false)")
-		}
-	}
-
-	token, err := gitCredentialToken(ctx, parsedURL)
-	if err != nil {
-		return nil, nil, err
-	}
-	if token != "" {
-		return resolveTokenCreds(ctx, token, "git credential helper token", parsedURL.Host, userdirs.Cache(), httpClient)
-	}
-	if noLoginFallback {
-		return nil, nil, errors.New("git credential lookup returned no usable credential; saved-login fallback is disabled by ENTIRE_GIT_NO_LOGIN_FALLBACK")
+		return resolveEnvTokenCreds(ctx, envToken, parsedURL.Host, userdirs.Cache(), httpClient)
 	}
 
 	// Resolve which login context authenticates this cluster: the cluster's
@@ -437,66 +409,13 @@ func resolveCreds(ctx context.Context, parsedURL *url.URL, skipTLS bool, httpCli
 	return provider, onUnauthorized, nil
 }
 
-func gitCredentialToken(ctx context.Context, repoURL *url.URL) (string, error) {
-	username := ""
-	if repoURL.User != nil {
-		username = repoURL.User.Username()
-	}
-	for _, value := range []string{repoURL.Host, repoURL.Path, username} {
-		if strings.ContainsAny(value, "\r\n\x00") {
-			return "", errors.New("invalid control character in Git credential lookup")
-		}
-	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	cmd := execx.NonInteractive(ctx, "git", "-c", "core.askPass=", "credential", "fill")
-	execx.TerminateOnCancel(cmd)
-	// Git uses the same exit status for unavailable credentials and explicit
-	// refusal. Pin its diagnostic language so only the non-interactive prompt
-	// failure permits saved-login fallback. Never expose helper stderr: it may
-	// contain tokens or the configured helper command.
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=", "SSH_ASKPASS=", "LC_ALL=C")
-	input := fmt.Sprintf("protocol=entire\nhost=%s\npath=%s\n", repoURL.Host, strings.TrimPrefix(repoURL.Path, "/"))
-	if repoURL.User != nil {
-		input += "username=" + username + "\n"
-	}
-	cmd.Stdin = strings.NewReader(input + "\n")
-	output, err := cmd.Output()
-	if err != nil {
-		if ctx.Err() != nil {
-			return "", fmt.Errorf("git credential lookup: %w", ctx.Err())
-		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			diagnostic := strings.TrimSpace(string(exitErr.Stderr))
-			if (strings.HasPrefix(diagnostic, "fatal: could not read Username for '") ||
-				strings.HasPrefix(diagnostic, "fatal: could not read Password for '")) &&
-				strings.HasSuffix(diagnostic, "': terminal prompts disabled") && !strings.ContainsAny(diagnostic, "\r\n") {
-				debuglog.Printf("Git credential lookup returned no credential")
-				return "", nil
-			}
-			return "", fmt.Errorf("git credential lookup failed (exit %d)", exitErr.ExitCode())
-		}
-		return "", fmt.Errorf("run Git credential lookup: %w", err)
-	}
-	for line := range strings.SplitSeq(string(output), "\n") {
-		if token, ok := strings.CutPrefix(line, "password="); ok {
-			if token == "" || strings.ContainsAny(token, "\r\x00") {
-				return "", errors.New("git credential helper returned an invalid token")
-			}
-			return token, nil
-		}
-	}
-	return "", errors.New("git credential helper returned no password")
-}
-
-// resolveTokenCreds returns a fixed token provider after validating
+// resolveEnvTokenCreds returns a fixed ENTIRE_TOKEN provider after validating
 // its control-plane audience against the target cluster. Split out of
 // resolveCreds with explicit clusterHost/cacheDir params (no os.Getenv /
 // userdirs.Cache globals) so the trust gate below is unit-testable against a
 // fake well-known server.
 //
-// SECURITY: coreURL is derived from the token's *unverified* aud claim, and
+// SECURITY: coreURL is derived from the env token's *unverified* aud claim, and
 // we confirm the core is one the target cluster actually advertises — anchored
 // to the clone URL's host the user typed (TLS to its
 // /.well-known/entire-cluster.json), not to the token's own claims.
@@ -506,10 +425,10 @@ func gitCredentialToken(ctx context.Context, repoURL *url.URL) (string, error) {
 // is no longer authenticated, so a MITM could advertise an attacker host as a
 // trusted core. Do not combine ENTIRE_TOKEN with ENTIRE_TLS_SKIP_VERIFY in
 // CI / workload environments.
-func resolveTokenCreds(ctx context.Context, token, source, clusterHost, cacheDir string, httpClient *http.Client) (credentialProvider, func(), error) {
-	coreURL, err := auth.CoreURLFromToken(token, source)
+func resolveEnvTokenCreds(ctx context.Context, envToken, clusterHost, cacheDir string, httpClient *http.Client) (credentialProvider, func(), error) {
+	coreURL, err := auth.CoreURLFromEnvToken(envToken)
 	if err != nil {
-		return nil, nil, err //nolint:wrapcheck // CoreURLFromToken already identifies the token source in its user-facing error
+		return nil, nil, err //nolint:wrapcheck // CoreURLFromEnvToken already returns a user-facing, ENTIRE_TOKEN-prefixed error
 	}
 	cluster, err := clusterdiscovery.ResolveClusterCores(ctx, cacheDir, clusterHost, httpClient, debuglog.Printf)
 	if err != nil {
@@ -517,12 +436,12 @@ func resolveTokenCreds(ctx context.Context, token, source, clusterHost, cacheDir
 	}
 	if !coreTrusted(coreURL, cluster.CoreURLs) {
 		return nil, nil, fmt.Errorf("%s aud %q is not a trusted login server for cluster %s (advertised: %s); the token belongs to a different cluster",
-			source, coreURL, clusterHost, strings.Join(cluster.CoreURLs, ", "))
+			auth.EnvTokenVar, coreURL, clusterHost, strings.Join(cluster.CoreURLs, ", "))
 	}
-	debuglog.Printf("auth: %s bearer (core=%s)", source, coreURL)
-	provider := func(context.Context) (string, error) { return token, nil }
+	debuglog.Printf("auth: %s bearer (core=%s)", auth.EnvTokenVar, coreURL)
+	provider := func(context.Context) (string, error) { return envToken, nil }
 	onUnauthorized := func() {
-		debuglog.Printf("data plane rejected static %s bearer; transport will retry once with the configured token", source)
+		debuglog.Printf("data plane rejected static %s bearer; transport will retry once with the configured token", auth.EnvTokenVar)
 	}
 	return provider, onUnauthorized, nil
 }

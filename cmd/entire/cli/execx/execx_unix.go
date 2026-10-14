@@ -24,9 +24,7 @@ func killProcessGroupOnCancel(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	// Setsid already makes the child a process-group leader. Combining it
-	// with Setpgid fails at exec, so reuse that group for detached commands.
-	cmd.SysProcAttr.Setpgid = !cmd.SysProcAttr.Setsid
+	cmd.SysProcAttr.Setpgid = true
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil

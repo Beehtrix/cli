@@ -306,16 +306,6 @@ ENTIRE_TOKEN=<login-or-sa-session-JWT> entire ...
 
 `ENTIRE_TOKEN` bypasses stored credentials; the CLI derives the control-plane endpoint from the token itself. Nothing is written to disk. This is the right path for CI pipelines and service accounts.
 
-### Git credential helpers
-
-`git-remote-entire` also accepts tokens from Git's configured `credential.helper`. When `ENTIRE_TOKEN` is unset, it calls `git credential fill` with `protocol=entire`, the original cluster host (including its port), the repository path without its leading slash, and the username only if supplied in the URL. Otherwise Git's configuration and credential helpers select the username. It uses the returned password as its bearer token, after the same cluster trust checks used for `ENTIRE_TOKEN`. There is no HTTPS URL translation or agent-side token exchange.
-
-For CI, set `ENTIRE_GIT_NO_LOGIN_FALLBACK=true` in the job environment. If Git supplies no usable credential, the operation fails without reading saved login credentials. Unset or `false` preserves saved-login fallback for interactive users. Invalid boolean values, including an empty value, fail closed when `ENTIRE_TOKEN` is unset. `ENTIRE_TOKEN`, including a set-but-empty value, always takes precedence.
-
-A CI credential helper should return both `username` and `password` on success, with the minted token in `password`, and return `quit=true` when minting fails. Git can report a silently failing helper, a partial credential or an explicitly expired credential as merely missing credentials. Without `ENTIRE_GIT_NO_LOGIN_FALLBACK=true`, that result permits saved-login fallback. Keep personal logins off CI runners. Use a helper appropriate for secret storage or on-demand minting; Git's `store` helper writes credentials in plaintext.
-
-The lookup is non-interactive and has a 30-second timeout. Explicit helper refusal, other lookup failures and invalid tokens returned by a successful lookup fail rather than falling back to another identity. Cancellation terminates the subprocess group on Unix. Windows retains direct-child cancellation, so descendants can survive; the wait for inherited pipes is bounded. The token is read once per remote-helper invocation; mint a fresh token for later Git operations as needed. The remote helper does not approve, store or erase Git credentials.
-
 > **Seeing `save login` / `failed to unlock correct collection` errors from `entire login`?** That's the OS keyring being unavailable — use one of the two paths above.
 
 ## Commands Reference
@@ -535,7 +525,9 @@ Personal overrides, gitignored by default:
 | `summary_generation.provider`             | e.g. `claude-code`, `codex`, `pi`            | Which agent generates summaries (defaults to Claude)                              |
 | `summary_generation.model`                | provider-specific model hint                 | Model hint for summary generation (requires `provider`)                            |
 | `summary_timeout_seconds`                 | seconds                                      | Hard deadline for `entire checkpoint explain --generate`. Unset or `0` means **no deadline** |
-| `redaction.*`                             | nested object                                | PII redaction, custom secret patterns, scanner engines, and the OpenAI Privacy Filter — documented in [docs/security-and-privacy.md](docs/security-and-privacy.md) |
+| `redaction.*`                             | nested object                                | PII redaction, custom secret patterns, and scanner engines — documented in [docs/security-and-privacy.md](docs/security-and-privacy.md) |
+
+> **Deprecated:** the OpenAI Privacy Filter (`redaction.openai_privacy_filter`) is deprecated and will be removed in a future release. Existing configurations keep working until then, but don't enable it in new setups.
 
 ### Agent Hook Configuration
 
@@ -669,7 +661,7 @@ Two exceptions to field-by-field merging:
 
 Entire automatically redacts detected secrets (API keys, tokens, credentials) from transcripts and metadata before writing a checkpoint, but redaction is best-effort.
 
-Older Entire versions also kept local `entire/<commit>-<worktree>` shadow branches whose code-file snapshots were raw blobs of your working tree. Current versions no longer create them, but do not delete leftover ones automatically: `entire doctor` reports them and `entire doctor --force` deletes them, leaving pending agent work alone (plain `entire clean` would also clear the session state that records it). `entire disable --uninstall` deletes the `entire/<commit>-<worktree>` form too, and lists any oldest-form `entire/<commit>` branches without deleting them, since a branch of yours named after a short SHA looks the same; `entire clean --all` covers that form after you confirm. See [docs/security-and-privacy.md](docs/security-and-privacy.md) for the full picture, including the configurable scanner layers, opt-in PII redaction, and the OpenAI Privacy Filter pass.
+Older Entire versions also kept local `entire/<commit>-<worktree>` shadow branches whose code-file snapshots were raw blobs of your working tree. Current versions no longer create them, but do not delete leftover ones automatically: `entire doctor` reports them and `entire doctor --force` deletes them, leaving pending agent work alone (plain `entire clean` would also clear the session state that records it). `entire disable --uninstall` deletes the `entire/<commit>-<worktree>` form too, and lists any oldest-form `entire/<commit>` branches without deleting them, since a branch of yours named after a short SHA looks the same; `entire clean --all` covers that form after you confirm. See [docs/security-and-privacy.md](docs/security-and-privacy.md) for the full picture, including the configurable scanner layers and opt-in PII redaction.
 
 ## Troubleshooting
 
