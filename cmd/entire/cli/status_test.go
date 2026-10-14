@@ -1937,9 +1937,9 @@ func TestRunStatusJSON_SecretScanners(t *testing.T) {
 // the outdated Task/TodoWrite matchers, `entire status --json` reports the agent
 // under hooks_outdated so scripts/agents can detect the drift.
 func TestRunStatusJSON_HooksOutdated(t *testing.T) {
-	dir := setupTestRepo(t)
+	setupTestRepo(t)
 	writeSettings(t, testSettingsEnabled)
-	writeStaleClaudeHookSettings(t, dir)
+	writeOutdatedClaudeHooks(t)
 
 	var stdout bytes.Buffer
 	if err := runStatus(context.Background(), &stdout, false, true); err != nil {
@@ -1952,6 +1952,49 @@ func TestRunStatusJSON_HooksOutdated(t *testing.T) {
 	}
 	if !slices.Contains(result.HooksOutdated, "claude-code") {
 		t.Errorf("Expected hooks_outdated to contain 'claude-code', got %v", result.HooksOutdated)
+	}
+}
+
+// TestRunStatus_HooksOutdatedPointsToDoctor: `entire enable --force` rebuilds
+// every Entire hook and drops the timeouts and fields the user set on them, while
+// doctor repairs what it can in place and names the fix for the rest.
+func TestRunStatus_HooksOutdatedPointsToDoctor(t *testing.T) {
+	setupTestRepo(t)
+	writeSettings(t, testSettingsEnabled)
+	writeOutdatedClaudeHooks(t)
+
+	var stdout bytes.Buffer
+	if err := runStatus(context.Background(), &stdout, false, false); err != nil {
+		t.Fatalf("runStatus() error = %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "hooks out of date · run 'entire doctor'") {
+		t.Errorf("status output does not point outdated hooks to doctor:\n%s", out)
+	}
+	if strings.Contains(out, "enable --force") {
+		t.Errorf("status output suggests enable --force:\n%s", out)
+	}
+}
+
+// writeOutdatedClaudeHooks writes Claude Code hooks under the retired
+// Task/TodoWrite matchers.
+func writeOutdatedClaudeHooks(t *testing.T) {
+	t.Helper()
+	if err := os.MkdirAll(".claude", 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	stale := `{
+  "hooks": {
+    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "entire hooks claude-code stop"}]}],
+    "PreToolUse": [{"matcher": "Task", "hooks": [{"type": "command", "command": "entire hooks claude-code pre-task"}]}],
+    "PostToolUse": [
+      {"matcher": "Task", "hooks": [{"type": "command", "command": "entire hooks claude-code post-task"}]},
+      {"matcher": "TodoWrite", "hooks": [{"type": "command", "command": "entire hooks claude-code post-todo"}]}
+    ]
+  }
+}`
+	if err := os.WriteFile(".claude/settings.json", []byte(stale), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
 	}
 }
 
