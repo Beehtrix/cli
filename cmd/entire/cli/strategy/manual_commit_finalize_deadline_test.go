@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -139,6 +140,22 @@ func TestFinalizeAllTurnCheckpoints_Deadline(t *testing.T) {
 			return ctx.Err()
 		}
 	}
+	// The first fetch succeeds; the second hangs like a stalled remote until
+	// the turn-end deadline ends it. The fallback fails the test instead of
+	// hanging it if finalize stops honouring the deadline.
+	stallOnSecond := func(f *finalizeFixture, _ context.CancelFunc, call int) checkpoint.RefFetchFunc {
+		return func(ctx context.Context, refName plumbing.ReferenceName) error {
+			if call == 1 {
+				return f.restore(refName)
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(10 * time.Second):
+				return errors.New("fetch outlived the turn-end deadline")
+			}
+		}
+	}
 	// A slow-but-alive remote: every fetch succeeds after a delay.
 	slow := func(f *finalizeFixture, _ context.CancelFunc, _ int) checkpoint.RefFetchFunc {
 		return func(_ context.Context, refName plumbing.ReferenceName) error {
@@ -160,6 +177,7 @@ func TestFinalizeAllTurnCheckpoints_Deadline(t *testing.T) {
 		{name: "future_deadline", deadline: func() time.Time { return time.Now().Add(time.Minute) }, fetch: immediate, finalized: 3, fetches: 3},
 		{name: "slow_fetches_without_deadline", deadline: noFinalizeDeadline, fetch: slow, finalized: 3, fetches: 3},
 		{name: "deadline_passed_before_network", deadline: func() time.Time { return time.Now().Add(-time.Second) }, fetch: immediate, finalized: 0, fetches: 0, degraded: true},
+		{name: "deadline_expires_mid_loop", deadline: func() time.Time { return time.Now().Add(time.Second) }, fetch: stallOnSecond, finalized: 1, fetches: 2, degraded: true},
 		{name: "context_ends_mid_loop", deadline: noFinalizeDeadline, fetch: cancelOnSecond, finalized: 1, fetches: 2, degraded: true},
 		{name: "parent_canceled_before_start", deadline: noFinalizeDeadline, cancelBefore: true, fetch: immediate, finalized: 0, fetches: 0, degraded: true},
 	} {
@@ -188,7 +206,7 @@ func TestFinalizeAllTurnCheckpoints_Deadline(t *testing.T) {
 			state, err := LoadSessionState(context.Background(), f.state.SessionID)
 			require.NoError(t, err)
 			require.Equal(t, tc.degraded, state.CaptureDegradedAt != nil, "capture degradation")
-			require.Equal(t, len(f.checkpointIDs)-tc.finalized, errCount)
+			require.Zero(t, errCount, "an interruption is reported as capture degradation, not as errors")
 			require.Equal(t, tc.fetches, fetches, "no fetch may start once the context has ended")
 			require.Empty(t, state.TurnCheckpointIDs, "turn start clears the IDs anyway; nothing retries them")
 			f.requireTranscripts(t, tc.finalized)

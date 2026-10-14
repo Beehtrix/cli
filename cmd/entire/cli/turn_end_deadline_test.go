@@ -39,6 +39,11 @@ func TestTurnEndBudgetLedger(t *testing.T) {
 	for _, name := range agent.List() {
 		ag, err := agent.Get(name)
 		require.NoError(t, err)
+		// External agents always take the default (no protocol field carries a
+		// hook timeout), and other tests in this package register them globally.
+		if _, external := ag.(agent.CapabilityDeclarer); external {
+			continue
+		}
 		_, declares := agent.AsTurnEndBudgeter(ag)
 		reason, listed := turnEndBudgetFallbacks[name]
 		switch {

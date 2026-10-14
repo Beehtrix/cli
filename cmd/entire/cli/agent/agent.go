@@ -589,7 +589,9 @@ type TurnEndBudgeter interface {
 
 	// TurnEndBudget returns how long the turn-end hook may run, measured from
 	// process start, leaving headroom for the work after finalization. Derive
-	// it from the hook timeout with TurnEndBudgetWithin.
+	// it from the hook timeout with TurnEndBudgetWithin. Zero means no time to
+	// finalize, so Entire skips it; unlike SessionEndBudget, it never means
+	// unbounded.
 	TurnEndBudget() time.Duration
 }
 
