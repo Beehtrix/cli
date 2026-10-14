@@ -68,8 +68,12 @@ func (a *AntigravityAgent) GenerateText(ctx context.Context, prompt string, mode
 		output, err = streamResultResponse(output)
 	}
 	if err != nil {
+		// A sign-in failure shows on stderr ("Authentication required" in text
+		// mode, lowercase in stream-json) and in the result event's error
+		// ("authentication failed or timed out"), which only err carries.
+		failure := strings.ToLower(capturedStderr + "\n" + err.Error())
 		switch {
-		case strings.Contains(strings.ToLower(capturedStderr), "authentication required"):
+		case strings.Contains(failure, "authentication required"), strings.Contains(failure, "authentication failed"):
 			err = fmt.Errorf("%w: agy runs summaries with an isolated home so your agy settings, hooks, and MCP servers are not loaded; only its sign-in is carried over (the OS keyring, its file token, application-default credentials, or Gemini API-key mode), and none of them authenticated. Run `agy` to sign in again, or choose another summary provider", err)
 		case strings.Contains(capturedStderr, "input-format"):
 			err = fmt.Errorf("%w: summaries need agy 1.1.15 or newer, which reads the prompt from stdin (--input-format stream-json); run `agy update`", err)

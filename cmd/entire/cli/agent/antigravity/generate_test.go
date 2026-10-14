@@ -175,21 +175,23 @@ func TestGenerateText_SignInFailureNamesTheIsolation(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses sh to fake agy")
 	}
-	// Text print mode and stream-json mode word the failure differently
-	// (observed live on agy 1.3.3).
-	for _, stderr := range []string{
-		"Authentication required. Please visit the URL to log in:",
-		"Error: authentication required. Run 'agy' to log in, then retry.",
+	// Text print mode and stream-json mode word the failure differently on
+	// stderr (observed live on agy 1.3.3), and stream-json also reports it in
+	// the result event, which must be enough on its own.
+	for name, script := range map[string]string{
+		"text mode stderr":   `echo "Authentication required. Please visit the URL to log in:" >&2; exit 1`,
+		"stream-json stderr": `echo "Error: authentication required. Run 'agy' to log in, then retry." >&2; exit 1`,
+		"result event only":  `cat >/dev/null; printf '{"event":"result","result":{"status":"ERROR","response":"","error":"authentication failed or timed out"}}\n'`,
 	} {
 		a := newTestTextGenerator(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-			return exec.CommandContext(ctx, "sh", "-c", `echo "$1" >&2; exit 1`, "sh", stderr)
+			return exec.CommandContext(ctx, "sh", "-c", script)
 		})
 		_, err := a.GenerateText(t.Context(), "prompt", "")
 		if err == nil {
-			t.Fatalf("GenerateText succeeded for %q; want the sign-in failure", stderr)
+			t.Fatalf("%s: GenerateText succeeded; want the sign-in failure", name)
 		}
 		if !strings.Contains(err.Error(), "isolated home") {
-			t.Errorf("error for %q does not explain the isolated home: %v", stderr, err)
+			t.Errorf("%s: error does not explain the isolated home: %v", name, err)
 		}
 	}
 }
