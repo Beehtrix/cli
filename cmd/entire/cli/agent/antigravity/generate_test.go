@@ -3,6 +3,7 @@ package antigravity
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,6 +110,27 @@ func TestGenerateText_ReportsStreamResultFailures(t *testing.T) {
 				t.Fatalf("GenerateText error = %v, want one naming %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// A result-event failure arrives with exit 0; what agy printed to stderr must
+// still reach TextGenerationError.Stderr, which `entire explain` shows.
+func TestGenerateText_KeepsStderrForResultEventFailures(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sh to fake agy")
+	}
+	a := newTestTextGenerator(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", `cat >/dev/null; echo "model overloaded" >&2
+printf '{"event":"result","result":{"status":"ERROR","response":"","error":"turn failed"}}\n'`)
+	})
+	_, err := a.GenerateText(t.Context(), "prompt", "")
+	var genErr *agent.TextGenerationError
+	if !errors.As(err, &genErr) {
+		t.Fatalf("GenerateText error = %v, want a *agent.TextGenerationError", err)
+	}
+	if genErr.Stderr != "model overloaded" {
+		t.Fatalf("TextGenerationError.Stderr = %q, want agy's stderr", genErr.Stderr)
 	}
 }
 
