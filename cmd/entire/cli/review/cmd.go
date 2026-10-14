@@ -1631,12 +1631,12 @@ func userMessageAlreadyPrinted(err error) bool {
 	return errors.As(err, &printed) && printed.AlreadyPrinted()
 }
 
-// combinedReviewNarratives joins the reviewers' narratives into one document,
-// used as the trail-posting body for single-reviewer runs (which have no
-// synthesized verdict) and as a fallback when synthesis produced nothing.
-func combinedReviewNarratives(summary reviewtypes.RunSummary) string {
+// combinedReviewNarratives joins the given reviewers' narratives into one
+// document, the trail-posting body for reviewers that did not honor the JSON
+// contract.
+func combinedReviewNarratives(runs []reviewtypes.AgentRun) string {
 	var b strings.Builder
-	for _, run := range usableAgentRuns(summary) {
+	for _, run := range runs {
 		narrative, _, _ := splitTrailJSON(joinAssistantText(run.Buffer))
 		if narrative == "" {
 			continue

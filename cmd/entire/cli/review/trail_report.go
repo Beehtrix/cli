@@ -39,9 +39,9 @@ type TrailLocation struct {
 	SelectedText string `json:"selected_text,omitempty"`
 }
 
-// TrailReport is what a trail-mode run posts: structured comments when the
-// review honored the JSON contract, otherwise its prose with any contract
-// line removed. Exactly one of the two is set.
+// TrailReport is what a trail-mode run posts: structured comments from
+// reviews that honored the JSON contract, and the prose, with any contract
+// line removed, of those that did not. At least one of the two is set.
 type TrailReport struct {
 	Comments []TrailComment
 	Prose    string
@@ -55,43 +55,58 @@ type TrailReport struct {
 func trailReportFor(summary reviewtypes.RunSummary, aggregateOutput string) (TrailReport, bool) {
 	if verdict := strings.TrimSpace(aggregateOutput); verdict != "" {
 		prose, comments, ok := splitTrailJSON(verdict)
-		if prose == "" {
-			prose = verdict
-		}
 		if !ok || (len(comments) == 0 && proseReportsFindings(prose)) {
+			if prose == "" {
+				// A JSON-only reply without a summary has no prose of its own.
+				prose = combinedReviewNarratives(usableAgentRuns(summary))
+			}
 			return TrailReport{Prose: prose}, true
 		}
 		return TrailReport{Comments: comments}, len(comments) > 0
 	}
 	var merged []TrailComment
+	var unstructured []reviewtypes.AgentRun
 	for _, run := range usableAgentRuns(summary) {
-		prose, comments, ok := splitTrailJSON(finalMessageText(run.Buffer))
+		prose, comments, ok := splitTrailJSON(reportText(run.Buffer))
 		if !ok || (len(comments) == 0 && proseReportsFindings(prose)) {
-			return TrailReport{Prose: combinedReviewNarratives(summary)}, true
+			unstructured = append(unstructured, run)
+			continue
 		}
 		merged = append(merged, comments...)
 	}
-	return TrailReport{Comments: merged}, len(merged) > 0
+	report := TrailReport{Comments: merged, Prose: combinedReviewNarratives(unstructured)}
+	return report, len(merged) > 0 || len(unstructured) > 0
 }
 
-// finalMessageText returns the text a reviewer produced after its last tool
-// call: the report the output format governs. Earlier text is exploration
-// narration, whose bullets ("I'll check:\n- retry.go") are not findings.
-func finalMessageText(buf []reviewtypes.Event) string {
-	start := 0
-	for i, ev := range buf {
-		if _, ok := ev.(reviewtypes.ToolCall); ok {
-			start = i + 1
+// reportText returns a reviewer's report: the last stretch of text between
+// tool calls that ends with a valid contract line, or "" if none does. It is
+// found by the contract line rather than by position, so a tool call after
+// the report does not hide it, and earlier exploration narration, whose
+// bullets ("I'll check:\n- retry.go") are not findings, is left out.
+func reportText(buf []reviewtypes.Event) string {
+	end := len(buf)
+	for i := len(buf) - 1; i >= -1; i-- {
+		if i >= 0 {
+			if _, ok := buf[i].(reviewtypes.ToolCall); !ok {
+				continue
+			}
 		}
+		text := joinAssistantText(buf[i+1 : end])
+		if _, _, ok := splitTrailJSON(text); ok {
+			return text
+		}
+		end = i
 	}
-	return joinAssistantText(buf[start:])
+	return ""
 }
 
-// splitTrailJSON separates a trailing JSON object (one line, a fenced block,
-// or a pretty-printed block) from the prose before it. Any trailing JSON
-// object is removed from prose so it is never posted as finding text; a
-// JSON-only reply contributes its summary as the prose instead. ok reports a
-// valid contract: a "comments" array. Entries without a body are dropped.
+// splitTrailJSON separates a trailing contract-shaped JSON object (one line,
+// a fenced block, or a pretty-printed block, with a "summary" or "comments"
+// key) from the prose before it, so a malformed contract is never posted as
+// finding text. Other trailing JSON, such as a config snippet quoted as
+// evidence, stays in the prose. A JSON-only reply contributes its summary as
+// the prose instead. ok reports a valid contract: a "comments" array.
+// Entries without a body are dropped.
 func splitTrailJSON(text string) (prose string, comments []TrailComment, ok bool) {
 	text = strings.TrimSpace(text)
 	lines := strings.Split(text, "\n")
@@ -107,6 +122,11 @@ func splitTrailJSON(text string) (prose string, comments []TrailComment, ok bool
 		var payload map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(strings.Join(lines[start:end], "\n")), &payload); err != nil {
 			continue
+		}
+		_, hasSummary := payload["summary"]
+		_, hasComments := payload["comments"]
+		if !hasSummary && !hasComments {
+			break
 		}
 		proseEnd := start
 		if fenced && proseEnd > 0 && strings.HasPrefix(strings.TrimSpace(lines[proseEnd-1]), "```") {
@@ -162,8 +182,8 @@ func proseReportsFindings(prose string) bool {
 			return true
 		}
 		lower := strings.ToLower(trimMarkdownEmphasis(trimmed))
-		if after, found := strings.CutPrefix(lower, "verdict:"); found {
-			lower = trimMarkdownEmphasis(after)
+		if after, found := strings.CutPrefix(lower, "verdict"); found {
+			lower = trimMarkdownEmphasis(strings.TrimLeft(after, ":-—– "))
 		}
 		if startsWithSeverityMarker(lower) {
 			return true

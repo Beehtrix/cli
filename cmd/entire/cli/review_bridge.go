@@ -60,10 +60,6 @@ func postReviewToTrail(ctx context.Context, out io.Writer, profileName string, r
 		return errors.New("no review output to post")
 	}
 	inputs := reviewTrailFindingInputs(profileName, report)
-	if len(inputs) == 0 {
-		fmt.Fprintln(out, "Nothing to report, so nothing was posted to the trail.")
-		return nil
-	}
 	return runAuthenticatedTrailAPI(ctx, out, false, "", func(ctx context.Context, client *api.Client, repoID string) error {
 		target, err := resolveTrailReviewTarget(ctx, client, repoID, "", "", "")
 		if err != nil {
@@ -93,17 +89,17 @@ func postReviewToTrail(ctx context.Context, out io.Writer, profileName string, r
 // markdown bullets, which keeps custom judge prompts that ignore the JSON
 // contract structurally correct.
 func reviewTrailFindingInputs(profileName string, report cliReview.TrailReport) []api.TrailReviewCommentInput {
-	if len(report.Comments) > 0 {
-		return reviewTrailFindingInputsFromComments(report.Comments)
-	}
+	inputs := reviewTrailFindingInputsFromComments(report.Comments)
 	verdict := report.Prose
+	if strings.TrimSpace(verdict) == "" {
+		return inputs
+	}
 	items := splitReviewVerdictFindings(verdict)
 	if len(items) == 0 {
 		// The verdict spans the whole change, so it uses "verdict" kind:
 		// the API requires a valid granularity and rejects an empty value.
-		return []api.TrailReviewCommentInput{reviewTrailFindingInputWithKind(profileName, verdict, "verdict")}
+		return append(inputs, reviewTrailFindingInputWithKind(profileName, verdict, "verdict"))
 	}
-	inputs := make([]api.TrailReviewCommentInput, 0, len(items))
 	for _, item := range items {
 		input := reviewTrailFindingInputWithKind(profileName, item, "finding")
 		enrichReviewTrailFindingInputFromMarkdown(&input, item)

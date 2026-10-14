@@ -62,9 +62,27 @@ func buildEventLines(buffer []reviewtypes.Event, maxWidth int) []string {
 		return nil
 	}
 	out := make([]string, 0, len(buffer))
+	// Streamed deltas join into one text before wrapping, so a fragment is
+	// not a line, and the trail contract line is hidden as in other sinks.
+	var text strings.Builder
+	flushText := func() {
+		if text.Len() > 0 {
+			out = append(out, eventLines(reviewtypes.AssistantText{Text: stripTrailJSON(text.String())}, maxWidth)...)
+			text.Reset()
+		}
+	}
 	for _, ev := range buffer {
+		if at, ok := ev.(reviewtypes.AssistantText); ok {
+			if !at.Delta {
+				flushText()
+			}
+			text.WriteString(at.Text)
+			continue
+		}
+		flushText()
 		out = append(out, eventLines(ev, maxWidth)...)
 	}
+	flushText()
 	return out
 }
 

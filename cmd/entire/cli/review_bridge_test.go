@@ -110,6 +110,7 @@ func TestReviewTrailFindingInputsSplitsTopLevelMarkedFindings(t *testing.T) {
 }
 
 func TestReviewTrailFindingInputsMapsStructuredComments(t *testing.T) {
+	t.Parallel()
 	confidence, lowConfidence := 0.92, 0.7
 	report := cliReview.TrailReport{Comments: []cliReview.TrailComment{
 		{Severity: "high", Confidence: &confidence, Body: "`daytona.ts` rejects public repos without a token; allow public clones or mint a token.", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "daytona.ts", StartLine: 901, SelectedText: "return err"}},
