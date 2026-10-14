@@ -338,9 +338,16 @@ func toolResultText(content json.RawMessage) string {
 	return ""
 }
 
-// extractAgentIDFromText extracts an agent ID from text containing "agentId: <id>".
+// extractAgentIDFromText extracts the agent ID from the last "agentId: <id>"
+// in text: Claude Code appends it as a trailer, and the report before it may
+// quote other agents' IDs.
 func extractAgentIDFromText(text string) string {
-	return extractIDAfter(text, "agentId: ", false)
+	const prefix = "agentId: "
+	idx := strings.LastIndex(text, prefix)
+	if idx == -1 {
+		return ""
+	}
+	return extractIDAfter(text[idx:], prefix, false)
 }
 
 // extractIDAfter extracts the identifier following the first occurrence of

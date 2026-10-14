@@ -429,6 +429,11 @@ func TestExtractAgentIDFromText(t *testing.T) {
 			text:     "agentId: xyz9999\nMore text",
 			expected: "xyz9999",
 		},
+		{
+			name:     "report quotes another agent before the trailer",
+			text:     "The log said agentId: aquoted1 earlier.\nagentId: atrailer2 (use SendMessage with to: 'atrailer2')",
+			expected: "atrailer2",
+		},
 	}
 
 	for _, tt := range tests {
