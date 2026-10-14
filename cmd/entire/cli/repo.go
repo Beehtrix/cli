@@ -12,6 +12,7 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/gitremote"
 	"github.com/entireio/cli/cmd/entire/cli/interactive"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/internal/coreapi"
 )
 
@@ -531,6 +532,12 @@ func newRepoViewCmd() *cobra.Command {
 // Keep Entire clone URLs intact so the normal view path selects the login
 // server fronting that cluster, including origins in another federation.
 func currentRepoViewRef(ctx context.Context) (string, error) {
+	if _, err := paths.WorktreeRoot(ctx); err != nil {
+		if errors.Is(err, paths.ErrNotARepository) {
+			return "", fmt.Errorf("not in a git repository; pass /gh/<owner>/<repo> or /et/<project>/<repo> explicitly: %w", err)
+		}
+		return "", fmt.Errorf("resolve current git repository: %w", err)
+	}
 	remoteURL, err := gitremote.GetRemoteURL(ctx, "origin")
 	if err != nil {
 		return "", fmt.Errorf("%w; pass /gh/<owner>/<repo> or /et/<project>/<repo> explicitly", err)
@@ -538,14 +545,14 @@ func currentRepoViewRef(ctx context.Context) (string, error) {
 	if strings.HasPrefix(strings.ToLower(remoteURL), entireCloneURLScheme) {
 		return remoteURL, nil
 	}
-	info, err := gitremote.ParseURL(remoteURL)
+	forge, owner, repo, err := gitremote.ResolveRemoteRepo(ctx, "origin")
 	if err != nil {
-		return "", fmt.Errorf("parse origin remote: %w", err)
+		return "", fmt.Errorf("resolve origin remote: %w", err)
 	}
-	if info.Forge != mirrorCloneForge {
+	if forge != mirrorCloneForge {
 		return "", errors.New("origin must name a GitHub or Entire repository; pass a /gh/ or /et/ repository reference explicitly")
 	}
-	return "/gh/" + info.Owner + "/" + info.Repo, nil
+	return "/gh/" + owner + "/" + repo, nil
 }
 
 // repoVisibility is the field/JSON view shared by `visibility get` and

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/entireio/cli/internal/coreapi"
 	"github.com/stretchr/testify/assert"
@@ -28,10 +29,8 @@ func TestRepoViewCoords_MirrorSelectsProcessingPlacement(t *testing.T) {
 		placementFixture{id: "mirror-eu", slug: euClusterSlug},
 	)
 
-	repoID, apiURL, ok := repoViewCoords(entry, clustersWithSlugs())
-	if !ok {
-		t.Fatal("expected coords for an onboarded repo")
-	}
+	repoID, apiURL, err := repoViewCoords(entry, clustersWithSlugs())
+	require.NoError(t, err)
 	if repoID != "mirror-eu" {
 		t.Fatalf("repoID = %q, want mirror-eu (the processing placement)", repoID)
 	}
@@ -46,14 +45,21 @@ func TestRepoViewCoords_NotOnboardedYieldsNoCoords(t *testing.T) {
 		placementFixture{id: "mirror-us", slug: usClusterSlug},
 	)
 
-	if _, _, ok := repoViewCoords(entry, clustersWithSlugs()); ok {
-		t.Fatal("expected no coords for an entry with no processing primary")
-	}
+	_, _, err := repoViewCoords(entry, clustersWithSlugs())
+	require.ErrorIs(t, err, errRepoNotOnboarded)
 }
 
 func TestRepoViewCoords_Unresolved(t *testing.T) {
 	t.Parallel()
-	for _, scenario := range []string{"candidate", "missing primary", "failed", "suspended", "missing cluster", "missing api URL", "missing jurisdiction"} {
+	for scenario, wantError := range map[string]string{
+		"candidate":            "not onboarded",
+		"missing primary":      "not in the repo's placement list",
+		"failed":               "processing placement is failed",
+		"suspended":            "processing placement is suspended",
+		"missing cluster":      "no cluster matches",
+		"missing api URL":      "missing apiUrl/jurisdiction",
+		"missing jurisdiction": "missing apiUrl/jurisdiction",
+	} {
 		t.Run(scenario, func(t *testing.T) {
 			t.Parallel()
 			entry := repoIndexFixture("acme/widget", "mirror-eu", placementFixture{id: "mirror-eu", slug: euClusterSlug})
@@ -74,8 +80,8 @@ func TestRepoViewCoords_Unresolved(t *testing.T) {
 			case "missing jurisdiction":
 				clusters[1].Jurisdiction = ""
 			}
-			repoID, apiURL, ok := repoViewCoords(entry, clusters)
-			require.False(t, ok)
+			repoID, apiURL, err := repoViewCoords(entry, clusters)
+			require.ErrorContains(t, err, wantError)
 			require.Empty(t, repoID)
 			require.Empty(t, apiURL)
 		})
@@ -239,6 +245,22 @@ func TestNativeRepoViewJSON_CoordsOmittedWhenUnresolved(t *testing.T) {
 
 // Not parallel: each subtest changes CWD to an isolated repository.
 func TestRepoView_OriginErrors(t *testing.T) {
+	t.Run("outside a repository", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		out, _, err := runCoreCmd(t, newRepoViewCmd, "http://unused.invalid", "--json")
+		require.ErrorIs(t, err, paths.ErrNotARepository)
+		require.ErrorContains(t, err, "not in a git repository")
+		require.NotContains(t, err.Error(), `remote "origin" not found`)
+		require.Empty(t, out)
+	})
+	t.Run("repository lookup failure is preserved", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, err := currentRepoViewRef(ctx)
+		require.ErrorIs(t, err, context.Canceled)
+		require.NotErrorIs(t, err, paths.ErrNotARepository)
+	})
 	for _, origin := range []string{"", "https://gitlab.com/acme/web.git", "not-a-url", "entire://eu.entire.io/et/only-project"} {
 		t.Run(origin, func(t *testing.T) {
 			dir := t.TempDir()
@@ -251,7 +273,8 @@ func TestRepoView_OriginErrors(t *testing.T) {
 			require.Error(t, err)
 			require.Empty(t, out)
 			if origin == "" {
-				require.ErrorContains(t, err, "origin")
+				require.ErrorContains(t, err, `remote "origin" not found`)
+				require.NotErrorIs(t, err, paths.ErrNotARepository)
 			}
 		})
 	}
@@ -259,7 +282,13 @@ func TestRepoView_OriginErrors(t *testing.T) {
 
 func TestNativeRepoViewCoords_Unresolved(t *testing.T) {
 	t.Parallel()
-	for _, scenario := range []string{"missing id", "missing host", "unknown host", "missing api URL"} {
+	for scenario, wantError := range map[string]string{
+		"missing id":           "repo has no id",
+		"missing host":         "repo has no cluster host",
+		"unknown host":         "no cluster matches host",
+		"missing api URL":      "missing apiUrl/jurisdiction",
+		"missing jurisdiction": "missing apiUrl/jurisdiction",
+	} {
 		t.Run(scenario, func(t *testing.T) {
 			t.Parallel()
 			repo := &coreapi.Repo{ID: testDeleteULID, ClusterHost: coreapi.NewOptString("eu.entire.io")}
@@ -273,8 +302,11 @@ func TestNativeRepoViewCoords_Unresolved(t *testing.T) {
 				repo.ClusterHost = coreapi.NewOptString("unknown.entire.io")
 			case "missing api URL":
 				clusters[1].ApiUrl = coreapi.OptString{}
+			case "missing jurisdiction":
+				clusters[1].Jurisdiction = ""
 			}
-			repoID, apiURL := nativeRepoViewCoords(repo, clusters)
+			repoID, apiURL, err := nativeRepoViewCoords(repo, clusters)
+			require.ErrorContains(t, err, wantError)
 			require.Empty(t, repoID)
 			require.Empty(t, apiURL)
 		})

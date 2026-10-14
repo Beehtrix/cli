@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/internal/coreapi"
 )
 
@@ -529,7 +530,10 @@ func runNativeRepoView(cmd *cobra.Command, ref, clusterHost string, authoritativ
 		}
 		row := nativeRepoDetailRow(name, repo, mirrors, clusters)
 		if jsonRequested(cmd) {
-			repoID, apiURL := nativeRepoViewCoords(repo, clusters)
+			repoID, apiURL, coordErr := nativeRepoViewCoords(repo, clusters)
+			if coordErr != nil {
+				logging.Debug(ctx, "repo view: API coordinates unavailable", "error", coordErr)
+			}
 			out, jerr := nativeRepoViewJSON(repo, row, repoID, apiURL)
 			if jerr != nil {
 				return jerr
@@ -544,17 +548,12 @@ func runNativeRepoView(cmd *cobra.Command, ref, clusterHost string, authoritativ
 
 // nativeRepoViewCoords pairs the native repo ID with its home cluster's API
 // URL, using the routing resolver's catalog join without another request.
-func nativeRepoViewCoords(repo *coreapi.Repo, clusters []coreapi.Cluster) (repoID, apiURL string) {
-	repoID = strings.TrimSpace(repo.ID)
-	clusterHost := strings.TrimSpace(repo.ClusterHost.Or(""))
-	if repoID == "" || clusterHost == "" {
-		return "", ""
-	}
-	target, err := cellTargetForClusterHostInCatalog(clusters, clusterHost)
+func nativeRepoViewCoords(repo *coreapi.Repo, clusters []coreapi.Cluster) (repoID, apiURL string, err error) {
+	placement, err := nativeRepoCellPlacementInCatalog(repo, clusters)
 	if err != nil {
-		return "", ""
+		return "", "", err
 	}
-	return repoID, target.BaseURL
+	return placement.RepoID, placement.Target.BaseURL, nil
 }
 
 // nativeRepoViewJSON answers with the repo as the SERVER describes it, plus the

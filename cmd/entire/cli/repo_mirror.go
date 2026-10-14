@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/entireio/cli/cmd/entire/cli/interactive"
+	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/internal/coreapi"
 )
 
@@ -1347,7 +1348,10 @@ func runRepoMirrorViewByName(cmd *cobra.Command, ref, clusterHost string) error 
 		row := mirrorRepoDetailRow(entry, clusterHostBySlug(clusters.Clusters))
 		if jsonRequested(cmd) {
 			view := mirrorRepoViewJSON{repoDirRow: row}
-			view.RepoID, view.APIURL, _ = repoViewCoords(entry, clusters.Clusters)
+			view.RepoID, view.APIURL, err = repoViewCoords(entry, clusters.Clusters)
+			if err != nil {
+				logging.Debug(ctx, "repo view: API coordinates unavailable", "error", err)
+			}
 			return printJSON(cmd.OutOrStdout(), view)
 		}
 		renderRepoDetail(cmd.OutOrStdout(), row)
@@ -1366,16 +1370,16 @@ type mirrorRepoViewJSON struct {
 
 // repoViewCoords reuses the routing resolver's selection and catalog join.
 // Missing coordinates must not prevent viewing an unready repo's status.
-func repoViewCoords(entry coreapi.RepoIndexEntry, clusters []coreapi.Cluster) (repoID, apiURL string, ok bool) {
+func repoViewCoords(entry coreapi.RepoIndexEntry, clusters []coreapi.Cluster) (repoID, apiURL string, err error) {
 	placement, err := processingPlacementOfEntry(entry)
 	if err != nil {
-		return "", "", false
+		return "", "", err
 	}
 	target, err := cellTargetForPlacementInCatalog(clusters, placement)
 	if err != nil {
-		return "", "", false
+		return "", "", err
 	}
-	return strings.TrimSpace(placement.ID), target.BaseURL, true
+	return strings.TrimSpace(placement.ID), target.BaseURL, nil
 }
 
 // mirrorRepoDetailRow shapes one directory entry for the record view, reusing the

@@ -350,17 +350,31 @@ func resolveNativeRepoCellPlacement(ctx context.Context, project, repoName strin
 		}
 		return repoCellPlacement{}, cellPlacementError(ctx, project+"/"+repoName, fmt.Errorf("resolve native repo %s/%s: %w", project, repoName, err))
 	}
+	clusters, err := c.ListClusters(ctx)
+	if err != nil {
+		return repoCellPlacement{}, cellPlacementError(ctx, project+"/"+repoName, fmt.Errorf("list clusters: %w", err))
+	}
+	placement, err := nativeRepoCellPlacementInCatalog(repo, clusters.Clusters)
+	if err != nil {
+		return repoCellPlacement{}, cellPlacementError(ctx, project+"/"+repoName, fmt.Errorf("resolve the Entire cell for %s/%s: %w", project, repoName, err))
+	}
+	return placement, nil
+}
+
+// nativeRepoCellPlacementInCatalog keeps native view coordinates and API routing
+// on the same identity validation and home-cluster catalog join.
+func nativeRepoCellPlacementInCatalog(repo *coreapi.Repo, clusters []coreapi.Cluster) (repoCellPlacement, error) {
 	repoID := strings.TrimSpace(repo.ID)
 	if repoID == "" {
-		return repoCellPlacement{}, fmt.Errorf("resolve native repo %s/%s: repo has no id", project, repoName)
+		return repoCellPlacement{}, errors.New("repo has no id")
 	}
 	clusterHost := strings.TrimSpace(repo.ClusterHost.Or(""))
 	if clusterHost == "" {
-		return repoCellPlacement{}, &repoNotOnboardedError{inner: fmt.Errorf("resolve the Entire cell for %s/%s: repo has no cluster host", project, repoName)}
+		return repoCellPlacement{}, &repoNotOnboardedError{inner: errors.New("repo has no cluster host")}
 	}
-	target, err := cellTargetForClusterHost(ctx, c, clusterHost)
+	target, err := cellTargetForClusterHostInCatalog(clusters, clusterHost)
 	if err != nil {
-		return repoCellPlacement{}, cellPlacementError(ctx, repoID, fmt.Errorf("resolve the Entire cell for %s/%s: %w", project, repoName, err))
+		return repoCellPlacement{}, err
 	}
 	return repoCellPlacement{RepoID: repoID, Target: target}, nil
 }
