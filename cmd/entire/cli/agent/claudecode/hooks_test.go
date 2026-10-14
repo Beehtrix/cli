@@ -3,7 +3,10 @@ package claudecode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -847,6 +850,149 @@ func TestHasStaleManagedHooks_MissingTimeout(t *testing.T) {
 	if c.HasStaleManagedHooks(context.Background()) {
 		t.Error("HasStaleManagedHooks() = true after install, want false")
 	}
+}
+
+// TestHasStaleManagedHooks_FreshInstall: hooks a first install adds are new,
+// not outdated, so enable must not say it updated them.
+func TestHasStaleManagedHooks_FreshInstall(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	if (&ClaudeCodeAgent{}).HasStaleManagedHooks(context.Background()) {
+		t.Error("HasStaleManagedHooks() = true with no settings file, want false")
+	}
+}
+
+// TestRepairHookTimeouts_FillsOnlyMissingTimeouts covers the doctor repair:
+// it may only give Entire hooks their missing timeout, so the user's matcher, a
+// hook type that does not parse, and the permissions block all stay as written.
+func TestRepairHookTimeouts_FillsOnlyMissingTimeouts(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	stopCmd := agentpkg.WrapProductionSilentHookCommand("entire hooks claude-code stop")
+	writeSettingsFile(t, tempDir, fmt.Sprintf(`{
+  "permissions": {},
+  "hooks": {
+    "SessionStart": {"not": "a matcher list"},
+    "Stop": [
+      {"matcher": "", "hooks": [{"type": "command", "command": %q}]},
+      %s
+    ]
+  }
+}`, stopCmd, userStopMatcherJSON))
+
+	c := &ClaudeCodeAgent{}
+	changed, err := c.RepairHookTimeouts(context.Background())
+	if err != nil {
+		t.Fatalf("RepairHookTimeouts() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("RepairHookTimeouts() changed = false, want true")
+	}
+
+	hook, ok := lookupHook(readClaudeSettingsHooksOnly(t, tempDir, "Stop"), "", stopCmd)
+	if !ok {
+		t.Fatal("Entire Stop hook missing after repair")
+	}
+	if hook.Timeout != checkpointHookTimeoutSec {
+		t.Errorf("Stop timeout = %d, want %d", hook.Timeout, checkpointHookTimeoutSec)
+	}
+	assertUserStopMatcherIntact(t, tempDir)
+
+	raw, err := os.ReadFile(filepath.Join(tempDir, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Permissions json.RawMessage            `json:"permissions"`
+		Hooks       map[string]json.RawMessage `json:"hooks"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("failed to parse settings.json: %v", err)
+	}
+	if got := slices.Sorted(maps.Keys(parsed.Hooks)); !slices.Equal(got, []string{"SessionStart", "Stop"}) {
+		t.Errorf("hook types = %v, want only [SessionStart Stop]", got)
+	}
+	require.JSONEq(t, `{"not": "a matcher list"}`, string(parsed.Hooks["SessionStart"]), "unparseable hook type changed")
+	require.JSONEq(t, `{}`, string(parsed.Permissions), "permissions block changed")
+
+	changed, err = c.RepairHookTimeouts(context.Background())
+	if err != nil {
+		t.Fatalf("second RepairHookTimeouts() error = %v", err)
+	}
+	if changed {
+		t.Error("second RepairHookTimeouts() changed = true, want false")
+	}
+}
+
+// TestRepairHookTimeouts_NoSettingsFile: doctor runs where Claude Code was
+// never set up, and the repair must not create a config there.
+func TestRepairHookTimeouts_NoSettingsFile(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	changed, err := (&ClaudeCodeAgent{}).RepairHookTimeouts(context.Background())
+	if err != nil {
+		t.Fatalf("RepairHookTimeouts() error = %v", err)
+	}
+	if changed {
+		t.Error("RepairHookTimeouts() changed = true with no settings file")
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, ".claude")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf(".claude exists after repair with no settings file (stat err = %v)", err)
+	}
+}
+
+// TestRepairHookTimeouts_KeepsUserSetTimeout: a timeout the user chose for an
+// Entire hook is not missing, so the repair leaves the file untouched.
+func TestRepairHookTimeouts_KeepsUserSetTimeout(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	stopCmd := agentpkg.WrapProductionSilentHookCommand("entire hooks claude-code stop")
+	content := fmt.Sprintf(`{
+  "hooks": {
+    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": %q, "timeout": 300}]}]
+  }
+}`, stopCmd)
+	writeSettingsFile(t, tempDir, content)
+
+	changed, err := (&ClaudeCodeAgent{}).RepairHookTimeouts(context.Background())
+	if err != nil {
+		t.Fatalf("RepairHookTimeouts() error = %v", err)
+	}
+	if changed {
+		t.Error("RepairHookTimeouts() changed = true for a user-set timeout")
+	}
+	raw, err := os.ReadFile(filepath.Join(tempDir, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != content {
+		t.Errorf("settings.json changed:\n%s", raw)
+	}
+}
+
+// readClaudeSettingsHooksOnly parses one hook type, for files where another
+// hook type is deliberately malformed and readClaudeSettings would fail.
+func readClaudeSettingsHooksOnly(t *testing.T, dir, hookType string) []ClaudeHookMatcher {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("failed to read settings.json: %v", err)
+	}
+	var parsed struct {
+		Hooks map[string]json.RawMessage `json:"hooks"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("failed to parse settings.json: %v", err)
+	}
+	var matchers []ClaudeHookMatcher
+	if err := json.Unmarshal(parsed.Hooks[hookType], &matchers); err != nil {
+		t.Fatalf("failed to parse %s: %v", hookType, err)
+	}
+	return matchers
 }
 
 // TestCaptureHookTimeoutExceedsStatusWalkBudget keeps Claude Code from killing

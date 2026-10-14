@@ -180,6 +180,19 @@ type StaleHookReporter interface {
 	HasStaleManagedHooks(ctx context.Context) bool
 }
 
+// HookTimeoutRepairer is implemented by agents whose Entire hooks carry
+// timeouts that configs written by older CLIs lack. `entire doctor` runs the
+// repair without asking, because a user who already enabled Entire has no
+// reason to run enable again. The repair must only give Entire's own hooks a
+// missing timeout and leave everything the user chose as it is.
+type HookTimeoutRepairer interface {
+	Agent
+
+	// RepairHookTimeouts adds the missing timeouts and reports whether it
+	// rewrote the hook config. An absent config is not an error.
+	RepairHookTimeouts(ctx context.Context) (bool, error)
+}
+
 // EffectiveHookDiagnostics marks agents whose effective hook state is reported
 // by an agent-owned diagnostic surface rather than generic freshness output.
 type EffectiveHookDiagnostics interface {

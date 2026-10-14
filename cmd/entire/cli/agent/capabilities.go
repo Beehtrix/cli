@@ -82,6 +82,12 @@ func AsStaleHookReporter(ag Agent) (StaleHookReporter, bool) {
 	return builtinCapability[StaleHookReporter](ag)
 }
 
+// AsHookTimeoutRepairer returns the agent as HookTimeoutRepairer if it can
+// add the hook timeouts an older CLI wrote its config without.
+func AsHookTimeoutRepairer(ag Agent) (HookTimeoutRepairer, bool) {
+	return builtinCapability[HookTimeoutRepairer](ag)
+}
+
 // AsEffectiveHookDiagnostics returns the agent as EffectiveHookDiagnostics if
 // it owns diagnostics for its effective hook configuration.
 func AsEffectiveHookDiagnostics(ag Agent) (EffectiveHookDiagnostics, bool) {

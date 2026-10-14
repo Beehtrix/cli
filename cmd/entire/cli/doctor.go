@@ -194,6 +194,10 @@ func runSessionsFix(cmd *cobra.Command, force bool) error {
 	// Fixes rather than only reporting: what it removes is a rule Entire wrote.
 	checkRetiredDenyRule(cmd)
 
+	// Hook timeouts that configs from older CLIs lack. Fixes rather than only
+	// reporting: it only fills in a timeout on a hook Entire wrote.
+	checkHookTimeouts(cmd)
+
 	// Hooks left by removed Gemini CLI support. Fixes rather than only
 	// reporting, for the same reason: every entry it removes is Entire's own.
 	checkRetiredGeminiHooks(cmd)
@@ -1410,6 +1414,41 @@ func checkRetiredDenyRule(cmd *cobra.Command) {
 			fmt.Fprintln(w, "  command naming that path) need manual approval, and it no longer protects")
 			fmt.Fprintln(w, "  anything: the file it guarded is removed once a session is condensed.")
 			fmt.Fprintln(w, "  ✓ Fixed: rule removed (your other deny rules are untouched).")
+			fmt.Fprintln(w, "  The settings file changed — commit or revert it as you prefer.")
+		}
+	}
+}
+
+// checkHookTimeouts gives Entire's hooks the timeouts a config written by an
+// older CLI lacks, so a stalled `entire` launch cannot block the agent until
+// its own default timeout. It repairs without asking for the reason
+// checkRetiredDenyRule does: it only sets a timeout on a hook Entire wrote that
+// has none, so nothing the user chose is touched. As there, a repair error is
+// logged rather than printed.
+func checkHookTimeouts(cmd *cobra.Command) {
+	ctx := cmd.Context()
+	w := cmd.OutOrStdout()
+	for _, name := range GetAgentsWithHooksInstalled(ctx) {
+		ag, err := agent.Get(name)
+		if err != nil {
+			continue
+		}
+		repairer, ok := agent.AsHookTimeoutRepairer(ag)
+		if !ok {
+			continue
+		}
+		changed, repairErr := repairer.RepairHookTimeouts(ctx)
+		if repairErr != nil {
+			logging.Warn(ctx, "could not add missing hook timeouts",
+				slog.String("agent", string(ag.Type())),
+				slog.String("error", repairErr.Error()))
+			continue
+		}
+		if changed {
+			fmt.Fprintf(w, "%s hooks: MISSING TIMEOUTS\n", ag.Type())
+			fmt.Fprintln(w, "  Some Entire hooks had no timeout, so a stalled `entire` launch could block")
+			fmt.Fprintln(w, "  the agent until its own default timeout.")
+			fmt.Fprintln(w, "  ✓ Fixed: timeouts added (your own hooks and timeouts are untouched).")
 			fmt.Fprintln(w, "  The settings file changed — commit or revert it as you prefer.")
 		}
 	}

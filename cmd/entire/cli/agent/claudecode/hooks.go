@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"slices"
 	"strings"
@@ -238,23 +239,99 @@ func entireToolUseHookCommands() (preTask, postTask string) {
 		agent.WrapProductionSilentHookCommand("entire hooks claude-code post-task")
 }
 
-// setMissingTimeout gives every entry running command the timeout, leaving any
-// timeout the user already chose. Reports whether it changed an entry.
-func setMissingTimeout(matchers []ClaudeHookMatcher, command string, timeout int) bool {
-	if timeout == 0 {
-		return false
+// entireHookTimeouts maps each Entire hook command to its timeout. SessionEnd
+// is left out because it runs without one.
+func entireHookTimeouts() map[string]int {
+	out := make(map[string]int)
+	for _, h := range entireSimpleHooks() {
+		if h.timeout != 0 {
+			out[h.command] = h.timeout
+		}
 	}
+	preTask, postTask := entireToolUseHookCommands()
+	out[preTask] = captureHookTimeoutSec
+	out[postTask] = checkpointHookTimeoutSec
+	return out
+}
+
+// setMissingTimeout gives every Entire entry in matchers its timeout from
+// timeouts, leaving any timeout the user already chose. Reports whether it
+// changed an entry.
+func setMissingTimeout(matchers []ClaudeHookMatcher, timeouts map[string]int) bool {
 	changed := false
 	for i := range matchers {
 		for j := range matchers[i].Hooks {
 			hook := &matchers[i].Hooks[j]
-			if hook.Command == command && hook.Timeout == 0 {
+			if timeout := timeouts[hook.Command]; timeout != 0 && hook.Timeout == 0 {
 				hook.Timeout = timeout
 				changed = true
 			}
 		}
 	}
 	return changed
+}
+
+// RepairHookTimeouts implements agent.HookTimeoutRepairer. Unlike an install,
+// it adds, removes and moves no hook and rewrites only the hooks block, so
+// `entire doctor` can run it without asking. A hook type that does not parse is
+// skipped rather than rewritten.
+func (c *ClaudeCodeAgent) RepairHookTimeouts(ctx context.Context) (bool, error) {
+	cfg, err := claudeHookConfig(ctx)
+	if err != nil {
+		return false, err
+	}
+	data, err := cfg.Read()
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err //nolint:wrapcheck // agent.HookConfigFile already names the file in its error
+	}
+	var rawSettings, rawHooks map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawSettings); err != nil {
+		return false, fmt.Errorf("failed to parse %s: %w", cfg.Path(), err)
+	}
+	hooksRaw, ok := rawSettings["hooks"]
+	if !ok {
+		return false, nil
+	}
+	if err := json.Unmarshal(hooksRaw, &rawHooks); err != nil {
+		return false, fmt.Errorf("failed to parse hooks in %s: %w", cfg.Path(), err)
+	}
+
+	timeouts := entireHookTimeouts()
+	changed := false
+	for hookType := range EntireHookCommands() {
+		raw, ok := rawHooks[hookType]
+		if !ok {
+			continue
+		}
+		var matchers []ClaudeHookMatcher
+		if err := json.Unmarshal(raw, &matchers); err != nil || !setMissingTimeout(matchers, timeouts) {
+			continue
+		}
+		updated, err := jsonutil.MarshalWithNoHTMLEscape(matchers)
+		if err != nil {
+			return false, fmt.Errorf("failed to marshal %s hooks: %w", hookType, err)
+		}
+		rawHooks[hookType] = updated
+		changed = true
+	}
+	if !changed {
+		return false, nil
+	}
+
+	if rawSettings["hooks"], err = jsonutil.MarshalWithNoHTMLEscape(rawHooks); err != nil {
+		return false, fmt.Errorf("failed to marshal hooks: %w", err)
+	}
+	output, err := jsonutil.MarshalIndentWithNewline(rawSettings, "", "  ")
+	if err != nil {
+		return false, fmt.Errorf("failed to marshal settings: %w", err)
+	}
+	if err := cfg.Write(output, 0o600); err != nil {
+		return false, err //nolint:wrapcheck // agent.HookConfigFile already names the file in its error
+	}
+	return true, nil
 }
 
 // retiredPostTodoHookCommand is the post-todo command older CLIs installed.
@@ -339,6 +416,7 @@ func installHookEntries(rawHooks map[string]json.RawMessage, force bool) (count 
 	postToolUse = drop(postToolUse, postTaskCmd)
 
 	// Add hooks if they don't exist
+	timeouts := entireHookTimeouts()
 	for _, h := range simpleHooks {
 		m := simpleMatchers[h.hookType]
 		exists := hookCommandExists(m, h.command)
@@ -346,33 +424,34 @@ func installHookEntries(rawHooks map[string]json.RawMessage, force bool) (count 
 			exists = hookCommandExistsWithMatcher(m, h.matcher, h.command)
 		}
 		if !exists {
-			simpleMatchers[h.hookType] = addHookToMatcher(m, h.matcher, h.command)
+			simpleMatchers[h.hookType] = addHookToMatcher(m, h.matcher, h.command, h.timeout)
 			count++
 		}
 	}
 	if !hookCommandExistsWithMatcher(preToolUse, subagentToolMatcher, preTaskCmd) {
-		preToolUse = addHookToMatcher(preToolUse, subagentToolMatcher, preTaskCmd)
+		preToolUse = addHookToMatcher(preToolUse, subagentToolMatcher, preTaskCmd, timeouts[preTaskCmd])
 		count++
 	}
 	if !hookCommandExistsWithMatcher(postToolUse, subagentToolMatcher, postTaskCmd) {
-		postToolUse = addHookToMatcher(postToolUse, subagentToolMatcher, postTaskCmd)
+		postToolUse = addHookToMatcher(postToolUse, subagentToolMatcher, postTaskCmd, timeouts[postTaskCmd])
 		count++
 	}
 	if !hookCommandExistsWithMatcher(postToolUse, skillToolMatcher, postTaskCmd) {
-		postToolUse = addHookToMatcher(postToolUse, skillToolMatcher, postTaskCmd)
+		postToolUse = addHookToMatcher(postToolUse, skillToolMatcher, postTaskCmd, timeouts[postTaskCmd])
 		count++
 	}
 
-	// Covers the entries just added and those older CLIs wrote without one.
+	// Entries just added already carry theirs, so this only reaches entries older
+	// CLIs wrote without one.
 	for _, h := range simpleHooks {
-		if setMissingTimeout(simpleMatchers[h.hookType], h.command, h.timeout) {
+		if setMissingTimeout(simpleMatchers[h.hookType], timeouts) {
 			timeoutsSet = true
 		}
 	}
-	if setMissingTimeout(preToolUse, preTaskCmd, captureHookTimeoutSec) {
+	if setMissingTimeout(preToolUse, timeouts) {
 		timeoutsSet = true
 	}
-	if setMissingTimeout(postToolUse, postTaskCmd, checkpointHookTimeoutSec) {
+	if setMissingTimeout(postToolUse, timeouts) {
 		timeoutsSet = true
 	}
 
@@ -733,12 +812,13 @@ func hookCommandExistsWithMatcher(matchers []ClaudeHookMatcher, matcherName, com
 	return false
 }
 
-// addHookToMatcher appends command to the matcher named matcherName, creating it
-// if absent. installHookEntries sets the entry's timeout afterwards.
-func addHookToMatcher(matchers []ClaudeHookMatcher, matcherName, command string) []ClaudeHookMatcher {
+// addHookToMatcher appends command with its timeout to the matcher named
+// matcherName, creating it if absent.
+func addHookToMatcher(matchers []ClaudeHookMatcher, matcherName, command string, timeout int) []ClaudeHookMatcher {
 	entry := ClaudeHookEntry{
 		Type:    "command",
 		Command: command,
+		Timeout: timeout,
 	}
 
 	// If no matcher name, add to a matcher with empty string
