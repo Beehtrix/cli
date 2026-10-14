@@ -34,11 +34,12 @@ func TestMain(m *testing.M) {
 	}
 
 	// Route every spawned CLI away from the developer's real ~/.config/entire
-	// (contexts.json, version_check.json), ~/.cache/entire (discovery caches and
-	// auth-go locks), and OS keychain. testing.Testing() is false in the
-	// subprocess, so the internal/testdirs fallback cannot protect it —
-	// isolation must come from the environment, which children inherit because
-	// all integration env building starts from os.Environ() (testutil.GitIsolatedEnv).
+	// (contexts.json, version_check.json), ~/.cache/entire (discovery caches),
+	// the auth-go lock dir (ENTIRE_AUTH_LOCK_DIR), and OS keychain.
+	// testing.Testing() is false in the subprocess, so the internal/testdirs
+	// fallback cannot protect it — isolation must come from the environment,
+	// which children inherit because all integration env building starts from
+	// os.Environ() (testutil.GitIsolatedEnv).
 	//
 	// GIT_TERMINAL_PROMPT=0 and ENTIRE_TEST_GIT_HERMETIC form the hermeticity
 	// tripwire: the latter makes GitIsolatedEnv's global git config route HTTPS

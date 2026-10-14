@@ -3,10 +3,7 @@
 package integration
 
 import (
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,7 +13,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/entireio/cli/cmd/entire/cli/auth"
 	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/entireio/cli/internal/entireclient/contexts"
@@ -26,7 +22,7 @@ import (
 func TestAuthToken_LockDirectoryIsolation(t *testing.T) {
 	t.Parallel()
 
-	for _, mode := range []string{"inherited", "empty", "unset"} {
+	for _, mode := range []string{"set", "empty", "unset"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Parallel()
 
@@ -54,9 +50,10 @@ func TestAuthToken_LockDirectoryIsolation(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			expiredJWT := "eyJhbGciOiJSUzI1NiJ9." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"iss":%q,"exp":1}`, server.URL)) + ".c2ln"
+			expiredJWT := fakeJWT(server.URL, 1)
 			data, err := json.Marshal(map[string]map[string]string{
-				service: {"alice": expiredJWT + "|0"}, tokenstore.RefreshService(service): {"alice": "old-refresh"},
+				service:                            {"alice": expiredJWT + tokenstore.TokenExpirationSeparator + "0"},
+				tokenstore.RefreshService(service): {"alice": "old-refresh"},
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -69,24 +66,27 @@ func TestAuthToken_LockDirectoryIsolation(t *testing.T) {
 			if runtime.GOOS == "darwin" {
 				defaultLockDir = filepath.Join(home, "Library", "Caches", "auth-go")
 			}
-			wantDir := os.Getenv("ENTIRE_AUTH_LOCK_DIR")
-			if wantDir == "" {
+			if os.Getenv("ENTIRE_AUTH_LOCK_DIR") == "" {
 				t.Fatal("test harness did not set ENTIRE_AUTH_LOCK_DIR")
 			}
 			cmd := execx.NonInteractive(t.Context(), getTestBinary(), "auth", "token", "--insecure-http-auth")
 			cmd.Dir = home
-			cmd.Env = append(testutil.GitIsolatedEnv(),
+			cmd.Env = slices.DeleteFunc(testutil.GitIsolatedEnv(), func(entry string) bool {
+				return strings.HasPrefix(entry, "ENTIRE_AUTH_LOCK_DIR=")
+			})
+			cmd.Env = append(cmd.Env,
 				"HOME="+home, "XDG_CACHE_HOME="+home, "LocalAppData="+home,
 				"ENTIRE_CONFIG_DIR="+configDir, "ENTIRE_TOKEN_STORE=file", "ENTIRE_TOKEN_STORE_PATH="+tokensPath,
 			)
-			if mode != "inherited" {
-				wantDir = defaultLockDir
-				cmd.Env = slices.DeleteFunc(cmd.Env, func(entry string) bool {
-					return strings.HasPrefix(entry, "ENTIRE_AUTH_LOCK_DIR=")
-				})
-				if mode == "empty" {
-					cmd.Env = append(cmd.Env, "ENTIRE_AUTH_LOCK_DIR=")
-				}
+			// The harness lock dir is shared by every spawned binary in this run,
+			// so the "set" case gets its own directory to count locks in.
+			wantDir := defaultLockDir
+			switch mode {
+			case "set":
+				wantDir = t.TempDir()
+				cmd.Env = append(cmd.Env, "ENTIRE_AUTH_LOCK_DIR="+wantDir)
+			case "empty":
+				cmd.Env = append(cmd.Env, "ENTIRE_AUTH_LOCK_DIR=")
 			}
 			out, err := cmd.CombinedOutput()
 			if err != nil {
@@ -95,12 +95,14 @@ func TestAuthToken_LockDirectoryIsolation(t *testing.T) {
 			if got := strings.TrimSpace(string(out)); got != refreshedJWT {
 				t.Fatalf("auth token returned %q, want refreshed token", got)
 			}
-			// Mirrors auth-go tokenmanager's lock name: sha256(ClientID + NUL + Issuer).lock.
-			sum := sha256.Sum256([]byte(auth.OAuthClientID + "\x00" + server.URL))
-			if _, err := os.Stat(filepath.Join(wantDir, fmt.Sprintf("%x.lock", sum))); err != nil {
-				t.Fatalf("refresh did not create its lock in %s: %v", wantDir, err)
+			locks, err := filepath.Glob(filepath.Join(wantDir, "*.lock"))
+			if err != nil {
+				t.Fatal(err)
 			}
-			if mode == "inherited" {
+			if len(locks) != 1 {
+				t.Fatalf("lock files in %s = %v, want exactly one from the refresh", wantDir, locks)
+			}
+			if mode == "set" {
 				if _, err := os.Stat(defaultLockDir); !os.IsNotExist(err) {
 					t.Fatalf("refresh touched the default user cache: %v", err)
 				}
