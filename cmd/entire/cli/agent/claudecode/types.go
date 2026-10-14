@@ -3,6 +3,7 @@ package claudecode
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"maps"
 	"slices"
 
@@ -55,6 +56,10 @@ type ClaudeHookEntry struct {
 	// default in place; set only where a hook needs an explicit budget.
 	Timeout int `json:"timeout,omitempty"`
 	extra   map[string]json.RawMessage
+	// raw holds the entry as the user wrote it when a modeled field has a type
+	// Entire does not model (such as a fractional timeout). It is written back
+	// unchanged, since re-encoding the decoded fields would lose that value.
+	raw json.RawMessage
 }
 
 // claudeHookEntryFields is ClaudeHookEntry without its JSON methods.
@@ -62,27 +67,48 @@ type claudeHookEntryFields ClaudeHookEntry
 
 func (e *ClaudeHookEntry) UnmarshalJSON(data []byte) error {
 	extra, err := unmarshalKeepingExtra(data, (*claudeHookEntryFields)(e), "type", "command", "timeout")
+	if typeErr := (*json.UnmarshalTypeError)(nil); errors.As(err, &typeErr) {
+		// The other modeled fields still decoded, so Entire can recognise its own
+		// hook; only the write-back has to use the original bytes.
+		e.raw = slices.Clone(data)
+		return nil
+	}
 	e.extra = extra
 	return err
 }
 
 func (e ClaudeHookEntry) MarshalJSON() ([]byte, error) {
+	if e.raw != nil {
+		return e.raw, nil
+	}
 	return marshalWithExtra(claudeHookEntryFields(e), e.extra)
 }
 
-// unmarshalKeepingExtra decodes data into known and returns the keys outside
-// knownKeys. Entire rewrites settings.json, which the user and Claude Code own,
-// so every field it does not model must survive the round trip.
+// unmarshalKeepingExtra decodes the knownKeys of data into known and returns
+// every other key. Entire rewrites settings.json, which the user and Claude Code
+// own, so every field it does not model must survive the round trip.
+//
+// Only exact knownKeys are decoded: encoding/json matches field names
+// case-insensitively, so decoding data whole would read a key such as "Command",
+// which Claude Code ignores, into the live command field.
 func unmarshalKeepingExtra(data []byte, known any, knownKeys ...string) (map[string]json.RawMessage, error) {
-	if err := json.Unmarshal(data, known); err != nil {
-		return nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
-	}
 	var extra map[string]json.RawMessage
 	if err := json.Unmarshal(data, &extra); err != nil {
 		return nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
 	}
+	modeled := make(map[string]json.RawMessage, len(knownKeys))
 	for _, k := range knownKeys {
-		delete(extra, k)
+		if v, ok := extra[k]; ok {
+			modeled[k] = v
+			delete(extra, k)
+		}
+	}
+	modeledJSON, err := json.Marshal(modeled)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
+	}
+	if err := json.Unmarshal(modeledJSON, known); err != nil {
+		return nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
 	}
 	return extra, nil
 }

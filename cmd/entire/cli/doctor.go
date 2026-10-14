@@ -187,16 +187,18 @@ func runSessionsFix(cmd *cobra.Command, force bool) error {
 	// Agent-specific: does agy actually load the workspace hooks?
 	checkAntigravityHooksLoaded(cmd)
 
+	// Hook timeouts that configs from older CLIs lack. Fixes rather than only
+	// reporting: it only fills in a timeout on a hook Entire wrote. Runs before
+	// the drift check, which does not look at timeouts, so that check reports on
+	// the repaired config instead of calling a config missing them OK.
+	checkHookTimeouts(cmd)
+
 	// Agent-specific: Claude Code hook config drift.
 	checkHookDrift(cmd)
 
 	// Retired permission rule that makes ordinary commands need approval.
 	// Fixes rather than only reporting: what it removes is a rule Entire wrote.
 	checkRetiredDenyRule(cmd)
-
-	// Hook timeouts that configs from older CLIs lack. Fixes rather than only
-	// reporting: it only fills in a timeout on a hook Entire wrote.
-	checkHookTimeouts(cmd)
 
 	// Hooks left by removed Gemini CLI support. Fixes rather than only
 	// reporting, for the same reason: every entry it removes is Entire's own.
@@ -1359,8 +1361,8 @@ func checkHookDrift(cmd *cobra.Command) {
 			fmt.Fprintf(w, "✓ %s hook config: OK\n", displayName)
 		case agent.HooksOutdated:
 			fmt.Fprintf(w, "%s hooks: OUT OF DATE\n", displayName)
-			fmt.Fprintln(w, "  The installed hook config no longer matches what this CLI writes,")
-			fmt.Fprintln(w, "  so some or all hooks may silently not fire.")
+			fmt.Fprintln(w, "  The installed hook config no longer matches what this CLI writes, so")
+			fmt.Fprintln(w, "  some hooks may not fire, or may block the agent if `entire` stalls on launch.")
 			fmt.Fprintln(w, "  Run `entire enable --force` to update it.")
 		}
 	}

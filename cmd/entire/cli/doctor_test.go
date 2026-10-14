@@ -1191,6 +1191,10 @@ func TestCheckHookTimeouts_RestoresWhatEnableWrites(t *testing.T) {
 	require.NoError(t, os.WriteFile(settingsPath, untimed, 0o600))
 
 	cmd, stdout := newTestCmd(t)
+	checkHookDrift(cmd)
+	require.Contains(t, stdout.String(), "Claude Code hooks: OUT OF DATE")
+
+	cmd, stdout = newTestCmd(t)
 	checkHookTimeouts(cmd)
 	out := stdout.String()
 	require.Contains(t, out, "Claude Code hooks: MISSING TIMEOUTS")
@@ -1203,6 +1207,10 @@ func TestCheckHookTimeouts_RestoresWhatEnableWrites(t *testing.T) {
 	cmd, stdout = newTestCmd(t)
 	checkHookTimeouts(cmd)
 	require.Empty(t, stdout.String())
+
+	cmd, stdout = newTestCmd(t)
+	checkHookDrift(cmd)
+	require.Contains(t, stdout.String(), "Claude Code hook config: OK")
 }
 
 // TestCheckCodexHookTrust_FlagsStaleHooksFile — user enabled Codex on

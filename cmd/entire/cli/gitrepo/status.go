@@ -41,11 +41,11 @@ func Status(_ context.Context, repo *git.Repository) (git.Status, error) {
 // StatusWalkBudget bounds the wall-clock time of one worktree status read on
 // the agent-hook capture paths — the go-git walk in StatusWithBudget and the
 // first-checkpoint `git status` subprocess in the checkpoint store. Agents
-// time out their hooks (Claude Code's Entire capture hooks at 30s, its
-// checkpoint hooks at 60s), but a timed-out hook PROCESS is not killed — an
-// unbounded walk over a pathological worktree (e.g. a stray `git init` in
-// $HOME with no .gitignore) has been observed grinding for hours at gigabytes
-// of RSS after the agent gave up. 20s is chosen as far beyond any healthy
+// cancel a hook at its timeout (for Claude Code, see claudecode's
+// captureHookTimeoutSec and checkpointHookTimeoutSec), but cancelling has not
+// reliably ended the hook PROCESS — an unbounded walk over a pathological
+// worktree (e.g. a stray `git init` in $HOME with no .gitignore) has been
+// observed grinding for hours at gigabytes of RSS after the agent gave up. 20s is chosen as far beyond any healthy
 // repository (a warm walk over a large working set finishes in seconds) while
 // leaving the rest of the hook's timeout for the remaining capture path —
 // transcript copy, tree building, state writes — so the hook still degrades

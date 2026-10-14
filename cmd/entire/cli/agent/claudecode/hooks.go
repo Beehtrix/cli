@@ -195,19 +195,25 @@ func loadRawClaudeSettingsForInstall(cfg *agent.HookConfigFile) (rawSettings, ra
 }
 
 // Claude Code waits on Entire's hooks, and an `entire` launch the OS stalls
-// before main() never returns on its own, so each hook carries a timeout that
-// lets Claude Code kill it and continue.
+// before main() never returns on its own, so each hook carries a timeout after
+// which Claude Code cancels it and continues.
 const (
-	// quickHookTimeoutSec bounds SessionStart, which only records state and
-	// finishes in milliseconds; Claude Code blocks startup on it.
+	// quickHookTimeoutSec bounds SessionStart, which records state behind a
+	// network refresh capped at about a second; Claude Code blocks startup on it.
 	quickHookTimeoutSec = 10
 	// captureHookTimeoutSec bounds hooks that snapshot the worktree before a
-	// prompt or subagent. It must outlast gitrepo.StatusWalkBudget so a slow
-	// walk degrades on its own instead of being killed, losing the snapshot.
+	// prompt or subagent. UserPromptSubmit already runs this work under Claude
+	// Code's 30s default; SubagentStart and pre-task drop from its 600s command
+	// default to match. It must outlast gitrepo.StatusWalkBudget so a slow walk
+	// degrades on its own before Claude Code cancels the hook and drops the
+	// snapshot.
 	captureHookTimeoutSec = 30
-	// checkpointHookTimeoutSec bounds hooks that write checkpoint data, whose
-	// cost grows with transcript size; a kill mid-write loses that checkpoint.
-	checkpointHookTimeoutSec = 60
+	// checkpointHookTimeoutSec bounds hooks that write checkpoint data. Their
+	// path can spend checkpoint/remote.WriteProbeFetchBudget on a remote probe
+	// and gitrepo.StatusWalkBudget on a first-checkpoint status before transcript
+	// work whose cost grows with transcript size; a hook cancelled mid-write may
+	// not finish that checkpoint.
+	checkpointHookTimeoutSec = 120
 )
 
 type entireSimpleHook struct {
@@ -255,14 +261,14 @@ func entireHookTimeouts() map[string]int {
 }
 
 // setMissingTimeout gives every Entire entry in matchers its timeout from
-// timeouts, leaving any timeout the user already chose. Reports whether it
-// changed an entry.
+// timeouts, leaving any timeout the user already chose, including one Entire
+// cannot model and so keeps as written. Reports whether it changed an entry.
 func setMissingTimeout(matchers []ClaudeHookMatcher, timeouts map[string]int) bool {
 	changed := false
 	for i := range matchers {
 		for j := range matchers[i].Hooks {
 			hook := &matchers[i].Hooks[j]
-			if timeout := timeouts[hook.Command]; timeout != 0 && hook.Timeout == 0 {
+			if timeout := timeouts[hook.Command]; timeout != 0 && hook.Timeout == 0 && hook.raw == nil {
 				hook.Timeout = timeout
 				changed = true
 			}
@@ -682,9 +688,10 @@ func (c *ClaudeCodeAgent) AreHooksInstalled(ctx context.Context) (bool, error) {
 // `entire status` and `entire doctor` can treat every agent's drift check
 // uniformly; the names stay exported here for existing call sites.
 //
-// For Claude Code, HooksOutdated means Entire hooks are installed but the
-// current tool-use matchers no longer carry them (e.g. an older CLI wrote them
-// under the now non-firing "Task"/"TodoWrite" matchers).
+// For Claude Code, HooksOutdated means Entire hooks are installed but a plain
+// install would change them: a required hook is missing (e.g. an older CLI
+// wrote them under the now non-firing "Task"/"TodoWrite" matchers), or an
+// Entire hook is in a shape this CLI no longer writes or lacks its timeout.
 type HookConfigState = agent.HookConfigState
 
 const (
@@ -706,10 +713,13 @@ func (c *ClaudeCodeAgent) CheckHookConfig(ctx context.Context) agent.HookConfigS
 
 // CheckHookConfig reports whether Entire's Claude Code hooks are absent,
 // current, or outdated. It is a read-only diagnostic used by `entire status`
-// and `entire doctor`; it never modifies settings. Outdated is detected on the
-// positive spec: Entire is installed (Stop hook present) yet one of the current
-// tool-use matchers (Agent, Skill), SubagentStart (for
-// Workflow agents), SubagentStop, or StopFailure does not carry its Entire hook.
+// and `entire doctor`; it never modifies settings. Entire is installed when a
+// Stop hook is present. It is outdated when one of the current tool-use
+// matchers (Agent, Skill), SubagentStart (for Workflow agents), SubagentStop,
+// or StopFailure does not carry its Entire hook, or when HasStaleManagedHooks
+// finds an Entire hook an install would prune or give a timeout. Without that
+// second check, a hook an older CLI wrote passes as current while a stalled
+// `entire` launch can still block Claude Code on it.
 func CheckHookConfig(ctx context.Context) HookConfigState {
 	settings, err := loadClaudeSettings(ctx)
 	// An unreadable or malformed settings file collapses to HooksAbsent
@@ -728,6 +738,9 @@ func CheckHookConfig(ctx context.Context) HookConfigState {
 		!hasEntireHookCoveringTools(settings.Hooks.SubagentStart, []string{workflowAgentMatcher}) ||
 		!hasEntireHook(settings.Hooks.SubagentStop) ||
 		!hasEntireHook(settings.Hooks.StopFailure) {
+		return HooksOutdated
+	}
+	if (&ClaudeCodeAgent{}).HasStaleManagedHooks(ctx) {
 		return HooksOutdated
 	}
 	return HooksCurrent

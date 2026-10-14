@@ -19,7 +19,7 @@
           {
             "type": "command",
             "command": "sh -c 'if ! command -v entire >/dev/null 2>&1; then exit 0; fi; exec entire hooks claude-code post-task'",
-            "timeout": 60
+            "timeout": 120
           }
         ]
       },
@@ -29,7 +29,7 @@
           {
             "type": "command",
             "command": "sh -c 'if ! command -v entire >/dev/null 2>&1; then exit 0; fi; exec entire hooks claude-code post-task'",
-            "timeout": 60
+            "timeout": 120
           }
         ]
       }
@@ -80,7 +80,7 @@
           {
             "type": "command",
             "command": "sh -c 'if ! command -v entire >/dev/null 2>&1; then exit 0; fi; exec entire hooks claude-code stop'",
-            "timeout": 60
+            "timeout": 120
           }
         ]
       }
@@ -92,7 +92,7 @@
           {
             "type": "command",
             "command": "sh -c 'if ! command -v entire >/dev/null 2>&1; then exit 0; fi; exec entire hooks claude-code stop-failure'",
-            "timeout": 60
+            "timeout": 120
           }
         ]
       }
@@ -116,7 +116,7 @@
           {
             "type": "command",
             "command": "sh -c 'if ! command -v entire >/dev/null 2>&1; then exit 0; fi; exec entire hooks claude-code subagent-stop'",
-            "timeout": 60
+            "timeout": 120
           }
         ]
       }
