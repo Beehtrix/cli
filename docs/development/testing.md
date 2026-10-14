@@ -178,12 +178,10 @@ using `entire` for real while tests run.
   `tokenstore.UseFileBackendForTesting(...)`.
 - **Spawned binaries are NOT covered**: `testing.Testing()` is false in a
   subprocess. The integration and e2e TestMains set `ENTIRE_CONFIG_DIR`,
-  `XDG_CACHE_HOME`, `ENTIRE_AUTH_LOCK_DIR`, `ENTIRE_TOKEN_STORE=file`,
-  `ENTIRE_TOKEN_STORE_PATH`, and `ENTIRE_TEST_AUTH_STORE_FILE` process-wide so
-  every spawned `entire` (and every agent-invoked hook) inherits isolation. Any
-  new harness that spawns the real binary must do the same, using absolute
-  paths: a relative directory override is rejected, so every command in the
-  child that needs that directory fails.
+  `XDG_CACHE_HOME`, `ENTIRE_TOKEN_STORE=file`, `ENTIRE_TOKEN_STORE_PATH`, and
+  `ENTIRE_TEST_AUTH_STORE_FILE` process-wide so every spawned `entire` (and
+  every agent-invoked hook) inherits isolation. Any new harness that spawns
+  the real binary must do the same.
 - **Agent credential preparation**: mocking a subprocess runner does not
   isolate code that discovers credentials before executing it. Antigravity
   generation tests use `newTestTextGenerator` with explicit temporary

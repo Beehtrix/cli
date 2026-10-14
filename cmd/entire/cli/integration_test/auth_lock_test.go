@@ -21,7 +21,7 @@ import (
 func TestAuthToken_LockDirectoryIsolation(t *testing.T) {
 	t.Parallel()
 
-	for _, mode := range []string{"set", "empty", "unset"} {
+	for _, mode := range []string{"xdg-set", "xdg-unset"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Parallel()
 
@@ -61,29 +61,22 @@ func TestAuthToken_LockDirectoryIsolation(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if os.Getenv("ENTIRE_AUTH_LOCK_DIR") == "" {
-				t.Fatal("test harness did not set ENTIRE_AUTH_LOCK_DIR")
-			}
+			// HOME, USERPROFILE and LocalAppData all point at home, so both
+			// Entire's cache and auth-go's own default would land under it.
+			cacheHome := t.TempDir()
+			wantDir := filepath.Join(home, ".cache", "entire", "auth-locks")
 			cmd := execx.NonInteractive(t.Context(), getTestBinary(), "auth", "token", "--insecure-http-auth")
 			cmd.Dir = home
 			cmd.Env = slices.DeleteFunc(testutil.GitIsolatedEnv(), func(entry string) bool {
-				return strings.HasPrefix(entry, "ENTIRE_AUTH_LOCK_DIR=")
+				return strings.HasPrefix(entry, "XDG_CACHE_HOME=")
 			})
 			cmd.Env = append(cmd.Env,
-				"HOME="+home, "XDG_CACHE_HOME="+home, "LocalAppData="+home,
+				"HOME="+home, "USERPROFILE="+home, "LocalAppData="+home,
 				"ENTIRE_CONFIG_DIR="+configDir, "ENTIRE_TOKEN_STORE=file", "ENTIRE_TOKEN_STORE_PATH="+tokensPath,
 			)
-			// HOME, XDG_CACHE_HOME and LocalAppData all point at home, so
-			// auth-go's default lock dir lands under it on every OS. The harness
-			// lock dir is shared by every spawned binary in this run, so the
-			// "set" case gets its own directory to count locks in.
-			lockDir := ""
-			switch mode {
-			case "set":
-				lockDir = t.TempDir()
-				cmd.Env = append(cmd.Env, "ENTIRE_AUTH_LOCK_DIR="+lockDir)
-			case "empty":
-				cmd.Env = append(cmd.Env, "ENTIRE_AUTH_LOCK_DIR=")
+			if mode == "xdg-set" {
+				wantDir = filepath.Join(cacheHome, "entire", "auth-locks")
+				cmd.Env = append(cmd.Env, "XDG_CACHE_HOME="+cacheHome)
 			}
 			out, err := cmd.CombinedOutput()
 			if err != nil {
@@ -92,16 +85,9 @@ func TestAuthToken_LockDirectoryIsolation(t *testing.T) {
 			if got := strings.TrimSpace(string(out)); got != refreshedJWT {
 				t.Fatalf("auth token returned %q, want refreshed token", got)
 			}
-			homeLocks := lockFiles(t, home)
-			if mode == "set" {
-				if locks := lockFiles(t, lockDir); len(locks) != 1 {
-					t.Fatalf("lock files in %s = %v, want exactly one from the refresh", lockDir, locks)
-				}
-				if len(homeLocks) != 0 {
-					t.Fatalf("refresh wrote locks into the default user cache: %v", homeLocks)
-				}
-			} else if len(homeLocks) != 1 {
-				t.Fatalf("lock files under %s = %v, want exactly one in auth-go's default dir", home, homeLocks)
+			locks := append(lockFiles(t, home), lockFiles(t, cacheHome)...)
+			if len(locks) != 1 || filepath.Dir(locks[0]) != wantDir {
+				t.Fatalf("lock files = %v, want exactly one in %s", locks, wantDir)
 			}
 		})
 	}

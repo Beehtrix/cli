@@ -78,9 +78,8 @@ implementations/tests. Check `.golangci.yaml`; handle errors and avoid duplicati
   `tokenstore.UseFileBackendForTesting` when isolation between tests is needed.
   Tests that can reach the OS keyring need `keyring.MockInit()` in `TestMain`.
 - Spawned binaries do not inherit Go's test detection. Harnesses must isolate
-  `ENTIRE_CONFIG_DIR`, `XDG_CACHE_HOME`, `ENTIRE_AUTH_LOCK_DIR`,
-  `ENTIRE_TOKEN_STORE=file`, `ENTIRE_TOKEN_STORE_PATH`, and
-  `ENTIRE_TEST_AUTH_STORE_FILE`.
+  `ENTIRE_CONFIG_DIR`, `XDG_CACHE_HOME`, `ENTIRE_TOKEN_STORE=file`,
+  `ENTIRE_TOKEN_STORE_PATH`, and `ENTIRE_TEST_AUTH_STORE_FILE`.
 - Prefer `execx.NonInteractive` for real CLI/git test subprocesses so a developer's
   terminal cannot make them prompt or hang.
 - Caller-resolution tests clear every variable from `agent.CallerSessionEnvVars()`;

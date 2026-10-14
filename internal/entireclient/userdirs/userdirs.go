@@ -8,10 +8,8 @@
 //   - Cache: discovery caches (nodes.json, cluster_cores.json,
 //     api_discovery.json). $XDG_CACHE_HOME/entire if set, else
 //     ~/.cache/entire.
-//   - AuthLock: auth-go's cross-process token-refresh lock files.
-//     $ENTIRE_AUTH_LOCK_DIR if set, else auth-go's own default.
 //
-// Under `go test`, all three fall back to a throwaway per-process directory when
+// Under `go test`, both fall back to a throwaway per-process directory when
 // their env override is unset (see internal/testdirs), so a test that
 // forgets to isolate can never read or pollute the developer's real state.
 package userdirs
@@ -32,8 +30,6 @@ const (
 	EnvConfigDir = "ENTIRE_CONFIG_DIR"
 	// EnvCacheHome overrides the per-user cache directory's parent.
 	EnvCacheHome = "XDG_CACHE_HOME"
-	// EnvAuthLockDir overrides the directory holding auth-go's lock files.
-	EnvAuthLockDir = "ENTIRE_AUTH_LOCK_DIR"
 )
 
 // RequireAbsoluteOverride rejects a non-absolute directory override.
@@ -150,29 +146,6 @@ func cacheDir() (string, error) {
 		return ownFallbackDir(".cache", "entire"), nil //nolint:nilerr // see ownFallbackDir
 	}
 	return filepath.Join(home, ".cache", "entire"), nil
-}
-
-// AuthLockDir returns the directory for auth-go's cross-process token-refresh
-// lock. Empty means auth-go's default, os.UserCacheDir()/auth-go.
-//
-// It is not derived from Cache because that would move the production lock:
-// during an upgrade, an old and a new binary would take different locks and
-// could refresh the same rotating refresh token concurrently. For the same
-// reason every process sharing a login must agree on the override.
-//
-// The override exists for spawned test binaries: testing.Testing is false
-// there, and macOS's os.UserCacheDir ignores XDG_CACHE_HOME.
-func AuthLockDir() (string, error) {
-	if dir := os.Getenv(EnvAuthLockDir); dir != "" {
-		if err := RequireAbsoluteOverride(EnvAuthLockDir, dir); err != nil {
-			return "", err
-		}
-		return dir, nil
-	}
-	if dir, ok := testdirs.Dir("authlock"); ok {
-		return dir, nil
-	}
-	return "", nil
 }
 
 // ownFallbackDir builds the home-relative default for a machine where

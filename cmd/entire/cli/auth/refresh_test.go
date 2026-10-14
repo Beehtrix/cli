@@ -473,17 +473,41 @@ func TestNewContextTokenManager_LockNeverInRealUserCache(t *testing.T) {
 	}
 }
 
-func TestNewRefreshingLoginProvider_RejectsRelativeLockDir(t *testing.T) {
+// TestTokenManagerLockDir_NeverRealUserCache pins the test-isolation half of
+// the LockDir contract: under `go test`, auth-go's cross-process lock must not
+// land in auth-go's default, os.UserCacheDir()/auth-go, which on macOS is the
+// developer's real ~/Library/Caches/auth-go regardless of XDG_CACHE_HOME.
+func TestTokenManagerLockDir_NeverRealUserCache(t *testing.T) {
+	t.Parallel()
+
+	dir, err := tokenManagerLockDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		t.Skipf("os.UserCacheDir unavailable: %v", err)
+	}
+	realLockDir := filepath.Join(cache, "auth-go")
+	if dir == realLockDir || strings.HasPrefix(dir, realLockDir+string(os.PathSeparator)) {
+		t.Fatalf("tokenManagerLockDir() = %q, which resolves under the real %q", dir, realLockDir)
+	}
+}
+
+func TestNewRefreshingLoginProvider_RejectsRelativeCacheDir(t *testing.T) {
 	// Not parallel: it sets process-wide environment.
-	t.Setenv(userdirs.EnvAuthLockDir, "relative-auth-locks")
+	t.Setenv(userdirs.EnvCacheHome, "relative-cache")
 	c := &contexts.Context{Name: "work-core", CoreURL: "https://core.example", Handle: "alice", KeychainService: testCoreService}
 	_, err := NewRefreshingLoginProvider(c, failRoundTripper(t), false)
 	if err == nil {
 		t.Fatal("NewRefreshingLoginProvider() error = nil, want a rejected lock directory")
 	}
-	for _, want := range []string{userdirs.EnvAuthLockDir, "absolute", `"work-core"`} {
+	for _, want := range []string{userdirs.EnvCacheHome, "absolute", `"work-core"`} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("NewRefreshingLoginProvider() error = %v, want it to mention %s", err, want)
 		}
+	}
+	if _, statErr := os.Stat("relative-cache"); statErr == nil {
+		t.Error("NewRefreshingLoginProvider() created the directory it was refusing")
 	}
 }

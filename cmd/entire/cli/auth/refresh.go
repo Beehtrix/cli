@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -122,7 +123,7 @@ func newContextTokenManager(c *contexts.Context, transport http.RoundTripper, al
 	if c.KeychainService == "" || c.Handle == "" {
 		return nil, fmt.Errorf("context %q has no keychain slot", c.Name)
 	}
-	lockDir, err := userdirs.AuthLockDir()
+	lockDir, err := tokenManagerLockDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolve auth lock directory for context %q: %w", c.Name, err)
 	}
@@ -140,6 +141,20 @@ func newContextTokenManager(c *contexts.Context, transport http.RoundTripper, al
 		return nil, fmt.Errorf("init token manager for context %q: %w", c.Name, err)
 	}
 	return mgr, nil
+}
+
+// tokenManagerLockDir puts auth-go's cross-process refresh lock in Entire's
+// per-user cache instead of auth-go's default, os.UserCacheDir()/auth-go.
+// That default ignores XDG_CACHE_HOME on macOS, so spawned test binaries,
+// which the testdirs fallback cannot reach, locked in the developer's real
+// ~/Library/Caches. The lock only serializes refreshes of the rotating refresh
+// token between processes that resolve the same directory.
+func tokenManagerLockDir() (string, error) {
+	cache, err := userdirs.CacheDirChecked()
+	if err != nil {
+		return "", err //nolint:wrapcheck // the caller wraps it with the context name
+	}
+	return filepath.Join(cache, "auth-locks"), nil
 }
 
 // reauthError carries a friendly, context-named re-login message while still
