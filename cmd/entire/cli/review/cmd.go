@@ -1204,11 +1204,12 @@ func runSingleAgentPath(
 
 	runCfg.EnrichSummary = reviewSummaryTokenEnricher(worktreeRoot, headSHA)
 	sinks := composeSingleAgentSinks(singleAgentSinkInputs{
-		out:       out,
-		isTTY:     canPrompt,
-		canPrompt: canPrompt,
-		agentName: displayName,
-		cancelRun: cancelRun,
+		out:               out,
+		isTTY:             canPrompt,
+		canPrompt:         canPrompt,
+		agentName:         displayName,
+		cancelRun:         cancelRun,
+		trailFindingsJSON: runCfg.TrailFindingsJSON,
 	})
 	if tuiSink, ok := findTUISink(sinks); ok {
 		tuiSink.Start()
@@ -1216,7 +1217,7 @@ func runSingleAgentPath(
 	}
 
 	summary, waitErr := Run(runCtx, reviewer, runCfg, sinks)
-	writePostReviewManifest(ctx, out, worktreeRoot, headSHA, summary, "")
+	writePostReviewManifest(ctx, out, worktreeRoot, headSHA, summary, "", runCfg.TrailFindingsJSON)
 	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, summary, "")
 	if waitErr != nil && runCtx.Err() == nil && ctx.Err() == nil {
 		// Non-cancellation error: surface to caller.
@@ -1408,7 +1409,7 @@ func runMultiAgentPath(
 		cmd.SilenceUsage = true
 		return multiReviewFailureError(waitErr)
 	}
-	writePostReviewManifest(ctx, out, worktreeRoot, headSHA, summary, aggregateOutput)
+	writePostReviewManifest(ctx, out, worktreeRoot, headSHA, summary, aggregateOutput, outputMode == ReviewOutputTrail)
 	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, summary, aggregateOutput)
 	// The judge produces the review's primary deliverable — the consolidated
 	// verdict. If it was attempted but failed (provider error or timeout), the
@@ -1477,11 +1478,12 @@ type multiAgentSinkInputs struct {
 }
 
 type singleAgentSinkInputs struct {
-	out       io.Writer
-	isTTY     bool
-	canPrompt bool
-	agentName string
-	cancelRun context.CancelFunc
+	out               io.Writer
+	isTTY             bool
+	canPrompt         bool
+	agentName         string
+	cancelRun         context.CancelFunc
+	trailFindingsJSON bool
 }
 
 // composeMultiAgentSinks builds the sink slice for a multi-agent run. The
@@ -1497,11 +1499,11 @@ type singleAgentSinkInputs struct {
 func composeMultiAgentSinks(in multiAgentSinkInputs) []reviewtypes.Sink {
 	sinks := []reviewtypes.Sink{}
 	if in.isTTY {
-		tui := NewTUISink(in.agentNames, in.cancelRun, in.out, os.Stdin)
+		tui := NewTUISink(in.agentNames, in.cancelRun, in.out, os.Stdin, in.trailFindingsJSON)
 		sinks = append(sinks, tui)
 		if in.synthesisProvider != nil {
 			postRunOut := &bytes.Buffer{}
-			sinks = append(sinks, DumpSink{W: postRunOut})
+			sinks = append(sinks, DumpSink{W: postRunOut, TrailFindingsJSON: in.trailFindingsJSON})
 			sinks = append(sinks, SynthesisSink{
 				Provider:          in.synthesisProvider,
 				Writer:            postRunOut,
@@ -1526,11 +1528,11 @@ func composeMultiAgentSinks(in multiAgentSinkInputs) []reviewtypes.Sink {
 			return sinks
 		}
 		sinks = append(sinks, tuiPostRunCompleteSink{tui: tui})
-		sinks = append(sinks, DumpSink{W: in.out})
+		sinks = append(sinks, DumpSink{W: in.out, TrailFindingsJSON: in.trailFindingsJSON})
 		return sinks
 	}
 
-	sinks = append(sinks, DumpSink{W: in.out})
+	sinks = append(sinks, DumpSink{W: in.out, TrailFindingsJSON: in.trailFindingsJSON})
 	if in.synthesisProvider != nil {
 		sinks = append(sinks, SynthesisSink{
 			Provider:          in.synthesisProvider,
@@ -1666,6 +1668,7 @@ func writePostReviewManifest(
 	headSHA string,
 	summary reviewtypes.RunSummary,
 	aggregateOutput string,
+	trailFindingsJSON bool,
 ) {
 	if summary.Cancelled || len(summary.AgentRuns) == 0 {
 		return
@@ -1683,6 +1686,7 @@ func writePostReviewManifest(
 		return
 	}
 	manifest.WorktreePath = reviewManifestWorktreePath(worktreeRoot)
+	manifest.TrailFindingsJSON = trailFindingsJSON
 	if len(manifest.Sources) == 0 {
 		reason, sentinel := explainEmptyManifest(worktreeRoot, headSHA, summary, states)
 		if sentinel {
@@ -1774,13 +1778,13 @@ func reviewAgentRunTokenEnricherForRuns(worktreeRoot, headSHA string, planned []
 func composeSingleAgentSinks(in singleAgentSinkInputs) []reviewtypes.Sink {
 	if !in.isTTY || !in.canPrompt {
 		fmt.Fprintf(in.out, "Running review with %s...\n", in.agentName)
-		return []reviewtypes.Sink{DumpSink{W: in.out}}
+		return []reviewtypes.Sink{DumpSink{W: in.out, TrailFindingsJSON: in.trailFindingsJSON}}
 	}
-	tui := NewTUISink([]string{in.agentName}, in.cancelRun, in.out, os.Stdin)
+	tui := NewTUISink([]string{in.agentName}, in.cancelRun, in.out, os.Stdin, in.trailFindingsJSON)
 	postRunOut := &bytes.Buffer{}
 	return []reviewtypes.Sink{
 		tui,
-		DumpSink{W: postRunOut},
+		DumpSink{W: postRunOut, TrailFindingsJSON: in.trailFindingsJSON},
 		tuiPostRunCompleteSink{tui: tui, buf: postRunOut, out: in.out},
 	}
 }

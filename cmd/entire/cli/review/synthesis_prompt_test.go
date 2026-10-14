@@ -296,7 +296,7 @@ func TestComposeSynthesisPrompt_OmitsReviewerTrailJSON(t *testing.T) {
 		{"codex", "approve", reviewtypes.AgentStatusSucceeded},
 	})
 
-	prompt := review.ExposedComposeSynthesisPrompt(summary, "")
+	prompt := review.ExposedComposeTrailSynthesisPrompt(summary, "")
 	if !strings.Contains(prompt, "- [high] Loop ignores ctx cancel.") {
 		t.Errorf("prompt must keep the reviewer's prose finding:\n%s", prompt)
 	}

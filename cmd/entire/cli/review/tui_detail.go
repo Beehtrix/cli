@@ -57,7 +57,7 @@ func eventLines(ev reviewtypes.Event, maxWidth int) []string {
 // buildEventLines returns every wrapped body line for the supplied event
 // buffer, in order. The result is suitable for feeding into a viewport via
 // SetContentLines.
-func buildEventLines(buffer []reviewtypes.Event, maxWidth int) []string {
+func buildEventLines(buffer []reviewtypes.Event, maxWidth int, trailFindingsJSON bool) []string {
 	if len(buffer) == 0 || maxWidth <= 0 {
 		return nil
 	}
@@ -67,7 +67,7 @@ func buildEventLines(buffer []reviewtypes.Event, maxWidth int) []string {
 	var text strings.Builder
 	flushText := func() {
 		if text.Len() > 0 {
-			out = append(out, eventLines(reviewtypes.AssistantText{Text: stripTrailJSON(text.String())}, maxWidth)...)
+			out = append(out, eventLines(reviewtypes.AssistantText{Text: stripTrailJSON(text.String(), trailFindingsJSON)}, maxWidth)...)
 			text.Reset()
 		}
 	}

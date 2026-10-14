@@ -157,7 +157,7 @@ func (s SynthesisSink) RunFinished(summary reviewtypes.RunSummary) {
 	// already ends with a newline, and the raw-markdown fallback path has its
 	// own terminal newline from the LLM response. Adding Fprintln would double
 	// the trailing blank line.
-	display := stripTrailJSON(result)
+	display := stripTrailJSON(result, s.TrailFindingsJSON)
 	rendered, err := mdrender.RenderForWriter(s.renderWriter(), display)
 	if err != nil {
 		rendered = display

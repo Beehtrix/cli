@@ -206,8 +206,13 @@ func decodeTrailComments(raw json.RawMessage) ([]TrailComment, bool) {
 	return comments, true
 }
 
-// stripTrailJSON removes a valid trailing contract line for display.
-func stripTrailJSON(text string) string {
+// stripTrailJSON removes a valid trailing contract line for display. Only a
+// run that asked for the line has one; elsewhere a trailing JSON block is the
+// reviewer's own text and stays.
+func stripTrailJSON(text string, trailFindingsJSON bool) string {
+	if !trailFindingsJSON {
+		return text
+	}
 	if prose, _, ok := splitTrailJSON(text); ok {
 		return prose
 	}

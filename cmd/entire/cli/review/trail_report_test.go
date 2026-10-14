@@ -380,24 +380,75 @@ func TestTrailFindingsJSONInstructionsExampleParses(t *testing.T) {
 
 func TestStripTrailJSONForDisplay(t *testing.T) {
 	t.Parallel()
-	got := stripTrailJSON("approve — no actionable findings\n" + emptyTrailJSON)
+	got := stripTrailJSON("approve — no actionable findings\n"+emptyTrailJSON, true)
 	if got != "approve — no actionable findings" {
 		t.Errorf("stripTrailJSON = %q, want the verdict line only", got)
 	}
-	if prose := "plain review text"; stripTrailJSON(prose) != prose {
-		t.Errorf("text without a JSON line must be unchanged, got %q", stripTrailJSON(prose))
+	if prose := "plain review text"; stripTrailJSON(prose, true) != prose {
+		t.Errorf("text without a JSON line must be unchanged, got %q", stripTrailJSON(prose, true))
+	}
+	if output := "approve\n" + emptyTrailJSON; stripTrailJSON(output, false) != output {
+		t.Errorf("a run that did not ask for the line must keep it, got %q", stripTrailJSON(output, false))
 	}
 }
 
-func TestReviewManifestPreviewStripsTrailJSON(t *testing.T) {
+type fixedSynthesisProvider string
+
+func (p fixedSynthesisProvider) Synthesize(context.Context, string) (string, error) {
+	return string(p), nil
+}
+
+// TestTrailJSONHiddenOnlyWhenRequested verifies every display surface hides
+// the contract line of a trail run and shows a local run's output unchanged,
+// where a trailing JSON block is the reviewer's own text.
+func TestTrailJSONHiddenOnlyWhenRequested(t *testing.T) {
 	t.Parallel()
 	narrative := "approve — no actionable findings"
-	sourced := LocalReviewManifest{Sources: []ManifestSource{{Label: "claude-code", Output: narrative + "\n" + emptyTrailJSON}}}
-	if got := reviewManifestPreview(sourced); got != narrative {
-		t.Fatalf("source preview = %q, want %q", got, narrative)
+	output := narrative + "\n" + emptyTrailJSON
+	manifest := func(trail bool) LocalReviewManifest {
+		return LocalReviewManifest{
+			TrailFindingsJSON: trail,
+			Sources:           []ManifestSource{{Label: "claude-code", Output: output}},
+			AggregateOutput:   output,
+		}
 	}
-	aggregated := LocalReviewManifest{AggregateOutput: narrative + "\n" + emptyTrailJSON}
-	if got := reviewManifestPreview(aggregated); got != narrative {
-		t.Fatalf("aggregate preview = %q, want %q", got, narrative)
+	surfaces := map[string]func(trail bool) string{
+		"dump": func(trail bool) string {
+			var b bytes.Buffer
+			DumpSink{W: &b, TrailFindingsJSON: trail}.RunFinished(trailRunsSummary(textRun("codex", output)))
+			return b.String()
+		},
+		"tui detail": func(trail bool) string {
+			return strings.Join(buildEventLines([]reviewtypes.Event{reviewtypes.AssistantText{Text: output}}, 200, trail), "\n")
+		},
+		"judge prompt": func(trail bool) string {
+			summary := trailRunsSummary(textRun("codex", output), textRun("claude-code", narrative))
+			return composeSynthesisPrompt(summary, synthesisPromptOptions{trailFindingsJSON: trail})
+		},
+		"judge verdict": func(trail bool) string {
+			var b bytes.Buffer
+			summary := trailRunsSummary(textRun("codex", narrative), textRun("claude-code", narrative))
+			SynthesisSink{Provider: fixedSynthesisProvider(output), Writer: &b, TrailFindingsJSON: trail}.RunFinished(summary)
+			return b.String()
+		},
+		"findings preview": func(trail bool) string {
+			return reviewManifestPreview(manifest(trail))
+		},
+		"findings detail": func(trail bool) string {
+			var b bytes.Buffer
+			printReviewManifestDetail(&b, manifest(trail))
+			return b.String()
+		},
+	}
+	for name, render := range surfaces {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := render(true); strings.Contains(got, emptyTrailJSON) || !strings.Contains(got, narrative) {
+				t.Errorf("trail run must show the prose without the contract line:\n%s", got)
+			}
+			if got := render(false); !strings.Contains(got, emptyTrailJSON) {
+				t.Errorf("local run must show the reviewer's trailing JSON:\n%s", got)
+			}
+		})
 	}
 }

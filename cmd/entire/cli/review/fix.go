@@ -197,15 +197,15 @@ func reviewManifestHandleCounts(manifests []LocalReviewManifest) map[string]int 
 func printReviewManifestDetail(w io.Writer, manifest LocalReviewManifest) {
 	fmt.Fprintf(w, "Review findings from %s\n\n", reviewManifestListLabel(manifest))
 	for _, source := range manifest.Sources {
-		printRenderedReviewSection(w, source.Label, source.Output)
+		printRenderedReviewSection(w, source.Label, stripTrailJSON(source.Output, manifest.TrailFindingsJSON))
 	}
 	if strings.TrimSpace(manifest.AggregateOutput) != "" {
-		printRenderedReviewSection(w, "Aggregate summary", manifest.AggregateOutput)
+		printRenderedReviewSection(w, "Aggregate summary", stripTrailJSON(manifest.AggregateOutput, manifest.TrailFindingsJSON))
 	}
 }
 
 func printRenderedReviewSection(w io.Writer, title string, body string) {
-	markdown := fmt.Sprintf("## %s\n\n%s\n", title, strings.TrimSpace(stripTrailJSON(body)))
+	markdown := fmt.Sprintf("## %s\n\n%s\n", title, strings.TrimSpace(body))
 	rendered, err := mdrender.RenderForWriter(w, markdown)
 	if err != nil {
 		rendered = markdown
@@ -239,11 +239,11 @@ func reviewManifestListLabel(manifest LocalReviewManifest) string {
 
 func reviewManifestPreview(manifest LocalReviewManifest) string {
 	for _, source := range manifest.Sources {
-		if text := strings.TrimSpace(stripTrailJSON(source.Output)); text != "" {
+		if text := strings.TrimSpace(stripTrailJSON(source.Output, manifest.TrailFindingsJSON)); text != "" {
 			return stringutil.TruncateRunes(strings.Join(strings.Fields(text), " "), 70, "...")
 		}
 	}
-	if text := strings.TrimSpace(stripTrailJSON(manifest.AggregateOutput)); text != "" {
+	if text := strings.TrimSpace(stripTrailJSON(manifest.AggregateOutput, manifest.TrailFindingsJSON)); text != "" {
 		return stringutil.TruncateRunes(strings.Join(strings.Fields(text), " "), 70, "...")
 	}
 	return ""
