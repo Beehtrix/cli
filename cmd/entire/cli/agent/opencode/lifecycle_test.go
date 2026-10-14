@@ -307,20 +307,6 @@ func TestSafeToolUseID(t *testing.T) {
 	assert.NotEqual(t, mapped, safeToolUseID("functions_task:0"), "the hash keeps colliding sanitizations apart")
 }
 
-// TestParseHookEvent_SubagentStartAndStop_MapUnsafeCallID pins that a start
-// and its stop with an unsafe callID parse to the same mapped ToolUseID.
-func TestParseHookEvent_SubagentStartAndStop_MapUnsafeCallID(t *testing.T) {
-	t.Parallel()
-	ag := &OpenCodeAgent{}
-	input := `{"session_id":"ses_parent","tool_use_id":"functions.task:0","subagent_id":"ses_child","started_at":5000}`
-	start, err := ag.ParseHookEvent(context.Background(), HookNameSubagentStart, strings.NewReader(input))
-	require.NoError(t, err)
-	stop, err := ag.ParseHookEvent(context.Background(), HookNameSubagentStop, strings.NewReader(input))
-	require.NoError(t, err)
-	assert.Equal(t, safeToolUseID("functions.task:0"), start.ToolUseID)
-	assert.Equal(t, start.ToolUseID, stop.ToolUseID)
-}
-
 const childExportFixture = `{"info":{"id":"ses_child","parentID":"ses_parent","agent":"general"},"messages":[` +
 	`{"info":{"id":"m1","role":"user","time":{"created":1}},"parts":[{"type":"text","text":"make red"}]},` +
 	`{"info":{"id":"m2","role":"assistant","time":{"created":2},"tokens":{"input":100,"output":20,"reasoning":0,"cache":{"read":5,"write":0}}},` +

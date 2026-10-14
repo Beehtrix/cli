@@ -46,9 +46,11 @@ func completionRecordKey(state *strategy.SessionState, event *agent.Event) strin
 		}
 		sameChild = true
 		switch {
+		// No start (a plugin restarted mid-call) cannot tell a new call on this child from a duplicate; skip rather than double-count.
 		case event.SubagentStartedAt.IsZero() || rec.StartedAt.UnixMilli() == startMs:
 			return rec.ToolUseID
 		case rec.CompletedAt.IsZero():
+			// Whatever its start: the plugin's background queue stops a child's calls first in, first out.
 			live = rec
 		case rec.StartedAt.UnixMilli() > startMs:
 			notEarlier = rec

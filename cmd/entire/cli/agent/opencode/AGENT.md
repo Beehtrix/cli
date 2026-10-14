@@ -92,5 +92,7 @@ text, so prompt extraction and the summary skip it.
 - `opencode run` aborts a running background child at exit, and its teardown instance can leave the parent ACTIVE until the exited-owner sweep; the TUI is unaffected.
 - Two calls in one message that resume the same child: the queued call ends at the first run's idle, so its own work lands in no record.
 - A call whose start the plugin never saw (restart mid-task) declares the child's full export.
+- A reused-`callID` call has no live marker while it runs (its start is deduplicated and the Go start path does not re-key), so commit overlap checks and the SessionEnd sweep miss it; if the parent ends before its stop, the call is lost.
+- A reused-`callID` stop with no `started_at` (the plugin restarted between the call's before and after hooks) for a child already recorded under that `callID` is indistinguishable from a duplicate, so it is skipped and that call's work is not recorded; deliberate, to avoid double-counting a real duplicate.
 - entire.io joins task records to task calls on exact `tool_use_id`, so mapped or re-keyed records show as unmatched until its subagent view joins as above.
 - A running background child's edits reach the parent's files only at its stop. Until then, an IDLE parent with no tracked files of its own is left out of a commit that another session also claims; otherwise it condenses and stores the child's export so far.
