@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -17,15 +16,12 @@ import (
 	"github.com/entireio/cli/internal/entireclient/contexts"
 	"github.com/entireio/cli/internal/entireclient/tokenstore"
 	"github.com/entireio/cli/internal/entireclient/userdirs"
-	"github.com/entireio/cli/internal/testdirs"
 )
 
 // defaultSavedTokenTTL is the encoded keychain expiry used when a refreshed
 // token carries no usable ExpiresAt. The server is the real authority; this
 // only governs when local readers consider the cached token stale.
 const defaultSavedTokenTTL = time.Hour
-
-const authLockDirEnvVar = "ENTIRE_AUTH_LOCK_DIR"
 
 // contextTokenStore adapts one login context's keyring slots to auth-go's
 // tokenstore.Store, so tokenmanager can load, refresh, and persist that
@@ -126,9 +122,9 @@ func newContextTokenManager(c *contexts.Context, transport http.RoundTripper, al
 	if c.KeychainService == "" || c.Handle == "" {
 		return nil, fmt.Errorf("context %q has no keychain slot", c.Name)
 	}
-	lockDir, err := tokenManagerLockDir()
+	lockDir, err := userdirs.AuthLockDir()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("resolve auth lock directory for context %q: %w", c.Name, err)
 	}
 	mgr, err := tokenmanager.New(tokenmanager.Config{
 		Issuer:            strings.TrimRight(c.CoreURL, "/"),
@@ -144,23 +140,6 @@ func newContextTokenManager(c *contexts.Context, transport http.RoundTripper, al
 		return nil, fmt.Errorf("init token manager for context %q: %w", c.Name, err)
 	}
 	return mgr, nil
-}
-
-// Spawned binaries need an inherited override because testing.Testing is false
-// there, and macOS's os.UserCacheDir ignores XDG_CACHE_HOME. In-process tests
-// without the override use testdirs; production without an override keeps
-// auth-go's default.
-func tokenManagerLockDir() (string, error) {
-	if dir := os.Getenv(authLockDirEnvVar); dir != "" {
-		if err := userdirs.RequireAbsoluteOverride(authLockDirEnvVar, dir); err != nil {
-			return "", fmt.Errorf("resolve auth lock directory: %w", err)
-		}
-		return dir, nil
-	}
-	if dir, ok := testdirs.Dir("authlock"); ok {
-		return dir, nil
-	}
-	return "", nil
 }
 
 // reauthError carries a friendly, context-named re-login message while still

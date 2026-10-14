@@ -181,9 +181,9 @@ using `entire` for real while tests run.
   `XDG_CACHE_HOME`, `ENTIRE_AUTH_LOCK_DIR`, `ENTIRE_TOKEN_STORE=file`,
   `ENTIRE_TOKEN_STORE_PATH`, and `ENTIRE_TEST_AUTH_STORE_FILE` process-wide so
   every spawned `entire` (and every agent-invoked hook) inherits isolation. Any
-  new harness that spawns the real binary must do the same. Set
-  `ENTIRE_AUTH_LOCK_DIR` to an absolute path so children in different working
-  directories share the same lock.
+  new harness that spawns the real binary must do the same, using absolute
+  paths: a relative directory override is rejected, so every command in the
+  child that needs that directory fails.
 - **Agent credential preparation**: mocking a subprocess runner does not
   isolate code that discovers credentials before executing it. Antigravity
   generation tests use `newTestTextGenerator` with explicit temporary

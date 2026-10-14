@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -62,10 +61,6 @@ func TestAuthToken_LockDirectoryIsolation(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			defaultLockDir := filepath.Join(home, "auth-go")
-			if runtime.GOOS == "darwin" {
-				defaultLockDir = filepath.Join(home, "Library", "Caches", "auth-go")
-			}
 			if os.Getenv("ENTIRE_AUTH_LOCK_DIR") == "" {
 				t.Fatal("test harness did not set ENTIRE_AUTH_LOCK_DIR")
 			}
@@ -78,13 +73,15 @@ func TestAuthToken_LockDirectoryIsolation(t *testing.T) {
 				"HOME="+home, "XDG_CACHE_HOME="+home, "LocalAppData="+home,
 				"ENTIRE_CONFIG_DIR="+configDir, "ENTIRE_TOKEN_STORE=file", "ENTIRE_TOKEN_STORE_PATH="+tokensPath,
 			)
-			// The harness lock dir is shared by every spawned binary in this run,
-			// so the "set" case gets its own directory to count locks in.
-			wantDir := defaultLockDir
+			// HOME, XDG_CACHE_HOME and LocalAppData all point at home, so
+			// auth-go's default lock dir lands under it on every OS. The harness
+			// lock dir is shared by every spawned binary in this run, so the
+			// "set" case gets its own directory to count locks in.
+			lockDir := ""
 			switch mode {
 			case "set":
-				wantDir = t.TempDir()
-				cmd.Env = append(cmd.Env, "ENTIRE_AUTH_LOCK_DIR="+wantDir)
+				lockDir = t.TempDir()
+				cmd.Env = append(cmd.Env, "ENTIRE_AUTH_LOCK_DIR="+lockDir)
 			case "empty":
 				cmd.Env = append(cmd.Env, "ENTIRE_AUTH_LOCK_DIR=")
 			}
@@ -95,18 +92,35 @@ func TestAuthToken_LockDirectoryIsolation(t *testing.T) {
 			if got := strings.TrimSpace(string(out)); got != refreshedJWT {
 				t.Fatalf("auth token returned %q, want refreshed token", got)
 			}
-			locks, err := filepath.Glob(filepath.Join(wantDir, "*.lock"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(locks) != 1 {
-				t.Fatalf("lock files in %s = %v, want exactly one from the refresh", wantDir, locks)
-			}
+			homeLocks := lockFiles(t, home)
 			if mode == "set" {
-				if _, err := os.Stat(defaultLockDir); !os.IsNotExist(err) {
-					t.Fatalf("refresh touched the default user cache: %v", err)
+				if locks := lockFiles(t, lockDir); len(locks) != 1 {
+					t.Fatalf("lock files in %s = %v, want exactly one from the refresh", lockDir, locks)
 				}
+				if len(homeLocks) != 0 {
+					t.Fatalf("refresh wrote locks into the default user cache: %v", homeLocks)
+				}
+			} else if len(homeLocks) != 1 {
+				t.Fatalf("lock files under %s = %v, want exactly one in auth-go's default dir", home, homeLocks)
 			}
 		})
 	}
+}
+
+func lockFiles(t *testing.T, root string) []string {
+	t.Helper()
+	var locks []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && strings.HasSuffix(path, ".lock") {
+			locks = append(locks, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return locks
 }
