@@ -154,12 +154,18 @@ func ExtractSpawnedAgentIDs(transcript []TranscriptLine) map[string]string {
 	return agentIDs
 }
 
-// spawnedAgentIDs returns every agent the transcript launched under its own
-// ID: Agent calls named in their result text (ExtractSpawnedAgentIDs) and
-// skills that ran forked (forkedSkillAgentIDs).
+// spawnedAgentIDs returns every agent the transcript launched, keyed to the
+// launching tool_use_id: the agents tool results name in their structured
+// result (toolResultAgentIDs), plus, for results that name none (older
+// transcripts), the "agentId:" in their text (ExtractSpawnedAgentIDs). A
+// result that names an agent is never read for text, which can quote other
+// agents' IDs.
 func spawnedAgentIDs(transcriptData []byte, parsed []TranscriptLine) map[string]string {
-	agentIDs := ExtractSpawnedAgentIDs(parsed)
-	for agentID, toolUseID := range forkedSkillAgentIDs(transcriptData) {
+	agentIDs, named := toolResultAgentIDs(transcriptData)
+	for agentID, toolUseID := range ExtractSpawnedAgentIDs(parsed) {
+		if named[toolUseID] {
+			continue
+		}
 		if _, ok := agentIDs[agentID]; !ok {
 			agentIDs[agentID] = toolUseID
 		}
@@ -167,16 +173,22 @@ func spawnedAgentIDs(transcriptData []byte, parsed []TranscriptLine) map[string]
 	return agentIDs
 }
 
-// forkedSkillAgentIDs returns the agents that skills with `context: fork` ran
-// in, keyed to the Skill call's tool_use_id. A forked Skill call's result
-// text does not name its agent; only the structured result does
-// ({"toolUseResult": {"status": "forked", "agentId": ...}}, Claude Code
-// 2.1.291). The agent's transcript is <subagentsDir>/agent-<id>.jsonl, as for
-// an Agent call. IDs that are not path-safe are dropped.
-func forkedSkillAgentIDs(transcriptData []byte) map[string]string {
-	agentIDs := make(map[string]string)
+// toolResultAgentIDs returns every agent a tool result names in its
+// structured result ({"toolUseResult": {"agentId": ...}}), keyed to that
+// result's tool_use_id: Agent calls in the foreground ("completed") and
+// background ("async_launched"), and skills that ran forked ("forked",
+// Claude Code 2.1.291). Foreground Explore and Plan results never print
+// "agentId:" in their text, so this is the only place they name their agent.
+// The first result naming an agent keeps it (later ones are follow-ups to
+// the same agent). named holds every tool_use_id whose result named an
+// agent, first or not: those results are not read for text. The agent's
+// transcript is <subagentsDir>/agent-<id>.jsonl. IDs that are empty or not
+// path-safe name no agent.
+func toolResultAgentIDs(transcriptData []byte) (agentIDs map[string]string, named map[string]bool) {
+	agentIDs = make(map[string]string)
+	named = make(map[string]bool)
 	for _, line := range bytes.Split(transcriptData, []byte("\n")) {
-		if !bytes.Contains(line, []byte(`"forked"`)) {
+		if !bytes.Contains(line, []byte(`"agentId"`)) {
 			continue
 		}
 		var entry struct {
@@ -188,13 +200,13 @@ func forkedSkillAgentIDs(transcriptData []byte) map[string]string {
 				} `json:"content"`
 			} `json:"message"`
 			ToolUseResult struct {
-				Status  string `json:"status"`
 				AgentID string `json:"agentId"`
 			} `json:"toolUseResult"`
 		}
+		// ValidateAgentID allows "" (an optional field elsewhere); here an
+		// empty ID names no agent.
 		if json.Unmarshal(line, &entry) != nil || entry.Type != transcript.TypeUser ||
-			entry.ToolUseResult.Status != skillToolStatusForked ||
-			validation.ValidateAgentID(entry.ToolUseResult.AgentID) != nil {
+			entry.ToolUseResult.AgentID == "" || validation.ValidateAgentID(entry.ToolUseResult.AgentID) != nil {
 			continue
 		}
 		toolUseID := ""
@@ -204,9 +216,12 @@ func forkedSkillAgentIDs(transcriptData []byte) map[string]string {
 				break
 			}
 		}
-		agentIDs[entry.ToolUseResult.AgentID] = toolUseID
+		named[toolUseID] = true
+		if _, seen := agentIDs[entry.ToolUseResult.AgentID]; !seen {
+			agentIDs[entry.ToolUseResult.AgentID] = toolUseID
+		}
 	}
-	return agentIDs
+	return agentIDs, named
 }
 
 // ExtractWorkflowRunIDs returns the IDs of the Workflow runs a transcript
