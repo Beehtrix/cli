@@ -7,11 +7,11 @@
     "kind": "prompt_runner",
     "agent": "claude",
     "model": "sonnet",
-    "timeout_ms": 900000,
+    "timeout_ms": 1500000,
     "sandbox": {
       "base_template": "claude",
       "repo_token": "read",
-      "auto_stop_minutes": 20
+      "auto_stop_minutes": 30
     }
   },
   "automation": {
