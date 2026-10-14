@@ -12,7 +12,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
 
@@ -182,11 +181,8 @@ func TestStagedBlobs_UnusualExistingPathIsNotDeletion(t *testing.T) {
 	testutil.WriteFile(t, dir, name, "after\n")
 	testutil.GitAdd(t, dir, name)
 	t.Chdir(dir)
-	repo, err := gitrepo.OpenPath(dir)
-	require.NoError(t, err)
-	defer repo.Close()
 
-	staged, err := stagedBlobs(context.Background(), repo)
+	staged, err := stagedBlobs(context.Background())
 	require.NoError(t, err)
 	entry, ok := staged[name]
 	require.True(t, ok, "staged path must retain its literal bytes: %#v", staged)
