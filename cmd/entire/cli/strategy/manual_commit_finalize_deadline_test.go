@@ -11,7 +11,6 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
-	"github.com/entireio/cli/cmd/entire/cli/checkpointpolicy"
 	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/redact"
@@ -92,9 +91,6 @@ func TestFinalizeAllTurnCheckpointsStopsAtTotalBudget(t *testing.T) {
 				refHashes[refName] = ref.Hash()
 				require.NoError(t, repo.Storer.RemoveReference(refName))
 			}
-
-			_, err = checkpointpolicy.WriteLocal(context.Background(), repo, plumbing.ZeroHash, checkpointpolicy.DefaultPolicy())
-			require.NoError(t, err)
 
 			transcriptPath := filepath.Join(workDir, ".entire", "metadata", sessionID, paths.TranscriptFileName)
 			require.NoError(t, os.MkdirAll(filepath.Dir(transcriptPath), 0o755))
