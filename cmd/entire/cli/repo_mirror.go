@@ -1330,24 +1330,24 @@ func newRepoMirrorListCmd() *cobra.Command {
 // than the active login resolves instead of reading as "no repo matching".
 func runRepoMirrorViewByName(cmd *cobra.Command, ref, clusterHost string) error {
 	return coreRunnerFor(clusterHost)(cmd, func(ctx context.Context, c *coreapi.Client) error {
-		out, err := c.ListRepos(ctx, coreapi.ListReposParams{Filter: coreapi.NewOptString(ref)})
-		if err != nil {
-			return err
-		}
-		if len(out.Repos) == 0 {
+		entry, err := lookupRepoIndexEntry(ctx, c, ref)
+		if errors.Is(err, errRepoNotOnboarded) {
 			// The filter only matches onboarded repos on today's control
 			// plane, so a not-yet-mirrored GitHub repo lands here too —
 			// point at the list mode that shows those.
 			return fmt.Errorf("no repo matching %q visible from your login (GitHub repos you could onboard: `entire repo mirror list --available`)", ref)
 		}
+		if err != nil {
+			return err
+		}
 		clusters, err := c.ListClusters(ctx)
 		if err != nil {
 			return err
 		}
-		row := mirrorRepoDetailRow(out.Repos[0], clusterHostBySlug(clusters.Clusters))
+		row := mirrorRepoDetailRow(entry, clusterHostBySlug(clusters.Clusters))
 		if jsonRequested(cmd) {
 			view := mirrorRepoViewJSON{repoDirRow: row}
-			view.RepoID, view.APIURL, _ = repoViewCoords(out.Repos[0], clusters.Clusters)
+			view.RepoID, view.APIURL, _ = repoViewCoords(entry, clusters.Clusters)
 			return printJSON(cmd.OutOrStdout(), view)
 		}
 		renderRepoDetail(cmd.OutOrStdout(), row)
