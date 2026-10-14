@@ -349,6 +349,17 @@ func TestTrailReportWithoutJudge(t *testing.T) {
 		}
 	})
 
+	t.Run("a report before a tool call is read with a JSON-only final message", func(t *testing.T) {
+		t.Parallel()
+		run := trailRun{name: "claude-code", events: []reviewtypes.Event{
+			reviewtypes.AssistantText{Text: "request changes\n- [high] retry.go:42 — loop ignores ctx."},
+			reviewtypes.ToolCall{Name: "TodoWrite"},
+			reviewtypes.AssistantText{Text: emptyTrailJSON},
+		}}
+		report, called, _ := postedTrailReport(t, trailRunsSummary(run), "")
+		requirePostedProse(t, report, called, "loop ignores ctx")
+	})
+
 	t.Run("a new message starts a new line after a tool call", func(t *testing.T) {
 		t.Parallel()
 		run := trailRun{name: "pi", events: []reviewtypes.Event{

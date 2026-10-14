@@ -115,22 +115,40 @@ func markedFindingCount(prose string) int {
 // the report does not hide it, and earlier exploration narration, whose
 // bullets ("I'll check:\n- retry.go") are not findings, is left out. A tool
 // call inside a message, where the next text continues it as a delta, is not
-// a boundary.
+// a boundary. A stretch holding only the contract line also takes the stretch
+// before it, so a report written before a final tool call is still checked
+// against the line.
 func reportText(buf []reviewtypes.Event) string {
 	end := len(buf)
 	for i := len(buf) - 1; i >= -1; i-- {
-		if i >= 0 {
-			if _, ok := buf[i].(reviewtypes.ToolCall); !ok || continuesMessage(buf[i+1:]) {
-				continue
-			}
+		if i >= 0 && !isTextBoundary(buf, i) {
+			continue
 		}
 		text := joinAssistantText(buf[i+1 : end])
-		if _, _, ok := splitTrailJSON(text); ok {
-			return text
+		prose, payload, found := splitTrailJSONPayload(text)
+		if _, ok := decodeTrailComments(payload["comments"]); !found || !ok {
+			end = i
+			continue
 		}
-		end = i
+		if prose == "" && i >= 0 {
+			start := i - 1
+			for start >= 0 && !isTextBoundary(buf, start) {
+				start--
+			}
+			if before := joinAssistantText(buf[start+1 : i]); strings.TrimSpace(before) != "" {
+				return before + "\n\n" + text
+			}
+		}
+		return text
 	}
 	return ""
+}
+
+// isTextBoundary reports whether buf[i] is a tool call that separates two
+// stretches of text rather than interrupting a message.
+func isTextBoundary(buf []reviewtypes.Event, i int) bool {
+	_, ok := buf[i].(reviewtypes.ToolCall)
+	return ok && !continuesMessage(buf[i+1:])
 }
 
 // continuesMessage reports whether the first text in buf continues the
@@ -152,6 +170,24 @@ func continuesMessage(buf []reviewtypes.Event) bool {
 // the prose instead. ok reports a valid contract: a "comments" array.
 // Entries without a body are dropped.
 func splitTrailJSON(text string) (prose string, comments []TrailComment, ok bool) {
+	prose, payload, found := splitTrailJSONPayload(text)
+	if !found {
+		return prose, nil, false
+	}
+	if prose == "" {
+		var summary string
+		if json.Unmarshal(payload["summary"], &summary) == nil {
+			prose = strings.TrimSpace(summary)
+		}
+	}
+	comments, ok = decodeTrailComments(payload["comments"])
+	return prose, comments, ok
+}
+
+// splitTrailJSONPayload finds a trailing contract-shaped JSON object and
+// returns the prose before it and its decoded keys. found is false, with
+// the whole text as prose, when there is none.
+func splitTrailJSONPayload(text string) (prose string, payload map[string]json.RawMessage, found bool) {
 	text = strings.TrimSpace(text)
 	lines := strings.Split(text, "\n")
 	end := len(lines)
@@ -163,7 +199,7 @@ func splitTrailJSON(text string) (prose string, comments []TrailComment, ok bool
 		if !strings.HasPrefix(strings.TrimSpace(lines[start]), "{") {
 			continue
 		}
-		var payload map[string]json.RawMessage
+		payload = nil
 		if err := json.Unmarshal([]byte(strings.Join(lines[start:end], "\n")), &payload); err != nil {
 			continue
 		}
@@ -176,15 +212,7 @@ func splitTrailJSON(text string) (prose string, comments []TrailComment, ok bool
 		if fenced && proseEnd > 0 && strings.HasPrefix(strings.TrimSpace(lines[proseEnd-1]), "```") {
 			proseEnd--
 		}
-		prose = strings.TrimSpace(strings.Join(lines[:proseEnd], "\n"))
-		if prose == "" {
-			var summary string
-			if json.Unmarshal(payload["summary"], &summary) == nil {
-				prose = strings.TrimSpace(summary)
-			}
-		}
-		comments, ok = decodeTrailComments(payload["comments"])
-		return prose, comments, ok
+		return strings.TrimSpace(strings.Join(lines[:proseEnd], "\n")), payload, true
 	}
 	return text, nil, false
 }
