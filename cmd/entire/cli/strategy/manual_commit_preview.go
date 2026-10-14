@@ -3,7 +3,6 @@ package strategy
 import (
 	"context"
 	"fmt"
-	"slices"
 	"sort"
 	"time"
 
@@ -27,7 +26,7 @@ type NextCheckpointPreview struct {
 	// Turns is the number of turn-end steps recorded since the last
 	// checkpoint (StepCount).
 	Turns int
-	// FilesTouched lists the files waiting for a commit, sorted.
+	// FilesTouched lists the files waiting for a commit in any worktree, sorted.
 	FilesTouched []string
 	// TaskRecords lists the subagent task records waiting to be materialized.
 	TaskRecords []NextCheckpointTaskRecord
@@ -78,8 +77,7 @@ func previewSession(ctx context.Context, state *SessionState) NextCheckpointPrev
 	if state.LastInteractionTime != nil {
 		lastActivity = *state.LastInteractionTime
 	}
-	files := slices.Clone(state.FilesTouched)
-	sort.Strings(files)
+	files := state.PendingFiles()
 	records := make([]NextCheckpointTaskRecord, 0, len(state.TaskRecords))
 	for _, rec := range state.TaskRecords {
 		records = append(records, NextCheckpointTaskRecord{

@@ -52,6 +52,8 @@ func TestStateHasPendingFiles(t *testing.T) {
 
 	both := State{FilesTouched: []string{"h.go"}, OtherWorktrees: map[string]*WorktreeWork{"wt": {FilesTouched: []string{"a.go", "b.go"}}}}
 	assert.Equal(t, 3, both.PendingFileCount())
+	assert.Equal(t, []string{"a.go", "b.go", "h.go"}, both.PendingFiles())
+	assert.Equal(t, []string{"a.go"}, onlyElsewhere.PendingFiles(), "files only in another worktree are pending files")
 }
 
 func TestWorktreeKey(t *testing.T) {

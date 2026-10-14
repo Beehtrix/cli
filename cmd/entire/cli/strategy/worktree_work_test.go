@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -217,4 +218,47 @@ func TestFastPath_FallbackMatchedSessionNeedsItsFiles(t *testing.T) {
 	data, err := os.ReadFile(msg)
 	require.NoError(t, err)
 	assert.NotContains(t, string(data), "Entire-Checkpoint")
+}
+
+// A background task's SubagentStop must not claim a file another session
+// recorded in the task's worktree from elsewhere: it counts as recorded, as
+// one in the FilesTouched of a session homed there does.
+func TestLoadBackgroundClaimContext_CountsEditsRecordedFromElsewhere(t *testing.T) {
+	mainDir, linkedDir := twoWorktrees(t)
+	ctx := context.Background()
+	s := &ManualCommitStrategy{}
+	saveSessionMatchState(ctx, t, s, linkedDir, &SessionState{
+		SessionID:    "task-owner",
+		WorktreePath: linkedDir,
+		TaskRecords:  []session.TaskRecord{{ToolUseID: "bg", Background: true, StartedAt: time.Now()}},
+	})
+	saveSessionMatchState(ctx, t, s, mainDir, &SessionState{
+		SessionID:    "from-main",
+		WorktreePath: mainDir,
+		OtherWorktrees: map[string]*session.WorktreeWork{
+			linkedKey(t, linkedDir): {Path: linkedDir, FilesTouched: []string{"theirs.go"}, Incarnation: mark(t, linkedDir)},
+		},
+	})
+
+	claims, ok, err := LoadBackgroundClaimContext(ctx, "task-owner", "bg")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Contains(t, claims.Recorded, "theirs.go", "the task may claim another session's edit in its worktree")
+}
+
+// The pending preview (checkpoint list --pending) lists a session's files in
+// every worktree, not only its home's.
+func TestPreviewSession_ListsFilesInOtherWorktrees(t *testing.T) {
+	mainDir, linkedDir := twoWorktrees(t)
+	chdirWorktree(t, mainDir)
+	preview := previewSession(context.Background(), &SessionState{
+		SessionID:    "preview",
+		WorktreePath: mainDir,
+		FilesTouched: []string{"home.go"},
+		StepCount:    2,
+		OtherWorktrees: map[string]*session.WorktreeWork{
+			linkedKey(t, linkedDir): {Path: linkedDir, FilesTouched: []string{"a.go"}},
+		},
+	})
+	assert.Equal(t, []string{"a.go", "home.go"}, preview.FilesTouched)
 }

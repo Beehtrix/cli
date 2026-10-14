@@ -209,8 +209,9 @@ func exactWorktreeMatches(states []*SessionState, worktreePath string) []*Sessio
 // BackgroundClaimContext is what a background task's SubagentStop needs to
 // decide which new untracked files it may claim.
 type BackgroundClaimContext struct {
-	// Recorded holds every path a session in the task's worktree has in
-	// FilesTouched.
+	// Recorded holds every path a session has pending in the task's
+	// worktree: in FilesTouched for one homed there, in its entry for that
+	// worktree for one that edited it from elsewhere.
 	Recorded map[string]struct{}
 
 	// Overlapped reports that another background task in the worktree was
@@ -243,6 +244,14 @@ func LoadBackgroundClaimContext(ctx context.Context, sessionID, toolUseID string
 		return BackgroundClaimContext{}, false, nil
 	}
 	claims.Recorded = make(map[string]struct{})
+	key := session.WorktreeKey(own.WorktreeID)
+	for _, state := range states {
+		if work := state.OtherWorktrees[key]; work != nil && !state.Kind.IsImported() {
+			for _, file := range work.FilesTouched {
+				claims.Recorded[file] = struct{}{}
+			}
+		}
+	}
 	for _, state := range exactWorktreeMatches(states, own.WorktreePath) {
 		for _, file := range state.FilesTouched {
 			claims.Recorded[file] = struct{}{}

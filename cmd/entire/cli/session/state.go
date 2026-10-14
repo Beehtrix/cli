@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -842,6 +843,19 @@ func (s *State) PendingFileCount() int {
 		}
 	}
 	return n
+}
+
+// PendingFiles is the files awaiting a commit across every worktree (see
+// HasPendingFiles), sorted, each worktree-relative name once.
+func (s *State) PendingFiles() []string {
+	files := slices.Clone(s.FilesTouched)
+	for _, work := range s.OtherWorktrees {
+		if work != nil {
+			files = append(files, work.FilesTouched...)
+		}
+	}
+	slices.Sort(files)
+	return slices.Compact(files)
 }
 
 // WorktreeWork is a session's record of edits in one worktree other than its
