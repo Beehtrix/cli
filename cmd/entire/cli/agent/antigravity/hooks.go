@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
@@ -265,6 +266,60 @@ func (a *AntigravityAgent) AreHooksInstalled(ctx context.Context) (bool, error) 
 // detection and SaveStep, which can exceed agy's 30s default timeout on large
 // repos, in which case agy kills the hook mid-turn-end with no trace.
 const stopHookTimeoutSeconds = 300
+
+var _ agent.HookTimeoutRepairer = (*AntigravityAgent)(nil)
+
+// RepairHookTimeouts implements agent.HookTimeoutRepairer. Installs from before
+// stopHookTimeoutSeconds leave agy's 30s default on Stop, which is shorter than
+// the turn-end budget derived from it. It only adds a missing Stop timeout to
+// the "entire" entry, editing raw JSON so keys Entire does not model survive,
+// and skips an entry that does not parse rather than rewriting it.
+func (a *AntigravityAgent) RepairHookTimeouts(ctx context.Context) (bool, error) {
+	cfg, err := a.hookConfig(ctx)
+	if err != nil {
+		return false, err
+	}
+	data, err := cfg.Read()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err //nolint:wrapcheck // agent.HookConfigFile already names the file in its error
+	}
+	var rawFile map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawFile); err != nil {
+		return false, fmt.Errorf("failed to parse hooks.json: %w", err)
+	}
+	var entry map[string]json.RawMessage
+	if err := json.Unmarshal(rawFile["entire"], &entry); err != nil || entry == nil {
+		return false, nil //nolint:nilerr // an absent or unparseable entry is left for install to replace
+	}
+	var stop []map[string]json.RawMessage
+	if err := json.Unmarshal(entry["Stop"], &stop); err != nil {
+		return false, nil //nolint:nilerr // an unparseable Stop list is left for install to replace
+	}
+
+	changed := false
+	for _, handler := range stop {
+		if _, ok := handler["timeout"]; !ok {
+			handler["timeout"] = json.RawMessage(strconv.Itoa(stopHookTimeoutSeconds))
+			changed = true
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+	if entry["Stop"], err = jsonutil.MarshalWithNoHTMLEscape(stop); err != nil {
+		return false, fmt.Errorf("failed to marshal Stop hooks: %w", err)
+	}
+	if rawFile["entire"], err = jsonutil.MarshalWithNoHTMLEscape(entry); err != nil {
+		return false, fmt.Errorf("failed to marshal hook config: %w", err)
+	}
+	if err := writeHooksFile(rawFile, cfg); err != nil {
+		return false, err
+	}
+	return true, nil
+}
 
 // buildEntireHookConfig constructs the HookConfig for the "entire" entry for
 // the host this binary runs on.

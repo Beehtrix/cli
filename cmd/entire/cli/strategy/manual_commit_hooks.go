@@ -3309,8 +3309,7 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 		slog.Int("checkpoint_count", len(state.TurnCheckpointIDs)),
 	)
 
-	if ctx.Err() != nil {
-		abandonInterruptedFinalize(logCtx, state, ctx.Err())
+	if finalizeInterrupted(ctx, logCtx, state) {
 		return 0
 	}
 
@@ -3370,8 +3369,7 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 	// Open repository (needed for the checkpoint store)
 	repo, err := OpenRepository(ctx)
 	if err != nil {
-		if ctx.Err() != nil {
-			abandonInterruptedFinalize(logCtx, state, ctx.Err())
+		if finalizeInterrupted(ctx, logCtx, state) {
 			return 0
 		}
 		logging.Warn(logCtx, "finalize: failed to open repository",
@@ -3471,14 +3469,12 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 		networkCtx, cancel = context.WithDeadline(ctx, deadline)
 		defer cancel()
 	}
-	if networkCtx.Err() != nil {
-		abandonInterruptedFinalize(logCtx, state, networkCtx.Err())
+	if finalizeInterrupted(networkCtx, logCtx, state) {
 		return 0
 	}
 	stores, err := checkpoint.Open(networkCtx, repo, s.hookCheckpointStoreOptions(networkCtx))
 	if err != nil {
-		if networkCtx.Err() != nil {
-			abandonInterruptedFinalize(logCtx, state, networkCtx.Err())
+		if finalizeInterrupted(networkCtx, logCtx, state) {
 			return 0
 		}
 		logging.Warn(logCtx, "finalize: failed to open checkpoint store",
@@ -3488,8 +3484,7 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 	}
 	// The deadline can pass while Open runs; precompute would then hash the
 	// whole transcript for writes that never start.
-	if networkCtx.Err() != nil {
-		abandonInterruptedFinalize(logCtx, state, networkCtx.Err())
+	if finalizeInterrupted(networkCtx, logCtx, state) {
 		return 0
 	}
 	store := stores.Persistent
@@ -3506,9 +3501,11 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 		SkillEvents:             skillEvents,
 		PrecomputedBlobs:        precomputed,
 	}
-	errCount, interrupted := finalizeTurnCheckpointWrites(networkCtx, logCtx, store, state, updateOpts)
-	if interrupted > 0 {
-		recordInterruptedFinalize(logCtx, state, interrupted, networkCtx.Err())
+	errCount, unfinalized := finalizeTurnCheckpointWrites(networkCtx, logCtx, store, state, updateOpts)
+	if unfinalized > 0 {
+		state.TurnCheckpointIDs = state.TurnCheckpointIDs[len(state.TurnCheckpointIDs)-unfinalized:]
+		finalizeInterrupted(networkCtx, logCtx, state)
+		return errCount
 	}
 
 	// Clear turn checkpoint IDs. Do NOT update CheckpointTranscriptStart here — it was
@@ -3527,7 +3524,7 @@ func finalizeTurnCheckpointWrites(
 	store checkpoint.PersistentStore,
 	state *SessionState,
 	updateOpts checkpoint.UpdateOptions,
-) (errCount, interrupted int) {
+) (errCount, unfinalized int) {
 	for checkpointIndex, cpIDStr := range state.TurnCheckpointIDs {
 		if ctx.Err() != nil {
 			return errCount, len(state.TurnCheckpointIDs) - checkpointIndex
@@ -3570,27 +3567,23 @@ func finalizeTurnCheckpointWrites(
 	return errCount, 0
 }
 
-// abandonInterruptedFinalize gives up on every remaining turn checkpoint after
-// the context ended before the writes began. Turn start clears the IDs anyway,
-// so the checkpoints keep their provisional transcripts for good; the
-// capture-degraded marker is what makes that visible.
-func abandonInterruptedFinalize(logCtx context.Context, state *SessionState, cause error) {
-	unfinalized := len(state.TurnCheckpointIDs)
-	state.TurnCheckpointIDs = nil
-	recordInterruptedFinalize(logCtx, state, unfinalized, cause)
-}
-
-// recordInterruptedFinalize marks the turn's capture as degraded. It covers a
-// host cancelling the hook (SIGTERM ends the root context) as well as the
-// turn-end deadline, since both leave checkpoints provisional.
-func recordInterruptedFinalize(logCtx context.Context, state *SessionState, unfinalized int, cause error) {
+// finalizeInterrupted reports whether ctx has ended, from the turn-end deadline
+// or the host cancelling the hook (SIGTERM ends the root context). If so it
+// marks the turn's capture as degraded and keeps the unfinalized
+// TurnCheckpointIDs, so a repeated Stop in the same turn can retry them; turn
+// start clears them otherwise, leaving their provisional transcripts for good.
+func finalizeInterrupted(ctx, logCtx context.Context, state *SessionState) bool {
+	if ctx.Err() == nil {
+		return false
+	}
 	now := time.Now().UTC()
 	state.CaptureDegradedAt = &now
 	logging.Warn(logCtx, "finalize: interrupted; checkpoints left with provisional transcripts",
 		slog.String("session_id", state.SessionID),
-		slog.Int("unfinalized_count", unfinalized),
-		slog.Any("cause", cause),
+		slog.Int("unfinalized_count", len(state.TurnCheckpointIDs)),
+		slog.Any("cause", ctx.Err()),
 	)
+	return true
 }
 
 // filesChangedInCommit returns the set of files changed in a commit using git diff-tree.

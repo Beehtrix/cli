@@ -210,8 +210,22 @@ func TestFinalizeAllTurnCheckpoints_Deadline(t *testing.T) {
 			require.Equal(t, tc.degraded, state.CaptureDegradedAt != nil, "capture degradation")
 			require.Zero(t, errCount, "an interruption is reported as capture degradation, not as errors")
 			require.Equal(t, tc.fetches, fetches, "no fetch may start once the context has ended")
-			require.Empty(t, state.TurnCheckpointIDs, "turn start clears the IDs anyway; nothing retries them")
+			var unfinalized []string
+			if tc.degraded {
+				unfinalized = f.state.TurnCheckpointIDs[tc.finalized:]
+			}
+			require.Equal(t, unfinalized, state.TurnCheckpointIDs, "an interruption keeps the unfinalized IDs for a repeated Stop")
 			f.requireTranscripts(t, tc.finalized)
+			if !tc.degraded {
+				return
+			}
+
+			// A repeated Stop retries the kept IDs and finishes the turn.
+			retry := NewManualCommitStrategy()
+			retry.checkpointRefFetcher = func(_ context.Context, refName plumbing.ReferenceName) error { return f.restore(refName) }
+			require.Zero(t, retry.finalizeAllTurnCheckpoints(context.Background(), state, noFinalizeDeadline()))
+			require.Empty(t, state.TurnCheckpointIDs)
+			f.requireTranscripts(t, len(f.checkpointIDs))
 		})
 	}
 }

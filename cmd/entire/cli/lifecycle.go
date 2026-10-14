@@ -1051,7 +1051,7 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 				}
 			}
 		}
-		transitionSessionTurnEnd(ctx, sessionID, event)
+		transitionSessionTurnEnd(ctx, sessionID, ag.Type(), event)
 		if cleanupErr := CleanupPrePromptState(ctx, sessionID); cleanupErr != nil {
 			logging.Warn(logCtx, "failed to cleanup pre-prompt state",
 				slog.String("error", cleanupErr.Error()))
@@ -1159,7 +1159,7 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 		}
 	}
 	recordCaptureDegraded(ctx, sessionID, captureDegraded)
-	transitionSessionTurnEnd(ctx, sessionID, event)
+	transitionSessionTurnEnd(ctx, sessionID, agentType, event)
 	if cleanupErr := CleanupPrePromptState(ctx, sessionID); cleanupErr != nil {
 		logging.Warn(logCtx, "failed to cleanup pre-prompt state",
 			slog.String("error", cleanupErr.Error()))
@@ -2439,7 +2439,7 @@ func saveSubagentSessionTaskStep(ctx context.Context, step subagentSessionStep) 
 
 	// Retire the subagent's own session the same way an ordinary turn-end does,
 	// so its phase and pre-prompt state do not linger as an active session.
-	transitionSessionTurnEnd(ctx, step.sessionID, step.event)
+	transitionSessionTurnEnd(ctx, step.sessionID, step.agentType, step.event)
 	if cleanupErr := CleanupPrePromptState(ctx, step.sessionID); cleanupErr != nil {
 		logging.Warn(logCtx, "failed to cleanup pre-prompt state",
 			slog.String("error", cleanupErr.Error()))
@@ -2513,7 +2513,9 @@ func recordCaptureDegraded(ctx context.Context, sessionID string, degraded bool)
 }
 
 // transitionSessionTurnEnd transitions the session phase to IDLE and dispatches turn-end actions.
-func transitionSessionTurnEnd(ctx context.Context, sessionID string, event *agent.Event) {
+// agentType is the agent running this hook: its host's timeout bounds the
+// finalize, while state.AgentType can be empty.
+func transitionSessionTurnEnd(ctx context.Context, sessionID string, agentType types.AgentType, event *agent.Event) {
 	logCtx := logging.WithComponent(ctx, "lifecycle")
 	var appendedSkillEvents []agent.SkillEvent
 	mutErr := strategy.MutateSessionStateOnSaved(ctx, sessionID, func(state *strategy.SessionState) error {
@@ -2531,7 +2533,7 @@ func transitionSessionTurnEnd(ctx context.Context, sessionID string, event *agen
 		// and appends the new ones to state.SkillEvents — snapshot its growth
 		// so those events reach telemetry alongside the hook-provided ones.
 		skillEventsBefore := len(state.SkillEvents)
-		if err := strat.HandleTurnEnd(ctx, state, turnEndFinalizeDeadline(state.AgentType)); err != nil {
+		if err := strat.HandleTurnEnd(ctx, state, turnEndFinalizeDeadline(agentType)); err != nil {
 			logging.Warn(logCtx, "turn-end action dispatch failed",
 				slog.String("error", err.Error()))
 		}

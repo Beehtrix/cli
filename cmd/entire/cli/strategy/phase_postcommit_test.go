@@ -1431,6 +1431,8 @@ func TestHandleTurnEnd_PartialFailure(t *testing.T) {
 	// TurnCheckpointIDs should be cleared regardless of partial failure
 	assert.Empty(t, state.TurnCheckpointIDs,
 		"TurnCheckpointIDs should be cleared after HandleTurnEnd, even with errors")
+	assert.Nil(t, state.CaptureDegradedAt,
+		"a write that fails while the context is alive is an error, not capture degradation")
 
 	// Verify the 2 valid checkpoints were finalized with the full transcript
 	store := checkpoint.NewGitStore(repo, checkpoint.DefaultV1Refs())
