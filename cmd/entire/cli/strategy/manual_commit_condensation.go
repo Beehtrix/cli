@@ -1805,7 +1805,13 @@ func storedSessionFileName(sessionID, base string) (string, error) {
 // ends in another worktree of the repository adds to the same copy rather
 // than starting a second one there.
 func storedSessionRoot(ctx context.Context, state *SessionState) (*os.Root, error) {
-	if root, ok := foreignWorktreeEntireRoot(ctx, state.WorktreePath, entiredir.OpenAtForRead); ok {
+	home := state.WorktreePath
+	if state.InWorktreeView {
+		// WorktreePath names the committing worktree for the view; the copy
+		// is still the home's.
+		home = state.ViewHomePath
+	}
+	if root, ok := foreignWorktreeEntireRoot(ctx, home, entiredir.OpenAtForRead); ok {
 		return root, nil
 	}
 	return entiredir.OpenForRead(ctx) //nolint:wrapcheck // callers treat any failure as "no stored copy"

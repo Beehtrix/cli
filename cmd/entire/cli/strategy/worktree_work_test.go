@@ -288,3 +288,31 @@ func TestLoadBackgroundClaimContext_IgnoresARemovedWorktreesEntry(t *testing.T) 
 	require.True(t, ok)
 	assert.NotContains(t, claims.Recorded, "stale.go", "a removed worktree's entry kept the task from claiming its own file")
 }
+
+// A commit in another worktree, judged through the session's record of it,
+// still reads the stored transcript and prompts from the home's .entire: the
+// view names the committing worktree, not where the copy lives.
+func TestStoredSessionRoot_InWorktreeViewReadsTheHomesCopy(t *testing.T) {
+	mainDir, linkedDir := twoWorktrees(t)
+	ctx := context.Background()
+	sessionID := "view-stored-copy"
+	writeStoredCopy(t, gitToplevel(t, mainDir), sessionID, "home-copy")
+	writeStoredCopy(t, linkedDir, sessionID, "linked-copy")
+	state := &SessionState{
+		SessionID:    sessionID,
+		WorktreePath: gitToplevel(t, mainDir),
+		FilesTouched: []string{"home.go"},
+		OtherWorktrees: map[string]*session.WorktreeWork{
+			linkedKey(t, linkedDir): {Path: linkedDir, FilesTouched: []string{"a.go"}, Incarnation: mark(t, linkedDir)},
+		},
+	}
+
+	chdirWorktree(t, linkedDir)
+	leave, ok := enterWorktreeView(ctx, state, gitToplevel(t, linkedDir))
+	require.True(t, ok)
+	root, err := storedSessionRoot(ctx, state)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"prompt from home-copy"}, readPromptsIn(root, sessionID), "the view read the committing worktree's copy")
+	leave()
+	assert.Empty(t, state.ViewHomePath)
+}

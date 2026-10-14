@@ -53,6 +53,7 @@ func enterWorktreeView(ctx context.Context, state *SessionState, root string) (l
 	state.BaseCommit = entry.BaseCommit
 	state.FilesTouched, state.TouchedFileHashes = entry.FilesTouched, entry.TouchedFileHashes
 	state.InWorktreeView = true
+	state.ViewHomePath = home.Path
 
 	return func() {
 		// The entry as it was, with what processing left in the view.
@@ -67,7 +68,7 @@ func enterWorktreeView(ctx context.Context, state *SessionState, root string) (l
 		state.WorktreePath, state.WorktreeID = home.Path, homeID
 		state.BaseCommit = home.BaseCommit
 		state.FilesTouched, state.TouchedFileHashes = home.FilesTouched, home.TouchedFileHashes
-		state.InWorktreeView = false
+		state.InWorktreeView, state.ViewHomePath = false, ""
 		if len(left.FilesTouched) > 0 {
 			state.OtherWorktrees[key] = &left
 		}

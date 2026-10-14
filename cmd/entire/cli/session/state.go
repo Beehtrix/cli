@@ -309,6 +309,10 @@ type State struct {
 	// worktree's entry instead of the home's, for a commit in that worktree.
 	InWorktreeView bool `json:"-"`
 
+	// ViewHomePath is the home's WorktreePath while InWorktreeView, in memory
+	// only: the stored transcript and prompt copy stays in the home's .entire.
+	ViewHomePath string `json:"-"`
+
 	// HomeNotHere is set in memory, never stored, while a commit is processed
 	// in a worktree at the session's recorded home path that its home marker
 	// shows is not its home (git removed the home and added another there):
