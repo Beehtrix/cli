@@ -72,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Thanks
 
-Thanks to @mvanhorn for making the shared HTTP transport honor proxy environment variables, to @wernerkasselman-au for responsibly reporting the HTTPS-to-HTTP downgrade paths, and to @ChetanReddyC for privately reporting that summary generation passed untrusted transcript content to a tool-enabled agent!
+Thanks to @mvanhorn for making the shared HTTP transport honor proxy environment variables, to @wernerkasselman-au for responsibly reporting the HTTPS-to-HTTP downgrade paths, and to @ChetanReddyC for privately reporting that summary generation passed transcript content to a tool-enabled agent!
 
 ## [0.11.4] - 2026-10-06
 
