@@ -205,7 +205,7 @@ func printReviewManifestDetail(w io.Writer, manifest LocalReviewManifest) {
 }
 
 func printRenderedReviewSection(w io.Writer, title string, body string) {
-	markdown := fmt.Sprintf("## %s\n\n%s\n", title, strings.TrimSpace(body))
+	markdown := fmt.Sprintf("## %s\n\n%s\n", title, strings.TrimSpace(stripTrailJSON(body)))
 	rendered, err := mdrender.RenderForWriter(w, markdown)
 	if err != nil {
 		rendered = markdown

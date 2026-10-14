@@ -67,12 +67,12 @@ type Deps struct {
 	// AppendReviewEnv), so review/cmd.go cannot import them back.
 	ReviewerFor func(agentName string) reviewtypes.AgentReviewer
 
-	// PostReviewToTrail posts the final review verdict to the current branch's
-	// trail as a finding (the "trail" output destination). Injected from the cli
+	// PostReviewToTrail posts the final review report to the current branch's
+	// trail as findings (the "trail" output destination). Injected from the cli
 	// package because the data API + auth live there. It prints its own success
 	// line to out. nil when trail delivery is unavailable (e.g. tests), in which
 	// case the run falls back to local output with a notice.
-	PostReviewToTrail func(ctx context.Context, out io.Writer, profileName, verdict string) error
+	PostReviewToTrail func(ctx context.Context, out io.Writer, profileName string, report TrailReport) error
 
 	// ResolveTarget resolves a branch, trail ID, or trail URL to a local branch
 	// and pins its head without checking anything out.
@@ -1195,6 +1195,8 @@ func runSingleAgentPath(
 		// No review runner adapter yet: write marker (with scope-aware prompt) and print guidance.
 		return RunMarkerFallback(ctx, agentName, runCfg, worktreeRoot, out)
 	}
+	// Set after the marker fallback, whose output is never posted to the trail.
+	runCfg.TrailFindingsJSON = outputMode == ReviewOutputTrail
 	reviewer = &perAgentConfiguredReviewer{name: displayName, inner: reviewer, cfg: runCfg}
 
 	runCtx, cancelRun := context.WithCancel(ctx)
@@ -1344,6 +1346,7 @@ func runMultiAgentPath(
 				PerRunPrompt:      perRunPrompt,
 				ScopeBaseRef:      scopeBaseRef,
 				CheckpointContext: checkpointContext,
+				TrailFindingsJSON: outputMode == ReviewOutputTrail,
 				StartingSHA:       headSHA,
 			}, agentCfg),
 		})
@@ -1382,6 +1385,7 @@ func runMultiAgentPath(
 		profileName:       profileName,
 		task:              profile.Task,
 		masterName:        masterLabel,
+		trailFindingsJSON: outputMode == ReviewOutputTrail,
 		judgeTimeout:      judgeTimeoutArg(timeout),
 		onSynthesisResult: func(result string) {
 			aggregateOutput = result
@@ -1462,6 +1466,7 @@ type multiAgentSinkInputs struct {
 	profileName       string
 	task              string
 	masterName        string
+	trailFindingsJSON bool
 	// judgeTimeout bounds the judge's consolidation call, following the same
 	// three-state convention as the reviewer timeout (positive: use it; zero:
 	// default; negative: disabled). Set from the resolved --timeout so one knob
@@ -1498,17 +1503,18 @@ func composeMultiAgentSinks(in multiAgentSinkInputs) []reviewtypes.Sink {
 			postRunOut := &bytes.Buffer{}
 			sinks = append(sinks, DumpSink{W: postRunOut})
 			sinks = append(sinks, SynthesisSink{
-				Provider:        in.synthesisProvider,
-				Writer:          postRunOut,
-				RenderWriter:    in.out,
-				PerRunPrompt:    in.perRunPrompt,
-				ProfileName:     in.profileName,
-				Task:            in.task,
-				MasterName:      in.masterName,
-				RunContext:      in.runContext,
-				ProviderTimeout: in.judgeTimeout,
-				OnResult:        in.onSynthesisResult,
-				OnError:         in.onSynthesisError,
+				Provider:          in.synthesisProvider,
+				Writer:            postRunOut,
+				RenderWriter:      in.out,
+				PerRunPrompt:      in.perRunPrompt,
+				ProfileName:       in.profileName,
+				Task:              in.task,
+				MasterName:        in.masterName,
+				TrailFindingsJSON: in.trailFindingsJSON,
+				RunContext:        in.runContext,
+				ProviderTimeout:   in.judgeTimeout,
+				OnResult:          in.onSynthesisResult,
+				OnError:           in.onSynthesisError,
 				OnStart: func() {
 					tui.FinalPhaseStarted(finalJudgeDisplayName(in.masterName))
 				},
@@ -1527,16 +1533,17 @@ func composeMultiAgentSinks(in multiAgentSinkInputs) []reviewtypes.Sink {
 	sinks = append(sinks, DumpSink{W: in.out})
 	if in.synthesisProvider != nil {
 		sinks = append(sinks, SynthesisSink{
-			Provider:        in.synthesisProvider,
-			Writer:          in.out,
-			PerRunPrompt:    in.perRunPrompt,
-			ProfileName:     in.profileName,
-			Task:            in.task,
-			MasterName:      in.masterName,
-			RunContext:      in.runContext,
-			ProviderTimeout: in.judgeTimeout,
-			OnResult:        in.onSynthesisResult,
-			OnError:         in.onSynthesisError,
+			Provider:          in.synthesisProvider,
+			Writer:            in.out,
+			PerRunPrompt:      in.perRunPrompt,
+			ProfileName:       in.profileName,
+			Task:              in.task,
+			MasterName:        in.masterName,
+			TrailFindingsJSON: in.trailFindingsJSON,
+			RunContext:        in.runContext,
+			ProviderTimeout:   in.judgeTimeout,
+			OnResult:          in.onSynthesisResult,
+			OnError:           in.onSynthesisError,
 		})
 	}
 	return sinks
@@ -1598,16 +1605,13 @@ func maybePostReviewToTrail(
 	if outputMode != ReviewOutputTrail || summary.Cancelled {
 		return
 	}
-	verdict := strings.TrimSpace(aggregateOutput)
-	clean := verdict != "" && isCleanReviewVerdict(verdict)
-	if verdict == "" {
-		verdict = combinedReviewNarratives(summary)
-		clean = verdict != "" && allReviewNarrativesClean(summary)
-	}
-	// A clean verdict is review metadata, not a finding. Posting it would make
-	// the trail show an "Unspecified finding" for a review that found nothing.
-	if verdict == "" || clean {
-		fmt.Fprintln(out, "Nothing to report, so nothing was posted to the trail.")
+	report, post, why := trailReportFor(summary, aggregateOutput)
+	if !post {
+		if why != "" {
+			fmt.Fprintf(out, "Nothing to report (%s), so nothing was posted to the trail.\n", why)
+		} else {
+			fmt.Fprintln(out, "Nothing to report, so nothing was posted to the trail.")
+		}
 		return
 	}
 	if deps.PostReviewToTrail == nil {
@@ -1615,7 +1619,7 @@ func maybePostReviewToTrail(
 		return
 	}
 	// On success the hook prints its own confirmation and trail link.
-	if err := deps.PostReviewToTrail(ctx, out, profileName, verdict); err != nil {
+	if err := deps.PostReviewToTrail(ctx, out, profileName, report); err != nil {
 		if !userMessageAlreadyPrinted(err) {
 			fmt.Fprintf(out, "Could not post the review to the trail: %v\n", err)
 		}
@@ -1637,7 +1641,7 @@ func userMessageAlreadyPrinted(err error) bool {
 func combinedReviewNarratives(summary reviewtypes.RunSummary) string {
 	var b strings.Builder
 	for _, run := range usableAgentRuns(summary) {
-		narrative := joinAssistantText(run.Buffer)
+		narrative, _, _ := splitTrailJSON(joinAssistantText(run.Buffer))
 		if narrative == "" {
 			continue
 		}

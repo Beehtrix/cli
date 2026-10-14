@@ -83,7 +83,12 @@ The profile-level `task` is the shared work item. Each `agents` map entry is a w
 
 - Reviewers run the profile task.
 - Multi-reviewer profiles run reviewers concurrently, then run one judge.
-- Results are printed and saved locally; `output: "trail"` also posts findings to the branch trail. A clean, unqualified approve is not posted.
+- Results are printed and saved locally; `output: "trail"` also posts findings to the branch trail.
+- In trail mode, reviewers and the judge end their output with a JSON line, `{"summary":...,"comments":[...]}` (`trail_report.go`). The instruction is appended last, after profile and per-run text, and is skipped for a verbatim `prompt` override. Posting reads that line instead of interpreting prose:
+  - `"comments":[]` posts nothing, unless the prose has a list item, a severity tag, or a `request changes` / `approve with nits` verdict. A judge `[]` also does not hide a reviewer's own high-severity comment.
+  - Comments post as native findings with their severity and location. Without a judge, each reviewer's line is read separately and the comments are merged.
+  - A missing or malformed line (no `comments` array, an empty body) posts the prose, with any trailing JSON removed, split into findings by top-level bullet.
+  - The line is kept in the saved manifest and hidden when results are displayed.
 - A bare non-interactive `entire review` does not auto-run a profile. Automation should pass a profile name.
 - Profile selection is positional/`--profile` → `review_default_profile` → `general` → the only configured profile.
 

@@ -87,7 +87,7 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 			case "message_update":
 				if text := env.AssistantMessageEvent.TextDelta(); text != "" {
 					messageIDsWithTextDelta[env.MessageID()] = struct{}{}
-					out <- reviewtypes.AssistantText{Text: text}
+					out <- reviewtypes.AssistantText{Text: text, Delta: true}
 				}
 			case "message_end":
 				if env.Message.Role == "assistant" {

@@ -9,10 +9,10 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -51,15 +51,15 @@ func buildReviewDeps() cliReview.Deps {
 	}
 }
 
-// postReviewToTrail posts the final review verdict to the current branch's
-// trail as a finding, implementing the review subpackage's "trail" output
+// postReviewToTrail posts the final review report to the current branch's
+// trail as findings, implementing the review subpackage's "trail" output
 // destination. It lives in the cli package because the data API client and
 // auth flow do.
-func postReviewToTrail(ctx context.Context, out io.Writer, profileName, verdict string) error {
-	if strings.TrimSpace(verdict) == "" {
+func postReviewToTrail(ctx context.Context, out io.Writer, profileName string, report cliReview.TrailReport) error {
+	if len(report.Comments) == 0 && strings.TrimSpace(report.Prose) == "" {
 		return errors.New("no review output to post")
 	}
-	inputs := reviewTrailFindingInputs(profileName, verdict)
+	inputs := reviewTrailFindingInputs(profileName, report)
 	if len(inputs) == 0 {
 		fmt.Fprintln(out, "Nothing to report, so nothing was posted to the trail.")
 		return nil
@@ -88,15 +88,15 @@ func postReviewToTrail(ctx context.Context, out io.Writer, profileName, verdict 
 	})
 }
 
-// reviewTrailFindingInputs turns a final review verdict into trail findings.
-// It first accepts the runner-style last JSON line format
-// {"summary":"","comments":[...]}; when absent, it falls back to splitting
-// top-level markdown bullets. This keeps trail output structurally correct even
-// when custom judge prompts produce prose.
-func reviewTrailFindingInputs(profileName, verdict string) []api.TrailReviewCommentInput {
-	if inputs, ok := reviewTrailFindingInputsFromJSON(verdict); ok {
-		return inputs
+// reviewTrailFindingInputs turns a trail report into trail findings.
+// Structured comments map directly; prose falls back to splitting top-level
+// markdown bullets, which keeps custom judge prompts that ignore the JSON
+// contract structurally correct.
+func reviewTrailFindingInputs(profileName string, report cliReview.TrailReport) []api.TrailReviewCommentInput {
+	if len(report.Comments) > 0 {
+		return reviewTrailFindingInputsFromComments(report.Comments)
 	}
+	verdict := report.Prose
 	items := splitReviewVerdictFindings(verdict)
 	if len(items) == 0 {
 		// The verdict spans the whole change, so it uses "verdict" kind:
@@ -112,24 +112,12 @@ func reviewTrailFindingInputs(profileName, verdict string) []api.TrailReviewComm
 	return inputs
 }
 
-func reviewTrailFindingInputsFromJSON(verdict string) ([]api.TrailReviewCommentInput, bool) {
-	line := lastNonEmptyLine(verdict)
-	if !strings.HasPrefix(line, "{") || !strings.Contains(line, "\"comments\"") {
-		return nil, false
-	}
-	var payload reviewTrailJSONOutput
-	if err := json.Unmarshal([]byte(line), &payload); err != nil {
-		return nil, false
-	}
-	inputs := make([]api.TrailReviewCommentInput, 0, len(payload.Comments))
-	for _, comment := range payload.Comments {
-		body := strings.TrimSpace(comment.Body)
-		if body == "" {
-			continue
-		}
+func reviewTrailFindingInputsFromComments(comments []cliReview.TrailComment) []api.TrailReviewCommentInput {
+	inputs := make([]api.TrailReviewCommentInput, 0, len(comments))
+	for _, comment := range comments {
 		input := api.TrailReviewCommentInput{
 			ClientID: generateTrailReviewClientID(),
-			Body:     stringPtr(body),
+			Body:     stringPtr(strings.TrimSpace(comment.Body)),
 			Location: reviewTrailLocationFromJSON(comment.Location),
 		}
 		if sev := normalizeReviewTrailSeverity(comment.Severity); sev != nil {
@@ -140,7 +128,7 @@ func reviewTrailFindingInputsFromJSON(verdict string) ([]api.TrailReviewCommentI
 		}
 		inputs = append(inputs, input)
 	}
-	return inputs, true
+	return inputs
 }
 
 func reviewTrailFindingInputWithKind(profileName, text, kind string) api.TrailReviewCommentInput {
@@ -155,27 +143,7 @@ func reviewTrailFindingInputWithKind(profileName, text, kind string) api.TrailRe
 	}
 }
 
-type reviewTrailJSONOutput struct {
-	Summary  string                   `json:"summary"`
-	Comments []reviewTrailJSONComment `json:"comments"`
-}
-
-type reviewTrailJSONComment struct {
-	Severity   string                  `json:"severity"`
-	Confidence *float64                `json:"confidence"`
-	Body       string                  `json:"body"`
-	Location   reviewTrailJSONLocation `json:"location"`
-}
-
-type reviewTrailJSONLocation struct {
-	Granularity  string `json:"granularity"`
-	FilePath     string `json:"file_path"`
-	StartLine    int    `json:"start_line"`
-	EndLine      int    `json:"end_line"`
-	SelectedText string `json:"selected_text"`
-}
-
-func reviewTrailLocationFromJSON(loc reviewTrailJSONLocation) api.TrailReviewLocationCreateRequest {
+func reviewTrailLocationFromJSON(loc cliReview.TrailLocation) api.TrailReviewLocationCreateRequest {
 	filePath := strings.TrimSpace(loc.FilePath)
 	withSelectedText := func(req api.TrailReviewLocationCreateRequest) api.TrailReviewLocationCreateRequest {
 		if strings.TrimSpace(loc.SelectedText) != "" {
@@ -217,18 +185,10 @@ func enrichReviewTrailFindingInputFromMarkdown(input *api.TrailReviewCommentInpu
 	}
 }
 
-func lastNonEmptyLine(s string) string {
-	lines := strings.Split(s, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		if line := strings.TrimSpace(lines[i]); line != "" {
-			return line
-		}
-	}
-	return ""
-}
+var reviewTrailLocationPattern = regexp.MustCompile("(?:^|[\\s(`])([A-Za-z0-9_./-]+\\.[A-Za-z0-9_+-]+):(\\d+)")
 
 func inferReviewTrailLocation(body string) (api.TrailReviewLocationCreateRequest, bool) {
-	match := cliReview.LocationPointerPattern.FindStringSubmatch(body)
+	match := reviewTrailLocationPattern.FindStringSubmatch(body)
 	if len(match) != 3 {
 		return api.TrailReviewLocationCreateRequest{}, false
 	}
@@ -284,12 +244,12 @@ func splitReviewVerdictFindings(verdict string) []string {
 		}
 	}
 	for _, line := range strings.Split(strings.TrimSpace(verdict), "\n") {
-		if item, ok := cliReview.TopLevelBulletText(line); ok {
+		if item, ok := topLevelBulletText(line); ok {
 			flush()
 			current.WriteString(item)
 			continue
 		}
-		if item, ok := cliReview.TopLevelMarkedFindingText(line); ok {
+		if item, ok := topLevelMarkedFindingText(line); ok {
 			flush()
 			current.WriteString(item)
 			continue
@@ -302,6 +262,63 @@ func splitReviewVerdictFindings(verdict string) []string {
 	}
 	flush()
 	return findings
+}
+
+func topLevelBulletText(line string) (string, bool) {
+	trimmedRight := strings.TrimRight(line, " \t")
+	leading := len(trimmedRight) - len(strings.TrimLeft(trimmedRight, " \t"))
+	if leading != 0 {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(trimmedRight)
+	if len(trimmed) < 3 {
+		return "", false
+	}
+	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") || strings.HasPrefix(trimmed, "+ ") {
+		return strings.TrimSpace(trimmed[2:]), true
+	}
+	for i, r := range trimmed {
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		if r == '.' && i > 0 && i+1 < len(trimmed) && trimmed[i+1] == ' ' {
+			return strings.TrimSpace(trimmed[i+2:]), true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+func topLevelMarkedFindingText(line string) (string, bool) {
+	trimmedRight := strings.TrimRight(line, " \t")
+	leading := len(trimmedRight) - len(strings.TrimLeft(trimmedRight, " \t"))
+	if leading != 0 {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(trimmedRight)
+	if !startsWithReviewSeverityMarker(trimmed) {
+		return "", false
+	}
+	return trimmed, true
+}
+
+func startsWithReviewSeverityMarker(s string) bool {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "**")
+	s = strings.TrimPrefix(s, "__")
+	s = strings.TrimSpace(s)
+	lower := strings.ToLower(s)
+	for _, marker := range []string{"[critical]", "[high]", "[medium]", "[low]", "[p0]", "[p1]", "[p2]", "[p3]", "[nit]"} {
+		if strings.HasPrefix(lower, marker) {
+			return true
+		}
+	}
+	for _, marker := range []string{"critical", "high", "medium", "low", "p0", "p1", "p2", "p3", "nit"} {
+		if strings.HasPrefix(lower, marker+" —") || strings.HasPrefix(lower, marker+" -") || strings.HasPrefix(lower, marker+":") {
+			return true
+		}
+	}
+	return false
 }
 
 // trailWebURL builds the browser URL for a trail, matching the server's

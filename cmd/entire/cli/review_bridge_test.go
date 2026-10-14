@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
+	cliReview "github.com/entireio/cli/cmd/entire/cli/review"
 )
 
 const testWholeChangeGranularity = "whole_change"
@@ -43,7 +44,7 @@ func TestReviewTrailFindingInputsSplitsTopLevelBullets(t *testing.T) {
   - nested detail stays with second
 - **[Low] Third issue:** remove the note from daytona-command-native-plan.md:1`
 
-	inputs := reviewTrailFindingInputs("general", verdict)
+	inputs := reviewTrailFindingInputs("general", cliReview.TrailReport{Prose: verdict})
 	if len(inputs) != 3 {
 		t.Fatalf("inputs = %d, want 3", len(inputs))
 	}
@@ -86,7 +87,7 @@ func TestReviewTrailFindingInputsSplitsTopLevelMarkedFindings(t *testing.T) {
 		"Additional detail for the first issue.\n\n" +
 		"**[MEDIUM] PATCH thread route missing requestBody** — `api/src/routes/trails.ts:2802`. Generated clients cannot send updates.\n"
 
-	inputs := reviewTrailFindingInputs("general", verdict)
+	inputs := reviewTrailFindingInputs("general", cliReview.TrailReport{Prose: verdict})
 	if len(inputs) != 2 {
 		t.Fatalf("inputs = %d, want 2", len(inputs))
 	}
@@ -108,11 +109,14 @@ func TestReviewTrailFindingInputsSplitsTopLevelMarkedFindings(t *testing.T) {
 	}
 }
 
-func TestReviewTrailFindingInputsAcceptsRunnerStyleJSONLastLine(t *testing.T) {
-	verdict := `Intermediate prose that should be ignored for posting.
-{"summary":"","comments":[{"severity":"high","confidence":0.92,"body":"` + "`" + `daytona.ts` + "`" + ` rejects public repos without a token; allow public clones or mint a token.","location":{"granularity":"line","file_path":"daytona.ts","start_line":901,"selected_text":"return err"}},{"severity":"P2","confidence":0.7,"body":"Delete failures are swallowed, orphaning provider snapshots.","location":{"granularity":"range","file_path":"daytona.ts","start_line":966,"end_line":970}}]}`
+func TestReviewTrailFindingInputsMapsStructuredComments(t *testing.T) {
+	confidence, lowConfidence := 0.92, 0.7
+	report := cliReview.TrailReport{Comments: []cliReview.TrailComment{
+		{Severity: "high", Confidence: &confidence, Body: "`daytona.ts` rejects public repos without a token; allow public clones or mint a token.", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "daytona.ts", StartLine: 901, SelectedText: "return err"}},
+		{Severity: "P2", Confidence: &lowConfidence, Body: "Delete failures are swallowed, orphaning provider snapshots.", Location: cliReview.TrailLocation{Granularity: "range", FilePath: "daytona.ts", StartLine: 966, EndLine: 970}},
+	}}
 
-	inputs := reviewTrailFindingInputs("general", verdict)
+	inputs := reviewTrailFindingInputs("general", report)
 	if len(inputs) != 2 {
 		t.Fatalf("inputs = %d, want 2", len(inputs))
 	}
@@ -140,7 +144,7 @@ func TestReviewTrailFindingInputsAcceptsRunnerStyleJSONLastLine(t *testing.T) {
 }
 
 func TestReviewTrailFindingInputsSingleVerdictUnchanged(t *testing.T) {
-	inputs := reviewTrailFindingInputs("general", "REQUEST CHANGES - missing input validation.")
+	inputs := reviewTrailFindingInputs("general", cliReview.TrailReport{Prose: "APPROVE - no actionable findings."})
 	if len(inputs) != 1 {
 		t.Fatalf("inputs = %d, want 1", len(inputs))
 	}
@@ -150,7 +154,7 @@ func TestReviewTrailFindingInputsSingleVerdictUnchanged(t *testing.T) {
 }
 
 func TestReviewTrailLocationFromJSON_SingleLineRangeBecomesLine(t *testing.T) {
-	loc := reviewTrailLocationFromJSON(reviewTrailJSONLocation{
+	loc := reviewTrailLocationFromJSON(cliReview.TrailLocation{
 		Granularity: reviewTrailGranularityRange,
 		FilePath:    "src/app.ts",
 		StartLine:   42,
@@ -165,7 +169,7 @@ func TestReviewTrailLocationFromJSON_SingleLineRangeBecomesLine(t *testing.T) {
 }
 
 func TestReviewTrailLocationFromJSON_InvalidRangeKeepsStartLineAnchor(t *testing.T) {
-	loc := reviewTrailLocationFromJSON(reviewTrailJSONLocation{
+	loc := reviewTrailLocationFromJSON(cliReview.TrailLocation{
 		Granularity: reviewTrailGranularityRange,
 		FilePath:    "src/app.ts",
 		StartLine:   42,

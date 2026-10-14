@@ -74,12 +74,12 @@ func (s DumpSink) dumpAgent(run reviewtypes.AgentRun) {
 		// Render any narrative text the agent produced before the failure
 		// surfaced — useful when the parser tore mid-response so reviewers
 		// can see partial output instead of a bare "(failed)" line.
-		if narrative := joinAssistantText(run.Buffer); narrative != "" {
+		if narrative := stripTrailJSON(joinAssistantText(run.Buffer)); narrative != "" {
 			b.WriteString(narrative)
 			b.WriteString("\n")
 		}
 	case reviewtypes.AgentStatusSucceeded, reviewtypes.AgentStatusUnknown:
-		if narrative := joinAssistantText(run.Buffer); narrative != "" {
+		if narrative := stripTrailJSON(joinAssistantText(run.Buffer)); narrative != "" {
 			b.WriteString(narrative)
 			b.WriteString("\n")
 		}
@@ -136,12 +136,18 @@ func sameFailureError(a, b error) bool {
 
 // joinAssistantText extracts AssistantText events from a buffer and joins
 // them with newlines, trimming the result to keep dump output tight.
+// Consecutive streamed deltas are fragments of one message, so they join
+// without a separator.
 func joinAssistantText(buf []reviewtypes.Event) string {
 	var b strings.Builder
+	prevDelta := false
 	for _, ev := range buf {
 		if at, ok := ev.(reviewtypes.AssistantText); ok {
+			if b.Len() > 0 && (!prevDelta || !at.Delta) {
+				b.WriteString("\n")
+			}
 			b.WriteString(at.Text)
-			b.WriteString("\n")
+			prevDelta = at.Delta
 		}
 	}
 	return strings.TrimSpace(b.String())

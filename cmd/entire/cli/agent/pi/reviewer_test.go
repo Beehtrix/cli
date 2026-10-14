@@ -77,14 +77,14 @@ func TestPiReviewer_ParseJSONEventStream(t *testing.T) {
 	if _, ok := events[0].(reviewtypes.Started); !ok {
 		t.Fatalf("events[0] = %T, want Started", events[0])
 	}
-	if got, ok := events[1].(reviewtypes.AssistantText); !ok || got.Text != "Finding " {
+	if got, ok := events[1].(reviewtypes.AssistantText); !ok || got.Text != "Finding " || !got.Delta {
 		t.Fatalf("events[1] = %#v, want AssistantText{Finding }", events[1])
 	}
 	tool, ok := events[2].(reviewtypes.ToolCall)
 	if !ok || tool.Name != "bash" || !strings.Contains(tool.Args, "git diff --stat") {
 		t.Fatalf("events[2] = %#v, want ToolCall(bash)", events[2])
 	}
-	if got, ok := events[3].(reviewtypes.AssistantText); !ok || got.Text != "one" {
+	if got, ok := events[3].(reviewtypes.AssistantText); !ok || got.Text != "one" || !got.Delta {
 		t.Fatalf("events[3] = %#v, want AssistantText{one}", events[3])
 	}
 	tokens, ok := events[4].(reviewtypes.Tokens)
