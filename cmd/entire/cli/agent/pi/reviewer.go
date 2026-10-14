@@ -53,6 +53,10 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 		scanner := bufio.NewScanner(r)
 		scanner.Buffer(make([]byte, min(1024*1024, piReviewMaxScannerBuf)), piReviewMaxScannerBuf)
 		messageIDsWithTextDelta := map[string]struct{}{}
+		// inMessage marks that a delta already started the current message, so
+		// the next one continues it. Message IDs can be empty, so message_end
+		// and a retry reset it instead.
+		inMessage := false
 		// pendingErr is the latest failure reason. It is reported only if the
 		// run still fails at the end: Pi auto-retries errors such as
 		// "overloaded", and a recovered error is not a failure.
@@ -82,14 +86,17 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 				// Pi is retrying the failed attempt; judge the retry instead.
 				success = true
 				pendingErr = ""
+				inMessage = false
 			case "session", "agent_start", "queue_update", "compaction_start", "compaction_end", "auto_retry_end":
 				// Session/control events do not map to user-visible review output.
 			case "message_update":
 				if text := env.AssistantMessageEvent.TextDelta(); text != "" {
 					messageIDsWithTextDelta[env.MessageID()] = struct{}{}
-					out <- reviewtypes.AssistantText{Text: text, Delta: true}
+					out <- reviewtypes.AssistantText{Text: text, Delta: inMessage}
+					inMessage = true
 				}
 			case "message_end":
+				inMessage = false
 				if env.Message.Role == "assistant" {
 					if env.Message.StopReason == "error" || env.Message.StopReason == "aborted" {
 						success = false

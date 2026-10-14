@@ -281,3 +281,26 @@ func TestComposeSynthesisPrompt_TrailFindingsJSON(t *testing.T) {
 		t.Errorf("local-mode judge prompt must not ask for the JSON line:\n%s", local)
 	}
 }
+
+// TestComposeSynthesisPrompt_OmitsReviewerTrailJSON verifies the judge sees each
+// reviewer finding once, as prose, not again as the reviewer's JSON line.
+func TestComposeSynthesisPrompt_OmitsReviewerTrailJSON(t *testing.T) {
+	t.Parallel()
+	reviewerJSON := `{"summary":"1 issue","comments":[{"severity":"high","body":"Loop ignores ctx cancel.","location":{"granularity":"whole_change"}}]}`
+	summary := makeSummaryWithNarratives([]struct {
+		name      string
+		narrative string
+		status    reviewtypes.AgentStatus
+	}{
+		{"claude-code", "request changes\n- [high] Loop ignores ctx cancel.\n" + reviewerJSON, reviewtypes.AgentStatusSucceeded},
+		{"codex", "approve", reviewtypes.AgentStatusSucceeded},
+	})
+
+	prompt := review.ExposedComposeSynthesisPrompt(summary, "")
+	if !strings.Contains(prompt, "- [high] Loop ignores ctx cancel.") {
+		t.Errorf("prompt must keep the reviewer's prose finding:\n%s", prompt)
+	}
+	if strings.Contains(prompt, reviewerJSON) {
+		t.Errorf("prompt must not repeat the reviewer's JSON line:\n%s", prompt)
+	}
+}

@@ -136,18 +136,16 @@ func sameFailureError(a, b error) bool {
 
 // joinAssistantText extracts AssistantText events from a buffer and joins
 // them with newlines, trimming the result to keep dump output tight.
-// Consecutive streamed deltas are fragments of one message, so they join
-// without a separator.
+// A streamed delta continues the previous text, so it joins without a
+// separator.
 func joinAssistantText(buf []reviewtypes.Event) string {
 	var b strings.Builder
-	prevDelta := false
 	for _, ev := range buf {
 		if at, ok := ev.(reviewtypes.AssistantText); ok {
-			if b.Len() > 0 && (!prevDelta || !at.Delta) {
+			if b.Len() > 0 && !at.Delta {
 				b.WriteString("\n")
 			}
 			b.WriteString(at.Text)
-			prevDelta = at.Delta
 		}
 	}
 	return strings.TrimSpace(b.String())

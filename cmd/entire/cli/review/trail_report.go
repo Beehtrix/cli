@@ -2,7 +2,6 @@ package review
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 
 	reviewtypes "github.com/entireio/cli/cmd/entire/cli/review/types"
@@ -51,64 +50,35 @@ type TrailReport struct {
 // trailReportFor decides what a trail-mode run posts. It returns post=false
 // only when the JSON contract reports no findings and nothing in the prose
 // contradicts that; every malformed or contradictory case posts, so a
-// misbehaving model costs an extra finding rather than a lost one. why
-// explains a skipped post.
-func trailReportFor(summary reviewtypes.RunSummary, aggregateOutput string) (report TrailReport, post bool, why string) {
+// misbehaving model costs an extra finding rather than a lost one. When a
+// judge ran, its verdict decides: it is asked to drop unsupported claims.
+func trailReportFor(summary reviewtypes.RunSummary, aggregateOutput string) (TrailReport, bool) {
 	if verdict := strings.TrimSpace(aggregateOutput); verdict != "" {
-		return judgeTrailReport(summary, verdict)
-	}
-	runs := usableAgentRuns(summary)
-	if len(runs) == 0 {
-		return TrailReport{}, false, ""
+		prose, comments, ok := splitTrailJSON(verdict)
+		if prose == "" {
+			prose = verdict
+		}
+		if !ok || (len(comments) == 0 && proseReportsFindings(prose)) {
+			return TrailReport{Prose: prose}, true
+		}
+		return TrailReport{Comments: comments}, len(comments) > 0
 	}
 	var merged []TrailComment
-	for _, run := range runs {
+	for _, run := range usableAgentRuns(summary) {
 		prose, comments, ok := splitTrailJSON(joinAssistantText(run.Buffer))
 		if !ok || (len(comments) == 0 && proseReportsFindings(prose)) {
-			return TrailReport{Prose: combinedReviewNarratives(summary)}, true, ""
+			return TrailReport{Prose: combinedReviewNarratives(summary)}, true
 		}
 		merged = append(merged, comments...)
 	}
-	if len(merged) > 0 {
-		return TrailReport{Comments: merged}, true, ""
-	}
-	return TrailReport{}, false, fmt.Sprintf("reviewer JSON: 0 comments from %d reviewer(s)", len(runs))
-}
-
-// judgeTrailReport applies the contract to the judge's verdict. A judge that
-// reports nothing cannot erase a reviewer's own high-severity comment, so
-// suppressing a finding takes misleading every model, not only the judge.
-func judgeTrailReport(summary reviewtypes.RunSummary, verdict string) (TrailReport, bool, string) {
-	prose, comments, ok := splitTrailJSON(verdict)
-	if prose == "" {
-		prose = verdict
-	}
-	switch {
-	case !ok, len(comments) == 0 && proseReportsFindings(prose):
-		return TrailReport{Prose: prose}, true, ""
-	case len(comments) > 0:
-		return TrailReport{Comments: comments}, true, ""
-	}
-	var high []TrailComment
-	for _, run := range usableAgentRuns(summary) {
-		if _, reviewerComments, ok := splitTrailJSON(joinAssistantText(run.Buffer)); ok {
-			for _, comment := range reviewerComments {
-				if isHighTrailSeverity(comment.Severity) {
-					high = append(high, comment)
-				}
-			}
-		}
-	}
-	if len(high) > 0 {
-		return TrailReport{Comments: high}, true, ""
-	}
-	return TrailReport{}, false, "judge JSON: 0 comments"
+	return TrailReport{Comments: merged}, len(merged) > 0
 }
 
 // splitTrailJSON separates a trailing JSON object (one line, a fenced block,
 // or a pretty-printed block) from the prose before it. Any trailing JSON
 // object is removed from prose so it is never posted as finding text. ok
-// reports a valid contract: a "comments" array whose every entry has a body.
+// reports a valid contract: a "comments" array. Entries without a body are
+// dropped.
 func splitTrailJSON(text string) (prose string, comments []TrailComment, ok bool) {
 	text = strings.TrimSpace(text)
 	lines := strings.Split(text, "\n")
@@ -140,13 +110,14 @@ func decodeTrailComments(raw json.RawMessage) ([]TrailComment, bool) {
 	if !strings.HasPrefix(strings.TrimSpace(string(raw)), "[") {
 		return nil, false
 	}
-	comments := []TrailComment{}
-	if err := json.Unmarshal(raw, &comments); err != nil {
+	var decoded []TrailComment
+	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return nil, false
 	}
-	for _, comment := range comments {
-		if strings.TrimSpace(comment.Body) == "" {
-			return nil, false
+	comments := []TrailComment{}
+	for _, comment := range decoded {
+		if strings.TrimSpace(comment.Body) != "" {
+			comments = append(comments, comment)
 		}
 	}
 	return comments, true
@@ -161,18 +132,45 @@ func stripTrailJSON(text string) string {
 }
 
 // proseReportsFindings reports whether prose contradicts an empty comments
-// array: a list item or severity tag at any indentation, or a verdict that
-// itself says there is feedback. These are the shapes the output format
-// asks for, so a clean review has none of them.
+// array: a list item, severity marker, or feedback label such as "Nits:" at
+// any indentation, or a verdict, labeled or not, that itself says there is
+// feedback. These are the shapes the output format asks for, so a clean
+// review has none of them.
 func proseReportsFindings(prose string) bool {
 	for _, line := range strings.Split(prose, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if isListItem(trimmed) {
 			return true
 		}
-		lower := strings.ToLower(strings.TrimLeft(trimmed, "#>*_` "))
-		for _, prefix := range []string{"[critical]", "[high]", "[medium]", "[low]", "request changes", "request_changes", "changes requested", "approve with nits"} {
+		lower := strings.ToLower(trimMarkdownEmphasis(trimmed))
+		if after, found := strings.CutPrefix(lower, "verdict:"); found {
+			lower = trimMarkdownEmphasis(after)
+		}
+		if startsWithSeverityMarker(lower) {
+			return true
+		}
+		for _, prefix := range []string{"request changes", "request_changes", "changes requested", "approve with nits", "nits:", "issues:", "concerns:", "suggestions:"} {
 			if strings.HasPrefix(lower, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func trimMarkdownEmphasis(s string) string {
+	return strings.TrimLeft(s, "#>*_` ")
+}
+
+// startsWithSeverityMarker reports whether lower opens with a severity tag in
+// the bracketed ("[high]") or delimited ("high —", "p2:") form.
+func startsWithSeverityMarker(lower string) bool {
+	for _, marker := range []string{"critical", "high", "medium", "low", "p0", "p1", "p2", "p3", "nit"} {
+		if strings.HasPrefix(lower, "["+marker+"]") {
+			return true
+		}
+		for _, suffix := range []string{" —", " -", ":"} {
+			if strings.HasPrefix(lower, marker+suffix) {
 				return true
 			}
 		}
@@ -187,13 +185,4 @@ func isListItem(trimmed string) bool {
 	digits := len(trimmed) - len(strings.TrimLeft(trimmed, "0123456789"))
 	rest := trimmed[digits:]
 	return digits > 0 && (strings.HasPrefix(rest, ". ") || strings.HasPrefix(rest, ") "))
-}
-
-func isHighTrailSeverity(severity string) bool {
-	switch strings.ToLower(strings.Trim(strings.TrimSpace(severity), "[]")) {
-	case "high", "critical", "p0", "p1":
-		return true
-	default:
-		return false
-	}
 }

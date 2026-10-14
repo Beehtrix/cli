@@ -1605,13 +1605,9 @@ func maybePostReviewToTrail(
 	if outputMode != ReviewOutputTrail || summary.Cancelled {
 		return
 	}
-	report, post, why := trailReportFor(summary, aggregateOutput)
+	report, post := trailReportFor(summary, aggregateOutput)
 	if !post {
-		if why != "" {
-			fmt.Fprintf(out, "Nothing to report (%s), so nothing was posted to the trail.\n", why)
-		} else {
-			fmt.Fprintln(out, "Nothing to report, so nothing was posted to the trail.")
-		}
+		fmt.Fprintln(out, "Nothing to report, so nothing was posted to the trail.")
 		return
 	}
 	if deps.PostReviewToTrail == nil {

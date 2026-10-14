@@ -190,8 +190,9 @@ func (Started) isEvent() {}
 // response, not tool-call chrome or session metadata).
 type AssistantText struct {
 	Text string
-	// Delta marks a streamed fragment of a larger message. Consecutive deltas
-	// join without a separator so a line split across fragments stays whole.
+	// Delta marks a streamed fragment that continues the previous
+	// AssistantText of the same message, so it joins without a separator and
+	// a line split across fragments stays whole.
 	Delta bool
 }
 

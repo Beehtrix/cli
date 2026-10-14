@@ -13,7 +13,6 @@ import (
 const (
 	emptyTrailJSON  = `{"summary":"No issues","comments":[]}`
 	oneHighComment  = `{"summary":"1 issue","comments":[{"severity":"high","body":"Loop ignores ctx cancel.","location":{"granularity":"line","file_path":"retry.go","start_line":42}}]}`
-	oneMediumOnly   = `{"summary":"1 issue","comments":[{"severity":"medium","body":"Rename x.","location":{"granularity":"whole_change"}}]}`
 	twoTrailComment = `{"summary":"2 issues","comments":[{"severity":"high","body":"A.","location":{"granularity":"line","file_path":"a.go","start_line":1}},{"severity":"low","body":"B.","location":{"granularity":"whole_change"}}]}`
 )
 
@@ -91,8 +90,8 @@ func TestTrailReportFromJudge(t *testing.T) {
 		t.Parallel()
 		_, called, out := postedTrailReport(t, reviewers, "approve — no actionable findings\n"+emptyTrailJSON)
 		requireNotPosted(t, called, out)
-		if !strings.Contains(out, "0 comments") {
-			t.Errorf("the notice should say why nothing was posted, got %q", out)
+		if strings.Contains(out, "JSON") {
+			t.Errorf("the notice must not mention the internal JSON line, got %q", out)
 		}
 	})
 
@@ -138,10 +137,18 @@ func TestTrailReportFromJudge(t *testing.T) {
 		requirePostedProse(t, report, called, "approve — fine")
 	})
 
-	t.Run("a comment with an empty body invalidates the JSON", func(t *testing.T) {
+	t.Run("a comment with an empty body is skipped, not the whole array", func(t *testing.T) {
 		t.Parallel()
-		report, called, _ := postedTrailReport(t, reviewers, "approve — fine\n"+`{"summary":"","comments":[{"severity":"high","body":"  "}]}`)
-		requirePostedProse(t, report, called, "approve — fine")
+		report, called, _ := postedTrailReport(t, reviewers, "request changes\n- [high] real bug\n"+`{"summary":"","comments":[{"severity":"high","body":"real bug"},{"severity":"low","body":"  "}]}`)
+		if !called || len(report.Comments) != 1 || report.Comments[0].Body != "real bug" {
+			t.Fatalf("called=%v report=%+v, want only the non-blank comment posted", called, report)
+		}
+	})
+
+	t.Run("only empty-body comments is clean", func(t *testing.T) {
+		t.Parallel()
+		_, called, out := postedTrailReport(t, reviewers, "approve — fine\n"+`{"summary":"","comments":[{"severity":"high","body":"  "}]}`)
+		requireNotPosted(t, called, out)
 	})
 
 	t.Run("empty JSON with a finding bullet in the prose is posted", func(t *testing.T) {
@@ -167,32 +174,47 @@ func TestTrailReportFromJudge(t *testing.T) {
 		report, called, _ := postedTrailReport(t, reviewers, "approve with nits — rename x\n"+emptyTrailJSON)
 		requirePostedProse(t, report, called, "rename x")
 	})
+
+	for name, prose := range map[string]string{
+		"labeled request changes verdict": "**Verdict:** request changes — retry ignores ctx",
+		"labeled approve with nits":       "Verdict: approve with nits — rename x",
+		"plural nits label":               "Nits: rename x",
+		"bold suggestions label":          "**Suggestions:** rename x",
+		"issues label":                    "Issues: retry ignores ctx",
+		"priority severity tag":           "[p1] retry.go:42 — retry ignores ctx",
+		"delimited severity marker":       "P2: retry ignores ctx",
+		"dashed severity marker":          "high — retry ignores ctx",
+	} {
+		t.Run("empty JSON with "+name+" is posted", func(t *testing.T) {
+			t.Parallel()
+			report, called, _ := postedTrailReport(t, reviewers, prose+"\n"+emptyTrailJSON)
+			requirePostedProse(t, report, called, prose)
+		})
+	}
+
+	for name, prose := range map[string]string{
+		"labeled approve verdict":   "**Verdict:** approve — no actionable findings",
+		"no issues prose":           "approve\nNo issues found.",
+		"word starting with marker": "approve\nHighlights: clean refactor.",
+	} {
+		t.Run("empty JSON with "+name+" is clean", func(t *testing.T) {
+			t.Parallel()
+			_, called, out := postedTrailReport(t, reviewers, prose+"\n"+emptyTrailJSON)
+			requireNotPosted(t, called, out)
+		})
+	}
 }
 
-func TestTrailReportJudgeCannotEraseHighSeverityReviewerFindings(t *testing.T) {
+// The judge is asked to drop unsupported claims, so its verdict decides what
+// is posted even when a reviewer reported a high-severity comment.
+func TestTrailReportJudgeDecidesOverReviewerComments(t *testing.T) {
 	t.Parallel()
-
-	t.Run("reviewer high comment survives an empty judge", func(t *testing.T) {
-		t.Parallel()
-		summary := trailRunsSummary(
-			textRun("claude-code", "request changes\n- [high] retry.go:42 — Loop ignores ctx cancel.\n"+oneHighComment),
-			textRun("codex", "approve\n"+emptyTrailJSON),
-		)
-		report, called, _ := postedTrailReport(t, summary, "approve — no actionable findings\n"+emptyTrailJSON)
-		if !called || len(report.Comments) != 1 || report.Comments[0].Body != "Loop ignores ctx cancel." {
-			t.Fatalf("called=%v report=%+v, want the reviewer's high comment posted", called, report)
-		}
-	})
-
-	t.Run("reviewer medium comment defers to the judge", func(t *testing.T) {
-		t.Parallel()
-		summary := trailRunsSummary(
-			textRun("claude-code", "approve with nits\n- [medium] Rename x.\n"+oneMediumOnly),
-			textRun("codex", "approve\n"+emptyTrailJSON),
-		)
-		_, called, out := postedTrailReport(t, summary, "approve — no actionable findings\n"+emptyTrailJSON)
-		requireNotPosted(t, called, out)
-	})
+	summary := trailRunsSummary(
+		textRun("claude-code", "request changes\n- [high] retry.go:42 — Loop ignores ctx cancel.\n"+oneHighComment),
+		textRun("codex", "approve\n"+emptyTrailJSON),
+	)
+	_, called, out := postedTrailReport(t, summary, "approve — no actionable findings\n"+emptyTrailJSON)
+	requireNotPosted(t, called, out)
 }
 
 func TestTrailReportWithoutJudge(t *testing.T) {
@@ -239,12 +261,24 @@ func TestTrailReportWithoutJudge(t *testing.T) {
 	t.Run("streamed text deltas join into one parsable JSON line", func(t *testing.T) {
 		t.Parallel()
 		run := trailRun{name: "pi", events: []reviewtypes.Event{
-			reviewtypes.AssistantText{Text: "approve — no actionable findings\n", Delta: true},
+			reviewtypes.AssistantText{Text: "approve — no actionable findings\n"},
 			reviewtypes.AssistantText{Text: `{"summary":"No issues",`, Delta: true},
 			reviewtypes.AssistantText{Text: `"comments":[]}`, Delta: true},
 		}}
 		_, called, out := postedTrailReport(t, trailRunsSummary(run), "")
 		requireNotPosted(t, called, out)
+	})
+
+	t.Run("a new message starts a new line after a tool call", func(t *testing.T) {
+		t.Parallel()
+		run := trailRun{name: "pi", events: []reviewtypes.Event{
+			reviewtypes.AssistantText{Text: "I'll read the diff."},
+			reviewtypes.ToolCall{Name: "bash"},
+			reviewtypes.AssistantText{Text: "request changes — retry ignores ctx\n"},
+			reviewtypes.AssistantText{Text: emptyTrailJSON, Delta: true},
+		}}
+		report, called, _ := postedTrailReport(t, trailRunsSummary(run), "")
+		requirePostedProse(t, report, called, "I'll read the diff.\nrequest changes")
 	})
 }
 
