@@ -856,6 +856,11 @@ type WorktreeWork struct {
 	BaseCommit        string            `json:"base_commit,omitempty"`
 	FilesTouched      []string          `json:"files_touched,omitempty"`
 	TouchedFileHashes map[string]string `json:"touched_file_hashes,omitempty"`
+	// Incarnation is the marker of the worktree the edits were made in
+	// (strategy's worktreeIncarnation): git reuses a removed worktree's ID, and
+	// a record whose marker no longer matches belongs to the removed one. Empty
+	// for the main worktree.
+	Incarnation string `json:"incarnation,omitempty"`
 }
 
 // WorktreeKey is the OtherWorktrees key for the worktree with git ID

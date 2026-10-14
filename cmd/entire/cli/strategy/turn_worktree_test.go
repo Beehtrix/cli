@@ -95,7 +95,7 @@ func TestPruneRemovedWorktrees(t *testing.T) {
 	s, mainDir, linkedDir := homedSession(t, "prune")
 	require.NoError(t, MutateSessionState(t.Context(), "prune", func(state *SessionState) error {
 		state.OtherWorktrees = map[string]*session.WorktreeWork{
-			linkedKey(t, linkedDir): {Path: linkedDir, FilesTouched: []string{"w.go"}},
+			linkedKey(t, linkedDir): {Path: linkedDir, FilesTouched: []string{"w.go"}, Incarnation: mark(t, linkedDir)},
 			"gone":                  {Path: filepath.Join(t.TempDir(), "gone"), FilesTouched: []string{"g.go"}},
 		}
 		return nil
@@ -116,7 +116,7 @@ func TestPruneRemovedWorktrees_KeepsMovedWorktrees(t *testing.T) {
 	s, mainDir, linkedDir := homedSession(t, "prune-moved")
 	key := linkedKey(t, linkedDir)
 	require.NoError(t, MutateSessionState(t.Context(), "prune-moved", func(state *SessionState) error {
-		state.OtherWorktrees = map[string]*session.WorktreeWork{key: {Path: mustEvalSymlinks(t, linkedDir), FilesTouched: []string{"w.go"}}}
+		state.OtherWorktrees = map[string]*session.WorktreeWork{key: {Path: mustEvalSymlinks(t, linkedDir), FilesTouched: []string{"w.go"}, Incarnation: mark(t, linkedDir)}}
 		return nil
 	}))
 	moved := filepath.Join(t.TempDir(), "moved")

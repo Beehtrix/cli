@@ -1395,7 +1395,7 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 		entryOnly := sess.LinkedByWorktreeEntry
 		mutErr := MutateSessionStateOnSaved(iterCtx, sessionID, func(state *SessionState) error {
 			// The same view of this worktree the linking set judged it by.
-			leave, inView := enterWorktreeView(state, worktreePath)
+			leave, inView := enterWorktreeView(iterCtx, state, worktreePath)
 			state.LinkedByWorktreeEntry = entryOnly
 			var condensed bool
 			newSkillEvents, condensedSignal, condensed = s.postCommitProcessSessionLocked(iterCtx, repo, state, &transitionCtx, checkpointID,

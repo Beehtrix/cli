@@ -34,6 +34,18 @@ func linkedKey(t *testing.T, dir string) string {
 	return session.WorktreeKey(worktreeID)
 }
 
+// mark returns the marker a record of edits in the linked worktree at dir is
+// made under (creating it), as recording an edit there would.
+func mark(t *testing.T, dir string) string {
+	t.Helper()
+	worktreeID, err := paths.GetWorktreeID(dir)
+	require.NoError(t, err)
+	marker, err := MarkWorktree(context.Background(), dir, worktreeID)
+	require.NoError(t, err)
+	require.NotEmpty(t, marker)
+	return marker
+}
+
 func TestEnterWorktreeView(t *testing.T) {
 	mainDir, linkedDir := twoWorktrees(t)
 	key := linkedKey(t, linkedDir)
@@ -44,14 +56,14 @@ func TestEnterWorktreeView(t *testing.T) {
 		FilesTouched:      []string{"home.go"},
 		TouchedFileHashes: map[string]string{"home.go": "h"},
 		OtherWorktrees: map[string]*session.WorktreeWork{
-			key: {Path: linkedDir, BaseCommit: "linked-base", FilesTouched: []string{"a.go", "b.go"}, TouchedFileHashes: map[string]string{"a.go": "ha"}},
+			key: {Path: linkedDir, BaseCommit: "linked-base", FilesTouched: []string{"a.go", "b.go"}, TouchedFileHashes: map[string]string{"a.go": "ha"}, Incarnation: mark(t, linkedDir)},
 		},
 	}
 
-	_, ok := enterWorktreeView(state, mainDir)
+	_, ok := enterWorktreeView(context.Background(), state, mainDir)
 	assert.False(t, ok, "the home has no view of its own")
 
-	leave, ok := enterWorktreeView(state, linkedDir)
+	leave, ok := enterWorktreeView(context.Background(), state, linkedDir)
 	require.True(t, ok)
 	assert.Equal(t, []string{"a.go", "b.go"}, state.FilesTouched)
 	assert.Equal(t, "linked-base", state.BaseCommit)
@@ -68,10 +80,11 @@ func TestEnterWorktreeView(t *testing.T) {
 	assert.Equal(t, mainDir, state.WorktreePath)
 	assert.Equal(t, []string{"b.go"}, state.OtherWorktrees[key].FilesTouched)
 	assert.Equal(t, "linked-new", state.OtherWorktrees[key].BaseCommit)
+	assert.Equal(t, mark(t, linkedDir), state.OtherWorktrees[key].Incarnation, "the view dropped the entry's marker")
 	assert.Len(t, state.OtherWorktrees, 1)
 
 	// Once that worktree has nothing left, its entry goes.
-	leave, ok = enterWorktreeView(state, linkedDir)
+	leave, ok = enterWorktreeView(context.Background(), state, linkedDir)
 	require.True(t, ok)
 	state.FilesTouched = nil
 	leave()
@@ -98,7 +111,7 @@ func homedWithEntry(t *testing.T, mainDir, linkedDir string) {
 		FilesTouched: []string{"home.go"},
 		StepCount:    1,
 		OtherWorktrees: map[string]*session.WorktreeWork{
-			linkedKey(t, linkedDir): {Path: linkedDir, FilesTouched: []string{"a.go"}, TouchedFileHashes: hashes},
+			linkedKey(t, linkedDir): {Path: linkedDir, FilesTouched: []string{"a.go"}, TouchedFileHashes: hashes, Incarnation: mark(t, linkedDir)},
 		},
 	})
 	require.NoError(t, MutateSessionState(ctx, "from-main", func(st *SessionState) error {
@@ -190,7 +203,7 @@ func TestFastPath_FallbackMatchedSessionNeedsItsFiles(t *testing.T) {
 		WorktreePath: mainDir,
 		StepCount:    1,
 		OtherWorktrees: map[string]*session.WorktreeWork{
-			linkedKey(t, linkedDir): {Path: linkedDir, FilesTouched: []string{"a.go"}, TouchedFileHashes: hashTouchedFiles(ctx, linkedDir, []string{"a.go"})},
+			linkedKey(t, linkedDir): {Path: linkedDir, FilesTouched: []string{"a.go"}, TouchedFileHashes: hashTouchedFiles(ctx, linkedDir, []string{"a.go"}), Incarnation: mark(t, linkedDir)},
 		},
 	})
 

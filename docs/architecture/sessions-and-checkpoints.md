@@ -211,6 +211,12 @@ worktree, in `.git`/`.entire`, or already matching that worktree's HEAD don't
 count). The hook's own worktree records as it always has; every other
 worktree's files go to that worktree's entry (files, hashes, and its HEAD as
 the entry's base), keyed by git worktree ID so `git worktree move` keeps it.
+Git reuses a removed worktree's ID for the next one of the same name, so each
+entry also carries the marker Entire keeps in that worktree's git admin
+directory (`<common>/worktrees/<id>/entire-incarnation`), which move keeps
+and remove deletes. An entry whose marker no longer matches belongs to the
+removed worktree: it links nothing, the next edit there starts a fresh one,
+and turn-end pruning drops it.
 A worktree other than the home records only transcript-named files, never
 the rest of its status, so someone else's uncommitted work there is never
 claimed. One turn is one step and carries its tokens once, however many

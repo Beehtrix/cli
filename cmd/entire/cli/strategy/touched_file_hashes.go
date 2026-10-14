@@ -306,7 +306,7 @@ func (s *ManualCommitStrategy) untrackedDeletionCandidates(ctx context.Context, 
 	}
 	if !homedAt(state, worktreeRoot) {
 		// Probe that worktree against what the session recorded there.
-		if _, inView := enterWorktreeView(state, worktreeRoot); !inView {
+		if _, inView := enterWorktreeView(ctx, state, worktreeRoot); !inView {
 			return nil
 		}
 	}
@@ -382,7 +382,7 @@ func (s *ManualCommitStrategy) RecordVanishedUntrackedFiles(ctx context.Context,
 		return nil
 	}
 	err = MutateSessionState(ctx, sessionID, func(state *SessionState) error {
-		if leave, inView := enterWorktreeView(state, worktreeRoot); inView {
+		if leave, inView := enterWorktreeView(ctx, state, worktreeRoot); inView {
 			defer leave()
 		}
 		before := maps.Clone(state.TouchedFileHashes)

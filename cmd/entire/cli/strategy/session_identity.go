@@ -44,7 +44,7 @@ func (s *ManualCommitStrategy) findSessionsForCommitLinking(ctx context.Context,
 	// sibling fallback rather than identified as the committer, is held to
 	// those edits like one that joins below.
 	for _, state := range sessions {
-		if (guest == nil || state.SessionID != guest.SessionID) && hasWorktreeEntry(state, worktreePath) {
+		if (guest == nil || state.SessionID != guest.SessionID) && hasWorktreeEntry(ctx, state, worktreePath) {
 			state.LinkedByWorktreeEntry = true
 		}
 	}
@@ -55,14 +55,14 @@ func (s *ManualCommitStrategy) findSessionsForCommitLinking(ctx context.Context,
 		if state.Kind.IsImported() || state.AdoptedIntoWorktreePath != "" || linkingSetContains(sessions, state.SessionID) {
 			continue
 		}
-		if hasWorktreeEntry(state, worktreePath) {
+		if hasWorktreeEntry(ctx, state, worktreePath) {
 			state.LinkedByWorktreeEntry = true
 			sessions = append(sessions, state)
 		}
 	}
 	// Every session judges this commit by what it recorded for this worktree.
 	for _, state := range sessions {
-		enterWorktreeView(state, worktreePath)
+		enterWorktreeView(ctx, state, worktreePath)
 	}
 	if ambiguous && len(sessions) == 0 && !isGitSequenceOperation(ctx) {
 		fmt.Fprintln(stderrWriter,

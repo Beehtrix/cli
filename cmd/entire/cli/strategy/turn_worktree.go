@@ -80,35 +80,53 @@ func SplitEditsByWorktree(ctx context.Context, hookRoot string, edited []string)
 }
 
 // PruneRemovedWorktrees drops sessionID's records of edits in worktrees git
-// no longer lists (removed, or a subagent's throwaway worktree): no commit can
-// be made there, and the session would otherwise stay pending forever.
+// no longer lists (removed, or a subagent's throwaway worktree), or lists
+// under the same ID for a worktree added since: no commit can carry those
+// edits, and the session would otherwise stay pending forever.
 func PruneRemovedWorktrees(ctx context.Context, sessionID, hookRoot string) {
+	pruneRemovedWorktrees(ctx, sessionID, hookRoot, gitrepo.ListWorktreePaths)
+}
+
+// pruneRemovedWorktrees is PruneRemovedWorktrees with the worktree listing
+// passed in, so a test can record an entry while it runs.
+func pruneRemovedWorktrees(ctx context.Context, sessionID, hookRoot string, list func(context.Context, string) ([]string, error)) {
 	state, err := LoadSessionState(ctx, sessionID)
 	if err != nil || state == nil || len(state.OtherWorktrees) == 0 {
 		return
 	}
-	registered, err := gitrepo.ListWorktreePaths(ctx, hookRoot)
-	if err != nil {
-		return
-	}
-	// Entries are keyed by worktree ID, which survives `git worktree move`;
-	// a stored path doesn't, so liveness is decided by key, and a moved
-	// worktree's entry takes its new path.
-	live := make(map[string]string, len(registered))
-	for _, p := range registered {
-		id, idErr := paths.GetWorktreeID(p)
-		if idErr != nil {
-			// Can't tell which entry this worktree is: prune nothing.
-			return
-		}
-		live[session.WorktreeKey(id)] = resolveExisting(p)
-	}
+	// Listed under the lock: an entry another hook records for a worktree
+	// added after a listing taken outside it would read as removed.
 	err = MutateSessionState(ctx, sessionID, func(state *SessionState) error {
+		if len(state.OtherWorktrees) == 0 {
+			return ErrMutationSkip
+		}
+		registered, err := list(ctx, hookRoot)
+		if err != nil {
+			return ErrMutationSkip
+		}
+		// Entries are keyed by worktree ID, which survives `git worktree
+		// move`; a stored path doesn't, so liveness is decided by key, and a
+		// moved worktree's entry takes its new path.
+		live := make(map[string]string, len(registered))
+		for _, p := range registered {
+			id, idErr := paths.GetWorktreeID(p)
+			if idErr != nil {
+				// Can't tell which entry this worktree is: prune nothing.
+				return ErrMutationSkip
+			}
+			live[session.WorktreeKey(id)] = resolveExisting(p)
+		}
 		changed := false
 		for key, work := range state.OtherWorktrees {
 			path, ok := live[key]
+			if ok {
+				// Dropped only when known to be another worktree's: a
+				// check that failed says nothing about the record.
+				current, err := worktreeEntryCurrent(ctx, path, key, work)
+				ok = current || err != nil
+			}
 			switch {
-			case work == nil || !ok:
+			case !ok:
 				delete(state.OtherWorktrees, key)
 				changed = true
 			case work.Path != path:

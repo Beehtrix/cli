@@ -707,7 +707,15 @@ func buildAdoptedSessionState(ctx context.Context, source *session.State, home a
 	adopted.OtherWorktrees = nil
 	if worktreeRegistered(ctx, worktreeRoot, source.WorktreePath) {
 		// Same repository: the source's edits elsewhere still link from there.
-		adopted.OtherWorktrees = adoptedOtherWorktrees(source, worktreeID)
+		// A home carries no marker of its own (it is matched by path), so a
+		// source home removed and re-added at the same path can't be told
+		// from the original here; its files take the current marker.
+		sourceMarker, markErr := strategy.MarkWorktree(ctx, source.WorktreePath, source.WorktreeID)
+		if markErr != nil {
+			logging.Debug(logging.WithComponent(ctx, "session"), "could not mark the source worktree; its pending files stay unlinked there",
+				slog.String("worktree", source.WorktreePath), slog.String("error", markErr.Error()))
+		}
+		adopted.OtherWorktrees = adoptedOtherWorktrees(source, worktreeID, sourceMarker, markErr == nil)
 	}
 
 	// Reset target-local checkpoint bookkeeping. Source checkpoint IDs can point
@@ -872,8 +880,10 @@ func worktreeRegistered(ctx context.Context, worktreeRoot, path string) bool {
 // adoptedOtherWorktrees is the adopted session's record of edits outside its
 // new home: the source's entries, minus any for the new home (whose files are
 // recomputed from its status above), plus the source home's pending files
-// when that was a different worktree, so they still link from there.
-func adoptedOtherWorktrees(source *session.State, targetWorktreeID string) map[string]*session.WorktreeWork {
+// when that was a different worktree, so they still link from there. Those
+// are recorded under sourceMarker (strategy.MarkWorktree), and left out when
+// the source worktree couldn't be marked (marked false).
+func adoptedOtherWorktrees(source *session.State, targetWorktreeID, sourceMarker string, marked bool) map[string]*session.WorktreeWork {
 	out := make(map[string]*session.WorktreeWork, len(source.OtherWorktrees)+1)
 	for key, work := range source.OtherWorktrees {
 		if work != nil && key != session.WorktreeKey(targetWorktreeID) {
@@ -884,12 +894,13 @@ func adoptedOtherWorktrees(source *session.State, targetWorktreeID string) map[s
 		}
 	}
 	sourceKey := session.WorktreeKey(source.WorktreeID)
-	if source.WorktreePath != "" && sourceKey != session.WorktreeKey(targetWorktreeID) && len(source.FilesTouched) > 0 {
+	if marked && source.WorktreePath != "" && sourceKey != session.WorktreeKey(targetWorktreeID) && len(source.FilesTouched) > 0 {
 		out[sourceKey] = &session.WorktreeWork{
 			Path:              source.WorktreePath,
 			BaseCommit:        source.BaseCommit,
 			FilesTouched:      slices.Clone(source.FilesTouched),
 			TouchedFileHashes: maps.Clone(source.TouchedFileHashes),
+			Incarnation:       sourceMarker,
 		}
 	}
 	if len(out) == 0 {

@@ -2,8 +2,10 @@ package strategy
 
 import (
 	"context"
+	"log/slog"
 	"path/filepath"
 
+	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/session"
 )
@@ -17,10 +19,11 @@ import (
 // anywhere" (HasPendingFiles) still sees it.
 //
 // ok is false, and nothing changes, when root is the session's home, the
-// session has no home recorded, or no entry for root. Otherwise leave puts
+// session has no home recorded, or no current entry for root (one made before
+// git gave root's ID to a new worktree is not). Otherwise leave puts
 // everything back, keeping what processing left in the view as root's entry
 // (dropped once empty). Call leave before the state is saved.
-func enterWorktreeView(state *SessionState, root string) (leave func(), ok bool) {
+func enterWorktreeView(ctx context.Context, state *SessionState, root string) (leave func(), ok bool) {
 	if root == "" || state.WorktreePath == "" || len(state.OtherWorktrees) == 0 ||
 		isSessionHomeWorktree(root, state) || sameDir(root, state.WorktreePath) {
 		return nil, false
@@ -31,7 +34,7 @@ func enterWorktreeView(state *SessionState, root string) (leave func(), ok bool)
 	}
 	key, homeKey := session.WorktreeKey(worktreeID), session.WorktreeKey(state.WorktreeID)
 	entry := state.OtherWorktrees[key]
-	if entry == nil || key == homeKey {
+	if key == homeKey || !worktreeEntryLinks(ctx, root, key, entry) {
 		return nil, false
 	}
 	if _, clash := state.OtherWorktrees[homeKey]; clash {
@@ -52,12 +55,10 @@ func enterWorktreeView(state *SessionState, root string) (leave func(), ok bool)
 	state.InWorktreeView = true
 
 	return func() {
-		left := session.WorktreeWork{
-			Path:              entry.Path,
-			BaseCommit:        state.BaseCommit,
-			FilesTouched:      state.FilesTouched,
-			TouchedFileHashes: state.TouchedFileHashes,
-		}
+		// The entry as it was, with what processing left in the view.
+		left := *entry
+		left.BaseCommit = state.BaseCommit
+		left.FilesTouched, left.TouchedFileHashes = state.FilesTouched, state.TouchedFileHashes
 		if left.Path == "" {
 			left.Path = root
 		}
@@ -77,8 +78,8 @@ func enterWorktreeView(state *SessionState, root string) (leave func(), ok bool)
 }
 
 // hasWorktreeEntry reports whether state recorded edits in the worktree at
-// root other than its home.
-func hasWorktreeEntry(state *SessionState, root string) bool {
+// root other than its home, while root is the worktree they were made in.
+func hasWorktreeEntry(ctx context.Context, state *SessionState, root string) bool {
 	if len(state.OtherWorktrees) == 0 || state.WorktreePath == "" || isSessionHomeWorktree(root, state) || sameDir(root, state.WorktreePath) {
 		return false
 	}
@@ -86,8 +87,9 @@ func hasWorktreeEntry(state *SessionState, root string) bool {
 	if err != nil {
 		return false
 	}
-	work := state.OtherWorktrees[session.WorktreeKey(worktreeID)]
-	return work != nil && len(work.FilesTouched) > 0
+	key := session.WorktreeKey(worktreeID)
+	work := state.OtherWorktrees[key]
+	return work != nil && len(work.FilesTouched) > 0 && worktreeEntryLinks(ctx, root, key, work)
 }
 
 // overlapsFiles reports whether any of files is in set.
@@ -108,7 +110,8 @@ func homedAt(state *SessionState, root string) bool {
 }
 
 // enterStepWorktree is enterWorktreeView for a turn-end step recorded in
-// root, creating root's entry when the session has none yet. A session with
+// root, creating root's entry when the session has none yet, or only one
+// left from an earlier worktree git gave root's ID to. A session with
 // no recorded home is first homed in the hook's worktree, so a step elsewhere
 // can't make that worktree its home by default.
 func enterStepWorktree(ctx context.Context, state *SessionState, root string) (leave func(), ok bool) {
@@ -133,13 +136,31 @@ func enterStepWorktree(ctx context.Context, state *SessionState, root string) (l
 	if state.OtherWorktrees == nil {
 		state.OtherWorktrees = map[string]*session.WorktreeWork{}
 	}
-	created := state.OtherWorktrees[key] == nil
+	previous := state.OtherWorktrees[key]
+	created := !worktreeEntryLinks(ctx, root, key, previous)
 	if created {
-		state.OtherWorktrees[key] = &session.WorktreeWork{Path: root}
+		incarnation, err := worktreeIncarnation(ctx, root, worktreeID, true)
+		if err != nil {
+			// Unmarked, the record would never count; git keeps this
+			// worktree's HEAD in the same directory, so it is broken anyway.
+			logging.Debug(logging.WithComponent(ctx, "session"), "could not mark worktree; its edits are not recorded",
+				slog.String("worktree", root), slog.String("error", err.Error()))
+			return nil, false
+		}
+		if previous != nil && previous.Incarnation == incarnation {
+			// The first check failed but the record is this worktree's.
+			created = false
+		} else {
+			state.OtherWorktrees[key] = &session.WorktreeWork{Path: root, Incarnation: incarnation}
+		}
 	}
-	leave, ok = enterWorktreeView(state, root)
+	leave, ok = enterWorktreeView(ctx, state, root)
 	if !ok && created {
-		delete(state.OtherWorktrees, key)
+		if previous != nil {
+			state.OtherWorktrees[key] = previous
+		} else {
+			delete(state.OtherWorktrees, key)
+		}
 		if len(state.OtherWorktrees) == 0 {
 			state.OtherWorktrees = nil
 		}
