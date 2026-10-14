@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -89,9 +90,7 @@ func newHooksFixture(t *testing.T) *hooksFixture {
 
 func (f *hooksFixture) write(name, content string) {
 	f.t.Helper()
-	if err := os.WriteFile(filepath.Join(f.dir, name), []byte(content), 0o755); err != nil {
-		f.t.Fatal(err)
-	}
+	writeExec(f.t, filepath.Join(f.dir, name), content)
 }
 
 func (f *hooksFixture) read(name string) string {
@@ -113,6 +112,15 @@ func (f *hooksFixture) install(specs ...hookSpec) {
 	if _, err := installHooks(context.Background(), f.lockRoot, f.root, f.dir, specs, backupClock); err != nil {
 		f.t.Fatalf("installHooks: %v", err)
 	}
+}
+
+// installExecutable protects the installer's writes as well as fixture writes
+// when a test will execute the resulting hooks. No subprocess runs during install.
+func (f *hooksFixture) installExecutable(specs ...hookSpec) {
+	f.t.Helper()
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	f.install(specs...)
 }
 
 func (f *hooksFixture) olderCopies() []string {
@@ -506,7 +514,7 @@ echo pre-commit >> `+log+"\n")
 	f.write("commit-msg"+legacySuffix, generateChainedContent(spec.content, spec.name))
 	f.write("commit-msg"+backupSuffix, "#!/bin/sh\necho user >> "+log+"\n")
 
-	f.install(spec)
+	f.installExecutable(spec)
 	if reinstall {
 		if err := os.Rename(filepath.Join(f.dir, "commit-msg"), filepath.Join(f.dir, "commit-msg"+legacySuffix)); err != nil {
 			t.Fatal(err)
@@ -585,6 +593,13 @@ func TestChainedPrePush_EntireFailureAbortsPush(t *testing.T) {
 
 func writeExec(t *testing.T, path, content string) {
 	t.Helper()
+	// A parallel fork can inherit an open write descriptor even with CLOEXEC:
+	// it closes only at exec. Linux then refuses to execute this script with
+	// ETXTBSY until the other child reaches exec. Match the plugin harness by
+	// excluding forks across open/write/close, including scripts run by sh.
+	// ForkLock is unused by CreateProcess on Windows.
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -888,7 +903,7 @@ func TestInstallHooks_ForeignWrapperOverEntireDoesNotRecurse(t *testing.T) {
 	f.write("commit-msg.tool-old", generateChainedContent(spec.content, spec.name))
 	f.write("commit-msg", "#!/bin/sh\n\"$(dirname \"$0\")/commit-msg.tool-old\" \"$@\" || exit $?\necho tool >> "+log+"\n")
 
-	f.install(spec)
+	f.installExecutable(spec)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second) // a recursive chain never ends
 	defer cancel()
@@ -932,7 +947,7 @@ fi
 	f.write("commit-msg.tool-old", preGuardChained)
 	f.write("commit-msg", "#!/bin/sh\n\"$(dirname \"$0\")/commit-msg.tool-old\" \"$@\" || exit $?\necho tool >> "+log+"\n")
 
-	f.install(spec)
+	f.installExecutable(spec)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second) // a recursive chain never ends
 	defer cancel()
