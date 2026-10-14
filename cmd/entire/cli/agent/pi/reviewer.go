@@ -68,12 +68,16 @@ func checkPiReviewVersion(ctx context.Context, version func(context.Context) (st
 	if err != nil {
 		return nil //nolint:nilerr // best-effort probe; a missing pi fails at Start with its own error
 	}
-	fields := strings.Fields(raw)
-	if len(fields) == 0 {
-		return nil
+	// Pi 0.70 prints just the version; take the first token that parses so a
+	// prefix ("pi 0.64.0") or trailing notice can't hide an old release.
+	have := ""
+	for _, field := range strings.Fields(raw) {
+		if v := strings.TrimPrefix(field, "v"); semver.IsValid("v" + v) {
+			have = v
+			break
+		}
 	}
-	have := strings.TrimPrefix(fields[len(fields)-1], "v")
-	if !semver.IsValid("v"+have) || semver.Compare("v"+have, "v"+MinPiStdinJSONVersion) >= 0 {
+	if have == "" || semver.Compare("v"+have, "v"+MinPiStdinJSONVersion) >= 0 {
 		return nil
 	}
 	return fmt.Errorf("pi %s is too old for review: it needs pi >= %s to keep JSON output for a prompt piped on stdin; upgrade pi and retry", have, MinPiStdinJSONVersion)

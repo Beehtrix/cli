@@ -318,6 +318,8 @@ func TestCheckPiReviewVersion(t *testing.T) {
 		{name: "minimum", out: MinPiStdinJSONVersion + "\n"},
 		{name: "newer", out: "0.70.2\n"},
 		{name: "v prefix", out: "v0.60.0", wantErr: true},
+		{name: "name prefix", out: "pi 0.64.0\n", wantErr: true},
+		{name: "trailing notice", out: "0.64.0\nUpdate available: 0.70.2\n", wantErr: true},
 		{name: "unparseable", out: "pi dev build\n"},
 		{name: "empty", out: ""},
 		{name: "probe failed", err: errNoPi},
