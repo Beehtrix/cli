@@ -127,6 +127,20 @@ type State struct {
 	// Derived from .git/worktrees/<name>/, stable across git worktree move
 	WorktreeID string `json:"worktree_id,omitempty"`
 
+	// WorktreeIncarnation is the marker (strategy's worktreeIncarnation) of
+	// the linked worktree the session is homed in: "" for the main worktree,
+	// and for a session homed before markers were kept until its next turn
+	// starts at home. Git keeps the marker through `git worktree move` and
+	// reuses a removed worktree's ID and path, so the worktree holding it is
+	// the home wherever it now is, and one at the home's path without it is
+	// not.
+	WorktreeIncarnation string `json:"worktree_incarnation,omitempty"`
+
+	// RehomedAt is when a turn started in a worktree git had added at the
+	// session's home path after removing the home, making it the new home.
+	// Background task records launched before then ran in the removed one.
+	RehomedAt *time.Time `json:"rehomed_at,omitempty"`
+
 	// AdoptedIntoWorktreePath marks a source-side tombstone left behind after
 	// `entire session adopt` moves this session into another repository/worktree.
 	// Hook TurnStart must not reactivate tombstoned source records, otherwise the
@@ -294,6 +308,12 @@ type State struct {
 	// (FilesTouched, TouchedFileHashes, BaseCommit, WorktreePath) hold another
 	// worktree's entry instead of the home's, for a commit in that worktree.
 	InWorktreeView bool `json:"-"`
+
+	// HomeNotHere is set in memory, never stored, while a commit is processed
+	// in a worktree at the session's recorded home path that its home marker
+	// shows is not its home (git removed the home and added another there):
+	// the commit is handled as a guest's, leaving the home's base and files.
+	HomeNotHere bool `json:"-"`
 
 	// LastCheckpointID is the checkpoint ID from the most recent condensation.
 	// Used to restore the Entire-Checkpoint trailer on amend and to identify

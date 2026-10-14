@@ -188,6 +188,13 @@ func isSessionHomeWorktree(worktreePath string, state *SessionState) bool {
 	return worktreePath != "" && state.WorktreePath != "" && filepath.Clean(state.WorktreePath) == filepath.Clean(worktreePath)
 }
 
+// committedAtHome is isSessionHomeWorktree for a commit hook that has also
+// checked the session's home marker (homeAt): a worktree git re-added at the
+// recorded path after removing the home is not it (State.HomeNotHere).
+func committedAtHome(repoDir string, state *SessionState) bool {
+	return !state.HomeNotHere && isSessionHomeWorktree(repoDir, state)
+}
+
 // hookInSessionHome is isSessionHomeWorktree for an agent hook running in
 // worktreeRoot: a turn can end in another worktree of the repository (the
 // agent resumed there). Such a turn still records its own changes and tokens,

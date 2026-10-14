@@ -1286,11 +1286,13 @@ func handleLifecycleSessionEnd(ctx context.Context, ag agent.Agent, event *agent
 		_, _ = refreshCodexInventory(ctx, ag, event.SessionID, nil, 0)
 		finalizeCodexObservedAtSessionEnd(ctx, event.SessionID)
 		completeLiveTaskRecords(ctx, ag, event.SessionID, event.SessionRef)
+		pruneRemovedWorktreesAtEnd(ctx, event.SessionID)
 		condenseEndedSession(ctx, event.SessionID, deadline)
 		return nil
 	}
 
 	completeLiveTaskRecords(ctx, ag, event.SessionID, event.SessionRef)
+	pruneRemovedWorktreesAtEnd(ctx, event.SessionID)
 
 	if _, err := endSessionNow(ctx, event, event.SessionID, nil, sessionEndCondenseDeadline(ag), endedNow); err != nil {
 		logging.Warn(logCtx, "failed to mark session ended",
@@ -1298,6 +1300,17 @@ func handleLifecycleSessionEnd(ctx context.Context, ag agent.Agent, event *agent
 	}
 
 	return nil
+}
+
+// pruneRemovedWorktreesAtEnd drops the ending session's records of worktrees
+// removed since its last turn end, which pruned them last: no turn end follows
+// to do it, and those records would keep the ended session pending for ever.
+func pruneRemovedWorktreesAtEnd(ctx context.Context, sessionID string) {
+	hookRoot, err := paths.WorktreeRoot(ctx)
+	if err != nil {
+		return
+	}
+	strategy.PruneRemovedWorktrees(ctx, sessionID, hookRoot)
 }
 
 // finalizeCodexObservedAtSessionEnd closes every observed turn of a VERIFIED

@@ -104,7 +104,9 @@ func overlapsFiles(files []string, set map[string]struct{}) bool {
 
 // homedAt reports whether root is state's home worktree. A state with no
 // recorded home is treated as homed wherever it is asked about, as before
-// homes were recorded.
+// homes were recorded. It compares paths only, which holds for turn-end hooks
+// because turn start already followed a moved home and re-homed a session in
+// a worktree re-added at its home path (reconcileWorktreePathForResumedTurn).
 func homedAt(state *SessionState, root string) bool {
 	return state.WorktreePath == "" || isSessionHomeWorktree(root, state) || sameDir(root, state.WorktreePath)
 }

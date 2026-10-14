@@ -232,12 +232,42 @@ worktree's files (carry-forward stays within it); files still waiting in any
 worktree keep the session pending and the next checkpoint self-contained
 (`carryForwardRemainingFiles`), and the stored transcript is released only
 when nothing is pending anywhere. Entries for worktrees git no longer lists
-are pruned at turn end. Known effects: when one window is split across
+are pruned at turn end, at session end, and before a commit-less salvage
+(`CondenseSessionByID`), so a worktree removed after the last turn doesn't
+keep an ended session pending or fold its files into the salvage. Known effects: when one window is split across
 commits in two worktrees, the second checkpoint repeats the transcript (and
 transcript-derived tokens) from the start, as split commits always have, and
 hook-reported tokens go to the first; files written only through shell
 commands never appear in the transcript and aren't recorded for another
 worktree; an older CLI that rewrites the state drops the entries.
+
+**A linked home is known by its marker** (`State.WorktreeIncarnation`, the
+same `entire-incarnation` marker; "" for the main worktree). It is stamped
+when the session starts, adopts into a linked worktree, or, for a session
+homed before markers were kept, at its next turn at home. Hooks judge a
+worktree against it (`homeAt`) rather than by path alone: the worktree
+holding the marker is the home even after `git worktree move` — provided
+git's own record of it (`<admin>/gitdir`) names that worktree, so a copy
+isn't, and the recorded path is no longer a worktree — and one git added at
+the home's path after removing it is not. A moved home is followed: commit
+linking matches it as the home in memory, and post-commit and turn start
+store the new path under the session's lock, keeping `WorktreeID`. A
+re-added worktree's commits don't match the old session by path or as a
+sibling; identity can still link it, as a guest (`State.HomeNotHere`). When
+the session's own turn starts there (its agent resumed in it), it is
+re-homed: the removed worktree's pending files and hashes are dropped, the
+checkpoint window advances to the current transcript end with no steps
+pending, the marker and base are the new worktree's, and background tasks
+launched before then (`RehomedAt`) claim nothing there; tokens are kept.
+Adopting from a re-added source home drops the removed one's files. When
+the marker can't be checked (a git or filesystem failure) the path rule
+applies, so a transient error never stops the home linking; only a marker
+that differs, or a missing one in the worktree's admin directory, counts as
+proof for re-homing or dropping files. Turn-end recording (`homedAt`),
+caller resolution's worktree tier, and status/review counts stay path-based:
+they rely on turn start having followed or re-homed first. A sibling
+worktree's hook that runs between a move and the moved home's next hook
+still reads the stored transcript copy from the hook's own worktree.
 
 **Squashes inherit their trailers** (`inheritSquashedCheckpointTrailers`). A
 commit made while `git merge --squash` is in progress (SQUASH_MSG present in

@@ -1394,6 +1394,14 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 		var condensedSignal *commitCondensedSignal
 		entryOnly := sess.LinkedByWorktreeEntry
 		mutErr := MutateSessionStateOnSaved(iterCtx, sessionID, func(state *SessionState) error {
+			// Judged again under the lock: a home moved here is stored at its
+			// new path, and a worktree re-added at the home's path commits
+			// as a guest (one linked by identity; it can't match by path).
+			switch followMovedHome(iterCtx, state, worktreePath) {
+			case homeNotHere, homeReplaced:
+				state.HomeNotHere = true
+			case homeUnknown, homeHere, homeMovedHere:
+			}
 			// The same view of this worktree the linking set judged it by.
 			leave, inView := enterWorktreeView(iterCtx, state, worktreePath)
 			state.LinkedByWorktreeEntry = entryOnly
@@ -1401,7 +1409,7 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 			newSkillEvents, condensedSignal, condensed = s.postCommitProcessSessionLocked(iterCtx, repo, state, &transitionCtx, checkpointID,
 				head, commit, newHead, worktreePath, headTree, parentTree,
 				committedFileSet, sessionsWithCommittedFiles, condensedTelemetry)
-			state.LinkedByWorktreeEntry = false
+			state.LinkedByWorktreeEntry, state.HomeNotHere = false, false
 			if inView {
 				leave()
 			}
@@ -1732,7 +1740,7 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 	// would rewrite the home worktree's pending files with foreign data (see
 	// condenseAndUpdateState).
 	_, carryForwardSpan := perf.Start(ctx, "carry_forward_files")
-	if handler.condensed && isSessionHomeWorktree(repoDir, state) {
+	if handler.condensed && committedAtHome(repoDir, state) {
 		remainingFiles := filesWithRemainingAgentChanges(ctx, repo, touchedFileHashesBefore, commit, filesTouchedBefore, committedFileSet, overlapOpts{
 			headTree: headTree,
 		})
@@ -1851,7 +1859,7 @@ func (s *ManualCommitStrategy) condenseAndUpdateState(
 	// (or letting the caller recompute them via carry-forward, which compares
 	// files in the current — wrong — worktree) would replace the home
 	// worktree's in-flight state with the committing worktree's files.
-	isHome := isSessionHomeWorktree(opts.repoDir, state)
+	isHome := committedAtHome(opts.repoDir, state)
 	if !isHome {
 		state.LastCheckpointID = result.CheckpointID
 		pendingStepCount := state.StepCount
@@ -1916,7 +1924,7 @@ func (s *ManualCommitStrategy) updateBaseCommitIfChanged(ctx context.Context, st
 	// Guest-linked sessions (identity-matched from a sibling worktree) keep
 	// their BaseCommit on their home worktree's HEAD — see
 	// condenseAndUpdateState for the rationale.
-	if !isSessionHomeWorktree(worktreePath, state) {
+	if !committedAtHome(worktreePath, state) {
 		return
 	}
 	if state.BaseCommit != newHead {
@@ -1961,6 +1969,12 @@ func (s *ManualCommitStrategy) postCommitUpdateBaseCommitOnly(ctx context.Contex
 		mutErr := MutateSessionState(ctx, sessionID, func(state *SessionState) error {
 			if !state.Phase.IsActive() || state.BaseCommit == newHead {
 				return ErrMutationSkip
+			}
+			// Judged again under the lock, as the post-commit loop does.
+			switch followMovedHome(ctx, state, worktreePath) {
+			case homeNotHere, homeReplaced:
+				return ErrMutationSkip
+			case homeUnknown, homeHere, homeMovedHere:
 			}
 			logging.Debug(logCtx, "post-commit (no trailer): updating BaseCommit",
 				slog.String("session_id", state.SessionID),
@@ -3241,19 +3255,15 @@ func advanceCheckpointTranscriptStartToTurnEnd(ctx context.Context, state *Sessi
 	_, isLate := agent.AsLateTranscriptWriter(ag)
 
 	advanced := false
-	if transcriptPath, resolveErr := resolveTranscriptPath(state); resolveErr == nil {
-		if analyzer, ok := agent.AsTranscriptAnalyzer(ag); ok {
-			if pos, posErr := analyzer.GetTranscriptPosition(transcriptPath); posErr == nil && pos > state.CheckpointTranscriptStart {
-				logging.Debug(logCtx,
-					"advancing CheckpointTranscriptStart to turn end after mid-turn commit",
-					slog.String("session_id", state.SessionID),
-					slog.Int("old_offset", state.CheckpointTranscriptStart),
-					slog.Int("new_offset", pos),
-				)
-				state.AdvanceDisplayWindow(pos)
-				advanced = true
-			}
-		}
+	if pos, ok := currentTranscriptPosition(state); ok && pos > state.CheckpointTranscriptStart {
+		logging.Debug(logCtx,
+			"advancing CheckpointTranscriptStart to turn end after mid-turn commit",
+			slog.String("session_id", state.SessionID),
+			slog.Int("old_offset", state.CheckpointTranscriptStart),
+			slog.Int("new_offset", pos),
+		)
+		state.AdvanceDisplayWindow(pos)
+		advanced = true
 	}
 
 	if !isLate {

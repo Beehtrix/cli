@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -44,33 +45,9 @@ func worktreeIncarnation(ctx context.Context, root, worktreeID string, create bo
 	if worktreeID == "" {
 		return "", nil
 	}
-	// The ID comes from the worktree's .git file: data, not a resolved path.
-	if worktreeID == "." || worktreeID == ".." || strings.ContainsAny(worktreeID, "/\\\x00") {
-		return "", fmt.Errorf("invalid worktree id %q", worktreeID)
-	}
-	// Resolved from root itself, not the process's directory or root's .git
-	// file: the admin directory is the one git uses for root.
-	commonDir, cached := worktreeCommonDirs.Load(root)
-	if !cached {
-		resolved, err := gitCommonDirForWorktree(ctx, root)
-		if err != nil {
-			return "", err
-		}
-		commonDir, _ = worktreeCommonDirs.LoadOrStore(root, resolved)
-	}
-	commonPath, ok := commonDir.(string)
-	if !ok {
-		return "", errors.New("cached git common dir is not a path")
-	}
-	common, err := gitdir.OpenAt(commonPath)
+	admin, _, closeAdmin, err := openWorktreeAdmin(ctx, root, worktreeID)
 	if err != nil {
-		return "", fmt.Errorf("open git common dir: %w", err)
-	}
-	// Not a shared root: remove + re-add replaces this directory, and a cached
-	// handle would keep reading the old one.
-	admin, closeAdmin, err := osroot.OpenDirNoSymlinks(common, "worktrees/"+worktreeID)
-	if err != nil {
-		return "", fmt.Errorf("open worktree admin dir: %w", err)
+		return "", err
 	}
 	defer closeAdmin()
 
@@ -86,6 +63,41 @@ func worktreeIncarnation(ctx context.Context, root, worktreeID string, create bo
 		return "", err
 	}
 	return readIncarnation(admin)
+}
+
+// openWorktreeAdmin opens the git admin directory of the linked worktree at
+// root, whose git ID is worktreeID, and returns it with its path (for
+// resolving paths git records relative to it, never for I/O).
+func openWorktreeAdmin(ctx context.Context, root, worktreeID string) (admin *os.Root, adminPath string, closeAdmin func(), err error) {
+	// The ID comes from the worktree's .git file: data, not a resolved path.
+	if worktreeID == "" || worktreeID == "." || worktreeID == ".." || strings.ContainsAny(worktreeID, "/\\\x00") {
+		return nil, "", nil, fmt.Errorf("invalid worktree id %q", worktreeID)
+	}
+	// Resolved from root itself, not the process's directory or root's .git
+	// file: the admin directory is the one git uses for root.
+	commonDir, cached := worktreeCommonDirs.Load(root)
+	if !cached {
+		resolved, err := gitCommonDirForWorktree(ctx, root)
+		if err != nil {
+			return nil, "", nil, err
+		}
+		commonDir, _ = worktreeCommonDirs.LoadOrStore(root, resolved)
+	}
+	commonPath, ok := commonDir.(string)
+	if !ok {
+		return nil, "", nil, errors.New("cached git common dir is not a path")
+	}
+	common, err := gitdir.OpenAt(commonPath)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("open git common dir: %w", err)
+	}
+	// Not a shared root: remove + re-add replaces this directory, and a cached
+	// handle would keep reading the old one.
+	admin, closeAdmin, err = osroot.OpenDirNoSymlinks(common, "worktrees/"+worktreeID)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("open worktree admin dir: %w", err)
+	}
+	return admin, filepath.Join(commonPath, "worktrees", worktreeID), closeAdmin, nil
 }
 
 // installIncarnation writes marker unless admin already has one, in which

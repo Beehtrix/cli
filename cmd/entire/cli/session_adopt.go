@@ -705,17 +705,29 @@ func buildAdoptedSessionState(ctx context.Context, source *session.State, home a
 	// FilesTouched is recomputed from its own status, so none of them apply.
 	adopted.TouchedFileHashes = nil
 	adopted.OtherWorktrees = nil
+	// The new home is known by its marker (State.WorktreeIncarnation); the
+	// main worktree has none.
+	adopted.WorktreeIncarnation = ""
+	if targetMarker, markErr := strategy.MarkWorktree(ctx, worktreeRoot, worktreeID); markErr == nil {
+		adopted.WorktreeIncarnation = targetMarker
+	} else {
+		logging.Debug(logging.WithComponent(ctx, "session"), "could not mark the target worktree; the adopted session is matched by path",
+			slog.String("worktree", worktreeRoot), slog.String("error", markErr.Error()))
+	}
 	if worktreeRegistered(ctx, worktreeRoot, source.WorktreePath) {
 		// Same repository: the source's edits elsewhere still link from there.
-		// A home carries no marker of its own (it is matched by path), so a
-		// source home removed and re-added at the same path can't be told
-		// from the original here; its files take the current marker.
-		sourceMarker, markErr := strategy.MarkWorktree(ctx, source.WorktreePath, source.WorktreeID)
-		if markErr != nil {
-			logging.Debug(logging.WithComponent(ctx, "session"), "could not mark the source worktree; its pending files stay unlinked there",
-				slog.String("worktree", source.WorktreePath), slog.String("error", markErr.Error()))
+		// A source home git removed and re-added at the same path since is
+		// another worktree: its pending files went with the removed one.
+		if strategy.HomeReplaced(ctx, source) {
+			adopted.OtherWorktrees = adoptedOtherWorktrees(source, worktreeID, "", false)
+		} else {
+			sourceMarker, markErr := strategy.MarkWorktree(ctx, source.WorktreePath, source.WorktreeID)
+			if markErr != nil {
+				logging.Debug(logging.WithComponent(ctx, "session"), "could not mark the source worktree; its pending files stay unlinked there",
+					slog.String("worktree", source.WorktreePath), slog.String("error", markErr.Error()))
+			}
+			adopted.OtherWorktrees = adoptedOtherWorktrees(source, worktreeID, sourceMarker, markErr == nil)
 		}
-		adopted.OtherWorktrees = adoptedOtherWorktrees(source, worktreeID, sourceMarker, markErr == nil)
 	}
 
 	// Reset target-local checkpoint bookkeeping. Source checkpoint IDs can point
@@ -882,7 +894,8 @@ func worktreeRegistered(ctx context.Context, worktreeRoot, path string) bool {
 // recomputed from its status above), plus the source home's pending files
 // when that was a different worktree, so they still link from there. Those
 // are recorded under sourceMarker (strategy.MarkWorktree), and left out when
-// the source worktree couldn't be marked (marked false).
+// the source worktree couldn't be marked or is no longer the source's home
+// (marked false).
 func adoptedOtherWorktrees(source *session.State, targetWorktreeID, sourceMarker string, marked bool) map[string]*session.WorktreeWork {
 	out := make(map[string]*session.WorktreeWork, len(source.OtherWorktrees)+1)
 	for key, work := range source.OtherWorktrees {

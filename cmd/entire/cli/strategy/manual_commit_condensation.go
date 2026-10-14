@@ -2053,6 +2053,13 @@ func (s *ManualCommitStrategy) CondenseSessionByID(ctx context.Context, sessionI
 	}
 	defer repo.Close()
 
+	// Records of worktrees removed since the session's last turn end are
+	// pruned first: no commit can carry those files, and salvaging them would
+	// fold them into this checkpoint.
+	if hookRoot, rootErr := paths.WorktreeRoot(ctx); rootErr == nil {
+		PruneRemovedWorktrees(ctx, sessionID, hookRoot)
+	}
+
 	var checkpointID id.CheckpointID
 	reserveErr := MutateSessionState(ctx, sessionID, func(state *SessionState) error {
 		var reserveErr error

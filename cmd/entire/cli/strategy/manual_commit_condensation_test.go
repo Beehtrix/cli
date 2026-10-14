@@ -1822,9 +1822,12 @@ func TestCondenseSessionByID_RecordsOtherWorktreesFiles(t *testing.T) { //nolint
 		AuthorEmail:   "test@test.com",
 		AgentType:     agent.AgentTypeClaudeCode,
 	}))
+	// A worktree git still lists: the salvage prunes records of removed ones.
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	testutil.RunGit(t, dir, "worktree", "add", elsewhere, "-b", "elsewhere")
 	require.NoError(t, MutateSessionState(t.Context(), sessionID, func(state *SessionState) error {
 		state.OtherWorktrees = map[string]*session.WorktreeWork{
-			session.WorktreeKey("elsewhere"): {Path: "/elsewhere", FilesTouched: []string{"elsewhere.go"}},
+			linkedKey(t, elsewhere): {Path: elsewhere, FilesTouched: []string{"elsewhere.go"}, Incarnation: mark(t, elsewhere)},
 		}
 		return nil
 	}))
