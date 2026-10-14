@@ -3706,6 +3706,7 @@ func TestHandleLifecycleSubagentStart_DeferredCompletion_RecordsInFlightMarker(t
 	assert.Equal(t, "ses_child_red", rec.AgentID)
 	assert.Equal(t, "general", rec.SubagentType)
 	assert.Equal(t, "Create docs/red.md", rec.TaskDescription)
+	assert.True(t, rec.Background, "a deferred launch runs until a later stop, so overlap checks must see it")
 
 	preState, preErr := LoadPreTaskState(ctx, "call_red")
 	require.NoError(t, preErr)

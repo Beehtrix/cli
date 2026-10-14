@@ -62,7 +62,7 @@ func runOpenCodeExportToFile(ctx context.Context, root *os.Root, sessionID, outp
 	}()
 
 	cmd := exec.CommandContext(ctx, "opencode", "export", sessionID)
-	// Exports run inside git hooks (condensation, the commit-overlap check),
+	// Exports run inside git hooks (condensation in post-commit),
 	// whose GIT_DIR / GIT_INDEX_FILE would otherwise reach OpenCode's own git
 	// calls (project detection) and point them at the hook's state.
 	cmd.Env = gitrepo.EnvWithoutRepoOverrides()

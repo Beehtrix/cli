@@ -8,7 +8,7 @@ generic task-record model is in
 
 ## Verdict: COMPATIBLE
 
-Verified against OpenCode 1.18.30. The plugin sees every signal Entire needs,
+Verified against OpenCode 1.18.30 and 1.18.33. The plugin sees every signal Entire needs,
 and the child session ID is on the launch signal, the completion signal and
 the child's own export. Live verification was done during development with a
 probe script that is not kept in the repo.
@@ -72,7 +72,7 @@ from the first non-synthetic, non-compaction user message at or after
 later than the record's completion). Without a `started_at` the full export is declared
 (`<child>.json`); a call that never prompted its child declares an empty
 slice. A failed export completes the record transcript-unavailable, and
-condensation (or the SessionEnd sweep) exports again with the same bounds.
+condensation exports again with the same bounds.
 The background result that OpenCode injects into the parent is synthetic
 text, so prompt extraction and the summary skip it.
 
@@ -83,4 +83,4 @@ text, so prompt extraction and the summary skip it.
 - Two calls in one message that resume the same child: the queued call ends at the first run's idle, so its own work lands in no record.
 - A call whose start the plugin never saw (restart mid-task) declares the child's full export.
 - `callID` is opaque and not globally unique; the child session ID is the cross-process key.
-- A running background child's edits do not count toward an IDLE parent's co-authorship of a commit until the child stops; condensation still stores its export so far.
+- A running background child's edits reach the parent's files only at its stop. Until then, an IDLE parent with no tracked files of its own is left out of a commit that another session also claims; otherwise it condenses and stores the child's export so far.

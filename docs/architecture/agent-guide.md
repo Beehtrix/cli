@@ -62,8 +62,8 @@ Every agent must implement all 19 methods on the `Agent` interface:
 
 Not an interface — a field. On `SubagentEnd`, set `Event.SubagentTranscriptPath` when
 the agent's hook payload names the subagent's own transcript (Codex and Cursor both
-send `agent_transcript_path`; OpenCode declares the `opencode export` cache path of
-the child). Leave it empty and the framework probes the layout
+send `agent_transcript_path`; for OpenCode the framework's capture runs `opencode export` for the child and declares
+that file). Leave it empty and the framework probes the layout
 Claude Code and Factory AI Droid share, which finds nothing for any other agent and
 fails silently — the task checkpoint simply stores no subagent transcript. See the
 field's doc comment in `cmd/entire/cli/agent/event.go`.
