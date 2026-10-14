@@ -71,21 +71,22 @@ func TestProxy_PolicyRejectionTriesRemainingReplicas(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, body.Close())
 	require.Equal(t, []string{bad, good}, dialed)
-	require.Empty(t, failed)
-	require.Equal(t, []string{bad, good}, p.nodes)
+	require.Equal(t, []string{bad}, failed, "a policy-rejected node is dropped like an unreachable one")
+	require.Equal(t, []string{good}, p.nodes)
 }
 
-func TestProxy_RedirectRejectionPreservesReplicaHealth(t *testing.T) {
+func TestProxy_RedirectRejectionFailsNodeWithoutLocationFallback(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name      string
-		cold      bool
-		wantCalls int
+		name       string
+		cold       bool
+		wantCalls  int
+		wantFailed int
 	}{
 		// Warm: the cached node is refused, then the entry URL re-advertises it
 		// and it is refused again. Neither path follows the server's Location.
-		{"warm downgrade", false, 3},
-		{"cold downgrade", true, 2},
+		{"warm downgrade", false, 3, 2},
+		{"cold downgrade", true, 2, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -112,8 +113,8 @@ func TestProxy_RedirectRejectionPreservesReplicaHealth(t *testing.T) {
 			p.discoveryTransport = rt
 			_, err := p.InfoRefs(t.Context(), "git-upload-pack")
 			require.ErrorIs(t, err, httpclient.ErrInsecureRedirect)
-			require.Empty(t, failed, "policy failures must not invoke the production cache-invalidation hook")
-			require.Equal(t, []string{node}, p.nodes)
+			require.Len(t, failed, tc.wantFailed, "every rejection invalidates the node")
+			require.Empty(t, p.nodes)
 			require.Equal(t, tc.wantCalls, calls, "a policy failure must not trigger the Location fallback")
 		})
 	}
@@ -134,7 +135,7 @@ func TestProxy_WarmPathFailureFallsBackToEntry(t *testing.T) {
 		wantFailed []string
 	}{
 		{"redirect loop", []string{looping}, []string{looping}},
-		{"downgrade and unavailable replica", []string{downgrading, unavailable}, []string{unavailable}},
+		{"downgrade and unavailable replica", []string{downgrading, unavailable}, []string{downgrading, unavailable}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -163,9 +164,40 @@ func TestProxy_WarmPathFailureFallsBackToEntry(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, body.Close())
 			require.Equal(t, 1, entryHits)
-			require.Equal(t, tc.wantFailed, failed)
+			require.ElementsMatch(t, tc.wantFailed, failed)
 		})
 	}
+}
+
+// When the entry answers info/refs itself (no X-Entire-Replicas), the POST must
+// go to the entry host, not back to the cached replica that was just refused.
+func TestProxy_RejectedReplicaIsNotThePostTargetAfterEntryFallback(t *testing.T) {
+	t.Parallel()
+	const entry = "https://cluster.example"
+	const downgrading = "https://down.cluster.example"
+	var failed, posted []string
+	p := New(Config{Nodes: replicas.NodeConfig{EntryURL: entry, ClusterHost: "cluster.example", InitialNodes: []string{downgrading}}, OnNodeFailed: func(node string) { failed = append(failed, node) }})
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		host := req.URL.Scheme + "://" + req.URL.Host
+		if req.Method == http.MethodPost {
+			posted = append(posted, host)
+		}
+		if host == downgrading {
+			h := http.Header{"Location": {"http://down.cluster.example/repo"}}
+			return &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: h, Body: http.NoBody, Request: req}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: req}, nil
+	})
+	p.client.Transport = rt
+	p.discoveryTransport = rt
+	body, err := p.InfoRefs(t.Context(), "git-upload-pack")
+	require.NoError(t, err)
+	require.NoError(t, body.Close())
+	rpc, err := p.ServiceRPC(t.Context(), "git-upload-pack", strings.NewReader("want"))
+	require.NoError(t, err)
+	require.NoError(t, rpc.Close())
+	require.Equal(t, []string{entry}, posted)
+	require.Equal(t, []string{downgrading}, failed)
 }
 
 func TestProxy_SkippedReplicaPreservesStorageError(t *testing.T) {

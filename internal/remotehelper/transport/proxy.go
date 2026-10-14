@@ -403,8 +403,11 @@ func (p *Proxy) retryOn401(client *http.Client, resp *http.Response, build func(
 // from a random offset (or the stickyNode if one is set and still in
 // the replica list). Connection errors and 5xx responses trigger
 // failover to the next node. The failed node is removed from the list
-// and OnNodeFailed is called. Redirect-policy errors also try the next eligible
-// node, but leave the rejected node's cache entry intact.
+// and OnNodeFailed is called. A redirect-policy rejection is a node failure
+// too: keeping the node would leave it as the only POST target after the
+// entry URL answers info/refs itself, pinning the failure until the replica
+// cache expires. The error still matches httpclient.ErrRequestPolicy, which
+// stops the cold path from following the server's Location.
 func (p *Proxy) doWithFailover(ctx context.Context, makeSuffix string, method string, body io.ReadSeeker, setHeaders func(*http.Request)) (*http.Response, error) {
 	nodes := slices.Clone(p.nodes)
 	if len(nodes) == 0 {
@@ -425,8 +428,8 @@ func (p *Proxy) doWithFailover(ctx context.Context, makeSuffix string, method st
 
 	for i := range nodes {
 		node := nodes[(start+i)%len(nodes)]
-		// Attempting HTTPS makes HTTP loopback replicas in the snapshot
-		// ineligible. Skip it before auth stamping,
+		// Once an HTTPS request has been attempted, HTTP loopback replicas in
+		// the snapshot are ineligible. Skip such a node before auth stamping,
 		// without treating it as unhealthy or abandoning later HTTPS nodes.
 		if !p.replicaInCluster(node) {
 			debuglog.Printf("skipping insecure or out-of-cluster replica %q", node)
@@ -468,9 +471,11 @@ func (p *Proxy) doWithFailover(ctx context.Context, makeSuffix string, method st
 		resp, err := p.client.Do(req)
 		if err != nil {
 			if errors.Is(err, httpclient.ErrRequestPolicy) {
-				// The node is reachable but proposes an unsafe hop. Keep its
-				// cache entry and try the remaining eligible replicas.
+				// The node proposes an unsafe hop. Nothing was sent to it;
+				// drop it like an unreachable node and try the rest.
+				debuglog.Printf("node %s rejected by redirect policy: %v", node, err)
 				policyErr = err
+				p.markNodeFailed(node)
 				continue
 			}
 			debuglog.Printf("node %s unreachable: %v", node, err)

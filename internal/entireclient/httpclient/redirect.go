@@ -68,7 +68,10 @@ func CheckSecureRedirect(req *http.Request, via []*http.Request) error {
 //   - if the callback permits the hop, the possibly rewritten req.URL is
 //     checked again, and the callback cannot undo an HTTPS upgrade.
 //
-// Callbacks must not call CheckSecureRedirect themselves. A nil client uses
+// The callback also runs on hops the shared policy then rejects, so it must
+// not have external side effects; changes to a rejected req are discarded
+// because that request is never sent. Callbacks must not call
+// CheckSecureRedirect themselves. A nil client uses
 // http.DefaultClient. Transport, timeout and jar are preserved; neither the
 // supplied client nor the default client is mutated.
 func WithSecureRedirects(client *http.Client) *http.Client {
