@@ -2,6 +2,7 @@ package pi
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -298,5 +299,48 @@ func TestPiReviewer_ParseErrorWithoutMessage(t *testing.T) {
 	}
 	if len(errs) != 1 || errs[0] != "pi: stopped with aborted" {
 		t.Fatalf("RunErrors = %q, want the stop reason", errs)
+	}
+}
+
+func TestCheckPiReviewVersion(t *testing.T) {
+	t.Parallel()
+
+	errNoPi := errors.New("pi: executable file not found")
+	tests := []struct {
+		name    string
+		out     string
+		err     error
+		wantErr bool
+	}{
+		// Before 0.65.1, piped stdin with --mode json printed plain text, which
+		// parsePiReviewOutput reports as malformed JSON and a failed review.
+		{name: "too old", out: "0.64.3\n", wantErr: true},
+		{name: "minimum", out: MinPiStdinJSONVersion + "\n"},
+		{name: "newer", out: "0.70.2\n"},
+		{name: "v prefix", out: "v0.60.0", wantErr: true},
+		{name: "unparseable", out: "pi dev build\n"},
+		{name: "empty", out: ""},
+		{name: "probe failed", err: errNoPi},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := checkPiReviewVersion(context.Background(), func(context.Context) (string, error) {
+				return tt.out, tt.err
+			})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("checkPiReviewVersion(%q) = %v, wantErr %v", tt.out, err, tt.wantErr)
+			}
+			if tt.wantErr && !strings.Contains(err.Error(), MinPiStdinJSONVersion) {
+				t.Errorf("error %q should name the minimum version", err)
+			}
+		})
+	}
+}
+
+func TestPiReviewer_HasVersionPreflight(t *testing.T) {
+	t.Parallel()
+	if NewReviewer().Preflight == nil {
+		t.Fatal("pi reviewer must check the pi version before piping the prompt on stdin")
 	}
 }

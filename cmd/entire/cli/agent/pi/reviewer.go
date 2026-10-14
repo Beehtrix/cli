@@ -10,6 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
+
+	"golang.org/x/mod/semver"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/review"
@@ -31,7 +34,49 @@ func NewReviewer() *reviewtypes.ReviewerTemplate {
 		AgentName: string(agent.AgentNamePi),
 		BuildCmd:  buildPiReviewCmd,
 		Parser:    parsePiReviewOutput,
+		Preflight: func(ctx context.Context) error {
+			return checkPiReviewVersion(ctx, piVersion)
+		},
 	}
+}
+
+// MinPiStdinJSONVersion is the first Pi release that keeps --mode json output
+// for a prompt piped on stdin. Earlier releases fall back to plain text, which
+// the review parser cannot read.
+const MinPiStdinJSONVersion = "0.65.1"
+
+// piVersionTimeout bounds the `pi --version` probe; it reads no config and
+// makes no network call, so a slow answer means something is wrong.
+const piVersionTimeout = 10 * time.Second
+
+// piVersion returns what `pi --version` prints (Pi writes it to stderr).
+func piVersion(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, piVersionTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "pi", "--version").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("pi --version: %w", err)
+	}
+	return string(out), nil
+}
+
+// checkPiReviewVersion refuses a Pi too old to read the review prompt from
+// stdin in --mode json. A version it cannot run or parse is let through: the
+// review then fails or succeeds on its own, as it did before this check.
+func checkPiReviewVersion(ctx context.Context, version func(context.Context) (string, error)) error {
+	raw, err := version(ctx)
+	if err != nil {
+		return nil //nolint:nilerr // best-effort probe; a missing pi fails at Start with its own error
+	}
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return nil
+	}
+	have := strings.TrimPrefix(fields[len(fields)-1], "v")
+	if !semver.IsValid("v"+have) || semver.Compare("v"+have, "v"+MinPiStdinJSONVersion) >= 0 {
+		return nil
+	}
+	return fmt.Errorf("pi %s is too old for review: it needs pi >= %s to keep JSON output for a prompt piped on stdin; upgrade pi and retry", have, MinPiStdinJSONVersion)
 }
 
 func buildPiReviewCmd(ctx context.Context, cfg reviewtypes.RunConfig) *exec.Cmd {
