@@ -25,8 +25,9 @@ func TestTurnEndFinalizeDeadline(t *testing.T) {
 
 // turnEndBudgetFallbacks lists the agents that deliberately take
 // defaultTurnEndHookTimeout instead of declaring agent.TurnEndBudgeter, with
-// the reason. Every other agent must declare its budget, so a new agent cannot
-// inherit the default without someone deciding it should.
+// the reason. Every other built-in agent must declare its budget (external
+// agents always take the default), so a new agent cannot inherit the default
+// without someone deciding it should.
 var turnEndBudgetFallbacks = map[types.AgentName]string{
 	agent.AgentNameCursor:   "Cursor documents only a \"platform default\" hook timeout, with no number",
 	vogon.AgentNameVogon:    "deterministic test agent with no host process to time it out",
