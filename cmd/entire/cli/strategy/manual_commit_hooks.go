@@ -15,7 +15,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
@@ -1498,47 +1497,35 @@ func logUnclaimedCheckpointTrailer(logCtx context.Context, checkpointID id.Check
 // subagent's edits reach FilesTouched only at completion, so this is the only
 // evidence that a record-bearing IDLE session co-authored a commit another
 // session also claims. Each record's transcript is resolved the way
-// materializeTaskRecords resolves it (readTaskTranscript): the declared path,
-// then the agent-layout fallback, then the agent's own re-export — an
-// in-flight OpenCode record has no transcript on disk until its stop hook
-// runs. The re-export runs inside the user's `git commit`, so it gets
-// liveTaskFetchTimeout rather than the agent's own command timeout; a fetch
-// that fails or times out is no evidence, as before.
+// materializeTaskRecords resolves it: the declared path, then the agent-layout
+// fallback.
 func (s *ManualCommitStrategy) liveTaskFilesInCommit(ctx context.Context, state *SessionState, committedFileSet map[string]struct{}) bool {
 	ag, err := agent.GetByAgentType(state.AgentType)
 	if err != nil {
 		return false
 	}
-	return liveTaskFilesInCommitFor(ctx, ag, state, committedFileSet)
-}
-
-// liveTaskFetchTimeout bounds the transcript re-export liveTaskFilesInCommit
-// may run from a post-commit hook.
-const liveTaskFetchTimeout = 10 * time.Second
-
-func liveTaskFilesInCommitFor(ctx context.Context, ag agent.Agent, state *SessionState, committedFileSet map[string]struct{}) bool {
 	analyzer, ok := agent.AsTranscriptAnalyzer(ag)
 	if !ok {
 		return false
 	}
-	fetchCtx, cancel := context.WithTimeout(ctx, liveTaskFetchTimeout)
-	defer cancel()
 	for _, record := range state.LiveTaskRecords() {
 		if record.AgentID == "" || validation.ValidateAgentID(record.AgentID) != nil {
 			continue
 		}
-		_, transcriptPath, readErr := readTaskTranscript(fetchCtx, ctx, ag, state, record, "")
-		if readErr != nil || transcriptPath == "" {
-			continue
-		}
-		files, _, extractErr := analyzer.ExtractModifiedFilesFromOffset(ctx, transcriptPath, 0)
-		if extractErr != nil {
-			continue
-		}
-		for _, f := range normalizeTranscriptFilePaths(ctx, state, files) {
-			if _, committed := committedFileSet[f]; committed {
-				return true
+		for _, transcriptPath := range []string{record.DeclaredTranscriptPath, resolveTaskTranscriptPath(state, record.AgentID)} {
+			if transcriptPath == "" || !fileExists(transcriptPath) {
+				continue
 			}
+			files, _, extractErr := analyzer.ExtractModifiedFilesFromOffset(ctx, transcriptPath, 0)
+			if extractErr != nil {
+				continue
+			}
+			for _, f := range normalizeTranscriptFilePaths(ctx, state, files) {
+				if _, committed := committedFileSet[f]; committed {
+					return true
+				}
+			}
+			break
 		}
 	}
 	return false
@@ -1701,11 +1688,9 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 		headTree:                   headTree,
 		parentTree:                 parentTree,
 		sessionsWithCommittedFiles: sessionsWithCommittedFiles,
-		// Memoized: the gate can be consulted more than once per commit, and
-		// each consultation may re-export a running subagent.
-		liveTaskClaimsCommit: sync.OnceValue(func() bool {
+		liveTaskClaimsCommit: func() bool {
 			return s.liveTaskFilesInCommit(ctx, state, committedFileSet)
-		}),
+		},
 		condensedTelemetry: condensedTelemetry,
 	}
 
