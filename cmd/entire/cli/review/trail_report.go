@@ -82,12 +82,14 @@ func trailReportFor(summary reviewtypes.RunSummary, aggregateOutput string) (Tra
 // tool calls that ends with a valid contract line, or "" if none does. It is
 // found by the contract line rather than by position, so a tool call after
 // the report does not hide it, and earlier exploration narration, whose
-// bullets ("I'll check:\n- retry.go") are not findings, is left out.
+// bullets ("I'll check:\n- retry.go") are not findings, is left out. A tool
+// call inside a message, where the next text continues it as a delta, is not
+// a boundary.
 func reportText(buf []reviewtypes.Event) string {
 	end := len(buf)
 	for i := len(buf) - 1; i >= -1; i-- {
 		if i >= 0 {
-			if _, ok := buf[i].(reviewtypes.ToolCall); !ok {
+			if _, ok := buf[i].(reviewtypes.ToolCall); !ok || continuesMessage(buf[i+1:]) {
 				continue
 			}
 		}
@@ -98,6 +100,17 @@ func reportText(buf []reviewtypes.Event) string {
 		end = i
 	}
 	return ""
+}
+
+// continuesMessage reports whether the first text in buf continues the
+// message before it.
+func continuesMessage(buf []reviewtypes.Event) bool {
+	for _, ev := range buf {
+		if at, ok := ev.(reviewtypes.AssistantText); ok {
+			return at.Delta
+		}
+	}
+	return false
 }
 
 // splitTrailJSON separates a trailing contract-shaped JSON object (one line,
