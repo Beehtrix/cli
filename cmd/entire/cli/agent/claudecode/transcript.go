@@ -216,7 +216,11 @@ func toolResultAgentIDs(transcriptData []byte) (agentIDs map[string]string, name
 				break
 			}
 		}
-		named[toolUseID] = true
+		// A result with no tool_use_id cannot be told apart from another such
+		// result, so it suppresses no text.
+		if toolUseID != "" {
+			named[toolUseID] = true
+		}
 		if _, seen := agentIDs[entry.ToolUseResult.AgentID]; !seen {
 			agentIDs[entry.ToolUseResult.AgentID] = toolUseID
 		}

@@ -1113,6 +1113,8 @@ func TestToolResultAgentIDs(t *testing.T) {
 		agentResultLine("toolu_empty", "", "completed", ""),
 		// The same shape on an assistant line is not a tool result.
 		`{"type":"assistant","toolUseResult":{"status":"completed","agentId":"aother"}}`,
+		// No tool_result block: the agent counts, but no tool_use_id is named.
+		`{"type":"user","message":{"role":"user","content":[]},"toolUseResult":{"status":"completed","agentId":"anoblock00000001"}}`,
 	)
 
 	agents, named := toolResultAgentIDs(data)
@@ -1120,6 +1122,7 @@ func TestToolResultAgentIDs(t *testing.T) {
 		"a4e0167c8089f0939": "toolu_fg",
 		"aa436bf42999fd283": "toolu_bg",
 		"a80ff32f89f7dadc4": "toolu_skill",
+		"anoblock00000001":  "",
 	}, agents)
 	assert.Equal(t, map[string]bool{"toolu_fg": true, "toolu_bg": true, "toolu_skill": true, "toolu_followup": true}, named)
 }
