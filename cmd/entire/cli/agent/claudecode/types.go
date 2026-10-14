@@ -93,8 +93,9 @@ func (e ClaudeHookEntry) MarshalJSON() ([]byte, error) {
 }
 
 // unmarshalKeepingExtra decodes the knownKeys of data into known and returns
-// every other key, plus the knownKeys data contained. Entire rewrites settings.json, which the user and Claude Code
-// own, so every field it does not model must survive the round trip.
+// every other key, plus the knownKeys data contained. Entire rewrites
+// settings.json, which the user and Claude Code own, so every field it does not
+// model must survive the round trip.
 //
 // Only exact knownKeys are decoded: encoding/json matches field names
 // case-insensitively, so decoding data whole would read a key such as "Command",

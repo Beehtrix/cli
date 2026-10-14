@@ -1033,6 +1033,37 @@ func TestRepairHookTimeouts_FillsOnlyMissingTimeouts(t *testing.T) {
 	}
 }
 
+// TestRepairHookTimeouts_DropsEmptyPermissions: the repair writes through the
+// same helper as install, so an empty permissions block goes the way install
+// drops it rather than surviving only when doctor rewrote the file.
+func TestRepairHookTimeouts_DropsEmptyPermissions(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+
+	stopCmd := agentpkg.WrapProductionSilentHookCommand("entire hooks claude-code stop")
+	writeSettingsFile(t, tempDir, fmt.Sprintf(`{
+  "permissions": {},
+  "hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command", "command": %q}]}]}
+}`, stopCmd))
+
+	changed, err := (&ClaudeCodeAgent{}).RepairHookTimeouts(context.Background())
+	if err != nil {
+		t.Fatalf("RepairHookTimeouts() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("RepairHookTimeouts() changed = false, want true")
+	}
+	raw, err := os.ReadFile(filepath.Join(tempDir, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &parsed))
+	if _, ok := parsed["permissions"]; ok {
+		t.Errorf("empty permissions block kept after repair:\n%s", raw)
+	}
+}
+
 // TestRepairHookTimeouts_NoSettingsFile: doctor runs where Claude Code was
 // never set up, and the repair must not create a config there.
 func TestRepairHookTimeouts_NoSettingsFile(t *testing.T) {
