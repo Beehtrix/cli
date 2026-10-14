@@ -136,7 +136,7 @@ func withoutStaleSubagentSnapshot(usage *agent.TokenUsage, ledgerVersion *uint64
 // per-turn counters to both the session total (TokenUsage) and the pending
 // checkpoint window (CheckpointTokenUsage), and rescopes the window's
 // cumulative SubagentTokens against the baseline. SaveStep and
-// AccumulateSessionTokenUsage (turns that change no files) both go through
+// ApplyTurnTokenUsage (turns that change no files) both go through
 // here, so a turn is accounted the same way whichever path records it. A nil
 // usage is a no-op.
 func applyTurnTokenUsage(state *SessionState, usage *agent.TokenUsage) {

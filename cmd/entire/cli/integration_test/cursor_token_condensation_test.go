@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,9 +22,18 @@ import (
 
 func runCursorHook(t *testing.T, env *TestEnv, cursorProjectDir, hookName string, input map[string]any) {
 	t.Helper()
+	require.NoError(t, tryCursorHook(t, env, cursorProjectDir, hookName, input))
+}
+
+// tryCursorHook runs a Cursor hook and returns its failure instead of failing
+// the test, so it can run off the test goroutine.
+func tryCursorHook(t *testing.T, env *TestEnv, cursorProjectDir, hookName string, input map[string]any) error {
+	t.Helper()
 
 	inputJSON, err := json.Marshal(input)
-	require.NoError(t, err)
+	if err != nil {
+		return fmt.Errorf("marshal %s input: %w", hookName, err)
+	}
 
 	cmd := execx.NonInteractive(context.Background(), getTestBinary(), "hooks", "cursor", hookName)
 	cmd.Dir = env.RepoDir
@@ -31,8 +41,11 @@ func runCursorHook(t *testing.T, env *TestEnv, cursorProjectDir, hookName string
 	cmd.Env = append(env.cliEnv(), "ENTIRE_TEST_CURSOR_PROJECT_DIR="+cursorProjectDir)
 
 	out, err := cmd.CombinedOutput()
-	require.NoErrorf(t, err, "cursor %s hook failed\ninput: %s\noutput: %s", hookName, inputJSON, out)
 	t.Logf("cursor %s output: %s", hookName, out)
+	if err != nil {
+		return fmt.Errorf("cursor %s hook failed\ninput: %s\noutput: %s: %w", hookName, inputJSON, out, err)
+	}
+	return nil
 }
 
 func TestCursorTokenUsage_SurvivesCondensation(t *testing.T) {
@@ -302,6 +315,63 @@ func TestCursorTokenUsage_TurnWithoutFileChanges(t *testing.T) {
 	require.Equal(t, 1000, cp2.InputTokens, "checkpoint 2 must hold turn 3 only")
 	require.Equal(t, 9, cp2.OutputTokens, "checkpoint 2 must hold turn 3 only")
 	require.Equal(t, 1300, sessionTokens().InputTokens, "session total = every turn once")
+}
+
+// TestCursorTokenUsage_RepeatedStopCountsNoChangeTurnOnce pins that a
+// no-change turn's stop-payload tokens are recorded once per turn: Cursor's
+// payload is the turn's own usage, so a repeated or concurrent stop for the
+// same turn would otherwise add it again.
+func TestCursorTokenUsage_RepeatedStopCountsNoChangeTurnOnce(t *testing.T) {
+	t.Parallel()
+
+	env := NewFeatureBranchEnv(t)
+	env.InitEntireWithAgent(agent.AgentNameCursor)
+
+	cursorProjectDir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(cursorProjectDir); err == nil {
+		cursorProjectDir = resolved
+	}
+
+	const conversationID = "cursor-repeated-stop-session"
+	transcriptDir := filepath.Join(cursorProjectDir, conversationID)
+	require.NoError(t, os.MkdirAll(transcriptDir, 0o755))
+	transcriptPath := filepath.Join(transcriptDir, conversationID+".jsonl")
+
+	input := func(extra map[string]any) map[string]any {
+		in := map[string]any{"conversation_id": conversationID, "transcript_path": transcriptPath}
+		for k, v := range extra {
+			in[k] = v
+		}
+		return in
+	}
+	startTurn := func(prompt string) {
+		t.Helper()
+		appendLines(t, transcriptPath, `{"type":"user","text":"`+prompt+`"}`)
+		runCursorHook(t, env, cursorProjectDir, "before-submit-prompt", input(map[string]any{"prompt": prompt}))
+	}
+	// Cursor's input_tokens includes cache reads and writes; none here.
+	stop := func(in, out int) func() error {
+		return func() error {
+			return tryCursorHook(t, env, cursorProjectDir, "stop", input(map[string]any{
+				"model": "cursor-default", "loop_count": 1, "input_tokens": in, "output_tokens": out,
+			}))
+		}
+	}
+
+	runCursorHook(t, env, cursorProjectDir, "session-start", input(map[string]any{"model": "cursor-default"}))
+
+	startTurn("turn one")
+	require.NoError(t, stop(100, 10)())
+	requireTurnTokens(t, env, conversationID, 100, 10, "after a no-change turn")
+
+	require.NoError(t, stop(100, 10)(), "a repeated stop must still succeed")
+	requireTurnTokens(t, env, conversationID, 100, 10, "a repeated stop must add nothing")
+
+	startTurn("turn two")
+	for i, err := range runConcurrently(stop(40, 4), stop(40, 4)) {
+		require.NoError(t, err, "concurrent stop %d", i)
+	}
+	requireTurnTokens(t, env, conversationID, 140, 14, "concurrent stops must record the turn once")
 }
 
 func readCommittedTokenUsage(t *testing.T, env *TestEnv, checkpointID string) *agent.TokenUsage {

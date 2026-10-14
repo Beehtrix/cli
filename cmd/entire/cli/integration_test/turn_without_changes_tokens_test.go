@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
@@ -156,4 +157,74 @@ func TestCodexTokenUsage_TurnWithoutFileChanges(t *testing.T) {
 	total = sessionTokenTotal(t, env, sessionID)
 	require.Equal(t, 115, total.InputTokens, "session total = every turn once")
 	require.Equal(t, 15, total.OutputTokens, "session total = every turn once")
+}
+
+// requireTurnTokens asserts the session total and the pending checkpoint
+// window both hold exactly the given usage.
+func requireTurnTokens(t *testing.T, env *TestEnv, sessionID string, input, output int, msg string) {
+	t.Helper()
+	state, err := env.GetSessionState(sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, state, "session state must exist")
+	require.NotNil(t, state.TokenUsage, "%s: session total", msg)
+	require.Equal(t, input, state.TokenUsage.InputTokens, "%s: session total input", msg)
+	require.Equal(t, output, state.TokenUsage.OutputTokens, "%s: session total output", msg)
+	require.NotNil(t, state.CheckpointTokenUsage, "%s: pending checkpoint usage", msg)
+	require.Equal(t, input, state.CheckpointTokenUsage.InputTokens, "%s: pending checkpoint input", msg)
+	require.Equal(t, output, state.CheckpointTokenUsage.OutputTokens, "%s: pending checkpoint output", msg)
+}
+
+// runConcurrently runs each fn at once and returns their errors.
+func runConcurrently(fns ...func() error) []error {
+	errs := make([]error, len(fns))
+	var wg sync.WaitGroup
+	for i, fn := range fns {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = fn()
+		}()
+	}
+	wg.Wait()
+	return errs
+}
+
+// TestClaudeCodeTokenUsage_RepeatedStopCountsNoChangeTurnOnce pins that a
+// no-change turn's tokens are recorded by the Stop that ends the turn and by
+// no other. A retried Stop runs after the pre-prompt state is gone, so it
+// resolves its transcript offset from the session instead and would re-add
+// every earlier turn; concurrent Stops would each add the turn.
+func TestClaudeCodeTokenUsage_RepeatedStopCountsNoChangeTurnOnce(t *testing.T) {
+	t.Parallel()
+
+	env := NewFeatureBranchEnv(t)
+	session := env.NewSession()
+	transcript := session.TranscriptPath
+
+	n := 0
+	startTurn := func(input, output int) {
+		t.Helper()
+		n++
+		prompt := fmt.Sprintf("turn %d", n)
+		require.NoError(t, env.SimulateUserPromptSubmitWithPromptAndTranscriptPath(session.ID, prompt, transcript))
+		appendLines(t, transcript,
+			fmt.Sprintf(`{"uuid":"user-%d","type":"user","message":{"content":%q}}`, n, prompt),
+			fmt.Sprintf(`{"uuid":"asst-%d","type":"assistant","message":{"id":"msg_%d","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":%d,"output_tokens":%d}}}`, n, n, input, output))
+	}
+	stop := func() error { return env.SimulateStop(session.ID, transcript) }
+
+	startTurn(100, 10)
+	require.NoError(t, stop())
+	startTurn(40, 4)
+	require.NoError(t, stop())
+	requireTurnTokens(t, env, session.ID, 140, 14, "after two no-change turns")
+
+	require.NoError(t, stop(), "a repeated Stop must still succeed")
+	requireTurnTokens(t, env, session.ID, 140, 14, "a repeated Stop must add nothing")
+
+	startTurn(7, 1)
+	for i, err := range runConcurrently(stop, stop) {
+		require.NoError(t, err, "concurrent Stop %d", i)
+	}
+	requireTurnTokens(t, env, session.ID, 147, 15, "concurrent Stops must record the turn once")
 }
