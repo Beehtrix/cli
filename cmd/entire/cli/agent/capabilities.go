@@ -31,6 +31,7 @@ type CapabilityDeclarer interface {
 //   - HomeScopedInventoryExtractor
 //   - HookConfigLocator
 //   - HookFreshness
+//   - HookTimeoutRepairer
 //   - InventoryAwareExtractor
 //   - LateTranscriptWriter (refuses CapabilityDeclarer agents)
 //   - ModelExtractor
