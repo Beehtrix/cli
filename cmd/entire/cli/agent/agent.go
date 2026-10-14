@@ -579,6 +579,29 @@ type SessionEndBudgeter interface {
 	SessionEndBudget() time.Duration
 }
 
+// TurnEndBudgeter is implemented by agents whose host bounds the hook that ends
+// a turn. Entire bounds the network-bound part of turn-end checkpoint
+// finalization by it, so a slow remote makes Entire give up on the remaining
+// checkpoints instead of the host killing the hook before the session state is
+// saved. Agents that do not implement it get a conservative default.
+type TurnEndBudgeter interface {
+	Agent
+
+	// TurnEndBudget returns how long the turn-end hook may run, measured from
+	// process start, leaving headroom for the work after finalization. Derive
+	// it from the hook timeout with TurnEndBudgetWithin.
+	TurnEndBudget() time.Duration
+}
+
+// TurnEndBudgetWithin returns the turn-end budget for a host hook timeout. It
+// keeps a fifth of the timeout, between 2s and 10s, for what the hook does
+// after finalization (saving session state) and for the shell wrapper and
+// binary load that run before Entire's clock starts.
+func TurnEndBudgetWithin(hookTimeout time.Duration) time.Duration {
+	headroom := min(max(hookTimeout/5, 2*time.Second), 10*time.Second)
+	return max(hookTimeout-headroom, 0)
+}
+
 // RestoredSessionPathResolver is implemented by agents that need a
 // transcript-specific path when Entire reconstructs a session from checkpoint
 // metadata. This is used for restored sessions only; live sessions still use

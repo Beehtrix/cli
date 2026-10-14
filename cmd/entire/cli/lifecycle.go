@@ -1465,6 +1465,25 @@ func sessionEndCondenseDeadline(ag agent.Agent) time.Time {
 	return processStart.Add(budget)
 }
 
+// defaultTurnEndHookTimeout is the turn-end hook timeout assumed for agents
+// that do not declare agent.TurnEndBudgeter. Cursor documents only a "platform
+// default", OpenCode applies none (its plugin blocks on the hook), and external
+// agents expose none; 30s is the limit Codex and Copilot CLI enforce.
+const defaultTurnEndHookTimeout = 30 * time.Second
+
+// turnEndFinalizeDeadline returns when turn-end checkpoint finalization must
+// stop waiting on the network so the hook finishes inside its host's timeout,
+// measured from process start like the host's own clock.
+func turnEndFinalizeDeadline(agentType types.AgentType) time.Time {
+	budget := agent.TurnEndBudgetWithin(defaultTurnEndHookTimeout)
+	if ag, err := agent.GetByAgentType(agentType); err == nil {
+		if budgeter, ok := agent.AsTurnEndBudgeter(ag); ok {
+			budget = budgeter.TurnEndBudget()
+		}
+	}
+	return processStart.Add(budget)
+}
+
 // endSessionNow runs the canonical "this session is over" sequence: it marks the
 // session ended (firing the SessionStop transition → PhaseEnded + EndedAt) and
 // eagerly condenses its pending work so PostCommit need not. This prevents
@@ -2512,7 +2531,7 @@ func transitionSessionTurnEnd(ctx context.Context, sessionID string, event *agen
 		// and appends the new ones to state.SkillEvents — snapshot its growth
 		// so those events reach telemetry alongside the hook-provided ones.
 		skillEventsBefore := len(state.SkillEvents)
-		if err := strat.HandleTurnEnd(ctx, state); err != nil {
+		if err := strat.HandleTurnEnd(ctx, state, turnEndFinalizeDeadline(state.AgentType)); err != nil {
 			logging.Warn(logCtx, "turn-end action dispatch failed",
 				slog.String("error", err.Error()))
 		}

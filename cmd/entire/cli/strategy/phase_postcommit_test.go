@@ -704,7 +704,7 @@ func TestTurnEnd_Active_NoActions(t *testing.T) {
 	require.NoError(t, err)
 
 	// Call HandleTurnEnd — should be a no-op (no TurnCheckpointIDs)
-	err = s.HandleTurnEnd(context.Background(), state)
+	err = s.HandleTurnEnd(context.Background(), state, time.Time{})
 	require.NoError(t, err)
 
 	// Verify state is unchanged
@@ -1424,7 +1424,7 @@ func TestHandleTurnEnd_PartialFailure(t *testing.T) {
 	require.NoError(t, s.saveSessionState(context.Background(), state))
 
 	// Call HandleTurnEnd — should NOT return error (best-effort)
-	err = s.HandleTurnEnd(context.Background(), state)
+	err = s.HandleTurnEnd(context.Background(), state, time.Time{})
 	require.NoError(t, err,
 		"HandleTurnEnd should return nil even with partial failures (best-effort)")
 
@@ -1448,7 +1448,9 @@ func TestHandleTurnEnd_PartialFailure(t *testing.T) {
 // scanner skips the finalize rewrite entirely: the provisional checkpoint's
 // transcript stays intact (no empty-transcript finalize), the call counts as
 // an error, and TurnCheckpointIDs is preserved so a repeated Stop process can
-// retry instead of orphaning the provisional checkpoints.
+// retry instead of orphaning the provisional checkpoints. The deadline has
+// already passed, which must not override that: it bounds only the network
+// phase, which a degraded finalize never reaches.
 func TestFinalizeAllTurnCheckpoints_ScannerDegraded(t *testing.T) {
 	// No t.Parallel: t.Chdir plus redact's process-global scanner state.
 	workDir := setupGitRepo(t)
@@ -1486,7 +1488,7 @@ func TestFinalizeAllTurnCheckpoints_ScannerDegraded(t *testing.T) {
 
 	redact.WithScannerDegradedSole(t)
 
-	errCount := NewManualCommitStrategy().finalizeAllTurnCheckpoints(context.Background(), state)
+	errCount := NewManualCommitStrategy().finalizeAllTurnCheckpoints(context.Background(), state, time.Now().Add(-time.Second))
 	require.Equal(t, 1, errCount)
 	require.Equal(t, []string{testTrailerCheckpointID.String()}, state.TurnCheckpointIDs,
 		"TurnCheckpointIDs must survive a degraded finalize so a repeated Stop process can retry")

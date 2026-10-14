@@ -36,19 +36,10 @@ type ManualCommitStrategy struct {
 	// process-global state cannot be parallelized").
 	blobFetchBudget time.Duration
 
-	// turnCheckpointFinalizeBudget bounds the whole turn-finalize pass. Zero
-	// means the production default.
-	turnCheckpointFinalizeBudget time.Duration
-
 	// checkpointRefFetcher overrides the hook ref fetcher in tests. Production
 	// uses remote.HookCheckpointRefFetcher.
 	checkpointRefFetcher checkpoint.RefFetchFunc
 }
-
-const (
-	standardTurnCheckpointFinalizeBudget    = 20 * time.Second
-	constrainedTurnCheckpointFinalizeBudget = 5 * time.Second
-)
 
 // getStateStore returns the session state store, initializing it lazily if needed.
 // Thread-safe via sync.Once.
