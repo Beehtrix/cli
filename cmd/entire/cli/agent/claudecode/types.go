@@ -40,7 +40,7 @@ type claudeHookMatcherFields ClaudeHookMatcher
 
 func (m *ClaudeHookMatcher) UnmarshalJSON(data []byte) error {
 	*m = ClaudeHookMatcher{} // see ClaudeHookEntry.UnmarshalJSON
-	extra, err := unmarshalKeepingExtra(data, (*claudeHookMatcherFields)(m), "matcher", "hooks")
+	extra, _, err := unmarshalKeepingExtra(data, (*claudeHookMatcherFields)(m), "matcher", "hooks")
 	m.extra = extra
 	return err
 }
@@ -57,9 +57,10 @@ type ClaudeHookEntry struct {
 	// default in place; set only where a hook needs an explicit budget.
 	Timeout int `json:"timeout,omitempty"`
 	extra   map[string]json.RawMessage
-	// raw holds the entry as the user wrote it when a modeled field has a type
-	// Entire does not model (such as a fractional timeout). It is written back
-	// unchanged, since re-encoding the decoded fields would lose that value.
+	// raw holds the entry as the user wrote it when a modeled field has a value
+	// Entire does not model: a fractional timeout, or an explicit 0 that would
+	// otherwise read and re-encode as no timeout. It is written back unchanged,
+	// since re-encoding the decoded fields would lose that value.
 	raw json.RawMessage
 }
 
@@ -70,13 +71,16 @@ func (e *ClaudeHookEntry) UnmarshalJSON(data []byte) error {
 	// encoding/json reuses slice elements without zeroing them, so bytes kept
 	// from a previous decode must not survive into this one.
 	*e = ClaudeHookEntry{}
-	extra, err := unmarshalKeepingExtra(data, (*claudeHookEntryFields)(e), "type", "command", "timeout")
+	extra, present, err := unmarshalKeepingExtra(data, (*claudeHookEntryFields)(e), "type", "command", "timeout")
 	e.extra = extra
 	if typeErr := (*json.UnmarshalTypeError)(nil); errors.As(err, &typeErr) {
 		// The other modeled fields still decoded, so Entire can recognise its own
 		// hook; only the write-back has to use the original bytes.
 		e.raw = slices.Clone(data)
 		return nil
+	}
+	if err == nil && e.Timeout == 0 && slices.Contains(present, "timeout") {
+		e.raw = slices.Clone(data)
 	}
 	return err
 }
@@ -89,32 +93,32 @@ func (e ClaudeHookEntry) MarshalJSON() ([]byte, error) {
 }
 
 // unmarshalKeepingExtra decodes the knownKeys of data into known and returns
-// every other key. Entire rewrites settings.json, which the user and Claude Code
+// every other key, plus the knownKeys data contained. Entire rewrites settings.json, which the user and Claude Code
 // own, so every field it does not model must survive the round trip.
 //
 // Only exact knownKeys are decoded: encoding/json matches field names
 // case-insensitively, so decoding data whole would read a key such as "Command",
 // which Claude Code ignores, into the live command field.
-func unmarshalKeepingExtra(data []byte, known any, knownKeys ...string) (map[string]json.RawMessage, error) {
-	var extra map[string]json.RawMessage
+func unmarshalKeepingExtra(data []byte, known any, knownKeys ...string) (extra map[string]json.RawMessage, present []string, err error) {
 	if err := json.Unmarshal(data, &extra); err != nil {
-		return nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
+		return nil, nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
 	}
 	modeled := make(map[string]json.RawMessage, len(knownKeys))
 	for _, k := range knownKeys {
 		if v, ok := extra[k]; ok {
 			modeled[k] = v
+			present = append(present, k)
 			delete(extra, k)
 		}
 	}
 	modeledJSON, err := json.Marshal(modeled)
 	if err != nil {
-		return nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
+		return nil, nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
 	}
 	if err := json.Unmarshal(modeledJSON, known); err != nil {
-		return nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
+		return nil, nil, err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
 	}
-	return extra, nil
+	return extra, present, nil
 }
 
 // marshalWithExtra encodes known, then appends extra in key order, so modeled

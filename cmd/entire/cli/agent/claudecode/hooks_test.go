@@ -873,44 +873,56 @@ func TestInstallHooks_KeepsUserHooksEntireCannotModel(t *testing.T) {
 	}
 }
 
-// TestInstallHooks_KeepsFractionalTimeoutOnEntireHook: a timeout the user set on
-// an Entire hook is theirs even when Entire cannot model it, so neither install
-// nor doctor backfills one, and enable does not report the hook as outdated.
-func TestInstallHooks_KeepsFractionalTimeoutOnEntireHook(t *testing.T) {
-	tempDir := t.TempDir()
-	t.Chdir(tempDir)
+// TestInstallHooks_KeepsUnmodeledTimeoutOnEntireHook: a timeout the user set on
+// an Entire hook is theirs even when Entire cannot model it, either because it
+// is fractional or because an explicit 0 reads the same as no timeout. Neither
+// install nor doctor backfills one, enable does not report the hook as
+// outdated, and a rewrite keeps the value as written.
+func TestInstallHooks_KeepsUnmodeledTimeoutOnEntireHook(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		timeout string
+	}{
+		{"fractional", "45.5"},
+		{"explicit zero", "0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			t.Chdir(tempDir)
 
-	stopCmd := agentpkg.WrapProductionSilentHookCommand("entire hooks claude-code stop")
-	entry := fmt.Sprintf(`{"type": "command", "command": %q, "timeout": 45.5}`, stopCmd)
-	writeSettingsFile(t, tempDir, fmt.Sprintf(`{"hooks": {"Stop": [{"matcher": "", "hooks": [%s]}]}}`, entry))
+			stopCmd := agentpkg.WrapProductionSilentHookCommand("entire hooks claude-code stop")
+			entry := fmt.Sprintf(`{"type": "command", "command": %q, "timeout": %s}`, stopCmd, tt.timeout)
+			writeSettingsFile(t, tempDir, fmt.Sprintf(`{"hooks": {"Stop": [{"matcher": "", "hooks": [%s]}]}}`, entry))
 
-	c := &ClaudeCodeAgent{}
-	if c.HasStaleManagedHooks(context.Background()) {
-		t.Error("HasStaleManagedHooks() = true for an Entire hook with a user-set fractional timeout")
-	}
-	changed, err := c.RepairHookTimeouts(context.Background())
-	if err != nil {
-		t.Fatalf("RepairHookTimeouts() error = %v", err)
-	}
-	if changed {
-		t.Error("RepairHookTimeouts() changed = true for a user-set fractional timeout")
-	}
-	if _, err := c.InstallHooks(context.Background(), false); err != nil {
-		t.Fatalf("InstallHooks() error = %v", err)
-	}
+			c := &ClaudeCodeAgent{}
+			if c.HasStaleManagedHooks(context.Background()) {
+				t.Errorf("HasStaleManagedHooks() = true for an Entire hook with user-set timeout %s", tt.timeout)
+			}
+			changed, err := c.RepairHookTimeouts(context.Background())
+			if err != nil {
+				t.Fatalf("RepairHookTimeouts() error = %v", err)
+			}
+			if changed {
+				t.Errorf("RepairHookTimeouts() changed = true for user-set timeout %s", tt.timeout)
+			}
+			if _, err := c.InstallHooks(context.Background(), false); err != nil {
+				t.Fatalf("InstallHooks() error = %v", err)
+			}
 
-	stop := readClaudeSettingsHooksOnly(t, tempDir, "Stop")
-	var hooks []map[string]any
-	for _, m := range stop {
-		data, err := json.Marshal(m.Hooks)
-		require.NoError(t, err)
-		var entries []map[string]any
-		require.NoError(t, json.Unmarshal(data, &entries))
-		hooks = append(hooks, entries...)
+			stop := readClaudeSettingsHooksOnly(t, tempDir, "Stop")
+			var hooks []map[string]any
+			for _, m := range stop {
+				data, err := json.Marshal(m.Hooks)
+				require.NoError(t, err)
+				var entries []map[string]any
+				require.NoError(t, json.Unmarshal(data, &entries))
+				hooks = append(hooks, entries...)
+			}
+			var want map[string]any
+			require.NoError(t, json.Unmarshal([]byte(entry), &want))
+			require.Equal(t, []map[string]any{want}, hooks, "Entire Stop hook changed or duplicated")
+		})
 	}
-	var want map[string]any
-	require.NoError(t, json.Unmarshal([]byte(entry), &want))
-	require.Equal(t, []map[string]any{want}, hooks, "Entire Stop hook changed or duplicated")
 }
 
 // TestClaudeHookEntry_RedecodeDropsKeptBytes: encoding/json reuses slice

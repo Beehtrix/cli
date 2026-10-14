@@ -45,12 +45,12 @@ func Status(_ context.Context, repo *git.Repository) (git.Status, error) {
 // captureHookTimeoutSec and checkpointHookTimeoutSec), but cancelling has not
 // reliably ended the hook PROCESS — an unbounded walk over a pathological
 // worktree (e.g. a stray `git init` in $HOME with no .gitignore) has been
-// observed grinding for hours at gigabytes of RSS after the agent gave up. 20s is chosen as far beyond any healthy
-// repository (a warm walk over a large working set finishes in seconds) while
-// leaving the rest of the hook's timeout for the remaining capture path —
-// transcript copy, tree building, state writes — so the hook still degrades
-// gracefully and exits instead of being orphaned. Hook timeouts must stay
-// above this budget.
+// observed grinding for hours at gigabytes of RSS after the agent gave up.
+// 20s is chosen as far beyond any healthy repository (a warm walk over a large
+// working set finishes in seconds) while leaving the rest of the hook's
+// timeout for the remaining capture path — transcript copy, tree building,
+// state writes — so the hook still degrades gracefully and exits instead of
+// being orphaned. Hook timeouts must stay above this budget.
 const StatusWalkBudget = 20 * time.Second
 
 // ErrStatusBudgetExceeded reports that a worktree status walk was abandoned

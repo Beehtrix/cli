@@ -1169,7 +1169,7 @@ func TestCheckHookDrift_ClaudeCodeWarnsWhenOutdated(t *testing.T) {
 
 	out := stdout.String()
 	require.Contains(t, out, "Claude Code hooks: OUT OF DATE")
-	require.Contains(t, out, "entire enable --force")
+	require.Contains(t, out, "Run `entire agent add claude-code` to update it.")
 }
 
 // TestCheckHookTimeouts_RestoresWhatEnableWrites — a Claude Code config from
