@@ -586,7 +586,7 @@ type expectedHookTimeout struct {
 func expectedHookTimeouts() []expectedHookTimeout {
 	silent := agentpkg.WrapProductionSilentHookCommand
 	return []expectedHookTimeout{
-		{"SessionStart", "", agentpkg.WrapProductionJSONWarningHookCommand("entire hooks claude-code session-start", agentpkg.WarningFormatMultiLine), 10},
+		{"SessionStart", "", agentpkg.WrapProductionJSONWarningHookCommand("entire hooks claude-code session-start", agentpkg.WarningFormatMultiLine), 30},
 		{"UserPromptSubmit", "", silent("entire hooks claude-code user-prompt-submit"), 30},
 		{"SubagentStart", workflowAgentMatcher, silent("entire hooks claude-code subagent-start"), 30},
 		{"PreToolUse", subagentToolMatcher, silent("entire hooks claude-code pre-task"), 30},
@@ -913,6 +913,21 @@ func TestInstallHooks_KeepsFractionalTimeoutOnEntireHook(t *testing.T) {
 	require.Equal(t, []map[string]any{want}, hooks, "Entire Stop hook changed or duplicated")
 }
 
+// TestClaudeHookEntry_RedecodeDropsKeptBytes: encoding/json reuses slice
+// elements when decoding into an existing value, so bytes kept from an entry
+// Entire could not model must not outlive the entry that replaced it.
+func TestClaudeHookEntry_RedecodeDropsKeptBytes(t *testing.T) {
+	t.Parallel()
+
+	matchers := []ClaudeHookMatcher{}
+	require.NoError(t, json.Unmarshal([]byte(`[{"matcher":"","hooks":[{"type":"command","command":"a","timeout":1.5}]}]`), &matchers))
+	require.NoError(t, json.Unmarshal([]byte(`[{"matcher":"","hooks":[{"type":"command","command":"b","timeout":30}]}]`), &matchers))
+
+	got, err := json.Marshal(matchers)
+	require.NoError(t, err)
+	require.JSONEq(t, `[{"matcher":"","hooks":[{"type":"command","command":"b","timeout":30}]}]`, string(got))
+}
+
 // TestHasStaleManagedHooks_MissingTimeout lets enable report a timeout
 // backfill instead of calling the rewritten config "already installed".
 func TestHasStaleManagedHooks_MissingTimeout(t *testing.T) {
@@ -952,7 +967,7 @@ func TestRepairHookTimeouts_FillsOnlyMissingTimeouts(t *testing.T) {
 
 	stopCmd := agentpkg.WrapProductionSilentHookCommand("entire hooks claude-code stop")
 	writeSettingsFile(t, tempDir, fmt.Sprintf(`{
-  "permissions": {},
+  "permissions": {"allow": ["Bash(ls)"]},
   "hooks": {
     "SessionStart": {"not": "a matcher list"},
     "Stop": [
@@ -995,7 +1010,7 @@ func TestRepairHookTimeouts_FillsOnlyMissingTimeouts(t *testing.T) {
 		t.Errorf("hook types = %v, want only [SessionStart Stop]", got)
 	}
 	require.JSONEq(t, `{"not": "a matcher list"}`, string(parsed.Hooks["SessionStart"]), "unparseable hook type changed")
-	require.JSONEq(t, `{}`, string(parsed.Permissions), "permissions block changed")
+	require.JSONEq(t, `{"allow": ["Bash(ls)"]}`, string(parsed.Permissions), "permissions block changed")
 
 	changed, err = c.RepairHookTimeouts(context.Background())
 	if err != nil {

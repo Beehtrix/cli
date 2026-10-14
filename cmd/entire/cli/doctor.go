@@ -189,8 +189,9 @@ func runSessionsFix(cmd *cobra.Command, force bool) error {
 
 	// Hook timeouts that configs from older CLIs lack. Fixes rather than only
 	// reporting: it only fills in a timeout on a hook Entire wrote. Runs before
-	// the drift check, which does not look at timeouts, so that check reports on
-	// the repaired config instead of calling a config missing them OK.
+	// the drift check, which counts a missing timeout as drift, so that check
+	// reports on the repaired config instead of telling the user to run
+	// `entire enable --force` for something doctor just fixed.
 	checkHookTimeouts(cmd)
 
 	// Agent-specific: Claude Code hook config drift.
@@ -1374,7 +1375,7 @@ func checkHookDrift(cmd *cobra.Command) {
 // under the repo root need manual approval, which defeats unattended permission
 // modes, and it guarded a staging buffer rather than the durable copy.
 //
-// This is the one doctor check that repairs without asking, and the reason is
+// It repairs without asking, as checkHookTimeouts does, and the reason is
 // ownership: it deletes only a rule byte-identical to the string Entire itself
 // wrote, so nothing the user chose is touched. `entire enable` performs the same
 // removal; this exists because a user who has already enabled Entire has no

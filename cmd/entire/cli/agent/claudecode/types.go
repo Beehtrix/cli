@@ -39,6 +39,7 @@ type ClaudeHookMatcher struct {
 type claudeHookMatcherFields ClaudeHookMatcher
 
 func (m *ClaudeHookMatcher) UnmarshalJSON(data []byte) error {
+	*m = ClaudeHookMatcher{} // see ClaudeHookEntry.UnmarshalJSON
 	extra, err := unmarshalKeepingExtra(data, (*claudeHookMatcherFields)(m), "matcher", "hooks")
 	m.extra = extra
 	return err
@@ -66,14 +67,17 @@ type ClaudeHookEntry struct {
 type claudeHookEntryFields ClaudeHookEntry
 
 func (e *ClaudeHookEntry) UnmarshalJSON(data []byte) error {
+	// encoding/json reuses slice elements without zeroing them, so bytes kept
+	// from a previous decode must not survive into this one.
+	*e = ClaudeHookEntry{}
 	extra, err := unmarshalKeepingExtra(data, (*claudeHookEntryFields)(e), "type", "command", "timeout")
+	e.extra = extra
 	if typeErr := (*json.UnmarshalTypeError)(nil); errors.As(err, &typeErr) {
 		// The other modeled fields still decoded, so Entire can recognise its own
 		// hook; only the write-back has to use the original bytes.
 		e.raw = slices.Clone(data)
 		return nil
 	}
-	e.extra = extra
 	return err
 }
 

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"slices"
 	"strings"
@@ -198,9 +197,12 @@ func loadRawClaudeSettingsForInstall(cfg *agent.HookConfigFile) (rawSettings, ra
 // before main() never returns on its own, so each hook carries a timeout after
 // which Claude Code cancels it and continues.
 const (
-	// quickHookTimeoutSec bounds SessionStart, which records state behind a
-	// network refresh capped at about a second; Claude Code blocks startup on it.
-	quickHookTimeoutSec = 10
+	// sessionStartHookTimeoutSec bounds SessionStart, which Claude Code blocks
+	// startup on. Besides a network refresh bounded by the cli package's
+	// trailEnablementSessionStartRefreshTimeout, it resolves the repository and
+	// reads and writes session state, which a cold start or a large repository
+	// can slow well past that refresh.
+	sessionStartHookTimeoutSec = 30
 	// captureHookTimeoutSec bounds hooks that snapshot the worktree before a
 	// prompt or subagent. UserPromptSubmit already runs this work under Claude
 	// Code's 30s default; SubagentStart and pre-task drop from its 600s command
@@ -227,7 +229,7 @@ type entireSimpleHook struct {
 // type, each under one matcher (empty for all but SubagentStart).
 func entireSimpleHooks() []entireSimpleHook {
 	return []entireSimpleHook{
-		{"SessionStart", "", agent.WrapProductionJSONWarningHookCommand("entire hooks claude-code session-start", agent.WarningFormatMultiLine), quickHookTimeoutSec},
+		{"SessionStart", "", agent.WrapProductionJSONWarningHookCommand("entire hooks claude-code session-start", agent.WarningFormatMultiLine), sessionStartHookTimeoutSec},
 		// No timeout: Claude Code gives SessionEnd a short exit grace by default,
 		// and an explicit timeout would make it wait longer on exit.
 		{"SessionEnd", "", agent.WrapProductionSilentHookCommand("entire hooks claude-code session-end"), 0},
@@ -278,31 +280,18 @@ func setMissingTimeout(matchers []ClaudeHookMatcher, timeouts map[string]int) bo
 }
 
 // RepairHookTimeouts implements agent.HookTimeoutRepairer. Unlike an install,
-// it adds, removes and moves no hook and rewrites only the hooks block, so
-// `entire doctor` can run it without asking. A hook type that does not parse is
-// skipped rather than rewritten.
+// it adds, removes and moves no hook, so `entire doctor` can run it without
+// asking. A hook type that does not parse is skipped rather than rewritten.
+// The write goes through writeClaudeSettingsFile, so an emptied permissions
+// block is dropped as an install would drop it.
 func (c *ClaudeCodeAgent) RepairHookTimeouts(ctx context.Context) (bool, error) {
 	cfg, err := claudeHookConfig(ctx)
 	if err != nil {
 		return false, err
 	}
-	data, err := cfg.Read()
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
+	rawSettings, rawHooks, rawPermissions, err := loadRawClaudeSettingsForInstall(cfg)
 	if err != nil {
-		return false, err //nolint:wrapcheck // agent.HookConfigFile already names the file in its error
-	}
-	var rawSettings, rawHooks map[string]json.RawMessage
-	if err := json.Unmarshal(data, &rawSettings); err != nil {
-		return false, fmt.Errorf("failed to parse %s: %w", cfg.Path(), err)
-	}
-	hooksRaw, ok := rawSettings["hooks"]
-	if !ok {
-		return false, nil
-	}
-	if err := json.Unmarshal(hooksRaw, &rawHooks); err != nil {
-		return false, fmt.Errorf("failed to parse hooks in %s: %w", cfg.Path(), err)
+		return false, err
 	}
 
 	timeouts := entireHookTimeouts()
@@ -326,16 +315,8 @@ func (c *ClaudeCodeAgent) RepairHookTimeouts(ctx context.Context) (bool, error) 
 	if !changed {
 		return false, nil
 	}
-
-	if rawSettings["hooks"], err = jsonutil.MarshalWithNoHTMLEscape(rawHooks); err != nil {
-		return false, fmt.Errorf("failed to marshal hooks: %w", err)
-	}
-	output, err := jsonutil.MarshalIndentWithNewline(rawSettings, "", "  ")
-	if err != nil {
-		return false, fmt.Errorf("failed to marshal settings: %w", err)
-	}
-	if err := cfg.Write(output, 0o600); err != nil {
-		return false, err //nolint:wrapcheck // agent.HookConfigFile already names the file in its error
+	if err := writeClaudeSettingsFile(cfg, rawSettings, rawHooks, rawPermissions); err != nil {
+		return false, err
 	}
 	return true, nil
 }
