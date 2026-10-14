@@ -239,11 +239,11 @@ func reviewManifestListLabel(manifest LocalReviewManifest) string {
 
 func reviewManifestPreview(manifest LocalReviewManifest) string {
 	for _, source := range manifest.Sources {
-		if text := strings.TrimSpace(source.Output); text != "" {
+		if text := strings.TrimSpace(stripTrailJSON(source.Output)); text != "" {
 			return stringutil.TruncateRunes(strings.Join(strings.Fields(text), " "), 70, "...")
 		}
 	}
-	if text := strings.TrimSpace(manifest.AggregateOutput); text != "" {
+	if text := strings.TrimSpace(stripTrailJSON(manifest.AggregateOutput)); text != "" {
 		return stringutil.TruncateRunes(strings.Join(strings.Fields(text), " "), 70, "...")
 	}
 	return ""

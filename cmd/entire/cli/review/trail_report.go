@@ -65,7 +65,7 @@ func trailReportFor(summary reviewtypes.RunSummary, aggregateOutput string) (Tra
 	}
 	var merged []TrailComment
 	for _, run := range usableAgentRuns(summary) {
-		prose, comments, ok := splitTrailJSON(joinAssistantText(run.Buffer))
+		prose, comments, ok := splitTrailJSON(finalMessageText(run.Buffer))
 		if !ok || (len(comments) == 0 && proseReportsFindings(prose)) {
 			return TrailReport{Prose: combinedReviewNarratives(summary)}, true
 		}
@@ -74,11 +74,24 @@ func trailReportFor(summary reviewtypes.RunSummary, aggregateOutput string) (Tra
 	return TrailReport{Comments: merged}, len(merged) > 0
 }
 
+// finalMessageText returns the text a reviewer produced after its last tool
+// call: the report the output format governs. Earlier text is exploration
+// narration, whose bullets ("I'll check:\n- retry.go") are not findings.
+func finalMessageText(buf []reviewtypes.Event) string {
+	start := 0
+	for i, ev := range buf {
+		if _, ok := ev.(reviewtypes.ToolCall); ok {
+			start = i + 1
+		}
+	}
+	return joinAssistantText(buf[start:])
+}
+
 // splitTrailJSON separates a trailing JSON object (one line, a fenced block,
 // or a pretty-printed block) from the prose before it. Any trailing JSON
-// object is removed from prose so it is never posted as finding text. ok
-// reports a valid contract: a "comments" array. Entries without a body are
-// dropped.
+// object is removed from prose so it is never posted as finding text; a
+// JSON-only reply contributes its summary as the prose instead. ok reports a
+// valid contract: a "comments" array. Entries without a body are dropped.
 func splitTrailJSON(text string) (prose string, comments []TrailComment, ok bool) {
 	text = strings.TrimSpace(text)
 	lines := strings.Split(text, "\n")
@@ -100,6 +113,12 @@ func splitTrailJSON(text string) (prose string, comments []TrailComment, ok bool
 			proseEnd--
 		}
 		prose = strings.TrimSpace(strings.Join(lines[:proseEnd], "\n"))
+		if prose == "" {
+			var summary string
+			if json.Unmarshal(payload["summary"], &summary) == nil {
+				prose = strings.TrimSpace(summary)
+			}
+		}
 		comments, ok = decodeTrailComments(payload["comments"])
 		return prose, comments, ok
 	}

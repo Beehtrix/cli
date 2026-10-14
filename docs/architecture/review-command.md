@@ -86,8 +86,8 @@ The profile-level `task` is the shared work item. Each `agents` map entry is a w
 - Results are printed and saved locally; `output: "trail"` also posts findings to the branch trail.
 - In trail mode, reviewers and the judge end their output with a JSON line, `{"summary":...,"comments":[...]}` (`trail_report.go`). The instruction is appended last, after profile and per-run text, and is skipped for a verbatim `prompt` override. Posting reads that line instead of interpreting prose:
   - `"comments":[]` posts nothing, unless the prose has a list item, a severity marker, a feedback label such as `Nits:`, or a `request changes` / `approve with nits` verdict (also when labeled `Verdict:`).
-  - Comments post as native findings with their severity and location; entries without a body are dropped. When a judge runs, its line alone decides what is posted. Without a judge, each reviewer's line is read separately and the comments are merged.
-  - A missing or malformed line (no `comments` array) posts the prose, with any trailing JSON removed, split into findings by top-level bullet.
+  - Comments post as native findings with their severity and location; entries without a body are dropped. When a judge runs, its line alone decides what is posted. Without a judge, each reviewer's final message (the text after its last tool call) is read separately and the comments are merged; earlier narration cannot contradict it, but is still posted when the final message does.
+  - A missing or malformed line (no `comments` array) posts the prose, with any trailing JSON removed, split into findings by top-level bullet. A JSON-only reply posts its `summary`.
   - The line is kept in the saved manifest and hidden when results are displayed.
 - A bare non-interactive `entire review` does not auto-run a profile. Automation should pass a profile name.
 - Profile selection is positional/`--profile` → `review_default_profile` → `general` → the only configured profile.

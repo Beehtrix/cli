@@ -125,6 +125,12 @@ func TestTrailReportFromJudge(t *testing.T) {
 		requireNotPosted(t, called, out)
 	})
 
+	t.Run("a JSON-only reply with null comments posts its summary, not raw JSON", func(t *testing.T) {
+		t.Parallel()
+		report, called, _ := postedTrailReport(t, reviewers, `{"summary":"approve — nothing found","comments":null}`)
+		requirePostedProse(t, report, called, "approve — nothing found")
+	})
+
 	t.Run("null comments is not clean", func(t *testing.T) {
 		t.Parallel()
 		report, called, _ := postedTrailReport(t, reviewers, "approve — fine\n"+`{"summary":"","comments":null}`)
@@ -269,6 +275,28 @@ func TestTrailReportWithoutJudge(t *testing.T) {
 		requireNotPosted(t, called, out)
 	})
 
+	t.Run("narration bullets before a tool call do not contradict a clean final message", func(t *testing.T) {
+		t.Parallel()
+		run := trailRun{name: "claude-code", events: []reviewtypes.Event{
+			reviewtypes.AssistantText{Text: "I'll check the changed files:\n- retry.go\n- retry_test.go"},
+			reviewtypes.ToolCall{Name: "Read"},
+			reviewtypes.AssistantText{Text: "approve — no actionable findings\n" + emptyTrailJSON},
+		}}
+		_, called, out := postedTrailReport(t, trailRunsSummary(run), "")
+		requireNotPosted(t, called, out)
+	})
+
+	t.Run("a finding bullet in the final message posts the whole narrative", func(t *testing.T) {
+		t.Parallel()
+		run := trailRun{name: "claude-code", events: []reviewtypes.Event{
+			reviewtypes.AssistantText{Text: "I'll check the changed files:\n- retry.go"},
+			reviewtypes.ToolCall{Name: "Read"},
+			reviewtypes.AssistantText{Text: "approve\n- [low] retry.go:42 — the lock leaks on error.\n" + emptyTrailJSON},
+		}}
+		report, called, _ := postedTrailReport(t, trailRunsSummary(run), "")
+		requirePostedProse(t, report, called, "I'll check the changed files")
+	})
+
 	t.Run("a new message starts a new line after a tool call", func(t *testing.T) {
 		t.Parallel()
 		run := trailRun{name: "pi", events: []reviewtypes.Event{
@@ -307,5 +335,18 @@ func TestStripTrailJSONForDisplay(t *testing.T) {
 	}
 	if prose := "plain review text"; stripTrailJSON(prose) != prose {
 		t.Errorf("text without a JSON line must be unchanged, got %q", stripTrailJSON(prose))
+	}
+}
+
+func TestReviewManifestPreviewStripsTrailJSON(t *testing.T) {
+	t.Parallel()
+	narrative := "approve — no actionable findings"
+	sourced := LocalReviewManifest{Sources: []ManifestSource{{Label: "claude-code", Output: narrative + "\n" + emptyTrailJSON}}}
+	if got := reviewManifestPreview(sourced); got != narrative {
+		t.Fatalf("source preview = %q, want %q", got, narrative)
+	}
+	aggregated := LocalReviewManifest{AggregateOutput: narrative + "\n" + emptyTrailJSON}
+	if got := reviewManifestPreview(aggregated); got != narrative {
+		t.Fatalf("aggregate preview = %q, want %q", got, narrative)
 	}
 }
