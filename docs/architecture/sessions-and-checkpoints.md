@@ -10,29 +10,43 @@ This document covers the domain model shared by both checkpoint storage backends
 
 ### Session
 
-A **Session** is a unit of work. Defined in `strategy/session.go`:
+A **Session** is a unit of work: one agent conversation, from its first hook
+to session end. Its live state is `session.State` (`session/state.go`),
+persisted per session at `.git/entire-sessions/<id>.json` and shared across
+worktrees:
 
 ```go
-type Session struct {
-    ID          string       // e.g., "2025-12-01-8f76b0e8-b8f1-4a87-9186-848bdd83d62e"
-    Description string       // Human-readable summary (first prompt or derived)
-    Strategy    string       // Strategy that created this session
-    StartTime   time.Time
-    Checkpoints []Checkpoint
+type State struct {
+    SessionID        string          // agent-provided session identifier
+    BaseCommit       string          // commit the pending work sits on; moves with HEAD
+    WorktreeID       string          // internal git worktree name; empty for the main worktree
+    Phase            Phase           // lifecycle phase (see Session State below)
+    StartedAt        time.Time
+    StepCount        int             // steps recorded in this session
+    FilesTouched     []string        // files modified, created, or deleted by the session
+    LastCheckpointID id.CheckpointID // checkpoint from the most recent condensation
+    AgentType        types.AgentType
+    // ...
 }
 ```
 
 ### Checkpoint
 
-A **Checkpoint** captures a point-in-time within a session. Defined in `strategy/session.go`:
+A **Checkpoint** is the permanent record of a session's work, linked to a code
+commit by its `Entire-Checkpoint` trailer. Its root metadata is
+`checkpoint.CheckpointSummary` (an alias of `api/checkpoint`), stored at
+`<id[:2]>/<id[2:]>/metadata.json`; per-session content sits beside it:
 
 ```go
-type Checkpoint struct {
-    CheckpointID     id.CheckpointID // Stable identifier (12-hex or ULID; see Checkpoint ID Linking)
-    Message          string          // Commit message or checkpoint description
-    Timestamp        time.Time
-    IsTaskCheckpoint bool            // Task checkpoint (subagent) vs session checkpoint
-    ToolUseID        string          // Tool use ID for task checkpoints (empty for session)
+type CheckpointSummary struct {
+    CheckpointID     id.CheckpointID    // stable identifier (12-hex or ULID; see Checkpoint ID Linking)
+    Strategy         string
+    Branch           string
+    CommitSHA        string
+    CheckpointsCount int
+    FilesTouched     []string
+    Sessions         []SessionFilePaths // one entry per session in the checkpoint
+    // ...
 }
 ```
 
@@ -51,11 +65,10 @@ Most persistent checkpoints are written when a commit condenses a session, but s
 
 ### Session Access
 
-`strategy/session.go` keeps the `Session` and `Checkpoint` data types used by
-status/explain formatting. Active session state is read from `.git/entire-sessions/`
-through `session.StateStore`; committed checkpoint/session content is read
-through the checkpoint facade (`checkpoint.Open(ctx, repo, opts)`, which resolves
-the ref topology and wires the blob fetcher).
+Active session state is read from `.git/entire-sessions/` through
+`session.StateStore`; committed checkpoint/session content is read through the
+checkpoint facade (`checkpoint.Open(ctx, repo, opts)`, which resolves the ref
+topology and wires the blob fetcher).
 
 ### Checkpoint Storage (Low-Level)
 
@@ -144,8 +157,10 @@ changes so the next commit can link to the adopted session.
 
 Condensation reads a declared task transcript path whole into the checkpoint, so
 adoption validates each one (`validateAdoptTaskTranscript`). The path must be
-absolute and lie in the session directory of the session's agent; a session
-recorded without an agent type takes it from the agent that owns its
+absolute and lie in the session directory of the session's agent, under its
+active home or under the session's trusted `AgentHome` (see
+[Recorded agent homes](../development/filesystem-safety.md#recorded-agent-homes));
+a session recorded without an agent type takes it from the agent that owns its
 transcript. Agents implementing `agent.TaskTranscriptMatcher` (Claude Code,
 Codex, Droid) also require the path to name that task's transcript in their
 layout. A path that fails is cleared, logged, and counted in adopt's output.
@@ -268,6 +283,7 @@ removed by the purge, not the sweep. See `cmd/entire/cli/session_sweep.go`.
 A turn end (`SaveStep`) writes no git objects. It records the turn into session state and leaves the transcript on local disk:
 
 - `StepCount` is incremented, `FilesTouched` gains the turn's modified, new and deleted paths, and `TouchedFileHashes` records the git blob hash of each modified or new regular file (hashed with `git hash-object`, so clean filters apply exactly as `git add` would) and `""` for each deleted path. A path whose hash is unknown — hashing failed, a symlink, or a path that arrived through a task record, a per-tool hook, or a Codex child-file merge (`MergeUnhashedFilesTouched`, which also drops any hash an earlier step recorded for it) — has no entry and falls back to name matching. Paths this turn named that neither exist nor are recorded deletions are dropped from `FilesTouched` as phantoms.
+- The turn's paths come from the transcript analyzer plus `git status` (`DetectFileChanges`): modified and deleted tracked files, and untracked files absent from the prompt-start baseline (`PrePromptState.UntrackedFiles`). An untracked file already in that baseline counts as modified when its stat data no longer matches `PrePromptState.UntrackedFileStats`, since git status reports it as untracked either way and a shell edit leaves no trace in the transcript. The stat data is what git's index compares: size, modification time, inode and status-change time. The change time catches a same-size rewrite that restores the modification time (`cp -p`, `touch -r`); Windows exposes no change time, so only size and modification time are compared there. The stat pass runs inside `UserPromptSubmit`, so it is bounded: above 10,000 untracked files it records no stats, and it stops after 500ms with what it has. Edits to the files it left out are not detected, as with state written before stats existed.
 - `.entire/metadata/<session-id>/` holds the sanitized transcript copy (`full.jsonl`) and `prompt.txt`. These are local, git-ignored files; nothing is redacted or committed until condensation.
 
 ```
@@ -351,7 +367,7 @@ commit has already condensed and removed the record is not captured.
 - **Workflow agent launch** (subagent-start, non-final): agents a Claude Code Workflow launches have no Agent call of their own — the Workflow's PostToolUse reports a run ID, not agents — so Claude Code's `SubagentStart` hook (installed with matcher `workflow-subagent`; other agent types are ignored at parse time too) records each one's in-flight record, keyed by its `agent_id` as both `ToolUseID` and `AgentID`. The launch is `SubagentLaunchIdempotent`: an existing record for that key is kept rather than replaced, so a repeated `SubagentStart` cannot reset the record while it is still in session state; once condensation has materialized and removed a completed record, a late repeat would start a new live one. Their transcripts live in `subagents/workflows/<runId>/agent-<id>.jsonl`. The stop's `agent_transcript_path` is used only when it is exactly that file for this session and agent inside the parent's session directory, with no link below it; otherwise it is dropped and the layout lookup applies. That file's run becomes the event's `SubagentRunID`: a resumed run reuses its agents' IDs, so its launch can find the earlier run's completed record and add none, and the stop then completes a record of its own (keyed `<agent_id>`, or `<agent_id>-<runId>` while that key is taken) unless a record already holds the same run's transcript, which makes it a repeated stop. The transcript resolvers (`paths.ResolveSubagentTranscriptPath`) probe every run for an agent ID; the session's `subagent_tokens` total counts only the runs the transcript (or, at import, the turn's transcript prefix) launched, named by the Workflow launch's structured `toolUseResult.runId` (`taskType: local_workflow`) or, as a fallback, its result's `Run ID:` lines (`paths.WorkflowRunAgentTranscripts`). A Workflow launched from inside a subagent names its run in that subagent's transcript, not the parent's, so its agents get task records but are not counted in the parent session's `subagent_tokens` — the same limit nested `Agent` subagents have.
 - **Forked skill launch** (post-task, non-final): a Claude Code skill with `context: fork` runs in an agent that Claude Code reports only in the Skill call's PostToolUse result (`status: "forked"`, `agentId`). Entire installs `PostToolUse[Skill]` → `post-task`, which records the launch under the Skill call's `tool_use_id` with that agent ID; the agent's `SubagentStop` completes it by agent ID. A result with `background: false` completes the record at once with files from the transcript only (`SubagentFilesFromTranscript`: no pre-task baseline exists for a Skill call); a missing `background` is treated as running. The agent can stop again when a background child wakes it; only the first stop updates the record.
 - **Foreground completion** (post-task, non-final): PostToolUse fires at true completion, so the record is created-and-completed in one step, files and transcript path attached. Claude Code's foreground `SubagentStop` arrives just *before* this PostToolUse, when no record exists yet, and is a no-op.
-- **SubagentStop (final, authoritative)**: the real completion signal for background tasks. Claude Code's payload carries `agent_id` but no `tool_use_id`, so `handleSubagentStopFinal` finds the record by `AgentID` (`FindTaskRecordByAgentID`, a live record before a completed one) and adopts its `ToolUseID`, which keys exactly-once completion and the checkpoint's `tasks/<tool_use_id>/` tree. It then completes the live record, bypassing any "no changes, skip" instinct: a read-only subagent (reviewer, search agent) still produced a transcript worth materializing. File attribution is analyzer-only (the subagent's own transcript, never a whole-worktree scan that would sweep in the parent's concurrent work); the accepted trade is that shell side-effect files the transcript never names, and deletions, are under-captured. A record already completed (duplicate/racing Final event) is skipped. Known gap: a subagent continued with `SendMessage` gets a second `SubagentStart`/`SubagentStop` under the same `agent_id` but no new Agent call, so its stop finds the completed record and the resumed run's edits are not attributed to the task.
+- **SubagentStop (final, authoritative)**: the real completion signal for background tasks. Claude Code's payload carries `agent_id` but no `tool_use_id`, so `handleSubagentStopFinal` finds the record by `AgentID` (`FindTaskRecordByAgentID`, a live record before a completed one) and adopts its `ToolUseID`, which keys exactly-once completion and the checkpoint's `tasks/<tool_use_id>/` tree. It then completes the live record, bypassing any "no changes, skip" instinct: a read-only subagent (reviewer, search agent) still produced a transcript worth materializing. File attribution comes from the subagent's own transcript, never from a whole-worktree diff that would sweep in the parent's concurrent edits. Untracked files are the exception (`unrecordedNewFilesSinceLaunch`): a file created since launch (absent from the pre-task baseline) that no session in the worktree has recorded is claimed too, so a file a shell command created is not lost. Once the parent's next prompt starts it sits in that prompt's untracked baseline, and no later turn end would claim it. The accepted trade is that a file the user created while the parent was idle is claimed as well, which only adds a session link to the commit that carries it; files the parent's own turns or another session recorded are excluded. The claim is skipped when another background task in the worktree (`TaskRecord.Background`, set at a background launch and by every background stop, including one that creates its record) ran during this one, still live or completed after this task's launch: a new file could then be either task's, and the first to stop would take both. Shell-side modifications of tracked files and deletions are still under-captured here; the parent's next turn end picks up modified tracked files through git status. A record already completed (duplicate/racing Final event) is skipped. Known gap: a subagent continued with `SendMessage` gets a second `SubagentStart`/`SubagentStop` under the same `agent_id` but no new Agent call, so its stop finds the completed record and the resumed run's edits are not attributed to the task.
 - **SessionEnd sweep** (`completeLiveTaskRecords`): a session closing with
   tasks still in flight completes every remaining live record, strictly
   **before** `endSessionNow` marks `PhaseEnded` and eagerly condenses, so the
@@ -620,9 +636,7 @@ write. It is also **skipped when the compacted output exceeds the 50MB blob cap*
 — unlike `full.jsonl`, `transcript.jsonl` is not chunked, so a very long session
 whose full compaction exceeds the cap will lack a compact transcript on those
 checkpoints. This is a known limitation; `full.jsonl` remains authoritative and
-the compact transcript is regenerable from it. During the OPF finalize rewrite, a
-failed or skipped regeneration **drops** the prior `transcript.jsonl` and clears
-`compact_transcript_start` rather than shipping a stale, less-redacted compact.
+the compact transcript is regenerable from it.
 
 **Root-level metadata.json (`CheckpointSummary`):**
 ```json
@@ -676,6 +690,77 @@ When condensing multiple concurrent sessions:
 - New `session_id` values are appended at the next index, so higher-numbered folders correspond to more recently introduced sessions, not necessarily the chronologically latest activity
 - `sessions` array in `CheckpointSummary` maps each session to its file paths
 - `files_touched` is merged from all sessions
+
+`entire session attach <id> [--commit <rev>]` (default HEAD) picks how to
+link from two facts about the target commit, the same for HEAD and `--commit`
+(`planAttachLink`):
+- the commit already carries an `Entire-Checkpoint` trailer: the session joins
+  that checkpoint, and history is unchanged. If a remote branch holds the
+  commit, the checkpoint is pushed now (there may be no later push of the
+  commit to carry it); otherwise it goes with the next git push;
+- a remote branch already holds the commit: the link is recorded in a new
+  checkpoint (or joins one an earlier attach recorded for it) and the commit
+  is left unchanged, so nothing needs a force-push;
+- no remote holds it: the trailer is added, rewriting the commit and every
+  commit after it up to HEAD (`attachRewriteChain`, `rewriteWithTrailer`).
+  The replay reuses each tree, author and message through `git commit-tree`
+  and moves the branch with a compare-and-swap `update-ref`, so the worktree
+  and index are untouched and no commit hooks run; session state naming the
+  old commits is remapped through `PostRewrite`. Merges after the target, a
+  target off the current branch, and an operation in progress (rebase, merge,
+  cherry-pick, revert, bisect) are refused, as is a commit with a non-UTF-8
+  encoding or extra headers, which `commit-tree` can't reproduce. "No remote
+  holds it" means no remote-tracking ref of any remote contains the commit,
+  and none of the remotes the branch pushes to (its upstream and push remotes,
+  else `origin`, else every remote) has a branch containing it: attach fetches
+  those and asks each directly, fetching only branches whose tips aren't local
+  (single-branch clones don't track every branch). If one can't be reached it
+  refuses rather than rewrite a commit it couldn't check. The checkpoint of a
+  pushed commit goes to the branch's remote even when only another remote
+  (upstream in a fork) holds the commit.
+
+Before writing anything attach prints what it will do (`attachWarning`): the
+commits it rewrites, or the remote that holds the commit and that the
+transcript is pushed now, plus author and rebase caveats. It asks on a
+terminal; without one (an agent, a script) it changes nothing and exits
+non-zero unless `--force` is passed, and agent-help tells agents to show the
+user that output and pass `--force` only once they agree.
+
+A session can be attached to several commits. Each checkpoint records the
+turns since the session's previous checkpoint: the window starts at the
+state's `CheckpointTranscriptStart` (recorded as the checkpoint's
+`checkpoint_transcript_start`, with prompts, turn count and token usage
+scoped to it), and an ended session's offset then advances to the transcript
+end in the agent's own position metric. A running session's offset belongs to
+its hooks and is left alone. The state's `TokenUsage` stays the whole
+session's. Re-attaching a session to the checkpoint that already holds it is a
+no-op.
+
+A recorded link is `linked_commits` on the root `CheckpointSummary`: a list of
+`{sha, repo}` objects (`repo` is `<forge>/<owner>/<repo>` from the remote that
+holds the commit, possibly empty). Unlike the import anchor below it is an
+**attributing** link: the server credits a verified entry as it would a
+trailer. The CLI can't verify who recorded a link (anyone who can push checkpoints
+can name any commit), so `explain` and `blame`/`why` label commits and lines
+found through one as unverified recorded links, and lookups ignore checkpoints
+dated in the future. Unlike a trailer it names one exact commit, so it does not follow a
+later rebase or amend of that commit; attach says so, and the remedy is to
+attach the session to the new commit. The server
+verifies it only when the authenticated checkpoint pusher is the commit's
+author (otherwise it is stored as an unverified attachment; attach warns when
+the local git author differs). Rewrites of the checkpoint keep existing entries
+(`unionLinkedCommits`). Readers consult trailers first and fall back to
+`checkpoint.CheckpointsLinkedToWithStubs` (`explain <commit>`, `blame`/`why`,
+and attach itself), which also reads git-refs stubs discovered on a remote
+that were minted no earlier than a day before the commit. Attach
+pushes the checkpoint itself through the pre-push path, since no later push may
+carry it, and confirms the remote's ref now matches before reporting success:
+for a pushed commit the checkpoint is the only record of the link, so a skipped
+or rejected push (push_sessions off, remote gating) is an error. A second
+attach to a linked commit finds the checkpoint through every copy, fetches it
+into the local store through the availability guard, and joins it. Git hooks keep writing trailers while a commit is made; nothing in
+Entire rewrites a commit that a remote already holds. A CLI that predates the
+field drops it if it rewrites that checkpoint's root metadata.
 
 Checkpoints written by the import path — `entire import <agent>` and `entire
 enable`'s optional history import — additionally carry a `commit_sha`
@@ -855,11 +940,9 @@ What it means for the domain model:
   the removal to the sync remote.
 - **Local and remote `v1` stay in one line.** After the removal is pushed to
   a `v1` push destination, local `v1` is rebuilt on that pushed commit (local
-  unpushed checkpoints replayed on top), so the next push is a fast-forward and
-  the OPF pre-push rewrite does not see a diverged branch. This happens only
+  unpushed checkpoints replayed on top), so the next push is a fast-forward. This happens only
   when the two removal commits are the whole difference: a remote that was
-  ahead or rewritten before the delete is left for pre-push to reconcile (or
-  for OPF to refuse), and with several pushurls only the first destination is
+  ahead or rewritten before the delete is left for pre-push to reconcile, and with several pushurls only the first destination is
   adopted, so the others can still diverge.
 - **`--local-only` copies can come back into view.** On git-refs, a read
   (explain, backfill) that misses locally fetches the remote copy and recreates
@@ -873,7 +956,8 @@ What it means for the domain model:
 
 ```
 strategy/
-├── session.go           # Session and Checkpoint types
+├── strategy.go          # Shared argument/result types (PendingCheckpoint, StepContext, ...)
+├── manual_commit.go     # ManualCommitStrategy and its constructor
 
 session/
 ├── state.go             # Active session state (StateStore, .git/entire-sessions/)

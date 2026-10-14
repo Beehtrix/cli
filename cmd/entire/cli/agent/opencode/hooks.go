@@ -135,26 +135,6 @@ func (a *OpenCodeAgent) CheckHookConfig(ctx context.Context) agent.HookConfigSta
 	return cfg.GeneratedState(entireMarker, renderPlugin())
 }
 
-// GetSupportedHooks returns the normalized lifecycle events this agent supports.
-// OpenCode's native hooks map to standard agent lifecycle events:
-//   - session-start → HookSessionStart
-//   - session-end   → HookSessionEnd
-//   - turn-start    → HookUserPromptSubmit (user prompt triggers a turn)
-//   - turn-end      → HookStop (agent response complete)
-//
-// Note: HookNames() returns 7 hooks (including "compaction", "subagent-start", and
-// "subagent-stop"), but GetSupportedHooks() returns only 4. Those three are
-// OpenCode-specific with no standard HookType mapping — they are handled via
-// ParseHookEvent but not advertised as standard lifecycle events.
-func (a *OpenCodeAgent) GetSupportedHooks() []agent.HookType {
-	return []agent.HookType{
-		agent.HookSessionStart,
-		agent.HookSessionEnd,
-		agent.HookUserPromptSubmit,
-		agent.HookStop,
-	}
-}
-
 // HookConfigRelPath implements agent.HookConfigLocator.
 func (a *OpenCodeAgent) HookConfigRelPath() string {
 	return ".opencode/" + pluginDirName + "/" + pluginFileName

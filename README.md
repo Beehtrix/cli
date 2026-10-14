@@ -112,7 +112,7 @@ go install github.com/entireio/cli/cmd/git-remote-entire@latest
 export PATH="$HOME/go/bin:$PATH"
 ```
 
-Install both, or just `entire` if you never clone over `entire://`. Git finds the helper by name on `$PATH`, which is what `go install` produces, so nothing else needs configuring.
+Install both, or just `entire` if you never clone over `entire://`. Git finds the helper by name on `$PATH`, which is what `go install` produces, so nothing else needs configuring. Like git itself, the helper honours `GIT_HTTP_USER_AGENT` for the HTTP `User-Agent` it sends.
 
 One difference from a stable release: a `go install` build leaves [experimental commands](#experimental-commands) visible in `entire help`, the same as a nightly or a local build.
 
@@ -166,8 +166,8 @@ The hooks capture session data as you work. Checkpoints are created when you or 
 
 If your repository already has git hooks (your own scripts, git-lfs, lefthook, pre-commit), `entire enable` keeps them: each one is moved to `<hook>.pre-entire` in the hooks directory, and Entire's hook runs first, then yours.
 
-- If a hook manager reinstalls its hooks later, Entire's hooks come back on the next agent turn or `entire enable`, chained to the hook manager's version. The exception is a hook that already has a `<hook>.pre-entire` copy: that copy is the one that keeps running, and the hook manager's version is replaced, with a warning naming the file.
-- `entire disable --uninstall` removes Entire's hooks and puts yours back.
+- If a hook manager reinstalls its hooks later, Entire's hooks come back on the next agent turn or `entire enable`, chained to the hook manager's version. If the hook already had a `<hook>.pre-entire` copy, the hook manager's version takes its place and runs after Entire's; the older copy is kept as `<hook>.pre-entire.<timestamp>` and no longer runs, with a warning naming the file.
+- `entire disable --uninstall` removes Entire's hooks and puts yours back. Older `<hook>.pre-entire.<timestamp>` copies are left in place and listed.
 
 ### 2. Work with Your AI Agent
 
@@ -525,7 +525,9 @@ Personal overrides, gitignored by default:
 | `summary_generation.provider`             | e.g. `claude-code`, `codex`, `pi`            | Which agent generates summaries (defaults to Claude)                              |
 | `summary_generation.model`                | provider-specific model hint                 | Model hint for summary generation (requires `provider`)                            |
 | `summary_timeout_seconds`                 | seconds                                      | Hard deadline for `entire checkpoint explain --generate`. Unset or `0` means **no deadline** |
-| `redaction.*`                             | nested object                                | PII redaction, custom secret patterns, scanner engines, and the OpenAI Privacy Filter — documented in [docs/security-and-privacy.md](docs/security-and-privacy.md) |
+| `redaction.*`                             | nested object                                | PII redaction, custom secret patterns, and scanner engines — documented in [docs/security-and-privacy.md](docs/security-and-privacy.md) |
+
+> **Deprecated:** the OpenAI Privacy Filter (`redaction.openai_privacy_filter`) is deprecated and will be removed in a future release. Existing configurations keep working until then, but don't enable it in new setups.
 
 ### Agent Hook Configuration
 
@@ -554,7 +556,7 @@ By default, checkpoint data rides along with your own pushes — but only to **o
 4. The sole remote, if the repo has exactly one
 5. The first remote in `.git/config` order
 
-A push to any *other* remote carries no checkpoint data. `entire status` shows the current destination, where it came from, and how many checkpoints are unpushed. This matters if you push code to several remotes: checkpoints go to exactly one of them.
+A push to any *other* remote carries no checkpoint data — unless every push URL of that remote names the same GitHub repository as the elected one, such as `git@github.com:acme/widgets.git` and its Entire mirror `entire://<cluster>/gh/acme/widgets`. Both reach the same repository, so either push carries the checkpoints. An SSH host alias from `~/.ssh/config` (`git@github-work:acme/widgets.git`) counts as GitHub when git runs plain `ssh`; with a custom `GIT_SSH_COMMAND` or `core.sshCommand` the alias cannot be resolved, so it does not match. `entire status` shows the current destination, where it came from, and how many checkpoints are unpushed. This matters if you push code to several remotes: checkpoints go to exactly one of them.
 
 When a repository has several remotes that could receive checkpoints, interactive first-time `entire enable` asks which one to use, after agent selection and before any hooks or settings are written. Re-running `entire enable` in an enabled repository does not ask again. Choosing a remote saves `strategy_options.checkpoint_push_remote` in `.entire/settings.local.json`, so teammates do not inherit a remote name specific to your clone; keeping the current destination writes nothing.
 
@@ -659,7 +661,7 @@ Two exceptions to field-by-field merging:
 
 Entire automatically redacts detected secrets (API keys, tokens, credentials) from transcripts and metadata before writing a checkpoint, but redaction is best-effort.
 
-Older Entire versions also kept local `entire/<commit>-<worktree>` shadow branches whose code-file snapshots were raw blobs of your working tree. Current versions no longer create them, but do not delete leftover ones automatically: `entire doctor` reports them and `entire doctor --force` deletes them, leaving pending agent work alone (plain `entire clean` would also clear the session state that records it). `entire disable --uninstall` deletes the `entire/<commit>-<worktree>` form too, and lists any oldest-form `entire/<commit>` branches without deleting them, since a branch of yours named after a short SHA looks the same; `entire clean --all` covers that form after you confirm. See [docs/security-and-privacy.md](docs/security-and-privacy.md) for the full picture, including the configurable scanner layers, opt-in PII redaction, and the OpenAI Privacy Filter pass.
+Older Entire versions also kept local `entire/<commit>-<worktree>` shadow branches whose code-file snapshots were raw blobs of your working tree. Current versions no longer create them, but do not delete leftover ones automatically: `entire doctor` reports them and `entire doctor --force` deletes them, leaving pending agent work alone (plain `entire clean` would also clear the session state that records it). `entire disable --uninstall` deletes the `entire/<commit>-<worktree>` form too, and lists any oldest-form `entire/<commit>` branches without deleting them, since a branch of yours named after a short SHA looks the same; `entire clean --all` covers that form after you confirm. See [docs/security-and-privacy.md](docs/security-and-privacy.md) for the full picture, including the configurable scanner layers and opt-in PII redaction.
 
 ## Troubleshooting
 

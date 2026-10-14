@@ -1345,16 +1345,6 @@ was not fully uninstalled.`,
 	return cmd
 }
 
-// runEnableInteractive runs the interactive enable flow.
-// agents must be provided by the caller (via detectOrSelectAgent).
-// runEnableOnConfiguredRepo handles `entire enable` when the repo is already set
-// up. Setup-mutating flags (strategy options, checkpoint backend, agent
-// management) behave like `configure`; a bare re-enable just flips the enabled
-// flag or reports current status.
-func runEnableOnConfiguredRepo(ctx context.Context, cmd *cobra.Command, opts EnableOptions) error {
-	return runEnableOnConfiguredRepoWithPreflight(ctx, cmd, opts, nil)
-}
-
 func runEnableOnConfiguredRepoWithPreflight(ctx context.Context, cmd *cobra.Command, opts EnableOptions, preflight func() error) error {
 	w := cmd.OutOrStdout()
 	runPreflight := func() error {
@@ -1478,6 +1468,8 @@ func scopeExplicitlyDisabled(ctx context.Context, useProject bool) bool {
 	return !enabled
 }
 
+// runEnableInteractive runs the interactive enable flow.
+// agents must be provided by the caller (via detectOrSelectAgent).
 func runEnableInteractive(ctx context.Context, w io.Writer, agents []agent.Agent, opts EnableOptions) error {
 	// Agents have been chosen, but no setup settings or hooks have been changed.
 	if err := opts.checkpointRemoteChoice.selectAfterAgents(ctx, opts, nil); err != nil {
@@ -1992,10 +1984,10 @@ func setupAgentHooks(ctx context.Context, ag agent.Agent, forceHooks bool) (int,
 }
 
 // installAgentHooks installs ag's hooks (setupAgentHooks) and reports whether
-// the install also pruned Entire hooks this version no longer writes (for
-// Claude Code, the retired post-todo hook). The stale check runs before the
-// install, because afterwards there is nothing left to detect. Every enable
-// path reports a prune, so a rewritten config is never called "already
+// the install also pruned or updated outdated Entire hooks (for Claude Code,
+// the retired post-todo hook or a hook missing its timeout). The stale check
+// runs before the install, because afterwards there is nothing left to detect.
+// Every enable path reports it, so a rewritten config is never called "already
 // installed" or left unmentioned.
 func installAgentHooks(ctx context.Context, ag agent.Agent, forceHooks bool) (installed int, prunedStale bool, err error) {
 	if reporter, ok := agent.AsStaleHookReporter(ag); ok {
@@ -2008,10 +2000,10 @@ func installAgentHooks(ctx context.Context, ag agent.Agent, forceHooks bool) (in
 	return installed, prunedStale, nil
 }
 
-// reportPrunedStaleHooks tells the user an install removed outdated Entire
-// hooks from ag's config.
+// reportPrunedStaleHooks tells the user an install removed or updated outdated
+// Entire hooks in ag's config.
 func reportPrunedStaleHooks(w io.Writer, ag agent.Agent) {
-	fmt.Fprintf(w, "  Removed outdated Entire hooks for %s (hooks no longer used by this version)\n", ag.Description())
+	fmt.Fprintf(w, "  Updated outdated Entire hooks for %s\n", ag.Description())
 }
 
 func setupAgentHookSet(ctx context.Context, w io.Writer, agents []agent.Agent, forceHooks bool) ([]agent.Agent, []error) {
@@ -2385,7 +2377,7 @@ func setupAgentHooksNonInteractive(ctx context.Context, w io.Writer, ag agent.Ag
 	case installedHooks == 0:
 		fmt.Fprintf(w, "  Hooks for %s already installed\n", ag.Description())
 	case prunedStaleHooks:
-		fmt.Fprintf(w, "  Installed %d hooks for %s and removed outdated ones\n", installedHooks, ag.Description())
+		fmt.Fprintf(w, "  Installed %d hooks for %s and updated outdated ones\n", installedHooks, ag.Description())
 	default:
 		fmt.Fprintf(w, "  Installed %d hooks for %s\n", installedHooks, ag.Description())
 	}
@@ -2958,6 +2950,9 @@ func uninstallGitHooks(ctx context.Context, p *uninstallPrinter) bool {
 	}
 	for _, hook := range res.Restored {
 		p.step("Restored your original %s hook", hook)
+	}
+	if len(res.Older) > 0 {
+		p.warn("Older copies of your hooks were left in place and do not run: %s", strings.Join(res.Older, ", "))
 	}
 	return true
 }
