@@ -2,6 +2,7 @@ package pi
 
 import (
 	"context"
+	"io"
 	"strings"
 	"testing"
 
@@ -33,16 +34,23 @@ func TestPiReviewer_BuildCmd(t *testing.T) {
 		t.Fatalf("Args[0] = %q, want pi; args=%v", cmd.Args[0], cmd.Args)
 	}
 	wantPrefix := []string{"pi", "--mode", "json", "--print", "--append-system-prompt", review.ReviewerGuardrail, "--model", "anthropic/claude-sonnet-4-5:high"}
-	if len(cmd.Args) != len(wantPrefix)+1 {
-		t.Fatalf("args len = %d, want %d: %v", len(cmd.Args), len(wantPrefix)+1, cmd.Args)
+	if len(cmd.Args) != len(wantPrefix) {
+		t.Fatalf("args len = %d, want %d (prompt must not be in argv): %v", len(cmd.Args), len(wantPrefix), cmd.Args)
 	}
 	for i, want := range wantPrefix {
 		if cmd.Args[i] != want {
 			t.Fatalf("Args[%d] = %q, want %q; args=%v", i, cmd.Args[i], want, cmd.Args)
 		}
 	}
-	if prompt := cmd.Args[len(cmd.Args)-1]; !strings.Contains(prompt, "Review the change.") || !strings.Contains(prompt, "Focus on API regressions.") {
-		t.Fatalf("prompt arg missing composed review content: %q", prompt)
+	if cmd.Stdin == nil {
+		t.Fatal("cmd.Stdin is nil, want the composed prompt")
+	}
+	stdin, err := io.ReadAll(cmd.Stdin)
+	if err != nil {
+		t.Fatalf("read stdin: %v", err)
+	}
+	if prompt := string(stdin); !strings.Contains(prompt, "Review the change.") || !strings.Contains(prompt, "Focus on API regressions.") {
+		t.Fatalf("stdin missing composed review content: %q", prompt)
 	}
 
 	env := envMap(cmd.Env)
