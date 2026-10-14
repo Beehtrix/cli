@@ -246,8 +246,10 @@ invariants the compiler cannot. Examples include `TestRootBasesAreTrusted` (root
 `TestGitStatusCallSitesPassNoOptionalLocks`, and
 `TestAllHookConfigRelPaths_CoversEveryWorktreeConfigAgent`.
 
-**They all go through `testutil.GitGrepGuard`, which owns three flags.** Each was
-missing from at least one guard, and the same one was missing from three:
+**Guards discover files through testutil's guard helpers: `GitGrepGuard` for
+grep-based guards and `GuardGoFiles` for guards that list files to parse.**
+They own the protections below. Each was missing from at least one hand-written
+guard call, and the same one was missing from three:
 
 - `--untracked`. `git grep` searches the INDEX. Every one of these guards has
   "someone just added a file" as its subject, so the file it most needs to see is
@@ -276,6 +278,9 @@ Two rules for writing one:
 - **Fail on zero matches.** A detection pattern that goes stale otherwise passes
   forever. `GitGrepGuard` does this itself; the `checked == 0` tallies are the
   second half of the same idea.
+
+Guards that parse files instead of grepping them list them with
+`testutil.GuardGoFiles`.
 
 ### Code Duplication Prevention
 
