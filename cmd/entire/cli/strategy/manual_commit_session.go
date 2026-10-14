@@ -273,10 +273,18 @@ func LoadBackgroundClaimContext(ctx context.Context, sessionID, toolUseID string
 	claims.Recorded = make(map[string]struct{})
 	key := session.WorktreeKey(own.WorktreeID)
 	for _, state := range states {
-		if work := state.OtherWorktrees[key]; work != nil && !state.Kind.IsImported() {
-			for _, file := range work.FilesTouched {
-				claims.Recorded[file] = struct{}{}
-			}
+		work := state.OtherWorktrees[key]
+		if work == nil || state.Kind.IsImported() {
+			continue
+		}
+		// An entry from a worktree git removed before adding this one under
+		// its ID records nothing here; one that can't be checked still counts,
+		// so a failed check can't hand another session's file to the task.
+		if current, err := worktreeEntryCurrent(ctx, own.WorktreePath, key, work); err == nil && !current {
+			continue
+		}
+		for _, file := range work.FilesTouched {
+			claims.Recorded[file] = struct{}{}
 		}
 	}
 	for _, state := range exactWorktreeMatches(ctx, states, own.WorktreePath) {

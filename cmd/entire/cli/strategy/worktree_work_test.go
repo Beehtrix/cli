@@ -262,3 +262,29 @@ func TestPreviewSession_ListsFilesInOtherWorktrees(t *testing.T) {
 	})
 	assert.Equal(t, []string{"a.go", "home.go"}, preview.FilesTouched)
 }
+
+// An entry from a worktree git has since removed and re-added under the same
+// ID records nothing in the new one: a background task there may claim it.
+func TestLoadBackgroundClaimContext_IgnoresARemovedWorktreesEntry(t *testing.T) {
+	mainDir, linkedDir := twoWorktrees(t)
+	ctx := context.Background()
+	s := &ManualCommitStrategy{}
+	saveSessionMatchState(ctx, t, s, mainDir, &SessionState{
+		SessionID:    "from-main",
+		WorktreePath: mainDir,
+		OtherWorktrees: map[string]*session.WorktreeWork{
+			linkedKey(t, linkedDir): {Path: linkedDir, FilesTouched: []string{"stale.go"}, Incarnation: mark(t, linkedDir)},
+		},
+	})
+	readdLinked(t, mainDir, linkedDir)
+	saveSessionMatchState(ctx, t, s, linkedDir, &SessionState{
+		SessionID:    "task-owner",
+		WorktreePath: linkedDir,
+		TaskRecords:  []session.TaskRecord{{ToolUseID: "bg", Background: true, StartedAt: time.Now()}},
+	})
+
+	claims, ok, err := LoadBackgroundClaimContext(ctx, "task-owner", "bg")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.NotContains(t, claims.Recorded, "stale.go", "a removed worktree's entry kept the task from claiming its own file")
+}
