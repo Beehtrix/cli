@@ -327,9 +327,25 @@ func CompleteTaskRecord(ctx context.Context, sessionID string, rec session.TaskR
 // (Factory Droid Workers reach turn-end once per Worker turn, all attributed
 // to one parent tool use), unlike CompleteTaskRecord's exactly-once claim.
 func UpsertCompletedTaskRecord(ctx context.Context, sessionID string, rec session.TaskRecord) error {
+	return upsertCompletedTaskRecord(ctx, sessionID, rec, false)
+}
+
+// UpsertCompletedTaskRecordTurn is UpsertCompletedTaskRecord for a producer
+// that reports usage per turn (Factory Droid Workers): rec.TokenUsage is this
+// turn's delta and is added to the record's usage rather than replacing it.
+// Condensation removes a completed record once stored, so a later turn starts
+// a fresh record holding only usage no checkpoint has yet.
+func UpsertCompletedTaskRecordTurn(ctx context.Context, sessionID string, rec session.TaskRecord) error {
+	return upsertCompletedTaskRecord(ctx, sessionID, rec, true)
+}
+
+func upsertCompletedTaskRecord(ctx context.Context, sessionID string, rec session.TaskRecord, addUsage bool) error {
 	return MutateSessionState(ctx, sessionID, func(state *SessionState) error {
 		if existing := state.FindTaskRecord(rec.ToolUseID); existing != nil {
 			rec.Files = mergeFilesTouched(existing.Files, rec.Files)
+			if addUsage && rec.TokenUsage != nil {
+				rec.TokenUsage = types.AddTokenUsage(existing.TokenUsage, rec.TokenUsage)
+			}
 		} else {
 			state.AddTaskRecord(launchStubTaskRecord(rec))
 		}

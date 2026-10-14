@@ -213,6 +213,31 @@ func TestFactoryDroidReadOnlyWorkerReachesParentCheckpoint(t *testing.T) {
 	if usage := readCommittedTokenUsage(t, env, checkpointID); usage != nil {
 		require.NotEqual(t, 70, usage.InputTokens, "the parent session's own usage must not absorb the Worker's")
 	}
+
+	// A second Worker turn after that commit: the next checkpoint's task must
+	// hold only the second turn, not the first again.
+	require.NoError(t, env.SimulateFactoryDroidUserPromptSubmit(parent.ID))
+	require.NoError(t, env.SimulateFactoryDroidUserPromptSubmitWithTranscript(worker.ID, worker.TranscriptPath))
+	appendLines(t, worker.TranscriptPath,
+		`{"type":"message","id":"w3","message":{"role":"user","content":[{"type":"text","text":"And the tests?"}]}}`,
+		`{"type":"message","id":"w4","message":{"role":"assistant","id":"msg_w2","content":[{"type":"text","text":"There are none."}],"usage":{"input_tokens":30,"output_tokens":3}}}`)
+	require.NoError(t, env.SimulateFactoryDroidStop(worker.ID, worker.TranscriptPath))
+
+	env.WriteFile("feature2.go", "package main\n")
+	parent.CreateDroidTranscript("Add another feature", []FileChange{{Path: "feature2.go", Content: "package main\n"}})
+	require.NoError(t, env.SimulateFactoryDroidStop(parent.ID, parent.TranscriptPath))
+	env.GitCommitWithHooks("Add feature 2", "feature2.go")
+	checkpoint2 := env.TryGetLatestCheckpointID()
+	require.NotEmpty(t, checkpoint2)
+	require.NotEqual(t, checkpointID, checkpoint2, "expected a second checkpoint")
+
+	raw, ok = env.ReadFileFromBranch(paths.MetadataBranchName, CheckpointTaskFilePath(checkpoint2, toolUseID, "task.json"))
+	require.True(t, ok, "the second Worker turn must be materialized in the second checkpoint")
+	var task2 checkpoint.TaskRecord
+	require.NoError(t, json.Unmarshal([]byte(raw), &task2))
+	require.NotNil(t, task2.TokenUsage, "the second stored task must carry the Worker's usage: %s", raw)
+	require.Equal(t, 30, task2.TokenUsage.InputTokens, "the first Worker turn is already in the first checkpoint: %s", raw)
+	require.Equal(t, 3, task2.TokenUsage.OutputTokens, "the first Worker turn is already in the first checkpoint: %s", raw)
 }
 
 // TestFactoryDroidTopLevelSessionStillCheckpoints guards the fallback: an
