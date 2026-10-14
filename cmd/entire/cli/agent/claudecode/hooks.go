@@ -726,6 +726,10 @@ func CheckHookConfig(ctx context.Context) HookConfigState {
 // rewrite. A config a newer CLI wrote still has every hook this one requires,
 // so unlike the full check it does not misfire across teammates' CLI versions.
 // Read-only; an unreadable file reports false.
+//
+// That holds only while the required list grows. Removing or renaming a hook
+// from missingRequiredHooks would make older CLIs warn about a newer config,
+// and their `entire agent add` would rewrite it back.
 func MissingRequiredHooks(ctx context.Context) bool {
 	settings, err := loadClaudeSettings(ctx)
 	return err == nil && hasEntireHook(settings.Hooks.Stop) && missingRequiredHooks(settings)

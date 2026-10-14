@@ -63,11 +63,12 @@ func TestMissingHooksBannerSuffix_StaleCommandStaysSilent(t *testing.T) {
 
 	data, err := os.ReadFile(settingsPath)
 	require.NoError(t, err)
+	ctx := context.Background()
+	require.NotContains(t, OutdatedHookAgents(ctx), agent.AgentNameClaudeCode, "fresh install should read as current")
 	newer := strings.Replace(string(data), "claude-code stop'", "claude-code stop --newer-flag'", 1)
 	require.NotEqual(t, string(data), newer, "fixture should have changed the Stop command")
 	require.NoError(t, os.WriteFile(settingsPath, []byte(newer), 0o600))
 
-	ctx := context.Background()
 	require.Contains(t, OutdatedHookAgents(ctx), agent.AgentNameClaudeCode, "status should still report it")
 	require.Empty(t, missingHooksBannerSuffix(ctx, mustGetAgent(t, agent.AgentNameClaudeCode)))
 }
@@ -76,6 +77,15 @@ func TestMissingHooksBannerSuffix_Current(t *testing.T) {
 	dir := setupGitRepoForPhaseTest(t)
 	t.Chdir(dir)
 	installCurrentClaudeHooks(t, dir)
+
+	require.Empty(t, missingHooksBannerSuffix(context.Background(), mustGetAgent(t, agent.AgentNameClaudeCode)))
+}
+
+// No Entire Stop hook means Entire isn't installed for Claude Code here, so
+// there is nothing to warn about.
+func TestMissingHooksBannerSuffix_Absent(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
 
 	require.Empty(t, missingHooksBannerSuffix(context.Background(), mustGetAgent(t, agent.AgentNameClaudeCode)))
 }
