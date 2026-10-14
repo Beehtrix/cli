@@ -1136,6 +1136,8 @@ func TestSpawnedAgentIDs_StructuredIDWinsOverText(t *testing.T) {
 		agentResultLine("toolu_followup", "areal0000000000001", "completed", "Forwarded: agentId: aquoted000000002"),
 		// No toolUseResult at all: the text is all there is.
 		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_old","content":[{"type":"text","text":"done\nagentId: aold00000000001 (for resuming)"}]}]}}`,
+		// A toolUseResult that is not an object names no agent: the text still counts.
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_odd","content":[{"type":"text","text":"done\nagentId: aodd00000000001"}]}]},"toolUseResult":[{"agentId":"aignored0000001"}]}`,
 	)
 	parsed, err := transcript.ParseFromBytes(data)
 	require.NoError(t, err)
@@ -1143,6 +1145,7 @@ func TestSpawnedAgentIDs_StructuredIDWinsOverText(t *testing.T) {
 	assert.Equal(t, map[string]string{
 		"areal0000000000001": "toolu_fg",
 		"aold00000000001":    "toolu_old",
+		"aodd00000000001":    "toolu_odd",
 	}, spawnedAgentIDs(data, parsed))
 }
 

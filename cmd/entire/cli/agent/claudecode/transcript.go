@@ -188,7 +188,7 @@ func toolResultAgentIDs(transcriptData []byte) (agentIDs map[string]string, name
 	agentIDs = make(map[string]string)
 	named = make(map[string]bool)
 	for _, line := range bytes.Split(transcriptData, []byte("\n")) {
-		if !bytes.Contains(line, []byte(`"agentId"`)) {
+		if !bytes.Contains(line, []byte(`"toolUseResult"`)) || !bytes.Contains(line, []byte(`"agentId"`)) {
 			continue
 		}
 		var entry struct {
@@ -531,7 +531,7 @@ func (c *ClaudeCodeAgent) CalculateTotalTokenUsage(transcriptData []byte, startL
 }
 
 // subagentTranscriptPaths maps every subagent the transcript launched to its
-// transcript: the agents named by "agentId:" tool results (spawnedAgentIDs),
+// transcript: the agents its tool results name (spawnedAgentIDs),
 // at <subagentsDir>/agent-<id>.jsonl, plus the agents of every Workflow run
 // the transcript launched (runIDs), under <subagentsDir>/workflows/<runId>/
 // (#2685). A Workflow's tool result names its run, never its agents, so those
