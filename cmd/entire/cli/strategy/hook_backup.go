@@ -455,7 +455,30 @@ func movedHookCopies(root *os.Root, hook string) ([]string, error) {
 // how a hook manager's wrapper runs the hook it moved aside.
 func runsByName(root *os.Root, name, moved string) bool {
 	data, err := osroot.ReadFileNoFollow(root, name)
-	return err == nil && !bytes.Contains(data, []byte(entireHookMarker)) && bytes.Contains(data, []byte(moved))
+	return err == nil && !bytes.Contains(data, []byte(entireHookMarker)) && namesFile(data, moved)
+}
+
+// namesFile finds file as a whole file name in data, not inside a longer one:
+// commit-msg.old in commit-msg.older or prepare-commit-msg.old is a different
+// file, and taking it for the one a wrapper runs would put the user's hook
+// where nothing runs it.
+func namesFile(data []byte, file string) bool {
+	name := []byte(file)
+	for i := 0; ; {
+		j := bytes.Index(data[i:], name)
+		if j < 0 {
+			return false
+		}
+		start, end := i+j, i+j+len(name)
+		if (start == 0 || !isFileNameByte(data[start-1])) && (end == len(data) || !isFileNameByte(data[end])) {
+			return true
+		}
+		i = start + 1
+	}
+}
+
+func isFileNameByte(b byte) bool {
+	return b == '.' || isHookNameByte(b)
 }
 
 // reclaimFromWrappers is reclaimFromPreCommit for any other hook manager that
@@ -577,6 +600,17 @@ func refreshMovedEntireHooks(root *os.Root, hook, content string) ([]string, err
 	return rewritten, nil
 }
 
+// restoreMovedHooks undoes, on uninstall, what hook managers and Entire's
+// reclaims left in copies of hook: pre-commit's .legacy, then every copy
+// another manager's wrapper runs. Both run, since both managers may have moved
+// Entire's hook, and a copy left holding it runs on after uninstall.
+func restoreMovedHooks(root *os.Root, hook string) error {
+	if err := restoreLegacy(root, hook); err != nil {
+		return err
+	}
+	return restoreWrapped(root, hook)
+}
+
 // restoreLegacy undoes reclaimFromPreCommit on uninstall: .legacy gets the
 // user's hook back if pre-commit moved Entire's onto it, and the keep copy goes.
 func restoreLegacy(root *os.Root, hook string) error {
@@ -595,15 +629,10 @@ func restoreLegacy(root *os.Root, hook string) error {
 		}
 		return root.Rename(keep, legacy) //nolint:wrapcheck // caller adds the hook name
 	}
-	if !keepExists {
-		return restoreWrapped(root, hook)
+	if keepExists && sameHookFile(root, keep, legacy) {
+		return root.Remove(keep) //nolint:wrapcheck // caller adds the hook name
 	}
-	if sameHookFile(root, keep, legacy) {
-		if err := root.Remove(keep); err != nil {
-			return err //nolint:wrapcheck // caller adds the hook name
-		}
-	}
-	return restoreWrapped(root, hook)
+	return nil
 }
 
 // restoreWrapped undoes reclaimFromWrappers on uninstall: each file a hook

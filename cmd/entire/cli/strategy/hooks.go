@@ -918,11 +918,11 @@ func RemoveGitHookDetailed(ctx context.Context) (GitHookRemoval, error) {
 		fmt.Fprintf(stderrWriter, "[entire] Warning: cannot open the git hooks lock directory (%v)\n", err)
 		lockRoot = nil // removeHooks goes ahead without the lock
 	}
-	return removeHooks(ctx, lockRoot, root, hooksDir, restoreLegacy)
+	return removeHooks(ctx, lockRoot, root, hooksDir, restoreMovedHooks)
 }
 
 // removeHooks is RemoveGitHookDetailed on an opened hooks root, under the hooks
-// lock. restore is restoreLegacy; tests pass a failing one.
+// lock. restore is restoreMovedHooks; tests pass a failing one.
 //
 // Uninstall is cleanup and must finish, so a lock that cannot be used at all
 // (nil lockRoot, or a lock file that will not open) is warned about and
