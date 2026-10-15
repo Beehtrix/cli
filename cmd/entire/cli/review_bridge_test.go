@@ -240,6 +240,67 @@ func TestSplitReviewVerdictFindingsEndsFindingAtHeading(t *testing.T) {
 	}
 }
 
+func TestSplitReviewVerdictFindingsKeepsTextAfterHeading(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		verdict string
+		want    []string
+	}{
+		{
+			name: "prose-only reviewer in combined output",
+			verdict: "## claude-code\n\nrequest changes\n- [high] retry.go:42 — loop ignores ctx\n\n" +
+				"## codex\n\nrequest changes. handler.go:9 drops the error.",
+			want: []string{"loop ignores ctx", "handler.go:9 drops the error"},
+		},
+		{
+			name:    "paragraph under a non-severity heading",
+			verdict: "request changes\n- [high] a.go:1 — A.\n## Notes\nb.go:3 also leaks the lock.",
+			want:    []string{"a.go:1", "b.go:3 also leaks the lock"},
+		},
+		{
+			name:    "paragraph under a severity heading",
+			verdict: "request changes\n### High\nretry.go:42 loops forever.",
+			want:    []string{"retry.go:42 loops forever"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			items := splitReviewVerdictFindings(tc.verdict)
+			if len(items) != len(tc.want) {
+				t.Fatalf("items = %#v, want %d findings", items, len(tc.want))
+			}
+			for i, w := range tc.want {
+				if !strings.Contains(items[i], w) || strings.Contains(items[i], "#") {
+					t.Errorf("items[%d] = %q, want it to hold %q without a heading", i, items[i], w)
+				}
+			}
+		})
+	}
+}
+
+func TestSplitReviewVerdictFindingsKeepsCodeBlocksWhole(t *testing.T) {
+	t.Parallel()
+	verdict := "request changes\n" +
+		"- [high] setup.sh:3 — deps installed twice:\n" +
+		"```sh\n# install deps\nnpm ci\nnpm ci\n```\n" +
+		"- [medium] a.go:1 — wrong default:\n" +
+		"```diff\n- timeout := 0\n+ timeout := 30\n```\n" +
+		"- [low] README.md:1 — typo"
+
+	items := splitReviewVerdictFindings(verdict)
+	if len(items) != 3 {
+		t.Fatalf("items = %#v, want 3 findings", items)
+	}
+	if !strings.Contains(items[0], "# install deps\nnpm ci\nnpm ci\n```") {
+		t.Errorf("items[0] = %q, want the whole sh block", items[0])
+	}
+	if !strings.Contains(items[1], "- timeout := 0\n+ timeout := 30\n```") {
+		t.Errorf("items[1] = %q, want the whole diff block", items[1])
+	}
+}
+
 func TestSplitReviewVerdictFindingsNumberedList(t *testing.T) {
 	t.Parallel()
 	items := splitReviewVerdictFindings("Verdict\n\n1. First\n2. Second")

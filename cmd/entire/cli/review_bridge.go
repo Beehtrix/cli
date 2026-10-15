@@ -233,44 +233,78 @@ func normalizeReviewTrailSeverity(raw string) *string {
 // findings. A line holding only a severity ("### High", "**Low:**") or a
 // Markdown heading that is not itself a marked finding, such as the
 // "## <reviewer>" separating combined narratives, ends the current finding
-// and is not one itself.
+// and is not one itself. Text under a heading is preamble when a finding
+// follows it and a finding of its own when none does, so a section without
+// list items is not lost. Code blocks always continue the current text, so
+// their "#" or "- " lines neither start nor end a finding.
 func splitReviewVerdictFindings(verdict string) []string {
 	var findings []string
-	var current strings.Builder
-	flush := func() {
-		item := strings.TrimSpace(current.String())
-		current.Reset()
+	var current, section strings.Builder
+	inSection, inFence := false, false
+	flush := func(b *strings.Builder) {
+		item := strings.TrimSpace(b.String())
+		b.Reset()
 		if item != "" {
 			findings = append(findings, item)
 		}
 	}
+	appendLine := func(line string) {
+		target := &current
+		if current.Len() == 0 {
+			if !inSection || (section.Len() == 0 && strings.TrimSpace(line) == "") {
+				return
+			}
+			target = &section
+		}
+		if target.Len() > 0 {
+			target.WriteByte('\n')
+		}
+		target.WriteString(line)
+	}
+	startFinding := func(item string) {
+		flush(&current)
+		section.Reset()
+		current.WriteString(item)
+	}
+	startSection := func() {
+		flush(&current)
+		flush(&section)
+		inSection = true
+	}
 	for _, line := range strings.Split(strings.TrimSpace(verdict), "\n") {
+		if fence := isCodeFence(line); inFence || fence {
+			if fence {
+				inFence = !inFence
+			}
+			appendLine(line)
+			continue
+		}
 		if isSeverityHeading(line) {
-			flush()
+			startSection()
 			continue
 		}
 		if item, ok := topLevelBulletText(line); ok {
-			flush()
-			current.WriteString(item)
+			startFinding(item)
 			continue
 		}
 		if item, ok := topLevelMarkedFindingText(line); ok {
-			flush()
-			current.WriteString(item)
+			startFinding(item)
 			continue
 		}
 		if isMarkdownHeading(line) {
-			flush()
+			startSection()
 			continue
 		}
-		if current.Len() == 0 {
-			continue
-		}
-		current.WriteByte('\n')
-		current.WriteString(line)
+		appendLine(line)
 	}
-	flush()
+	flush(&current)
+	flush(&section)
 	return findings
+}
+
+func isCodeFence(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~")
 }
 
 // isSeverityHeading reports whether line, unindented, holds only a severity
