@@ -196,24 +196,16 @@ func TestReviewTrailLocationFromJSON_InvalidRangeKeepsStartLineAnchor(t *testing
 	}
 }
 
-func TestReviewTrailFindingInputsGroupsBySeverityHeading(t *testing.T) {
+func TestReviewTrailFindingInputsSkipsSeverityHeadings(t *testing.T) {
 	t.Parallel()
 	verdict := "request changes\n" +
 		"### High\n" +
 		"- retry.go:42 — loop ignores ctx\n" +
-		"- [low] cache.go:7 — stale entry\n" +
 		"**Low:**\n" +
-		"- docs typo in README.md:3\n" +
-		"## Medium\n" +
-		"handler.go:9 drops the error.\n"
+		"- docs typo in README.md:3\n"
 
 	inputs := reviewTrailFindingInputs("", cliReview.TrailReport{Prose: verdict})
-	want := []struct{ body, severity string }{
-		{"loop ignores ctx", "high"},
-		{"stale entry", "low"},
-		{"docs typo", "low"},
-		{"drops the error", "medium"},
-	}
+	want := []string{"loop ignores ctx", "docs typo"}
 	if len(inputs) != len(want) {
 		bodies := make([]string, len(inputs))
 		for i, in := range inputs {
@@ -222,11 +214,9 @@ func TestReviewTrailFindingInputsGroupsBySeverityHeading(t *testing.T) {
 		t.Fatalf("inputs = %#v, want %d findings and no heading findings", bodies, len(want))
 	}
 	for i, w := range want {
-		if !strings.Contains(*inputs[i].Body, w.body) || strings.Contains(*inputs[i].Body, "#") {
-			t.Errorf("body[%d] = %q, want it to hold %q without a heading", i, *inputs[i].Body, w.body)
-		}
-		if inputs[i].Severity == nil || *inputs[i].Severity != w.severity {
-			t.Errorf("severity[%d] = %v, want %s", i, inputs[i].Severity, w.severity)
+		body := *inputs[i].Body
+		if !strings.Contains(body, w) || strings.Contains(body, "High") || strings.Contains(body, "Low") {
+			t.Errorf("body[%d] = %q, want it to hold %q without a heading", i, body, w)
 		}
 	}
 }
@@ -234,7 +224,7 @@ func TestReviewTrailFindingInputsGroupsBySeverityHeading(t *testing.T) {
 func TestSplitReviewVerdictFindingsNumberedList(t *testing.T) {
 	t.Parallel()
 	items := splitReviewVerdictFindings("Verdict\n\n1. First\n2. Second")
-	if len(items) != 2 || items[0].text != "First" || items[1].text != "Second" {
+	if len(items) != 2 || items[0] != "First" || items[1] != "Second" {
 		t.Fatalf("items = %#v, want numbered findings", items)
 	}
 }

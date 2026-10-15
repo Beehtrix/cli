@@ -101,9 +101,8 @@ func reviewTrailFindingInputs(profileName string, report cliReview.TrailReport) 
 		return append(inputs, reviewTrailFindingInputWithKind(profileName, verdict, "verdict"))
 	}
 	for _, item := range items {
-		input := reviewTrailFindingInputWithKind(profileName, item.text, "finding")
-		input.Severity = item.severity
-		enrichReviewTrailFindingInputFromMarkdown(&input, item.text)
+		input := reviewTrailFindingInputWithKind(profileName, item, "finding")
+		enrichReviewTrailFindingInputFromMarkdown(&input, item)
 		inputs = append(inputs, input)
 	}
 	return inputs
@@ -230,32 +229,22 @@ func normalizeReviewTrailSeverity(raw string) *string {
 	}
 }
 
-// verdictFinding is one finding split from a prose verdict. severity comes
-// from the severity heading it sits under, if any; a marker in text wins.
-type verdictFinding struct {
-	text     string
-	severity *string
-}
-
 // splitReviewVerdictFindings splits a prose verdict into its top-level
-// findings. A line holding only a severity ("### High", "**Low:**") groups the
-// findings below it rather than being one, and text under it that is not a
-// list item is kept as a finding instead of being dropped as preamble.
-func splitReviewVerdictFindings(verdict string) []verdictFinding {
-	var findings []verdictFinding
+// findings. A line holding only a severity ("### High", "**Low:**") ends the
+// current finding and is not one itself.
+func splitReviewVerdictFindings(verdict string) []string {
+	var findings []string
 	var current strings.Builder
-	var groupSeverity *string
 	flush := func() {
 		item := strings.TrimSpace(current.String())
 		current.Reset()
 		if item != "" {
-			findings = append(findings, verdictFinding{text: item, severity: groupSeverity})
+			findings = append(findings, item)
 		}
 	}
 	for _, line := range strings.Split(strings.TrimSpace(verdict), "\n") {
-		if sev, ok := severityHeading(line); ok {
+		if isSeverityHeading(line) {
 			flush()
-			groupSeverity = sev
 			continue
 		}
 		if item, ok := topLevelBulletText(line); ok {
@@ -269,27 +258,22 @@ func splitReviewVerdictFindings(verdict string) []verdictFinding {
 			continue
 		}
 		if current.Len() == 0 {
-			if groupSeverity == nil || strings.TrimSpace(line) == "" {
-				continue
-			}
-		} else {
-			current.WriteByte('\n')
+			continue
 		}
+		current.WriteByte('\n')
 		current.WriteString(line)
 	}
 	flush()
 	return findings
 }
 
-// severityHeading reports whether line, unindented, holds only a severity
-// label, and returns that severity.
-func severityHeading(line string) (*string, bool) {
+// isSeverityHeading reports whether line, unindented, holds only a severity
+// label.
+func isSeverityHeading(line string) bool {
 	if line != strings.TrimLeft(line, " \t") {
-		return nil, false
+		return false
 	}
-	label := strings.TrimLeft(strings.TrimSpace(line), "#> ")
-	sev := normalizeReviewTrailSeverity(label)
-	return sev, sev != nil
+	return normalizeReviewTrailSeverity(strings.TrimLeft(strings.TrimSpace(line), "#> ")) != nil
 }
 
 func topLevelBulletText(line string) (string, bool) {
