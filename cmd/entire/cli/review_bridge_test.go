@@ -221,6 +221,25 @@ func TestReviewTrailFindingInputsSkipsSeverityHeadings(t *testing.T) {
 	}
 }
 
+func TestSplitReviewVerdictFindingsEndsFindingAtHeading(t *testing.T) {
+	t.Parallel()
+	verdict := "## claude-code\n\n" +
+		"request changes\n" +
+		"- [high] retry.go:42 — loop ignores ctx\n\n" +
+		"## codex\n\n" +
+		"I read the diff.\n" +
+		"- [low] README.md:3 — docs typo\n" +
+		"### [medium] cache.go:7 — stale entry\n"
+
+	items := splitReviewVerdictFindings(verdict)
+	if len(items) != 3 || !strings.Contains(items[2], "stale entry") {
+		t.Fatalf("items = %#v, want 3 findings, the last a heading-styled finding", items)
+	}
+	if strings.Contains(items[0], "codex") || strings.Contains(items[0], "I read the diff") {
+		t.Errorf("items[0] = %q, want it to end at the next reviewer's heading", items[0])
+	}
+}
+
 func TestSplitReviewVerdictFindingsNumberedList(t *testing.T) {
 	t.Parallel()
 	items := splitReviewVerdictFindings("Verdict\n\n1. First\n2. Second")

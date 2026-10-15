@@ -230,8 +230,10 @@ func normalizeReviewTrailSeverity(raw string) *string {
 }
 
 // splitReviewVerdictFindings splits a prose verdict into its top-level
-// findings. A line holding only a severity ("### High", "**Low:**") ends the
-// current finding and is not one itself.
+// findings. A line holding only a severity ("### High", "**Low:**") or a
+// Markdown heading that is not itself a marked finding, such as the
+// "## <reviewer>" separating combined narratives, ends the current finding
+// and is not one itself.
 func splitReviewVerdictFindings(verdict string) []string {
 	var findings []string
 	var current strings.Builder
@@ -257,6 +259,10 @@ func splitReviewVerdictFindings(verdict string) []string {
 			current.WriteString(item)
 			continue
 		}
+		if isMarkdownHeading(line) {
+			flush()
+			continue
+		}
 		if current.Len() == 0 {
 			continue
 		}
@@ -274,6 +280,14 @@ func isSeverityHeading(line string) bool {
 		return false
 	}
 	return normalizeReviewTrailSeverity(strings.TrimLeft(strings.TrimSpace(line), "#> ")) != nil
+}
+
+// isMarkdownHeading reports whether line is an unindented ATX heading:
+// one to six "#" followed by a space or nothing.
+func isMarkdownHeading(line string) bool {
+	rest := strings.TrimLeft(line, "#")
+	level := len(line) - len(rest)
+	return level >= 1 && level <= 6 && (strings.TrimSpace(rest) == "" || strings.HasPrefix(rest, " "))
 }
 
 func topLevelBulletText(line string) (string, bool) {
