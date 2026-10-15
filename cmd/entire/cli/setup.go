@@ -1833,6 +1833,7 @@ func runRemoveAgent(ctx context.Context, w io.Writer, name string) error {
 		return runRemoveRetiredGeminiHooks(ctx, w)
 	}
 
+	discoverNamedExternalAgent(ctx, types.AgentName(name))
 	ag, err := agent.Get(types.AgentName(name))
 	if err != nil {
 		printWrongAgentError(w, name)
