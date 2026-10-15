@@ -39,9 +39,15 @@ type jsonlAdapter struct {
 
 // openAssistant is the assistant message that further fragments, or the next
 // user entry's tool results, still attach to.
+//
+// Merging fragment content costs time in the whole message, so it is deferred:
+// parts holds each fragment's content, and entry.content is brought up to date
+// only when the message has to be restated.
 type openAssistant struct {
-	key   string
-	entry parsedEntry // fragments merged so far; content mirrors the fold's
+	key     string
+	entry   parsedEntry       // fragments merged so far, except content
+	parts   []json.RawMessage // content of each fragment since the last restatement
+	isArray bool              // whether the merged content is a JSON array
 }
 
 func newJSONLAdapter(preprocess linePreprocessor) *jsonlAdapter {
@@ -104,17 +110,24 @@ func (a *jsonlAdapter) consumeLine(lineBytes []byte, out []Record) []Record {
 func (a *jsonlAdapter) assistant(e parsedEntry, out []Record) []Record {
 	o := a.open
 	if o == nil || o.entry.id != e.id {
-		o = &openAssistant{key: a.newKey(e.id), entry: e}
+		o = &openAssistant{key: a.newKey(e.id), entry: e, parts: []json.RawMessage{e.content}, isArray: isJSONArray(e.content)}
 		a.open = o
 		return append(out, o.message())
 	}
 
-	prev := o.entry.content
-	o.entry = mergeAssistantEntries(o.entry, e)
-	if !isJSONArray(prev) || !isJSONArray(e.content) {
+	o.entry.ts = e.ts
+	if e.inputTokens > 0 {
+		o.entry.inputTokens = e.inputTokens
+	}
+	if e.outputTokens > 0 {
+		o.entry.outputTokens = e.outputTokens
+	}
+	o.parts = append(o.parts, e.content)
+	if !o.isArray || !isJSONArray(e.content) {
 		// Compaction's merge treats a non-array side as contributing no
 		// blocks and can yield null; restate the merged message rather than
 		// rely on the fold's append agreeing.
+		o.mergeParts()
 		return append(out, o.message())
 	}
 	return append(out, Record{
@@ -174,6 +187,18 @@ func (a *jsonlAdapter) newKey(sourceID string) string {
 	}
 	a.keys[key] = true
 	return key
+}
+
+// mergeParts merges the pending fragment contents the way compaction merges
+// fragments, one at a time, and keeps the result as the only part.
+func (o *openAssistant) mergeParts() {
+	merged := parsedEntry{content: o.parts[0]}
+	for _, part := range o.parts[1:] {
+		merged = mergeAssistantEntries(merged, parsedEntry{content: part})
+	}
+	o.entry.content = merged.content
+	o.parts = []json.RawMessage{merged.content}
+	o.isArray = isJSONArray(merged.content)
 }
 
 func (o *openAssistant) message() Record {

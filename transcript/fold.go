@@ -7,19 +7,43 @@ import (
 	"fmt"
 )
 
+// message is one folded message. Its content is either raw, exactly as the
+// last message record gave it, or a decoded block list once an append or a
+// tool result has touched it. Blocks are re-encoded only when a line is
+// produced, so each record costs time in its own size, not the message's.
 type message struct {
 	id           string
 	sourceID     string
 	role         string
 	ts           json.RawMessage
-	content      json.RawMessage
+	raw          json.RawMessage // content while blocks is unused
+	blocks       []block         // content once decoded
+	decoded      bool            // whether blocks holds the content
+	nonObjects   int             // blocks that are neither an object nor null
 	inputTokens  int
 	outputTokens int
 	dropped      bool
 }
 
+// block is one content block of a decoded message.
+type block struct {
+	raw json.RawMessage
+	typ string // the "type" string, if any
+	id  string // the "id" string, if any
+	// rekey is set on every block present when a tool result was attached:
+	// the block is then written with its keys sorted, as encoding a decoded
+	// object does, which is how compaction has always written such content.
+	rekey  bool
+	result *ToolResult
+}
+
 // Folder applies records incrementally. Messages keep the order in which
 // their IDs were first created. The zero value is not usable; call NewFolder.
+//
+// A Folder keeps every message in memory and has no limits of its own.
+// Applying a record costs time in the record's size; producing a line costs
+// time in that message's size. Callers folding records from an untrusted
+// source must bound the number and size of records and messages.
 type Folder struct {
 	opts Options
 	msgs []*message
@@ -76,7 +100,9 @@ func (f *Folder) Lines() []byte {
 
 // Line returns the compact line (without a trailing newline) for message id.
 // visible is false when the message is unknown, dropped, or an assistant
-// message with no content yet; such a message has no line in Lines.
+// message whose content is [] or null; such a message has no line in Lines.
+// An assistant message with no content at all is visible and prints
+// "content":null, as Convert always has.
 func (f *Folder) Line(id string) (line []byte, visible bool) {
 	m, ok := f.byID[id]
 	if !ok {
@@ -86,7 +112,11 @@ func (f *Folder) Line(id string) (line []byte, visible bool) {
 }
 
 func (f *Folder) line(m *message) ([]byte, bool) {
-	if m.dropped || (m.role == TypeAssistant && isEmptyContentArray(m.content)) {
+	if m.dropped || (m.role == TypeAssistant && m.isEmpty()) {
+		return nil, false
+	}
+	content, err := m.content()
+	if err != nil {
 		return nil, false
 	}
 	line := newTranscriptLine(f.opts)
@@ -95,7 +125,7 @@ func (f *Folder) line(m *message) ([]byte, bool) {
 	line.ID = m.sourceID
 	line.InputTokens = m.inputTokens
 	line.OutputTokens = m.outputTokens
-	line.Content = m.content
+	line.Content = content
 	b, err := json.Marshal(line)
 	if err != nil {
 		return nil, false
@@ -148,8 +178,7 @@ func validateRecord(r Record) error {
 
 // apply applies a validated record. It copies any record bytes it keeps:
 // callers may reuse a Record's buffers, for example by decoding every record
-// of a stream into the same variable. appendBlocks and setToolResult already
-// build new content.
+// of a stream into the same variable.
 func (f *Folder) apply(r Record) {
 	m := f.byID[r.ID]
 	switch r.Op {
@@ -162,15 +191,16 @@ func (f *Folder) apply(r Record) {
 		m.sourceID = r.SourceID
 		m.role = r.Role
 		m.ts = cloneRaw(r.TS)
-		m.content = cloneRaw(r.Content)
+		m.raw = cloneRaw(r.Content)
+		m.blocks, m.decoded, m.nonObjects = nil, false, 0
 		m.dropped = false
 		m.setTokens(r)
 	case OpAppend:
 		m.ts = cloneRaw(r.TS)
-		m.content = appendBlocks(m.content, r.Content)
+		m.appendBlocks(r.Content)
 		m.setTokens(r)
 	case OpResult:
-		m.content = setToolResult(m.content, r.ToolUseID, r.Result)
+		m.setToolResult(r.ToolUseID, r.Result)
 	case OpUsage:
 		m.setTokens(r)
 	case OpDrop:
@@ -178,8 +208,12 @@ func (f *Folder) apply(r Record) {
 	}
 }
 
-// cloneRaw copies raw, keeping nil distinct from empty.
+// cloneRaw copies raw. Empty and nil both mean absent, as they do when a
+// Record is encoded, so empty becomes nil.
 func cloneRaw(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
 	return json.RawMessage(bytes.Clone(raw))
 }
 
@@ -194,52 +228,124 @@ func (m *message) setTokens(r Record) {
 	}
 }
 
-// appendBlocks concatenates two content arrays. A value that is not an array
-// contributes no blocks.
-func appendBlocks(content, add json.RawMessage) json.RawMessage {
-	var blocks, more []json.RawMessage
-	if json.Unmarshal(content, &blocks) != nil {
-		blocks = nil
+// decode switches m to a block list. Content that is not an array (or is
+// null) becomes no blocks.
+func (m *message) decode() {
+	if m.decoded {
+		return
 	}
-	if json.Unmarshal(add, &more) != nil {
-		more = nil
-	}
-	blocks = append(blocks, more...)
-	if blocks == nil {
-		blocks = []json.RawMessage{} // encode as [], not null
-	}
-	data, err := json.Marshal(blocks)
-	if err != nil {
-		return content
-	}
-	return data
+	m.blocks, m.nonObjects = decodeBlocks(m.raw)
+	m.raw, m.decoded = nil, true
+}
+
+// appendBlocks appends the blocks of add, a content array; a value that is
+// not an array contributes no blocks.
+func (m *message) appendBlocks(add json.RawMessage) {
+	m.decode()
+	more, nonObjects := decodeBlocks(add)
+	m.blocks = append(m.blocks, more...)
+	m.nonObjects += nonObjects
 }
 
 // setToolResult sets result on the last tool_use block whose id is
-// toolUseID, or on the last tool_use block when toolUseID is empty. Content
-// that is not an array of blocks, or has no such block, is returned unchanged.
-func setToolResult(content json.RawMessage, toolUseID string, result *ToolResult) json.RawMessage {
-	var blocks []map[string]json.RawMessage
-	if json.Unmarshal(content, &blocks) != nil {
-		return content
+// toolUseID, or on the last tool_use block when toolUseID is empty. Nothing
+// changes when the content is not an array, when one of its blocks is not an
+// object, or when no block matches.
+func (m *message) setToolResult(toolUseID string, result *ToolResult) {
+	blocks, nonObjects := m.blocks, m.nonObjects
+	if !m.decoded {
+		if !isJSONArray(m.raw) {
+			return
+		}
+		blocks, nonObjects = decodeBlocks(m.raw)
+	}
+	if nonObjects > 0 {
+		return
 	}
 	for i := len(blocks) - 1; i >= 0; i-- {
-		if unquote(blocks[i]["type"]) != ContentTypeToolUse {
+		if blocks[i].typ != ContentTypeToolUse || (toolUseID != "" && blocks[i].id != toolUseID) {
 			continue
 		}
-		if toolUseID != "" && unquote(blocks[i]["id"]) != toolUseID {
-			continue
+		m.blocks, m.nonObjects, m.raw, m.decoded = blocks, nonObjects, nil, true
+		for j := range m.blocks {
+			m.blocks[j].rekey = true
 		}
-		resultJSON, err := json.Marshal(result)
-		if err != nil {
-			return content
-		}
-		blocks[i]["result"] = resultJSON
-		data, err := json.Marshal(blocks)
-		if err != nil {
-			return content
-		}
-		return data
+		m.blocks[i].result = cloneToolResult(result)
+		return
 	}
-	return content
+}
+
+// isEmpty reports whether the content is an empty array or null.
+func (m *message) isEmpty() bool {
+	if m.decoded {
+		return len(m.blocks) == 0
+	}
+	return isEmptyContentArray(m.raw)
+}
+
+// content encodes the message's content for its line.
+func (m *message) content() (json.RawMessage, error) {
+	if !m.decoded {
+		return m.raw, nil
+	}
+	out := make([]json.RawMessage, len(m.blocks))
+	for i, b := range m.blocks {
+		if !b.rekey {
+			out[i] = b.raw
+			continue
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(b.raw, &obj); err != nil {
+			return nil, fmt.Errorf("decoding content block %d: %w", i, err)
+		}
+		if b.result != nil {
+			r, err := json.Marshal(b.result)
+			if err != nil {
+				return nil, fmt.Errorf("encoding tool result: %w", err)
+			}
+			obj["result"] = r
+		}
+		enc, err := json.Marshal(obj)
+		if err != nil {
+			return nil, fmt.Errorf("encoding content block %d: %w", i, err)
+		}
+		out[i] = enc
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("encoding content: %w", err)
+	}
+	return data, nil
+}
+
+// decodeBlocks splits a content array into blocks, reading each block's type
+// and id. It returns no blocks for anything but an array, and counts the
+// blocks that are neither an object nor null.
+func decodeBlocks(content json.RawMessage) ([]block, int) {
+	var raws []json.RawMessage
+	if json.Unmarshal(content, &raws) != nil {
+		return nil, 0
+	}
+	blocks := make([]block, len(raws))
+	nonObjects := 0
+	for i, raw := range raws {
+		blocks[i].raw = raw
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(raw, &obj) != nil {
+			nonObjects++
+			continue
+		}
+		blocks[i].typ = unquote(obj["type"])
+		blocks[i].id = unquote(obj["id"])
+	}
+	return blocks, nonObjects
+}
+
+func cloneToolResult(r *ToolResult) *ToolResult {
+	c := *r
+	if r.File != nil {
+		file := *r.File
+		c.File = &file
+	}
+	return &c
 }

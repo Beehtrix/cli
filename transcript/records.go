@@ -7,10 +7,10 @@ import "encoding/json"
 // emits records; it never revises a record it has emitted, so records can be
 // streamed and stored as plain appends. The fold (Fold, Folder) is
 // agent-agnostic: applying records in order produces the lines Convert writes.
-// Claude Code, Cursor and Droid transcripts go through an adapter and the fold;
-// the other converters still write lines directly. The CLI folds records when
-// it writes a checkpoint, and the backend folds the same records to show a
-// live session.
+// Convert sends Claude Code, Cursor and Droid transcripts through an adapter
+// and the fold; the other converters still write lines directly. The fold is
+// meant to be shared with a backend that folds the same records to show a
+// live session. README.md specifies the record wire format.
 
 // Op names what a record does to its target message.
 type Op string
@@ -19,10 +19,12 @@ const (
 	// OpMessage creates a message, or replaces the role, timestamp, source ID
 	// and content of a known one and restores it if it was dropped.
 	OpMessage Op = "message"
-	// OpAppend appends content blocks to a message; the record's timestamp
-	// becomes the message's timestamp.
+	// OpAppend appends content blocks to a message. The record's timestamp
+	// replaces the message's, so an append without one clears it.
 	OpAppend Op = "append"
-	// OpResult sets the result of a tool_use block in a message.
+	// OpResult sets the result of a tool_use block in a message. Nothing
+	// changes when the content is not an array, when one of its blocks is not
+	// an object, or when no tool_use block matches.
 	OpResult Op = "result"
 	// OpUsage sets a message's token counts.
 	OpUsage Op = "usage"
@@ -39,6 +41,8 @@ const (
 // when the agent has none. The two differ when the adapter had to derive a key,
 // for example when the agent reuses a message ID for a second, non-adjacent
 // message that compaction keeps separate.
+//
+// Empty TS and Content mean absent, as they do once the record is encoded.
 //
 // When decoding a stream, decode each record into a zero Record: a field the
 // next record omits keeps its old value otherwise, so an append without "ts"

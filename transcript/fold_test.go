@@ -269,6 +269,94 @@ func TestFolder_ApplyDoesNotRetainRecordBuffers(t *testing.T) {
 	)
 }
 
+// Empty content and timestamps mean absent, as they do once a Record is
+// encoded. Empty content used to fold to a line that could not be encoded,
+// so the message vanished without an error.
+func TestFolder_EmptyRawFieldsMeanAbsent(t *testing.T) {
+	t.Parallel()
+
+	f := NewFolder(testMeta)
+	if _, err := f.Apply([]Record{{Op: OpMessage, ID: "u", Role: TypeUser, TS: rawMsg(`"t1"`), Content: rawMsg(`[{"text":"a"}]`)}}); err != nil {
+		t.Fatal(err)
+	}
+	batch := []Record{
+		{Op: OpMessage, ID: "u", Role: TypeUser, TS: json.RawMessage{}, Content: json.RawMessage{}},
+		{Op: OpMessage, ID: "v", Role: TypeUser, TS: rawMsg(`"t2"`), Content: rawMsg(`[{"text":"b"}]`)},
+	}
+	touched, err := f.Apply(batch)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !reflect.DeepEqual(touched, []string{"u", "v"}) {
+		t.Errorf("touched = %v, want [u v]", touched)
+	}
+	got := strings.Split(strings.TrimSuffix(string(f.Lines()), "\n"), "\n")
+	assertLines(t, got,
+		linePrefix+`"type":"user","content":null}`,
+		linePrefix+`"type":"user","ts":"t2","content":[{"text":"b"}]}`,
+	)
+
+	// Folding the same records after a JSON round trip gives the same lines.
+	data, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded []Record
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	want, err := Fold(batch, testMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotRoundTrip, err := Fold(decoded, testMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotRoundTrip) != string(want) {
+		t.Errorf("fold differs after round trip\ngot:  %s\nwant: %s", gotRoundTrip, want)
+	}
+}
+
+// A message record restates a message completely, even after appends and
+// results decoded its content.
+func TestFold_MessageReplacesDecodedContent(t *testing.T) {
+	t.Parallel()
+
+	got := foldLines(t,
+		assistantRecord("a", "a", `[{"type":"tool_use","id":"tu1","name":"Bash","input":{}}]`),
+		Record{Op: OpAppend, ID: "a", Content: rawMsg(`[{"type":"text","text":"x"}]`)},
+		Record{Op: OpResult, ID: "a", ToolUseID: "tu1", Result: &ToolResult{Output: "o", Status: ToolStatusSuccess}},
+		assistantRecord("a", "a", `[{"type":"text","text":"fresh"}]`),
+	)
+	assertLines(t, got,
+		linePrefix+`"type":"assistant","ts":"t1","id":"a","content":[{"type":"text","text":"fresh"}]}`,
+	)
+}
+
+// The fold keeps its own copy of a result: the caller may reuse it.
+func TestFold_ResultIsCopied(t *testing.T) {
+	t.Parallel()
+
+	f := NewFolder(testMeta)
+	result := &ToolResult{Output: "first", Status: ToolStatusSuccess, File: &ToolResultFile{FilePath: "/a"}}
+	if _, err := f.Apply([]Record{
+		assistantRecord("a", "a", `[{"type":"tool_use","id":"tu1","name":"Read","input":{}}]`),
+		{Op: OpResult, ID: "a", ToolUseID: "tu1", Result: result},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result.Output = "changed"
+	result.File.FilePath = "/b"
+	line, ok := f.Line("a")
+	if !ok {
+		t.Fatal("line not visible")
+	}
+	assertLines(t, []string{string(line)},
+		linePrefix+`"type":"assistant","ts":"t1","id":"a","content":[{"id":"tu1","input":{},"name":"Read","result":{"output":"first","status":"success","file":{"filePath":"/a"}},"type":"tool_use"}]}`,
+	)
+}
+
 func TestFolder_ApplyRejectsInvalidBatchAtomically(t *testing.T) {
 	t.Parallel()
 
