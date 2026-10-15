@@ -1,6 +1,7 @@
 package transcript
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -145,7 +146,10 @@ func validateRecord(r Record) error {
 	return nil
 }
 
-// apply applies a validated record.
+// apply applies a validated record. It copies any record bytes it keeps:
+// callers may reuse a Record's buffers, for example by decoding every record
+// of a stream into the same variable. appendBlocks and setToolResult already
+// build new content.
 func (f *Folder) apply(r Record) {
 	m := f.byID[r.ID]
 	switch r.Op {
@@ -157,12 +161,12 @@ func (f *Folder) apply(r Record) {
 		}
 		m.sourceID = r.SourceID
 		m.role = r.Role
-		m.ts = r.TS
-		m.content = r.Content
+		m.ts = cloneRaw(r.TS)
+		m.content = cloneRaw(r.Content)
 		m.dropped = false
 		m.setTokens(r)
 	case OpAppend:
-		m.ts = r.TS
+		m.ts = cloneRaw(r.TS)
 		m.content = appendBlocks(m.content, r.Content)
 		m.setTokens(r)
 	case OpResult:
@@ -172,6 +176,11 @@ func (f *Folder) apply(r Record) {
 	case OpDrop:
 		m.dropped = true
 	}
+}
+
+// cloneRaw copies raw, keeping nil distinct from empty.
+func cloneRaw(raw json.RawMessage) json.RawMessage {
+	return json.RawMessage(bytes.Clone(raw))
 }
 
 // setTokens applies the record's non-zero token counts. Agents report

@@ -39,6 +39,10 @@ const (
 // when the agent has none. The two differ when the adapter had to derive a key,
 // for example when the agent reuses a message ID for a second, non-adjacent
 // message that compaction keeps separate.
+//
+// When decoding a stream, decode each record into a zero Record: a field the
+// next record omits keeps its old value otherwise, so an append without "ts"
+// would inherit the previous record's timestamp instead of clearing it.
 type Record struct {
 	Op       Op     `json:"op"`
 	ID       string `json:"id"`

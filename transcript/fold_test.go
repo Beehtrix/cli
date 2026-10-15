@@ -2,6 +2,8 @@ package transcript
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -219,6 +221,40 @@ func TestFolder_ApplyReportsTouchedIDsAndLines(t *testing.T) {
 	if got := string(f.Lines()); got != linePrefix+`"type":"assistant","id":"a","content":[{"type":"text","text":"x"}]}`+"\n" {
 		t.Errorf("Lines() = %s", got)
 	}
+}
+
+// A streaming consumer decodes every record into the same variable, and
+// json.RawMessage reuses its buffer. The Folder must not keep those buffers.
+func TestFolder_ApplyDoesNotRetainRecordBuffers(t *testing.T) {
+	t.Parallel()
+
+	stream := `{"op":"message","id":"m1","role":"user","ts":"t1","content":[{"text":"one"}]}
+{"op":"message","id":"m2","role":"user","ts":"t2","content":[{"text":"two"}]}
+{"op":"append","id":"m2","ts":"t3","content":[]}
+{"op":"message","id":"m3","role":"user","ts":"t4","content":[{"text":"xxx"}]}
+`
+	f := NewFolder(testMeta)
+	dec := json.NewDecoder(strings.NewReader(stream))
+	var r Record
+	for {
+		err := dec.Decode(&r)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Apply([]Record{r}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := strings.Split(strings.TrimSuffix(string(f.Lines()), "\n"), "\n")
+	assertLines(t, got,
+		linePrefix+`"type":"user","ts":"t1","content":[{"text":"one"}]}`,
+		linePrefix+`"type":"user","ts":"t3","content":[{"text":"two"}]}`,
+		linePrefix+`"type":"user","ts":"t4","content":[{"text":"xxx"}]}`,
+	)
 }
 
 func TestFolder_ApplyRejectsInvalidBatchAtomically(t *testing.T) {
