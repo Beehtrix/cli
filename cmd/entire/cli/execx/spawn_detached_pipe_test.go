@@ -12,6 +12,7 @@ import (
 // pipe whose read end dies with this process, so a child that outlives a
 // short-lived parent (a git hook) is killed by SIGPIPE on its next write.
 func TestNewDetachedCmdHoldsNoParentPipes(t *testing.T) {
+	t.Parallel()
 	cmd := newDetachedCmd("/bin/true", "/tmp", "arg")
 	require.Nil(t, cmd.Stdout, "Stdout must stay nil (null device in the child)")
 	require.Nil(t, cmd.Stderr, "Stderr must stay nil (null device in the child)")
@@ -20,6 +21,7 @@ func TestNewDetachedCmdHoldsNoParentPipes(t *testing.T) {
 }
 
 func TestNewDetachedCmdDefaultsDirOffTheParentWorkingDirectory(t *testing.T) {
+	t.Parallel()
 	cmd := newDetachedCmd("/bin/true", "")
 	require.NotEmpty(t, cmd.Dir, "empty dir must fall back so the child never holds the parent's cwd")
 }
