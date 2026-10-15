@@ -26,12 +26,12 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/summarize"
-	"github.com/entireio/cli/cmd/entire/cli/transcript"
 	"github.com/entireio/cli/cmd/entire/cli/transcript/geminilegacy"
 	"github.com/entireio/cli/cmd/entire/cli/transcript/imageextract"
 	"github.com/entireio/cli/cmd/entire/cli/validation"
 	"github.com/entireio/cli/perf"
 	"github.com/entireio/cli/redact"
+	transcriptlib "github.com/entireio/cli/transcript"
 
 	"github.com/go-git/go-git/v6"
 )
@@ -986,7 +986,7 @@ func generateSummary(ctx context.Context, redactedTranscript redact.RedactedByte
 			// line count. Antigravity is listed only to keep the switch
 			// exhaustive — it scopes through its own metric above, and
 			// reaches this line only if its registry lookup fails.
-			scopedTranscript = transcript.SliceFromLine(transcriptBytes, state.CheckpointTranscriptStart)
+			scopedTranscript = transcriptlib.SliceFromLine(transcriptBytes, state.CheckpointTranscriptStart)
 		}
 	}
 
