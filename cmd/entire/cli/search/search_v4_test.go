@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
 )
@@ -229,5 +231,108 @@ func TestCellV4_ProblemJSON404IsCellUnavailable(t *testing.T) {
 	}
 	if errors.Is(err, ErrRepoFilterUnmatched) {
 		t.Fatalf("err = %v, want NOT ErrRepoFilterUnmatched for a problem+json 404", err)
+	}
+}
+
+// TestCellV4_RetriesA429ThenSucceeds: query-serve's admission gate sheds a
+// burst with 429 + Retry-After (entire-search trail 208); the primitive sleeps
+// for the hint and retries a bounded number of times, so an agent's parallel
+// fan-out rides out the burst instead of surfacing an error per search.
+func TestCellV4_RetriesA429ThenSucceeds(t *testing.T) {
+	shedBackoffUnit = time.Millisecond
+	t.Cleanup(func() { shedBackoffUnit = time.Second })
+
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		if n <= 2 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":"Too many concurrent searches, retry shortly"}`)) //nolint:errcheck // test helper response
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(Response{Results: []Result{}, Total: 0, Page: 1}) //nolint:errcheck // test helper response
+	}))
+	defer srv.Close()
+
+	client := api.NewClientWithBaseURL("id-token-123", srv.URL)
+	resp, err := CellV4(context.Background(), client, Config{Query: "q", Limit: 10}, nil)
+	if err != nil {
+		t.Fatalf("CellV4 after two 429s: %v", err)
+	}
+	if resp == nil || atomic.LoadInt32(&hits) != 3 {
+		t.Fatalf("hits = %d, want 3 (two sheds then success)", hits)
+	}
+}
+
+// TestCellV4_GivesUpAfterBoundedRetries: a gate that stays full is the
+// caller's problem after shedMaxRetries; the 429 surfaces as an HTTPStatusError
+// so the cli layer can report it, and no further requests are sent.
+func TestCellV4_GivesUpAfterBoundedRetries(t *testing.T) {
+	shedBackoffUnit = time.Millisecond
+	t.Cleanup(func() { shedBackoffUnit = time.Second })
+
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"Too many concurrent searches, retry shortly"}`)) //nolint:errcheck // test helper response
+	}))
+	defer srv.Close()
+
+	client := api.NewClientWithBaseURL("id-token-123", srv.URL)
+	_, err := CellV4(context.Background(), client, Config{Query: "q", Limit: 10}, nil)
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("err = %v, want HTTPStatusError 429", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != int32(shedMaxRetries+1) {
+		t.Fatalf("hits = %d, want %d (initial + bounded retries)", got, shedMaxRetries+1)
+	}
+}
+
+// TestCellV4_429RetryHonoursContext: a caller that gives up during the
+// backoff is not kept waiting for the next attempt.
+func TestCellV4_429RetryHonoursContext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	client := api.NewClientWithBaseURL("id-token-123", srv.URL)
+	start := time.Now()
+	_, err := CellV4(ctx, client, Config{Query: "q", Limit: 10}, nil)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context deadline", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("retry backoff outlived the caller's context")
+	}
+}
+
+func TestShedBackoff(t *testing.T) {
+	shedBackoffUnit = time.Millisecond
+	t.Cleanup(func() { shedBackoffUnit = time.Second })
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"", time.Millisecond},        // absent: default one unit
+		{"abc", time.Millisecond},     // unparsable: default
+		{"0", time.Millisecond},       // sub-second hint: default
+		{"2", 2 * time.Millisecond},   // honoured
+		{" 3 ", 3 * time.Millisecond}, // whitespace tolerated
+		{"60", 5 * time.Millisecond},  // capped
+		{"-1", time.Millisecond},
+		{"1.5", time.Millisecond}, // only the integer-seconds form is sent
+	}
+	for _, tc := range cases {
+		if got := shedBackoff(tc.in); got != tc.want {
+			t.Errorf("shedBackoff(%q) = %v, want %v", tc.in, got, tc.want)
+		}
 	}
 }

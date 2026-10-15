@@ -240,12 +240,18 @@ branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
 				return nil
 			}
 
-			// Fetch a full page (DefaultLimit, matching the web UI) up front and
-			// paginate client-side for all output modes; the requested --limit
-			// only controls the client-side page size.
+			// Paginate client-side for all output modes; the requested --limit
+			// only controls the client-side page size. The TUI fetches a full
+			// page (DefaultLimit, matching the web UI) so a human can page
+			// locally. JSON and piped output fetch only what the requested
+			// window needs: the server fetches ~5 candidate rows per
+			// requested result per namespace, so an agent's default --limit 10
+			// costs a third of a 100-row request on the query pod, and it is
+			// agents' parallel fan-outs that OOMKilled that pod (entire-search
+			// trail 208).
 			requestedLimit := searchCfg.Limit
 			requestedPage := searchCfg.Page
-			searchCfg.Limit = search.DefaultLimit
+			searchCfg.Limit = semanticFetchLimit(requestedLimit, requestedPage, jsonOutput || !isTerminal)
 			searchCfg.Page = 0 // let API default to page 1
 
 			resp, err := searcher(ctx, searchCfg)
@@ -999,6 +1005,27 @@ func isASCII(s string) bool {
 // paginateSearchResults slices results for the requested client-side page,
 // normalizing limit and page, and returns the page slice (never nil) plus the
 // normalized pagination values.
+// semanticFetchLimit is how many results one semantic search asks the server
+// for. Interactive output fetches DefaultLimit (the web UI's page) and pages
+// locally. Non-interactive output needs only the requested window, page x
+// limit, capped at DefaultLimit so a deep page never asks for more than the
+// interactive path does; the zero-value defaults mirror paginateSearchResults.
+func semanticFetchLimit(limit, page int, nonInteractive bool) int {
+	if !nonInteractive {
+		return search.DefaultLimit
+	}
+	if limit <= 0 {
+		limit = resultsPerPage
+	}
+	if page < 1 {
+		page = 1
+	}
+	if page > search.DefaultLimit/limit {
+		return search.DefaultLimit
+	}
+	return page * limit
+}
+
 func paginateSearchResults(results []search.Result, limit, page int) (pageResults []search.Result, total, totalPages, normLimit, normPage int) {
 	if limit <= 0 {
 		limit = resultsPerPage

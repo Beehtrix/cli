@@ -1139,3 +1139,33 @@ func TestMergeSearchResults_AllCellsFail(t *testing.T) {
 		t.Errorf("error = %q, want containing 'code search failed'", err.Error())
 	}
 }
+
+// TestSemanticFetchLimit pins how many results one semantic search asks the
+// server for: the interactive TUI fetches the web UI's full page and pages
+// locally; JSON and piped output fetch only the requested window, capped at
+// that same page, so an agent's default search costs the query pod a third of
+// what it used to (entire-search trail 208).
+func TestSemanticFetchLimit(t *testing.T) {
+	cases := []struct {
+		name           string
+		limit, page    int
+		nonInteractive bool
+		want           int
+	}{
+		{"tui always fetches the full page", 10, 1, false, search.DefaultLimit},
+		{"tui ignores a deep page", 10, 7, false, search.DefaultLimit},
+		{"json default window", 0, 0, true, resultsPerPage},
+		{"json explicit limit", 25, 1, true, 25},
+		{"json page 2 of 10", 10, 2, true, 20},
+		{"json window at the cap", 50, 2, true, search.DefaultLimit},
+		{"json window past the cap", 50, 3, true, search.DefaultLimit},
+		{"json limit above the cap", 500, 1, true, search.DefaultLimit},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := semanticFetchLimit(tc.limit, tc.page, tc.nonInteractive); got != tc.want {
+				t.Fatalf("semanticFetchLimit(%d, %d, %v) = %d, want %d", tc.limit, tc.page, tc.nonInteractive, got, tc.want)
+			}
+		})
+	}
+}
