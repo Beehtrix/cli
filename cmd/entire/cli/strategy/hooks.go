@@ -776,6 +776,14 @@ func installHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string,
 			fmt.Fprintf(stderrWriter, "[entire] pre-commit had moved Entire's %s hook to %s%s; Entire's hook is back and runs pre-commit's after it.\n", spec.name, spec.name, legacySuffix)
 			logging.Info(ctx, "git hook reclaimed from pre-commit", slog.String("hook", spec.name))
 		}
+		wrapped, err := reclaimFromWrappers(root, spec.name)
+		if err != nil {
+			return installedCount, fmt.Errorf("failed to take %s back from the hook manager that moved it: %w", spec.name, err)
+		}
+		if len(wrapped) > 0 {
+			fmt.Fprintf(stderrWriter, "[entire] Another hook manager had moved Entire's %s hook to %s; Entire's hook runs first again, then that manager's, then your own hook.\n", spec.name, strings.Join(wrapped, ", "))
+			logging.Info(ctx, "git hook reclaimed from a hook manager's wrapper", slog.String("hook", spec.name), slog.String("copies", strings.Join(wrapped, ",")))
+		}
 
 		// Back up existing non-Entire hooks. A symlinked hook is one of those:
 		// Entire never installs a link, so it belongs to the user or another
