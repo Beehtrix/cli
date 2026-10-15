@@ -3,7 +3,7 @@ package compact
 import (
 	"testing"
 
-	"github.com/entireio/cli/transcript"
+	transcriptlib "github.com/entireio/cli/transcript"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -84,7 +84,7 @@ func TestBuildCondensedEntries_NumericTimestampFromConverter(t *testing.T) {
 	t.Parallel()
 
 	native := []byte(`{"type":"user","timestamp":1712345678000,"message":{"role":"user","content":"hi"}}` + "\n")
-	compact, err := transcript.Convert(native, transcript.Options{Agent: "claude-code", CLIVersion: "0.5.1"})
+	compact, err := transcriptlib.Convert(native, transcriptlib.Options{Agent: "claude-code", CLIVersion: "0.5.1"})
 	require.NoError(t, err)
 
 	entries, err := BuildCondensedEntries(compact)

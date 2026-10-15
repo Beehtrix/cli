@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/entireio/cli/transcript"
+	transcriptlib "github.com/entireio/cli/transcript"
 )
 
 type CondensedEntry struct {
@@ -17,7 +17,7 @@ type CondensedEntry struct {
 }
 
 func BuildCondensedEntries(content []byte) ([]CondensedEntry, error) {
-	lines, err := transcript.Decode(content)
+	lines, err := transcriptlib.Decode(content)
 	if err != nil {
 		return nil, fmt.Errorf("parsing compact transcript: %w", err)
 	}
@@ -25,7 +25,7 @@ func BuildCondensedEntries(content []byte) ([]CondensedEntry, error) {
 	entries := make([]CondensedEntry, 0, len(lines))
 	for _, line := range lines {
 		switch line.Type {
-		case transcript.TypeUser:
+		case transcriptlib.TypeUser:
 			var parts []string
 			for _, block := range line.Blocks {
 				if block.Text != "" {
@@ -33,17 +33,17 @@ func BuildCondensedEntries(content []byte) ([]CondensedEntry, error) {
 				}
 			}
 			if len(parts) > 0 {
-				entries = append(entries, CondensedEntry{Type: transcript.TypeUser, Content: strings.Join(parts, "\n")})
+				entries = append(entries, CondensedEntry{Type: transcriptlib.TypeUser, Content: strings.Join(parts, "\n")})
 			}
 
-		case transcript.TypeAssistant:
+		case transcriptlib.TypeAssistant:
 			for _, block := range line.Blocks {
 				switch block.Type {
-				case transcript.BlockText:
+				case transcriptlib.BlockText:
 					if block.Text != "" {
-						entries = append(entries, CondensedEntry{Type: transcript.TypeAssistant, Content: block.Text})
+						entries = append(entries, CondensedEntry{Type: transcriptlib.TypeAssistant, Content: block.Text})
 					}
-				case transcript.BlockToolUse:
+				case transcriptlib.BlockToolUse:
 					if block.Name == "" {
 						continue
 					}
