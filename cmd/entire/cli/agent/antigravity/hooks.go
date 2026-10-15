@@ -268,7 +268,10 @@ func (a *AntigravityAgent) AreHooksInstalled(ctx context.Context) (bool, error) 
 // repos, in which case agy kills the hook mid-turn-end with no trace.
 const stopHookTimeoutSeconds = 300
 
-var _ agent.HookTimeoutRepairer = (*AntigravityAgent)(nil)
+var (
+	_ agent.HookTimeoutRepairer = (*AntigravityAgent)(nil)
+	_ agent.HookFreshness       = (*AntigravityAgent)(nil)
+)
 
 // RepairHookTimeouts implements agent.HookTimeoutRepairer. Installs from before
 // stopHookTimeoutSeconds leave agy's 30s default on Stop, which is shorter than
@@ -289,21 +292,58 @@ func (a *AntigravityAgent) RepairHookTimeouts(ctx context.Context) (bool, error)
 		}
 		return false, err //nolint:wrapcheck // agent.HookConfigFile already names the file in its error
 	}
+	rawFile, changed, err := withMissingStopTimeouts(data)
+	if err != nil || !changed {
+		return false, err
+	}
+	if err := writeHooksFile(rawFile, cfg); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// CheckHookConfig implements agent.HookFreshness. It reports outdated only when
+// RepairHookTimeouts has a Stop timeout to add, because `entire status` sends
+// the user to `entire doctor` for an outdated config; flagging anything doctor
+// does not repair would leave a warning the user cannot clear.
+func (a *AntigravityAgent) CheckHookConfig(ctx context.Context) agent.HookConfigState {
+	if installed, err := a.AreHooksInstalled(ctx); err != nil || !installed {
+		return agent.HooksAbsent
+	}
+	cfg, err := a.hookConfig(ctx)
+	if err != nil {
+		return agent.HooksAbsent
+	}
+	data, err := cfg.Read()
+	if err != nil {
+		return agent.HooksAbsent
+	}
+	if _, changed, err := withMissingStopTimeouts(data); err == nil && changed {
+		return agent.HooksOutdated
+	}
+	return agent.HooksCurrent
+}
+
+// withMissingStopTimeouts returns hooks.json with stopHookTimeoutSeconds added
+// to each of Entire's Stop handlers that has no timeout, and whether it added
+// any. It decides what RepairHookTimeouts writes and what CheckHookConfig
+// reports, so the two cannot disagree.
+func withMissingStopTimeouts(data []byte) (map[string]json.RawMessage, bool, error) {
 	var rawFile map[string]json.RawMessage
 	if err := json.Unmarshal(data, &rawFile); err != nil {
-		return false, fmt.Errorf("failed to parse hooks.json: %w", err)
+		return nil, false, fmt.Errorf("failed to parse hooks.json: %w", err)
 	}
 	var entry map[string]json.RawMessage
 	if err := json.Unmarshal(rawFile["entire"], &entry); err != nil || entry == nil {
-		return false, nil //nolint:nilerr // an absent or unparseable entry is left for install to replace
+		return nil, false, nil //nolint:nilerr // an absent or unparseable entry is left for install to replace
 	}
 	var parsed HookConfig
 	if err := json.Unmarshal(rawFile["entire"], &parsed); err == nil && parsed.Enabled != nil && !*parsed.Enabled {
-		return false, nil
+		return nil, false, nil
 	}
 	var stop []map[string]json.RawMessage
 	if err := json.Unmarshal(entry["Stop"], &stop); err != nil {
-		return false, nil //nolint:nilerr // an unparseable Stop list is left for install to replace
+		return nil, false, nil //nolint:nilerr // an unparseable Stop list is left for install to replace
 	}
 
 	changed := false
@@ -314,18 +354,16 @@ func (a *AntigravityAgent) RepairHookTimeouts(ctx context.Context) (bool, error)
 		}
 	}
 	if !changed {
-		return false, nil
+		return nil, false, nil
 	}
+	var err error
 	if entry["Stop"], err = jsonutil.MarshalWithNoHTMLEscape(stop); err != nil {
-		return false, fmt.Errorf("failed to marshal Stop hooks: %w", err)
+		return nil, false, fmt.Errorf("failed to marshal Stop hooks: %w", err)
 	}
 	if rawFile["entire"], err = jsonutil.MarshalWithNoHTMLEscape(entry); err != nil {
-		return false, fmt.Errorf("failed to marshal hook config: %w", err)
+		return nil, false, fmt.Errorf("failed to marshal hook config: %w", err)
 	}
-	if err := writeHooksFile(rawFile, cfg); err != nil {
-		return false, err
-	}
-	return true, nil
+	return rawFile, true, nil
 }
 
 // isEntireRawHandler reports whether a raw hook handler runs a command Entire
