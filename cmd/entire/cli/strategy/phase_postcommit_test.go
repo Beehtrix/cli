@@ -1450,9 +1450,8 @@ func TestHandleTurnEnd_PartialFailure(t *testing.T) {
 // scanner skips the finalize rewrite entirely: the provisional checkpoint's
 // transcript stays intact (no empty-transcript finalize), the call counts as
 // an error, and TurnCheckpointIDs is preserved so a repeated Stop process can
-// retry instead of orphaning the provisional checkpoints. The deadline has
-// already passed, which must not override that: it bounds only the network
-// phase, which a degraded finalize never reaches.
+// retry instead of orphaning the provisional checkpoints. The degraded exit
+// returns before the network phase, so a live deadline never comes into play.
 func TestFinalizeAllTurnCheckpoints_ScannerDegraded(t *testing.T) {
 	// No t.Parallel: t.Chdir plus redact's process-global scanner state.
 	workDir := setupGitRepo(t)
@@ -1490,7 +1489,7 @@ func TestFinalizeAllTurnCheckpoints_ScannerDegraded(t *testing.T) {
 
 	redact.WithScannerDegradedSole(t)
 
-	errCount := NewManualCommitStrategy().finalizeAllTurnCheckpoints(context.Background(), state, time.Now().Add(-time.Second))
+	errCount := NewManualCommitStrategy().finalizeAllTurnCheckpoints(context.Background(), state, time.Now().Add(time.Minute))
 	require.Equal(t, 1, errCount)
 	require.Equal(t, []string{testTrailerCheckpointID.String()}, state.TurnCheckpointIDs,
 		"TurnCheckpointIDs must survive a degraded finalize so a repeated Stop process can retry")

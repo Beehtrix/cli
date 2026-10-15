@@ -579,20 +579,19 @@ type SessionEndBudgeter interface {
 	SessionEndBudget() time.Duration
 }
 
-// TurnEndBudgeter is implemented by agents whose host bounds the hook that ends
-// a turn. Entire bounds the network-bound part of turn-end checkpoint
+// TurnEndHookTimeouter is implemented by agents whose host bounds the hook that
+// ends a turn. Entire derives a finalize budget from the timeout with
+// TurnEndBudgetWithin and bounds the network-bound part of turn-end checkpoint
 // finalization by it, so a slow remote makes Entire give up on the remaining
 // checkpoints instead of the host killing the hook before the session state is
 // saved. Agents that do not implement it get a conservative default.
-type TurnEndBudgeter interface {
+type TurnEndHookTimeouter interface {
 	Agent
 
-	// TurnEndBudget returns how long the turn-end hook may run, measured from
-	// process start, leaving headroom for the work after finalization. Derive
-	// it from the hook timeout with TurnEndBudgetWithin. Zero means no time to
-	// finalize, so Entire skips it; unlike SessionEndBudget, it never means
-	// unbounded.
-	TurnEndBudget() time.Duration
+	// TurnEndHookTimeout returns how long the host lets the turn-end hook run
+	// before killing it: the host's own limit, not a budget. A non-positive
+	// value is treated as unknown, and the default applies.
+	TurnEndHookTimeout() time.Duration
 }
 
 // TurnEndBudgetWithin returns the turn-end budget for a host hook timeout. It

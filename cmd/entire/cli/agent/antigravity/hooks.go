@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
@@ -271,9 +272,11 @@ var _ agent.HookTimeoutRepairer = (*AntigravityAgent)(nil)
 
 // RepairHookTimeouts implements agent.HookTimeoutRepairer. Installs from before
 // stopHookTimeoutSeconds leave agy's 30s default on Stop, which is shorter than
-// the turn-end budget derived from it. It only adds a missing Stop timeout to
-// the "entire" entry, editing raw JSON so keys Entire does not model survive,
-// and skips an entry that does not parse rather than rewriting it.
+// the turn-end budget derived from it. Doctor runs this without asking, so it
+// only adds a timeout to Entire's own Stop handler (matched by command) when
+// that handler has none in any key case, the decoder being case-insensitive.
+// Other handlers, null entries, a user-disabled entry, and an entry that does
+// not parse are left as they are; raw JSON editing keeps unmodeled keys.
 func (a *AntigravityAgent) RepairHookTimeouts(ctx context.Context) (bool, error) {
 	cfg, err := a.hookConfig(ctx)
 	if err != nil {
@@ -294,6 +297,10 @@ func (a *AntigravityAgent) RepairHookTimeouts(ctx context.Context) (bool, error)
 	if err := json.Unmarshal(rawFile["entire"], &entry); err != nil || entry == nil {
 		return false, nil //nolint:nilerr // an absent or unparseable entry is left for install to replace
 	}
+	var parsed HookConfig
+	if err := json.Unmarshal(rawFile["entire"], &parsed); err == nil && parsed.Enabled != nil && !*parsed.Enabled {
+		return false, nil
+	}
 	var stop []map[string]json.RawMessage
 	if err := json.Unmarshal(entry["Stop"], &stop); err != nil {
 		return false, nil //nolint:nilerr // an unparseable Stop list is left for install to replace
@@ -301,7 +308,7 @@ func (a *AntigravityAgent) RepairHookTimeouts(ctx context.Context) (bool, error)
 
 	changed := false
 	for _, handler := range stop {
-		if _, ok := handler["timeout"]; !ok {
+		if isEntireRawHandler(handler) && !hasKeyFold(handler, "timeout") {
 			handler["timeout"] = json.RawMessage(strconv.Itoa(stopHookTimeoutSeconds))
 			changed = true
 		}
@@ -319,6 +326,25 @@ func (a *AntigravityAgent) RepairHookTimeouts(ctx context.Context) (bool, error)
 		return false, err
 	}
 	return true, nil
+}
+
+// isEntireRawHandler reports whether a raw hook handler runs a command Entire
+// wrote. A nil handler (a JSON null) or one without a string command is not.
+func isEntireRawHandler(handler map[string]json.RawMessage) bool {
+	var command string
+	if err := json.Unmarshal(handler["command"], &command); err != nil {
+		return false
+	}
+	return agent.IsManagedHookCommand(command)
+}
+
+func hasKeyFold(m map[string]json.RawMessage, key string) bool {
+	for k := range m {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildEntireHookConfig constructs the HookConfig for the "entire" entry for

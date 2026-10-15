@@ -3133,6 +3133,7 @@ var errPartialState = errors.New("partial session state")
 // During a turn, PostCommit writes provisional transcript data (whatever was available
 // at commit time). HandleTurnEnd replaces that with the complete session transcript
 // (from prompt to stop event), ensuring every checkpoint has the full context.
+//
 // finalizeDeadline bounds that rewrite's network phase so the hook finishes
 // before its host kills it; the zero time means no deadline.
 func (s *ManualCommitStrategy) HandleTurnEnd(ctx context.Context, state *SessionState, finalizeDeadline time.Time) error { //nolint:unparam // error return is part of the hook contract; callers check it
@@ -3284,6 +3285,10 @@ func redactFinalizedTranscript(
 	return redact.RedactedBytes{}, true
 }
 
+// errTurnEndDeadline is the cause recorded when the turn-end budget, rather
+// than the host cancelling the hook, ends finalize.
+var errTurnEndDeadline = errors.New("turn-end finalize deadline exceeded")
+
 // finalizeAllTurnCheckpoints replaces the provisional transcript in each checkpoint
 // created during this turn with the full session transcript.
 //
@@ -3291,8 +3296,9 @@ func redactFinalizedTranscript(
 // transcript was available at commit time. Now we have the complete transcript and
 // replace it so every checkpoint has the full prompt-to-stop context.
 //
-// deadline bounds only the store open and the checkpoint writes, the steps
-// that can wait on a slow remote; the zero time means no deadline.
+// deadline bounds the store open and the checkpoint writes, the steps that
+// can wait on a slow remote, and finalize does not start once it has passed;
+// the zero time means no deadline.
 //
 // Returns the number of errors encountered (best-effort: continues processing on error).
 // Checkpoints the deadline or a cancellation cut off are not counted: the
@@ -3309,7 +3315,17 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 		slog.Int("checkpoint_count", len(state.TurnCheckpointIDs)),
 	)
 
-	if finalizeInterrupted(ctx, logCtx, state) {
+	// budgetCtx ends at the deadline or with ctx. Only the entry check and the
+	// network phase observe it: local preparation is never cut part-way, but
+	// once the budget is spent, nothing it prepares could be written, and its
+	// time is the headroom the hook needs to save state before the host kills it.
+	budgetCtx := ctx
+	if !deadline.IsZero() {
+		var cancel context.CancelFunc
+		budgetCtx, cancel = context.WithDeadlineCause(ctx, deadline, errTurnEndDeadline)
+		defer cancel()
+	}
+	if abandonIfInterrupted(budgetCtx, logCtx, state) {
 		return 0
 	}
 
@@ -3369,7 +3385,7 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 	// Open repository (needed for the checkpoint store)
 	repo, err := OpenRepository(ctx)
 	if err != nil {
-		if finalizeInterrupted(ctx, logCtx, state) {
+		if abandonIfInterrupted(ctx, logCtx, state) {
 			return 0
 		}
 		logging.Warn(logCtx, "finalize: failed to open repository",
@@ -3460,21 +3476,15 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 	// network costs the budget N times: gitRefsStore.fetchFailure covers refs,
 	// and hookBlobFetcher memoizes an exhausted blob fetch. Neither memo detects
 	// a slow remote whose fetches succeed just under budget, so the turn-end
-	// deadline bounds this network phase as a whole. Only this phase checks it:
-	// the preparation above is local work, and the deadline exists to stop slow
-	// fetches.
-	networkCtx := ctx
-	if !deadline.IsZero() {
-		var cancel context.CancelFunc
-		networkCtx, cancel = context.WithDeadline(ctx, deadline)
-		defer cancel()
-	}
-	if finalizeInterrupted(networkCtx, logCtx, state) {
+	// deadline (budgetCtx) bounds this network phase as a whole. The preparation
+	// above ran under ctx: it is local work, and the deadline exists to stop
+	// slow fetches.
+	if abandonIfInterrupted(budgetCtx, logCtx, state) {
 		return 0
 	}
-	stores, err := checkpoint.Open(networkCtx, repo, s.hookCheckpointStoreOptions(networkCtx))
+	stores, err := checkpoint.Open(budgetCtx, repo, s.hookCheckpointStoreOptions(budgetCtx))
 	if err != nil {
-		if finalizeInterrupted(networkCtx, logCtx, state) {
+		if abandonIfInterrupted(budgetCtx, logCtx, state) {
 			return 0
 		}
 		logging.Warn(logCtx, "finalize: failed to open checkpoint store",
@@ -3484,7 +3494,7 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 	}
 	// The deadline can pass while Open runs; precompute would then hash the
 	// whole transcript for writes that never start.
-	if finalizeInterrupted(networkCtx, logCtx, state) {
+	if abandonIfInterrupted(budgetCtx, logCtx, state) {
 		return 0
 	}
 	store := stores.Persistent
@@ -3501,10 +3511,10 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 		SkillEvents:             skillEvents,
 		PrecomputedBlobs:        precomputed,
 	}
-	errCount, unfinalized := finalizeTurnCheckpointWrites(networkCtx, logCtx, store, state, updateOpts)
+	errCount, unfinalized := finalizeTurnCheckpointWrites(budgetCtx, logCtx, store, state, updateOpts)
 	if unfinalized > 0 {
 		state.TurnCheckpointIDs = state.TurnCheckpointIDs[len(state.TurnCheckpointIDs)-unfinalized:]
-		finalizeInterrupted(networkCtx, logCtx, state)
+		recordFinalizeInterruption(budgetCtx, logCtx, state)
 		return errCount
 	}
 
@@ -3518,6 +3528,12 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 	return errCount
 }
 
+// finalizeTurnCheckpointWrites writes the finalized transcript to each
+// checkpoint in state.TurnCheckpointIDs, in order. errCount counts checkpoints
+// that failed for reasons other than ctx ending; processing continues past
+// them. If ctx ends, the loop stops and unfinalized is the length of the
+// unprocessed suffix of state.TurnCheckpointIDs, which the caller keeps for a
+// retry; it is zero whenever ctx did not end.
 func finalizeTurnCheckpointWrites(
 	ctx context.Context,
 	logCtx context.Context,
@@ -3567,23 +3583,29 @@ func finalizeTurnCheckpointWrites(
 	return errCount, 0
 }
 
-// finalizeInterrupted reports whether ctx has ended, from the turn-end deadline
-// or the host cancelling the hook (SIGTERM ends the root context). If so it
-// marks the turn's capture as degraded and keeps the unfinalized
-// TurnCheckpointIDs, so a repeated Stop in the same turn can retry them; turn
-// start clears them otherwise, leaving their provisional transcripts for good.
-func finalizeInterrupted(ctx, logCtx context.Context, state *SessionState) bool {
+// abandonIfInterrupted reports whether ctx has ended, from the turn-end
+// deadline or the host cancelling the hook (SIGTERM ends the root context),
+// and if so records the interruption with recordFinalizeInterruption.
+func abandonIfInterrupted(ctx, logCtx context.Context, state *SessionState) bool {
 	if ctx.Err() == nil {
 		return false
 	}
+	recordFinalizeInterruption(ctx, logCtx, state)
+	return true
+}
+
+// recordFinalizeInterruption marks the turn's capture as degraded and logs why
+// ctx ended. The caller keeps the unfinalized TurnCheckpointIDs, so a repeated
+// Stop in the same turn can retry them; turn start clears them otherwise,
+// leaving their provisional transcripts for good.
+func recordFinalizeInterruption(ctx, logCtx context.Context, state *SessionState) {
 	now := time.Now().UTC()
 	state.CaptureDegradedAt = &now
 	logging.Warn(logCtx, "finalize: interrupted; checkpoints left with provisional transcripts",
 		slog.String("session_id", state.SessionID),
 		slog.Int("unfinalized_count", len(state.TurnCheckpointIDs)),
-		slog.Any("cause", ctx.Err()),
+		slog.Any("cause", context.Cause(ctx)),
 	)
-	return true
 }
 
 // filesChangedInCommit returns the set of files changed in a commit using git diff-tree.

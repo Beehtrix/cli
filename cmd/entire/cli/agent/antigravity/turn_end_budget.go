@@ -6,10 +6,11 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 )
 
-var _ agent.TurnEndBudgeter = (*AntigravityAgent)(nil)
+var _ agent.TurnEndHookTimeouter = (*AntigravityAgent)(nil)
 
-// TurnEndBudget implements agent.TurnEndBudgeter. Entire installs the Stop hook
-// with stopHookTimeoutSeconds, and RepairHookTimeouts adds it to older installs.
-func (*AntigravityAgent) TurnEndBudget() time.Duration {
-	return agent.TurnEndBudgetWithin(time.Duration(stopHookTimeoutSeconds) * time.Second)
+// TurnEndHookTimeout implements agent.TurnEndHookTimeouter. Entire installs the
+// Stop hook with stopHookTimeoutSeconds, and RepairHookTimeouts adds it to
+// older installs.
+func (*AntigravityAgent) TurnEndHookTimeout() time.Duration {
+	return time.Duration(stopHookTimeoutSeconds) * time.Second
 }

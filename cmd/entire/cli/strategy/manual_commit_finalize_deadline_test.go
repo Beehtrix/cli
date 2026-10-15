@@ -137,7 +137,7 @@ func TestFinalizeAllTurnCheckpoints_Deadline(t *testing.T) {
 			}
 			cancelParent()
 			<-ctx.Done()
-			return ctx.Err()
+			return context.Cause(ctx)
 		}
 	}
 	// The first fetch succeeds; the second hangs like a stalled remote until
@@ -150,7 +150,7 @@ func TestFinalizeAllTurnCheckpoints_Deadline(t *testing.T) {
 			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return context.Cause(ctx)
 			case <-time.After(10 * time.Second):
 				return errors.New("fetch outlived the turn-end deadline")
 			}
@@ -172,15 +172,21 @@ func TestFinalizeAllTurnCheckpoints_Deadline(t *testing.T) {
 		finalized    int
 		fetches      int
 		degraded     bool
+		// cause is what the interrupted fetch saw end its context, so logs
+		// can tell the budget apart from the host cancelling the hook.
+		cause error
 	}{
 		{name: "no_deadline", deadline: noFinalizeDeadline, fetch: immediate, finalized: 3, fetches: 3},
 		{name: "future_deadline", deadline: func() time.Time { return time.Now().Add(time.Minute) }, fetch: immediate, finalized: 3, fetches: 3},
 		{name: "slow_fetches_without_deadline", deadline: noFinalizeDeadline, fetch: slow, finalized: 3, fetches: 3},
-		{name: "deadline_passed_before_network", deadline: func() time.Time { return time.Now().Add(-time.Second) }, fetch: immediate, finalized: 0, fetches: 0, degraded: true},
+		{name: "deadline_passed_before_start", deadline: func() time.Time { return time.Now().Add(-time.Second) }, fetch: immediate, finalized: 0, fetches: 0, degraded: true},
 		// The deadline also covers transcript preparation and the store open,
 		// so it leaves room for a slow runner to reach the first fetch.
-		{name: "deadline_expires_mid_loop", deadline: func() time.Time { return time.Now().Add(3 * time.Second) }, fetch: stallOnSecond, finalized: 1, fetches: 2, degraded: true},
-		{name: "context_ends_mid_loop", deadline: noFinalizeDeadline, fetch: cancelOnSecond, finalized: 1, fetches: 2, degraded: true},
+		{name: "deadline_expires_mid_loop", deadline: func() time.Time { return time.Now().Add(3 * time.Second) }, fetch: stallOnSecond, finalized: 1, fetches: 2, degraded: true, cause: errTurnEndDeadline},
+		{name: "context_ends_mid_loop", deadline: noFinalizeDeadline, fetch: cancelOnSecond, finalized: 1, fetches: 2, degraded: true, cause: context.Canceled},
+		// The host's budget still bounds the hook while the deadline does: a
+		// parent cancellation under a live deadline is not reported as the budget.
+		{name: "context_ends_mid_loop_under_deadline", deadline: func() time.Time { return time.Now().Add(time.Minute) }, fetch: cancelOnSecond, finalized: 1, fetches: 2, degraded: true, cause: context.Canceled},
 		{name: "parent_canceled_before_start", deadline: noFinalizeDeadline, cancelBefore: true, fetch: immediate, finalized: 0, fetches: 0, degraded: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -193,9 +199,14 @@ func TestFinalizeAllTurnCheckpoints_Deadline(t *testing.T) {
 
 			s := NewManualCommitStrategy()
 			fetches := 0
+			var fetchErrs []error
 			s.checkpointRefFetcher = func(fetchCtx context.Context, refName plumbing.ReferenceName) error {
 				fetches++
-				return tc.fetch(f, cancel, fetches)(fetchCtx, refName)
+				err := tc.fetch(f, cancel, fetches)(fetchCtx, refName)
+				if err != nil {
+					fetchErrs = append(fetchErrs, err)
+				}
+				return err
 			}
 
 			require.NoError(t, SaveSessionState(context.Background(), f.state))
@@ -210,6 +221,10 @@ func TestFinalizeAllTurnCheckpoints_Deadline(t *testing.T) {
 			require.Equal(t, tc.degraded, state.CaptureDegradedAt != nil, "capture degradation")
 			require.Zero(t, errCount, "an interruption is reported as capture degradation, not as errors")
 			require.Equal(t, tc.fetches, fetches, "no fetch may start once the context has ended")
+			if tc.cause != nil {
+				require.Len(t, fetchErrs, 1)
+				require.ErrorIs(t, fetchErrs[0], tc.cause, "the interrupted fetch must see why its context ended")
+			}
 			var unfinalized []string
 			if tc.degraded {
 				unfinalized = f.state.TurnCheckpointIDs[tc.finalized:]
@@ -243,6 +258,28 @@ func TestFinalizeAllTurnCheckpoints_WriteErrorIsNotDegradation(t *testing.T) {
 	require.Equal(t, 1, errCount)
 	require.Nil(t, f.state.CaptureDegradedAt)
 	f.requireTranscripts(t, len(f.checkpointIDs))
+}
+
+// Once the deadline has passed, nothing finalize prepares can be written, so
+// it must not start the local preparation at all: that time is the headroom
+// the hook needs to save state before its host kills it. The transcript path
+// does not exist, so preparation, had it started, would have cleared the IDs
+// and reported an error.
+func TestFinalizeAllTurnCheckpoints_ExpiredDeadlineSkipsPreparation(t *testing.T) {
+	t.Parallel()
+
+	turnIDs := []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV", "01ARZ3NDEKTSV4RRFFQ69G5FAW"}
+	state := &SessionState{
+		SessionID:         "expired-before-finalize",
+		AgentType:         "Claude Code",
+		TranscriptPath:    filepath.Join(t.TempDir(), "missing", paths.TranscriptFileName),
+		TurnCheckpointIDs: append([]string(nil), turnIDs...),
+	}
+
+	errCount := NewManualCommitStrategy().finalizeAllTurnCheckpoints(context.Background(), state, time.Now().Add(-time.Second))
+	require.Zero(t, errCount, "an interruption is reported as capture degradation, not as errors")
+	require.NotNil(t, state.CaptureDegradedAt)
+	require.Equal(t, turnIDs, state.TurnCheckpointIDs, "the IDs survive for a repeated Stop")
 }
 
 func noFinalizeDeadline() time.Time { return time.Time{} }

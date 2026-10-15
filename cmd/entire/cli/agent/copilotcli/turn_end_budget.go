@@ -12,9 +12,10 @@ import (
 // (https://docs.github.com/en/copilot/reference/hooks-configuration).
 const hostDefaultHookTimeoutSec = 30
 
-var _ agent.TurnEndBudgeter = (*CopilotCLIAgent)(nil)
+var _ agent.TurnEndHookTimeouter = (*CopilotCLIAgent)(nil)
 
-// TurnEndBudget implements agent.TurnEndBudgeter. Sized against the host default, since Entire sets no timeoutSec.
-func (*CopilotCLIAgent) TurnEndBudget() time.Duration {
-	return agent.TurnEndBudgetWithin(time.Duration(hostDefaultHookTimeoutSec) * time.Second)
+// TurnEndHookTimeout implements agent.TurnEndHookTimeouter. Entire sets no
+// timeoutSec, so the host default applies.
+func (*CopilotCLIAgent) TurnEndHookTimeout() time.Duration {
+	return time.Duration(hostDefaultHookTimeoutSec) * time.Second
 }

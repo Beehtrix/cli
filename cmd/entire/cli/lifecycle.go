@@ -1466,22 +1466,26 @@ func sessionEndCondenseDeadline(ag agent.Agent) time.Time {
 }
 
 // defaultTurnEndHookTimeout is the turn-end hook timeout assumed for agents
-// that do not declare agent.TurnEndBudgeter. Cursor documents only a "platform
-// default", OpenCode applies none (its plugin blocks on the hook), and external
-// agents expose none; 30s is the limit Codex and Copilot CLI enforce.
+// that do not declare agent.TurnEndHookTimeouter, or declare a non-positive
+// one. Cursor documents only a "platform default", OpenCode applies none (its
+// plugin blocks on the hook), and external agents expose none, so it borrows
+// the limit Codex and Copilot CLI enforce (their defaultHookTimeoutSec and
+// hostDefaultHookTimeoutSec).
 const defaultTurnEndHookTimeout = 30 * time.Second
 
 // turnEndFinalizeDeadline returns when turn-end checkpoint finalization must
 // stop waiting on the network so the hook finishes inside its host's timeout,
 // measured from process start like the host's own clock.
 func turnEndFinalizeDeadline(agentType types.AgentType) time.Time {
-	budget := agent.TurnEndBudgetWithin(defaultTurnEndHookTimeout)
+	hookTimeout := defaultTurnEndHookTimeout
 	if ag, err := agent.GetByAgentType(agentType); err == nil {
-		if budgeter, ok := agent.AsTurnEndBudgeter(ag); ok {
-			budget = budgeter.TurnEndBudget()
+		if timeouter, ok := agent.AsTurnEndHookTimeouter(ag); ok {
+			if declared := timeouter.TurnEndHookTimeout(); declared > 0 {
+				hookTimeout = declared
+			}
 		}
 	}
-	return processStart.Add(budget)
+	return processStart.Add(agent.TurnEndBudgetWithin(hookTimeout))
 }
 
 // endSessionNow runs the canonical "this session is over" sequence: it marks the

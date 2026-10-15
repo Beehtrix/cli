@@ -6,9 +6,10 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 )
 
-var _ agent.TurnEndBudgeter = (*CodexAgent)(nil)
+var _ agent.TurnEndHookTimeouter = (*CodexAgent)(nil)
 
-// TurnEndBudget implements agent.TurnEndBudgeter. Entire installs the Stop hook with defaultHookTimeoutSec.
-func (*CodexAgent) TurnEndBudget() time.Duration {
-	return agent.TurnEndBudgetWithin(time.Duration(defaultHookTimeoutSec) * time.Second)
+// TurnEndHookTimeout implements agent.TurnEndHookTimeouter. Entire installs the
+// Stop hook with defaultHookTimeoutSec.
+func (*CodexAgent) TurnEndHookTimeout() time.Duration {
+	return time.Duration(defaultHookTimeoutSec) * time.Second
 }

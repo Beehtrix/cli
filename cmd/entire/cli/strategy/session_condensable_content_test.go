@@ -111,9 +111,9 @@ func TestFinalizeAllTurnCheckpoints_LateTranscriptNotFlushedDefers(t *testing.T)
 		TurnCheckpointIDs: []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"},
 	}
 
-	// An already-expired deadline must not override the deferral: it bounds
-	// only the network phase, which a deferred finalize never reaches.
-	errCount := NewManualCommitStrategy().finalizeAllTurnCheckpoints(context.Background(), state, time.Now().Add(-time.Second))
+	// A live deadline is irrelevant here: the deferral returns before the
+	// network phase, the only part of finalize the deadline bounds once it starts.
+	errCount := NewManualCommitStrategy().finalizeAllTurnCheckpoints(context.Background(), state, time.Now().Add(time.Minute))
 	require.Equal(t, 1, errCount, "a deferred finalize is still reported to the best-effort caller")
 	require.Equal(t, []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}, state.TurnCheckpointIDs,
 		"TurnCheckpointIDs must survive an unflushed late transcript so a later turn end retries")

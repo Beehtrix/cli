@@ -12,9 +12,10 @@ import (
 // (https://docs.factory.com/reference/hooks-reference).
 const hostDefaultHookTimeoutSec = 60
 
-var _ agent.TurnEndBudgeter = (*FactoryAIDroidAgent)(nil)
+var _ agent.TurnEndHookTimeouter = (*FactoryAIDroidAgent)(nil)
 
-// TurnEndBudget implements agent.TurnEndBudgeter. Sized against the host default, since Entire sets no timeout.
-func (*FactoryAIDroidAgent) TurnEndBudget() time.Duration {
-	return agent.TurnEndBudgetWithin(time.Duration(hostDefaultHookTimeoutSec) * time.Second)
+// TurnEndHookTimeout implements agent.TurnEndHookTimeouter. Entire sets no
+// timeout, so the host default applies.
+func (*FactoryAIDroidAgent) TurnEndHookTimeout() time.Duration {
+	return time.Duration(hostDefaultHookTimeoutSec) * time.Second
 }

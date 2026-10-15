@@ -6,9 +6,10 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 )
 
-var _ agent.TurnEndBudgeter = (*ClaudeCodeAgent)(nil)
+var _ agent.TurnEndHookTimeouter = (*ClaudeCodeAgent)(nil)
 
-// TurnEndBudget implements agent.TurnEndBudgeter. Entire installs the turn-end hooks with checkpointHookTimeoutSec.
-func (*ClaudeCodeAgent) TurnEndBudget() time.Duration {
-	return agent.TurnEndBudgetWithin(time.Duration(checkpointHookTimeoutSec) * time.Second)
+// TurnEndHookTimeout implements agent.TurnEndHookTimeouter. Entire installs the
+// turn-end hooks with checkpointHookTimeoutSec.
+func (*ClaudeCodeAgent) TurnEndHookTimeout() time.Duration {
+	return time.Duration(checkpointHookTimeoutSec) * time.Second
 }

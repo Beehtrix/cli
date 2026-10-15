@@ -52,7 +52,7 @@ type CapabilityDeclarer interface {
 //   - ToolInvocationScanner
 //   - TranscriptFetcher
 //   - TranscriptSanitizer
-//   - TurnEndBudgeter
+//   - TurnEndHookTimeouter
 //
 // Their As* helpers resolve through builtinCapability, or through
 // nonDeclarerCapability for the entries marked as refusing CapabilityDeclarer
@@ -358,9 +358,9 @@ func AsSessionEndBudgeter(ag Agent) (SessionEndBudgeter, bool) {
 	return builtinCapability[SessionEndBudgeter](ag)
 }
 
-// AsTurnEndBudgeter returns the agent as TurnEndBudgeter if it implements the
-// interface. Built-in only: the bounded work runs in the entire process, and the
-// external-agent protocol carries no host hook timeout to derive a budget from.
-func AsTurnEndBudgeter(ag Agent) (TurnEndBudgeter, bool) {
-	return builtinCapability[TurnEndBudgeter](ag)
+// AsTurnEndHookTimeouter returns the agent as TurnEndHookTimeouter if it
+// implements the interface. Built-in only: the bounded work runs in the entire
+// process, and the external-agent protocol carries no host hook timeout.
+func AsTurnEndHookTimeouter(ag Agent) (TurnEndHookTimeouter, bool) {
+	return builtinCapability[TurnEndHookTimeouter](ag)
 }

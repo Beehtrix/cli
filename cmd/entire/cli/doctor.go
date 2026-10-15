@@ -1414,10 +1414,10 @@ func checkRetiredDenyRule(cmd *cobra.Command) {
 // checkHookTimeouts gives Entire's hooks the timeouts a config written by an
 // older CLI lacks, so the agent's own default does not apply instead: a longer
 // one lets a stalled `entire` launch block the agent, and a shorter one (agy's
-// 30s on Stop) kills a turn-end hook before it saves session state. It repairs without asking for the reason
-// checkRetiredDenyRule does: it only sets a timeout on a hook Entire wrote that
-// has none, so nothing the user chose is touched. As there, a repair error is
-// logged rather than printed.
+// on Stop) kills a turn-end hook before it saves session state. It repairs
+// without asking for the reason checkRetiredDenyRule does: it only sets a
+// timeout on a hook Entire wrote that has none, so nothing the user chose is
+// touched. As there, a repair error is logged rather than printed.
 func checkHookTimeouts(cmd *cobra.Command) {
 	repairInstalledAgents(cmd, "could not add missing hook timeouts",
 		func(ctx context.Context, ag agent.Agent) (bool, error) {

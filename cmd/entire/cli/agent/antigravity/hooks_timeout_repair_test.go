@@ -83,6 +83,11 @@ func TestRepairHookTimeouts_LeavesFileAloneWhenNothingToAdd(t *testing.T) {
 		{name: "no_entire_entry", content: `{"mine": {"Stop": [{"type": "command", "command": "my-hook"}]}}`},
 		{name: "own_timeout_kept", content: fmt.Sprintf(`{"entire": {"Stop": [{"type": "command", "command": %q, "timeout": 45}]}}`, stopCmd)},
 		{name: "unparseable_entry", content: `{"entire": {"Stop": "not a handler list"}}`},
+		// Entire's handler decoder matches keys case-insensitively, so this is
+		// already a timeout.
+		{name: "own_timeout_other_case_kept", content: fmt.Sprintf(`{"entire": {"Stop": [{"type": "command", "command": %q, "Timeout": 600}]}}`, stopCmd)},
+		{name: "null_handler_only", content: `{"entire": {"Stop": [null]}}`},
+		{name: "user_disabled_entry", content: fmt.Sprintf(`{"entire": {"enabled": false, "Stop": [{"type": "command", "command": %q}]}}`, stopCmd)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tmpDir := t.TempDir()
@@ -113,5 +118,70 @@ func TestRepairHookTimeouts_LeavesFileAloneWhenNothingToAdd(t *testing.T) {
 				t.Errorf("hooks.json rewritten:\n%s", data)
 			}
 		})
+	}
+}
+
+// repairEntireStop runs the repair over an "entire" entry with the given Stop
+// list, expects it to rewrite the file, and returns the rewritten Stop list.
+func repairEntireStop(t *testing.T, stopJSON string) []map[string]any {
+	t.Helper()
+	tmpDir := t.TempDir()
+	t.Chdir(tmpDir)
+	path := writeHooksJSON(t, tmpDir, `{"entire": {"Stop": `+stopJSON+`}}`)
+
+	changed, err := (&AntigravityAgent{}).RepairHookTimeouts(context.Background())
+	if err != nil {
+		t.Fatalf("RepairHookTimeouts: %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(data, &file); err != nil {
+		t.Fatal(err)
+	}
+	var stop []map[string]any
+	if err := json.Unmarshal(file["entire"]["Stop"], &stop); err != nil {
+		t.Fatal(err)
+	}
+	return stop
+}
+
+// The repair runs without asking, so it may only touch the handler Entire
+// wrote; any other handler in the Stop list is the user's.
+func TestRepairHookTimeouts_OnlyRepairsEntireHandler(t *testing.T) {
+	stopCmd := buildEntireHookConfig().Stop[0].Command
+	stop := repairEntireStop(t, fmt.Sprintf(`[
+  {"type": "command", "command": "my-hook"},
+  {"type": "command"},
+  {"type": "command", "command": %q}
+]`, stopCmd))
+
+	if len(stop) != 3 {
+		t.Fatalf("Stop has %d handlers, want 3: %v", len(stop), stop)
+	}
+	for _, i := range []int{0, 1} {
+		if _, ok := stop[i]["timeout"]; ok {
+			t.Errorf("non-Entire Stop handler %d gained a timeout: %v", i, stop[i])
+		}
+	}
+	if got := stop[2]["timeout"]; got != float64(stopHookTimeoutSeconds) {
+		t.Errorf("Entire Stop timeout = %v, want %d", got, stopHookTimeoutSeconds)
+	}
+}
+
+func TestRepairHookTimeouts_PreservesNullHandler(t *testing.T) {
+	stopCmd := buildEntireHookConfig().Stop[0].Command
+	stop := repairEntireStop(t, fmt.Sprintf(`[null, {"type": "command", "command": %q}]`, stopCmd))
+
+	if len(stop) != 2 || stop[0] != nil {
+		t.Fatalf("null handler was not preserved: %v", stop)
+	}
+	if got := stop[1]["timeout"]; got != float64(stopHookTimeoutSeconds) {
+		t.Errorf("Entire Stop timeout = %v, want %d", got, stopHookTimeoutSeconds)
 	}
 }

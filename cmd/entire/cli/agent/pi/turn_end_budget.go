@@ -12,9 +12,10 @@ import (
 // in step.
 const extensionHookTimeout = 10 * time.Second
 
-var _ agent.TurnEndBudgeter = (*PiAgent)(nil)
+var _ agent.TurnEndHookTimeouter = (*PiAgent)(nil)
 
-// TurnEndBudget implements agent.TurnEndBudgeter. Sized against the extension's own execFile timeout.
-func (*PiAgent) TurnEndBudget() time.Duration {
-	return agent.TurnEndBudgetWithin(extensionHookTimeout)
+// TurnEndHookTimeout implements agent.TurnEndHookTimeouter. The extension's own
+// execFile timeout is the only limit on agent_end.
+func (*PiAgent) TurnEndHookTimeout() time.Duration {
+	return extensionHookTimeout
 }
