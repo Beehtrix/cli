@@ -78,6 +78,18 @@ func TestFold_AppendConcatenatesAndLaterTSWins(t *testing.T) {
 	)
 }
 
+func TestFold_AppendOfNothingToNullContentWritesEmptyArray(t *testing.T) {
+	t.Parallel()
+
+	got := foldLines(t,
+		Record{Op: OpMessage, ID: "u", Role: TypeUser, Content: rawMsg(`null`)},
+		Record{Op: OpAppend, ID: "u", Content: rawMsg(`[]`)},
+	)
+	assertLines(t, got,
+		linePrefix+`"type":"user","content":[]}`,
+	)
+}
+
 func TestFold_AppendWithoutTSClearsIt(t *testing.T) {
 	t.Parallel()
 

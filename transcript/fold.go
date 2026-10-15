@@ -204,10 +204,11 @@ func appendBlocks(content, add json.RawMessage) json.RawMessage {
 	if json.Unmarshal(add, &more) != nil {
 		more = nil
 	}
-	all := make([]json.RawMessage, 0, len(blocks)+len(more))
-	all = append(all, blocks...)
-	all = append(all, more...)
-	data, err := json.Marshal(all)
+	blocks = append(blocks, more...)
+	if blocks == nil {
+		blocks = []json.RawMessage{} // encode as [], not null
+	}
+	data, err := json.Marshal(blocks)
 	if err != nil {
 		return content
 	}
