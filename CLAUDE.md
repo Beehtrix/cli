@@ -144,8 +144,10 @@ I/O beneath it.** Read the filesystem reference before adding or changing I/O.
 - A git subprocess targeting a repository independently of the current hook must
   use `gitrepo.EnvWithoutRepoOverrides()`; `Dir` or `-C` alone does not override
   inherited selectors. Queries inspecting the commit Git is preparing must retain
-  the hook environment, including its temporary `GIT_INDEX_FILE`. User-invoked
-  CWD commands also honor intentionally exported repo selectors.
+  the hook environment, including its temporary `GIT_INDEX_FILE`. Hook queries
+  reading only the hook's own refs or reflog may strip selectors and resolve from
+  `paths.WorktreeRoot`. User-invoked CWD commands also honor intentionally
+  exported repo selectors.
 - PATH scanners use `execx.PathScanDirs()`; external-agent execution requires
   absolute binary paths. User-directory overrides use the checked `userdirs`
   resolvers before any I/O.

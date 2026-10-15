@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -20,47 +21,67 @@ import (
 // ordinary index can hold different content than what is being committed.
 func TestRedo_ComparesTheCommitIndex(t *testing.T) {
 	t.Parallel()
+	// Long enough for git's rename detection to pair a deleted b.txt with a copy.
+	body := strings.Repeat("unchanged line\n", 30)
+	commitStaged := []string{"commit", "--no-gpg-sign", "-m", "redo"}
+	commitAll := []string{"commit", "--no-gpg-sign", "-am", "redo"}
+	commitPath := []string{"commit", "--no-gpg-sign", "-m", "redo", "--", "a.txt"}
+	stageAll := func(_ *TestEnv, git func(...string) string) { git("add", "-A") }
+	// The ordinary index then holds exactly the dropped commit's content, so
+	// only the commit index shows the rewrite.
+	stageAllThenRewriteA := func(env *TestEnv, git func(...string) string) {
+		git("add", "-A")
+		env.WriteFile("a.txt", "human rewrite\n")
+	}
 	for _, tc := range []struct {
-		name      string
-		rewritten bool
-		commit    []string
+		name     string
+		prepare  func(*TestEnv, func(...string) string)
+		commit   []string
+		inherits bool
 	}{
-		{name: "staged", commit: []string{"commit", "--no-gpg-sign", "-m", "redo"}},
-		{name: "all", commit: []string{"commit", "--no-gpg-sign", "-am", "redo"}},
-		{name: "partial", commit: []string{"commit", "--no-gpg-sign", "-m", "redo", "--", "a.txt"}},
-		{name: "all-rewritten", rewritten: true, commit: []string{"commit", "--no-gpg-sign", "-am", "redo"}},
-		{name: "partial-rewritten", rewritten: true, commit: []string{"commit", "--no-gpg-sign", "-m", "redo", "--", "a.txt"}},
+		{name: "staged", prepare: stageAll, commit: commitStaged, inherits: true},
+		{name: "all", commit: commitAll, inherits: true},
+		{name: "partial", commit: commitPath, inherits: true},
+		{name: "amend-all", commit: []string{"commit", "--no-gpg-sign", "--amend", "-a", "--no-edit"}, inherits: true},
+		{name: "all-rewritten", prepare: stageAllThenRewriteA, commit: commitAll},
+		{name: "partial-rewritten", prepare: stageAllThenRewriteA, commit: commitPath},
+		// The dropped commit changed b.txt, and b.txt is staged as deleted.
+		// Git pairs that deletion with c.txt as a rename, which must not hide it.
+		{name: "renamed-deletion", prepare: func(env *TestEnv, git func(...string) string) {
+			git("add", "a.txt")
+			git("rm", "-qf", "b.txt")
+			env.WriteFile("c.txt", body)
+			git("add", "c.txt")
+		}, commit: commitStaged},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			env := NewFeatureBranchEnv(t)
 			git := gitWithEntireCommitHooks(t, env)
 			env.WriteFile("a.txt", "base\n")
-			git("add", "a.txt")
+			env.WriteFile("b.txt", body)
+			env.WriteFile("d.txt", "doomed\n")
+			git("add", "a.txt", "b.txt", "d.txt")
 			git("commit", "--no-gpg-sign", "-m", "base")
 			env.WriteFile("a.txt", "agent\n")
-			env.GitAdd("a.txt")
-			env.GitCommitWithCheckpointID("agent: edit a", advForeignCheckpoint)
+			env.WriteFile("b.txt", body+"agent\n")
+			git("add", "a.txt", "b.txt")
+			git("rm", "-q", "d.txt")
+			env.GitCommitWithCheckpointID("agent: edit a and b, delete d", advForeignCheckpoint)
 
 			git("reset", "-q", "HEAD~1")
-			want := "agent\n"
-			if tc.rewritten {
-				git("add", "a.txt")
-				want = "human rewrite\n"
-				env.WriteFile("a.txt", want)
-			}
-			if tc.name == "staged" {
-				git("add", "a.txt")
+			if tc.prepare != nil {
+				tc.prepare(env, git)
 			}
 			git(tc.commit...)
 
-			require.Equal(t, want, git("show", "HEAD:a.txt"))
+			require.Equal(t, env.ReadFile("a.txt"), git("show", "HEAD:a.txt"), "the commit records a.txt as the worktree has it")
 			ids := trailers.ParseAllCheckpoints(git("log", "-1", "--format=%B"))
 			var got []string
 			for _, cpID := range ids {
 				got = append(got, cpID.String())
 			}
-			if tc.rewritten {
+			if !tc.inherits {
 				require.NotContains(t, got, advForeignCheckpoint, "rewritten content is new work, not a redo")
 				return
 			}
@@ -70,15 +91,22 @@ func TestRedo_ComparesTheCommitIndex(t *testing.T) {
 }
 
 // gitWithEntireCommitHooks runs real git with Entire's commit hooks, so the
-// hooks see the environment git gives them, including a temporary index.
+// hooks see the environment git gives them, including a temporary index. Each
+// hook passes the arguments the installed hook passes (strategy/hooks.go).
 func gitWithEntireCommitHooks(t *testing.T, env *TestEnv) func(...string) string {
 	t.Helper()
 	hooksDir := t.TempDir()
 	binary := "'" + strings.ReplaceAll(filepath.ToSlash(getTestBinary()), "'", "'\"'\"'") + "'"
-	for _, hook := range []string{"prepare-commit-msg", "post-commit"} {
-		script := fmt.Sprintf("#!/bin/sh\nexec %s hooks git %s \"$@\"\n", binary, hook)
-		require.NoError(t, os.WriteFile(filepath.Join(hooksDir, hook), []byte(script), 0o755))
-	}
+	func() {
+		// A parallel fork inherits an open write descriptor until it execs, and
+		// Linux refuses to execute the script meanwhile (ETXTBSY).
+		syscall.ForkLock.RLock()
+		defer syscall.ForkLock.RUnlock()
+		for hook, args := range map[string]string{"prepare-commit-msg": `"$1" "$2"`, "post-commit": ""} {
+			script := fmt.Sprintf("#!/bin/sh\nexec %s hooks git %s %s\n", binary, hook, args)
+			require.NoError(t, os.WriteFile(filepath.Join(hooksDir, hook), []byte(script), 0o755))
+		}
+	}()
 	return func(args ...string) string {
 		t.Helper()
 		args = append([]string{"-c", "core.hooksPath=" + hooksDir}, args...)

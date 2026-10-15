@@ -3056,16 +3056,18 @@ type stagedChange struct {
 	path string
 }
 
-// getStagedChanges reads staged paths and their blobs in one query. It keeps
-// the hook's GIT_INDEX_FILE: `git commit -a` and path-limited commits prepare
-// the commit in a temporary index, which the ordinary index does not match.
-func getStagedChanges(ctx context.Context) ([]stagedChange, error) {
+// getStagedChanges reads staged paths and their blobs in one query, with
+// diffArgs added to it. It keeps the hook's GIT_INDEX_FILE: `git commit -a` and
+// path-limited commits prepare the commit in a temporary index, which the
+// ordinary index does not match.
+func getStagedChanges(ctx context.Context, diffArgs ...string) ([]stagedChange, error) {
 	repoRoot, err := paths.WorktreeRoot(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("resolve worktree root: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--raw", "-z", "--no-abbrev")
+	args := append([]string{"diff", "--cached", "--raw", "-z", "--no-abbrev"}, diffArgs...)
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = repoRoot
 	output, err := cmd.Output()
 	if err != nil {

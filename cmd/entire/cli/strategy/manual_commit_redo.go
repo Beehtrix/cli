@@ -395,9 +395,11 @@ type stagedEntry struct {
 	deleted bool
 }
 
-// stagedBlobs maps each file staged against HEAD to what the commit index stages.
+// stagedBlobs maps each file staged against HEAD to what the commit index
+// stages. A detected rename would report only its destination, hiding the
+// staged deletion of its source, so rename detection is off.
 func stagedBlobs(ctx context.Context) (map[string]stagedEntry, error) {
-	changes, err := getStagedChanges(ctx)
+	changes, err := getStagedChanges(ctx, "--no-renames")
 	if err != nil {
 		return nil, err
 	}

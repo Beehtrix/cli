@@ -150,6 +150,14 @@ can land between someone's `git add` and their `git commit`. For the writers we
 do not control, the mitigation is `GIT_OPTIONAL_LOCKS=0` in the environment
 (devcontainers: `containerEnv`), which covers every git process in the session.
 
+This exact producer was diagnosed once before (ENT-242, Feb 2026) and lost: the
+fix was closed unmerged on the premise that `git status --porcelain -z` "reads
+without rewriting", which is false, and it would have grown the number of
+index-rewriting call sites from one to eleven. That is why the guard test exists
+rather than a comment.
+
+#### Git Subprocesses in Hooks - Keep the Commit Index
+
 Git subprocesses that target a repository independently of the current hook must
 set `cmd.Env = gitrepo.EnvWithoutRepoOverrides()` (`gitrepo/env.go`). Setting
 `cmd.Dir` or `-C` alone does not override inherited repository selectors.
@@ -158,15 +166,14 @@ Queries inspecting the commit Git is preparing must retain the hook environment,
 including `GIT_INDEX_FILE`: `git commit -a` and path-limited commits supply a
 temporary index that can differ from the worktree's ordinary index. Read staged
 paths and their blob IDs together from that commit index (`getStagedChanges`),
-never paths from one index and blobs from go-git's `Storer.Index()`.
-User-invoked commands acting on the current repository also honor the user's
-repository selectors.
+never paths from one index and blobs from go-git's `Storer.Index()`. A query
+that compares per-path state must pass `--no-renames`: rename detection, which
+follows the user's `diff.renames`, reports only a rename's destination and hides
+the staged deletion of its source.
 
-This exact producer was diagnosed once before (ENT-242, Feb 2026) and lost: the
-fix was closed unmerged on the premise that `git status --porcelain -z` "reads
-without rewriting", which is false, and it would have grown the number of
-index-rewriting call sites from one to eleven. That is why the guard test exists
-rather than a comment.
+Hook queries reading only the hook's own refs or reflog may strip selectors and
+resolve from `paths.WorktreeRoot`. User-invoked commands acting on the current
+repository also honor the user's repository selectors.
 
 #### go-git v5 Bugs - Use CLI Instead
 
