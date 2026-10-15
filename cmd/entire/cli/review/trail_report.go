@@ -68,8 +68,9 @@ func trailReportFor(summary reviewtypes.RunSummary, aggregateOutput string) (Tra
 	var merged []TrailComment
 	var unstructured []reviewtypes.AgentRun
 	for _, run := range usableAgentRuns(summary) {
-		prose, comments, ok := splitTrailJSON(reportText(run.Buffer))
-		if !contractCoversProse(prose, comments, ok) {
+		earlier, final := reportParts(run.Buffer)
+		prose, comments, ok := splitTrailJSON(final)
+		if !contractCoversProse(prose, comments, ok) || earlierReportsFindings(earlier, comments) {
 			unstructured = append(unstructured, run)
 			continue
 		}
@@ -93,6 +94,17 @@ func contractCoversProse(prose string, comments []TrailComment, ok bool) bool {
 	return markedFindingCount(prose) <= len(comments)
 }
 
+// earlierReportsFindings reports whether text borrowed from before a
+// JSON-only final message contradicts its contract. That text is often
+// exploration narration, whose bullets ("I'll check:\n- retry.go") are not
+// findings, so only severity markers and a feedback verdict count.
+func earlierReportsFindings(earlier string, comments []TrailComment) bool {
+	if len(comments) == 0 {
+		return reportsFindings(earlier, false)
+	}
+	return markedFindingCount(earlier) > len(comments)
+}
+
 // markedFindingCount counts the lines, list items included, that open with a
 // severity marker: the finding shape the output format asks for.
 func markedFindingCount(prose string) int {
@@ -109,16 +121,25 @@ func markedFindingCount(prose string) int {
 	return count
 }
 
-// reportText returns a reviewer's report: the last stretch of text between
-// tool calls that ends with a valid contract line, or "" if none does. It is
-// found by the contract line rather than by position, so a tool call after
-// the report does not hide it, and earlier exploration narration, whose
-// bullets ("I'll check:\n- retry.go") are not findings, is left out. A tool
-// call inside a message, where the next text continues it as a delta, is not
-// a boundary. A stretch holding only the contract line also takes the stretch
-// before it, so a report written before a final tool call is still checked
-// against the line.
+// reportText returns a reviewer's report as one text: see reportParts.
 func reportText(buf []reviewtypes.Event) string {
+	earlier, final := reportParts(buf)
+	if earlier == "" {
+		return final
+	}
+	return earlier + "\n\n" + final
+}
+
+// reportParts finds a reviewer's report: final is the last stretch of text
+// between tool calls that ends with a valid contract line, or "" if none
+// does. It is found by the contract line rather than by position, so a tool
+// call after the report does not hide it, and earlier exploration narration,
+// whose bullets ("I'll check:\n- retry.go") are not findings, is left out. A
+// tool call inside a message, where the next text continues it as a delta,
+// is not a boundary. When final holds only the contract line, earlier is the
+// stretch before it, which may hold a report written before a last tool call
+// or may be narration.
+func reportParts(buf []reviewtypes.Event) (earlier, final string) {
 	end := len(buf)
 	for i := len(buf) - 1; i >= -1; i-- {
 		if i >= 0 && !isTextBoundary(buf, i) {
@@ -136,12 +157,12 @@ func reportText(buf []reviewtypes.Event) string {
 				start--
 			}
 			if before := joinAssistantText(buf[start+1 : i]); strings.TrimSpace(before) != "" {
-				return before + "\n\n" + text
+				return before, text
 			}
 		}
-		return text
+		return "", text
 	}
-	return ""
+	return "", ""
 }
 
 // isTextBoundary reports whether buf[i] is a tool call that separates two
@@ -253,10 +274,20 @@ func stripTrailJSON(text string, trailFindingsJSON bool) string {
 // feedback. These are the shapes the output format asks for, so a clean
 // review has none of them.
 func proseReportsFindings(prose string) bool {
+	return reportsFindings(prose, true)
+}
+
+// reportsFindings reports whether prose holds a finding signal. Severity
+// markers and feedback verdicts always count; plain list items and feedback
+// labels count only when includeWeak is set.
+func reportsFindings(prose string, includeWeak bool) bool {
 	for _, line := range strings.Split(prose, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if _, ok := ListItemText(trimmed); ok {
-			return true
+		if item, ok := ListItemText(trimmed); ok {
+			if includeWeak {
+				return true
+			}
+			trimmed = item
 		}
 		lower := strings.ToLower(trimMarkdownEmphasis(trimmed))
 		if after, found := strings.CutPrefix(lower, "verdict"); found {
@@ -265,11 +296,14 @@ func proseReportsFindings(prose string) bool {
 		if StartsWithSeverityMarker(lower) {
 			return true
 		}
-		for _, prefix := range []string{
+		prefixes := []string{
 			"request changes", "request_changes", "changes requested", "approve with nits",
 			"needs changes", "needs work", "changes needed",
-			"nits:", "issues:", "concerns:", "suggestions:", "findings:", "problems:", "blocking:",
-		} {
+		}
+		if includeWeak {
+			prefixes = append(prefixes, "nits:", "issues:", "concerns:", "suggestions:", "findings:", "problems:", "blocking:")
+		}
+		for _, prefix := range prefixes {
 			if strings.HasPrefix(lower, prefix) {
 				return true
 			}

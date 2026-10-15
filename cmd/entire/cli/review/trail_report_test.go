@@ -360,6 +360,28 @@ func TestTrailReportWithoutJudge(t *testing.T) {
 		requirePostedProse(t, report, called, "loop ignores ctx")
 	})
 
+	t.Run("narration bullets before a JSON-only final message do not contradict it", func(t *testing.T) {
+		t.Parallel()
+		run := trailRun{name: "codex", events: []reviewtypes.Event{
+			reviewtypes.AssistantText{Text: "I'll check the changed files:\n- retry.go\n- retry_test.go"},
+			reviewtypes.ToolCall{Name: "Read"},
+			reviewtypes.AssistantText{Text: emptyTrailJSON},
+		}}
+		_, called, out := postedTrailReport(t, trailRunsSummary(run), "")
+		requireNotPosted(t, called, out)
+	})
+
+	t.Run("a feedback verdict before a JSON-only final message contradicts it", func(t *testing.T) {
+		t.Parallel()
+		run := trailRun{name: "codex", events: []reviewtypes.Event{
+			reviewtypes.AssistantText{Text: "approve with nits\n- retry.go:42 could name the backoff constant."},
+			reviewtypes.ToolCall{Name: "TodoWrite"},
+			reviewtypes.AssistantText{Text: emptyTrailJSON},
+		}}
+		report, called, _ := postedTrailReport(t, trailRunsSummary(run), "")
+		requirePostedProse(t, report, called, "backoff constant")
+	})
+
 	t.Run("a new message starts a new line after a tool call", func(t *testing.T) {
 		t.Parallel()
 		run := trailRun{name: "pi", events: []reviewtypes.Event{
