@@ -36,6 +36,29 @@ func benchToolResults(n int) []byte {
 	return []byte(b.String())
 }
 
+// benchUnmatchedResults is one assistant entry with n tool_use blocks followed
+// by a user entry carrying n results that match none of them.
+func benchUnmatchedResults(n int) []byte {
+	var b strings.Builder
+	b.WriteString(`{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[`)
+	for i := range n {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"type":"tool_use","id":"tu%d","name":"Bash","input":{"command":"echo %d"}}`, i, i)
+	}
+	b.WriteString("]}}\n")
+	b.WriteString(`{"type":"user","timestamp":"t2","message":{"content":[`)
+	for i := range n {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"type":"tool_result","tool_use_id":"other%d","content":"x"}`, i)
+	}
+	b.WriteString("]}}\n")
+	return []byte(b.String())
+}
+
 func BenchmarkJSONLConversion(b *testing.B) {
 	inputs := []struct {
 		name  string
@@ -43,6 +66,7 @@ func BenchmarkJSONLConversion(b *testing.B) {
 	}{
 		{"fragments-200", benchFragments(200)},
 		{"tool-results-100", benchToolResults(100)},
+		{"unmatched-results-500", benchUnmatchedResults(500)},
 	}
 	for _, in := range inputs {
 		b.Run(in.name+"/legacy", func(b *testing.B) {

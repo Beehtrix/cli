@@ -10,30 +10,36 @@ import (
 // message is one folded message. Its content is either raw, exactly as the
 // last message record gave it, or a decoded block list once an append or a
 // tool result has touched it. Blocks are re-encoded only when a line is
-// produced, so each record costs time in its own size, not the message's.
+// produced.
 type message struct {
-	id           string
-	sourceID     string
-	role         string
-	ts           json.RawMessage
-	raw          json.RawMessage // content while blocks is unused
-	blocks       []block         // content once decoded
-	decoded      bool            // whether blocks holds the content
-	nonObjects   int             // blocks that are neither an object nor null
+	id       string
+	sourceID string
+	role     string
+	ts       json.RawMessage
+	raw      json.RawMessage // content while decoded is false
+	// blocks is the content once decoded. Before that, once split is set,
+	// it holds raw split into blocks, so that tool results that match
+	// nothing do not split raw again.
+	blocks       []block
+	split        bool           // whether blocks and the fields below describe the content
+	decoded      bool           // whether blocks is the content and raw is unused
+	nonObjects   int            // blocks that are neither an object nor null
+	lastToolUse  int            // index of the last tool_use block, or -1
+	toolUses     map[string]int // index of the last tool_use block with each id
+	rekeyed      int            // blocks[:rekeyed] are written with sorted keys
 	inputTokens  int
 	outputTokens int
 	dropped      bool
 }
 
-// block is one content block of a decoded message.
+// block is one content block of a decoded message. Every block present when
+// a tool result was attached is written with its keys sorted, as encoding a
+// decoded object does, which is how compaction has always written such
+// content; message.rekeyed counts them.
 type block struct {
-	raw json.RawMessage
-	typ string // the "type" string, if any
-	id  string // the "id" string, if any
-	// rekey is set on every block present when a tool result was attached:
-	// the block is then written with its keys sorted, as encoding a decoded
-	// object does, which is how compaction has always written such content.
-	rekey  bool
+	raw    json.RawMessage
+	typ    string // the "type" string, if any
+	id     string // the "id" string, if any
 	result *ToolResult
 }
 
@@ -41,9 +47,13 @@ type block struct {
 // their IDs were first created. The zero value is not usable; call NewFolder.
 //
 // A Folder keeps every message in memory and has no limits of its own.
-// Applying a record costs time in the record's size; producing a line costs
-// time in that message's size. Callers folding records from an untrusted
-// source must bound the number and size of records and messages.
+// Applying a record costs time in the record's size, except that the first
+// append or result after a message record splits that record's content into
+// blocks, once. Until an append or a matching result decodes the message, the
+// split blocks are kept beside the raw content. Producing a line costs time
+// in that message's size, and Lines in the size of all messages. Callers
+// folding records from an untrusted source must bound the number and size of
+// records and messages.
 type Folder struct {
 	opts Options
 	msgs []*message
@@ -191,8 +201,7 @@ func (f *Folder) apply(r Record) {
 		m.sourceID = r.SourceID
 		m.role = r.Role
 		m.ts = cloneRaw(r.TS)
-		m.raw = cloneRaw(r.Content)
-		m.blocks, m.decoded, m.nonObjects = nil, false, 0
+		m.setContent(r.Content)
 		m.dropped = false
 		m.setTokens(r)
 	case OpAppend:
@@ -228,23 +237,55 @@ func (m *message) setTokens(r Record) {
 	}
 }
 
-// decode switches m to a block list. Content that is not an array (or is
-// null) becomes no blocks.
-func (m *message) decode() {
-	if m.decoded {
+// setContent replaces the content with raw, undecoded.
+func (m *message) setContent(raw json.RawMessage) {
+	m.raw = cloneRaw(raw)
+	m.blocks, m.split, m.decoded = nil, false, false
+	m.nonObjects, m.lastToolUse, m.toolUses, m.rekeyed = 0, -1, nil, 0
+}
+
+// splitRaw splits raw into blocks, once. Content that is not an array (or
+// is null) has no blocks.
+func (m *message) splitRaw() {
+	if m.split {
 		return
 	}
-	m.blocks, m.nonObjects = decodeBlocks(m.raw)
+	m.addBlocks(m.raw)
+	m.split = true
+}
+
+// decode switches m to its block list.
+func (m *message) decode() {
+	m.splitRaw()
 	m.raw, m.decoded = nil, true
 }
 
-// appendBlocks appends the blocks of add, a content array; a value that is
-// not an array contributes no blocks.
-func (m *message) appendBlocks(add json.RawMessage) {
-	m.decode()
-	more, nonObjects := decodeBlocks(add)
+// addBlocks adds the blocks of content, a content array, and indexes its
+// tool_use blocks.
+func (m *message) addBlocks(content json.RawMessage) {
+	more, nonObjects := decodeBlocks(content)
+	for i, b := range more {
+		if b.typ != ContentTypeToolUse {
+			continue
+		}
+		m.lastToolUse = len(m.blocks) + i
+		if b.id != "" {
+			if m.toolUses == nil {
+				m.toolUses = make(map[string]int)
+			}
+			m.toolUses[b.id] = m.lastToolUse
+		}
+	}
 	m.blocks = append(m.blocks, more...)
 	m.nonObjects += nonObjects
+}
+
+// appendBlocks appends the blocks of add, a content array; a value that is
+// not an array contributes no blocks. Content that is not an array has no
+// blocks, so appending to it discards it.
+func (m *message) appendBlocks(add json.RawMessage) {
+	m.decode()
+	m.addBlocks(add)
 }
 
 // setToolResult sets result on the last tool_use block whose id is
@@ -252,27 +293,23 @@ func (m *message) appendBlocks(add json.RawMessage) {
 // changes when the content is not an array, when one of its blocks is not an
 // object, or when no block matches.
 func (m *message) setToolResult(toolUseID string, result *ToolResult) {
-	blocks, nonObjects := m.blocks, m.nonObjects
-	if !m.decoded {
-		if !isJSONArray(m.raw) {
+	m.splitRaw()
+	if m.nonObjects > 0 {
+		return
+	}
+	i := m.lastToolUse
+	if toolUseID != "" {
+		var ok bool
+		if i, ok = m.toolUses[toolUseID]; !ok {
 			return
 		}
-		blocks, nonObjects = decodeBlocks(m.raw)
 	}
-	if nonObjects > 0 {
+	if i < 0 {
 		return
 	}
-	for i := len(blocks) - 1; i >= 0; i-- {
-		if blocks[i].typ != ContentTypeToolUse || (toolUseID != "" && blocks[i].id != toolUseID) {
-			continue
-		}
-		m.blocks, m.nonObjects, m.raw, m.decoded = blocks, nonObjects, nil, true
-		for j := range m.blocks {
-			m.blocks[j].rekey = true
-		}
-		m.blocks[i].result = cloneToolResult(result)
-		return
-	}
+	m.decode()
+	m.rekeyed = len(m.blocks)
+	m.blocks[i].result = cloneToolResult(result)
 }
 
 // isEmpty reports whether the content is an empty array or null.
@@ -290,7 +327,7 @@ func (m *message) content() (json.RawMessage, error) {
 	}
 	out := make([]json.RawMessage, len(m.blocks))
 	for i, b := range m.blocks {
-		if !b.rekey {
+		if i >= m.rekeyed {
 			out[i] = b.raw
 			continue
 		}

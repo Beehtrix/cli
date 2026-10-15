@@ -128,7 +128,7 @@ that integration does not exist yet.
 
 ### Record wire format v1
 
-One JSON object per record. Absent and empty values are equivalent.
+One JSON object per record. An omitted field and a zero-length one mean the same: in Go, a nil or empty `json.RawMessage` is absent. This is about the field, not its JSON value: `content` of `[]` or `null` is present, and the visibility rules below treat it differently from absent content.
 
 | Field | Type | Ops | Notes |
 | --- | --- | --- | --- |
@@ -137,7 +137,7 @@ One JSON object per record. Absent and empty values are equivalent.
 | `sourceId` | string | `message` | The agent's own message ID, printed as the line's `id`. Differs from `id` when the agent reuses an ID for a later, separate message. |
 | `role` | string | `message` | `user` or `assistant`; becomes the line's `type`. Required on `message`. |
 | `ts` | any JSON | `message`, `append` | Copied to the line's `ts` verbatim. An `append` without `ts` clears the timestamp. |
-| `content` | any JSON | `message`, `append` | Normally an array of blocks. `message` replaces the content; `append` adds the blocks of an array and ignores anything else. |
+| `content` | any JSON | `message`, `append` | Normally an array of blocks. `message` replaces the content; `append` adds the blocks of an array and ignores anything else. Appending to content that is not an array discards that content, since it has no blocks. |
 | `toolUseId` | string | `result` | The `tool_use` block to target, searching from the end. Empty targets the last `tool_use` block. |
 | `result` | object | `result` | The tool result object described under Blocks. Required on `result`. |
 | `inputTokens`, `outputTokens` | int | `message`, `append`, `usage` | A non-zero value replaces the previous one; agents report cumulative usage. |
@@ -145,7 +145,7 @@ One JSON object per record. Absent and empty values are equivalent.
 What each op does to the message `id` names:
 
 - `message` creates it, or restates it: role, source ID, timestamp and content are replaced, token counts are updated, and a dropped message is restored. A message keeps the position where it was first created.
-- `append` concatenates content blocks and replaces the timestamp.
+- `append` concatenates content blocks and replaces the timestamp. Appending to non-array content (a string, `null`, or none) replaces it with the appended blocks, possibly none: the result is always an array.
 - `result` sets the result of one `tool_use` block. Nothing changes when the content is not an array, when one of its blocks is not an object, or when no block matches.
 - `usage` updates token counts.
 - `drop` hides the message.
@@ -177,4 +177,4 @@ Decode each streamed record into a zero `Record`. `encoding/json` leaves fields 
 
 ### Resource use
 
-A `Folder` keeps every message in memory and has no limits of its own. Applying a record costs time in the record's size; producing a line costs time in that message's size. A caller folding records from an untrusted source must bound the number and size of records and messages itself.
+A `Folder` keeps every message in memory and has no limits of its own. Applying a record costs time in the record's size, with one exception: the first `append` or `result` after a `message` record splits that record's content into blocks, once. Until an `append` or a matching `result` takes the split blocks over as the content, they are kept beside the original bytes, so such a message briefly costs twice its size. Producing a line costs time in that message's size, and `Lines` in the size of all messages. A caller folding records from an untrusted source must bound the number and size of records and messages itself.

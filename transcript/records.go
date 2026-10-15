@@ -20,7 +20,9 @@ const (
 	// and content of a known one and restores it if it was dropped.
 	OpMessage Op = "message"
 	// OpAppend appends content blocks to a message. The record's timestamp
-	// replaces the message's, so an append without one clears it.
+	// replaces the message's, so an append without one clears it. Content
+	// that is not an array adds no blocks, and appending to a message whose
+	// content is not an array discards that content.
 	OpAppend Op = "append"
 	// OpResult sets the result of a tool_use block in a message. Nothing
 	// changes when the content is not an array, when one of its blocks is not
@@ -42,7 +44,8 @@ const (
 // for example when the agent reuses a message ID for a second, non-adjacent
 // message that compaction keeps separate.
 //
-// Empty TS and Content mean absent, as they do once the record is encoded.
+// Zero-length TS and Content mean absent, as they do once the record is
+// encoded. JSON null or [] content is present.
 //
 // When decoding a stream, decode each record into a zero Record: a field the
 // next record omits keeps its old value otherwise, so an append without "ts"

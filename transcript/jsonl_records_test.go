@@ -66,6 +66,15 @@ not json
 {"type":"assistant","timestamp":null,"message":{"id":"m4","content":[1,{"type":"tool_use","id":"tu1","name":"X","input":{}}]}}
 {"type":"user","timestamp":"t8","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"x"}]}}
 `,
+	"non-array fragments after array content": `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"tool_use","id":"tu1","name":"X","input":{}}],"usage":{"input_tokens":5}}}
+{"type":"assistant","timestamp":"t2","message":{"id":"m1","content":"str"}}
+{"type":"assistant","timestamp":"t3","message":{"id":"m1","content":null,"usage":{"output_tokens":7}}}
+{"type":"assistant","message":{"id":"m1"}}
+{"type":"assistant","timestamp":"t5","message":{"id":"m1","content":[{"type":"text","text":"b"}]}}
+{"type":"user","timestamp":"t6","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"x"}]}}
+{"type":"assistant","timestamp":"t7","message":{"id":"m2","content":[]}}
+{"type":"assistant","timestamp":"t8","message":{"id":"m2","content":"str"}}
+`,
 	"id-less assistants merge (Cursor)": `{"role":"user","message":{"content":[{"type":"text","text":"<user_query>hi</user_query>"}]}}
 {"role":"assistant","message":{"content":[{"type":"text","text":"a"}]}}
 {"role":"assistant","message":{"content":[{"type":"text","text":"b <&>"}]}}
@@ -246,6 +255,32 @@ func TestJSONLAdapter_EmptyAssistantBeforeConsumedUserTextIsSkipped(t *testing.T
 	want := `{"v":1,"agent":"claude-code","cli_version":"0.5.1","type":"user","ts":"t2","content":[{"text":"stop"}]}` + "\n"
 	if string(out) != want {
 		t.Errorf("got:\n%s\nwant:\n%s", out, want)
+	}
+}
+
+// Alternating array and non-array fragments must not restate the message on
+// every non-array fragment: the records would grow with the square of the
+// message's length.
+func TestJSONLAdapter_AlternatingFragmentRecordsGrowLinearly(t *testing.T) {
+	t.Parallel()
+
+	alternating := func(n int) []byte {
+		var b strings.Builder
+		for i := range n {
+			content := `"s"`
+			if i%2 == 0 {
+				content = fmt.Sprintf(`[{"type":"text","text":"fragment %d"}]`, i)
+			}
+			fmt.Fprintf(&b, `{"type":"assistant","timestamp":"t%d","message":{"id":"m1","content":%s}}`+"\n", i, content)
+		}
+		return []byte(b.String())
+	}
+	for _, n := range []int{1000, 4000} {
+		input := alternating(n)
+		assertMatchesLegacy(t, input, nil)
+		if size := len(encodeRecords(t, adapterRecords(input, nil, nil))); size > 2*len(input) {
+			t.Errorf("%d fragments: %d bytes of records for %d bytes of input", n, size, len(input))
+		}
 	}
 }
 

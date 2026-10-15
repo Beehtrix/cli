@@ -127,6 +127,62 @@ func TestFold_Result(t *testing.T) {
 	}
 }
 
+func TestFold_ResultTargetsLastToolUseWithID(t *testing.T) {
+	t.Parallel()
+
+	got := foldLines(t,
+		assistantRecord("a", "", `[{"type":"tool_use","id":"tu1","name":"A","input":{}}]`),
+		Record{Op: OpAppend, ID: "a", TS: rawMsg(`"t1"`), Content: rawMsg(`[{"type":"tool_use","id":"tu1","name":"B","input":{}}]`)},
+		Record{Op: OpResult, ID: "a", ToolUseID: "tu1", Result: &ToolResult{Output: "o", Status: ToolStatusSuccess}},
+	)
+	assertLines(t, got, linePrefix+`"type":"assistant","ts":"t1","content":[{"id":"tu1","input":{},"name":"A","type":"tool_use"},{"id":"tu1","input":{},"name":"B","result":{"output":"o","status":"success"},"type":"tool_use"}]}`)
+}
+
+// Results that match nothing leave the content's key order as given, even
+// after the fold has split it to look for a match.
+func TestFold_UnmatchedResultsKeepKeyOrder(t *testing.T) {
+	t.Parallel()
+
+	content := `[{"type":"tool_use","id":"tu1","name":"A","input":{}}]`
+	got := foldLines(t,
+		assistantRecord("a", "", content),
+		Record{Op: OpResult, ID: "a", ToolUseID: "tu8", Result: &ToolResult{Output: "o"}},
+		Record{Op: OpResult, ID: "a", ToolUseID: "tu9", Result: &ToolResult{Output: "o"}},
+	)
+	assertLines(t, got, linePrefix+`"type":"assistant","ts":"t1","content":`+content+`}`)
+}
+
+// A message record replaces whatever the fold learned from earlier content
+// while looking for a result's target.
+func TestFold_ResultAfterRestatementSeesNewContentOnly(t *testing.T) {
+	t.Parallel()
+
+	got := foldLines(t,
+		assistantRecord("a", "", `[{"type":"tool_use","id":"tu1","name":"A","input":{}}]`),
+		Record{Op: OpResult, ID: "a", ToolUseID: "tu9", Result: &ToolResult{Output: "o"}},
+		assistantRecord("a", "", `[{"type":"text","text":"x"},{"type":"tool_use","id":"tu2","name":"B","input":{}}]`),
+		Record{Op: OpResult, ID: "a", ToolUseID: "tu1", Result: &ToolResult{Output: "stale"}},
+		Record{Op: OpResult, ID: "a", ToolUseID: "tu2", Result: &ToolResult{Output: "o", Status: ToolStatusSuccess}},
+	)
+	assertLines(t, got, linePrefix+`"type":"assistant","ts":"t1","content":[{"text":"x","type":"text"},{"id":"tu2","input":{},"name":"B","result":{"output":"o","status":"success"},"type":"tool_use"}]}`)
+}
+
+// Only blocks present when a result is attached are written with sorted keys.
+func TestFold_ResultSortsKeysOfBlocksPresentOnly(t *testing.T) {
+	t.Parallel()
+
+	result := &ToolResult{Output: "o", Status: ToolStatusSuccess}
+	records := []Record{
+		assistantRecord("a", "", `[{"type":"tool_use","id":"tu1","name":"A","input":{}}]`),
+		{Op: OpResult, ID: "a", ToolUseID: "tu1", Result: result},
+		{Op: OpAppend, ID: "a", TS: rawMsg(`"t1"`), Content: rawMsg(`[{"type":"text","text":"x"}]`)},
+	}
+	assertLines(t, foldLines(t, records...), linePrefix+`"type":"assistant","ts":"t1","content":[{"id":"tu1","input":{},"name":"A","result":{"output":"o","status":"success"},"type":"tool_use"},{"type":"text","text":"x"}]}`)
+
+	records = append(records, Record{Op: OpResult, ID: "a", ToolUseID: "tu1", Result: result})
+	assertLines(t, foldLines(t, records...), linePrefix+`"type":"assistant","ts":"t1","content":[{"id":"tu1","input":{},"name":"A","result":{"output":"o","status":"success"},"type":"tool_use"},{"text":"x","type":"text"}]}`)
+}
+
 func TestFold_ResultOnNonArrayContentIsIgnored(t *testing.T) {
 	t.Parallel()
 
