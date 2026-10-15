@@ -110,4 +110,40 @@ lines, err := transcript.Decode(full)
 checkpointLines := lines[boundary:]
 ```
 
-There is no writer for the format; only the converters produce it.
+There is no general-purpose writer for the format; the converters and the fold
+produce it.
+
+## Records and fold
+
+A `Record` is one append-only change to a transcript: `message` creates or
+restates a message, `append` adds content blocks to it, `result` sets a
+`tool_use` block's result, `usage` sets token counts, and `drop` hides a
+message. Records are never revised once emitted, so they can be streamed and
+stored as plain appends.
+
+`Fold` applies records in order and returns the transcript lines. A `Folder`
+does the same incrementally: `Apply` validates a whole batch before changing
+anything and returns the IDs of the messages it touched, and `Line(id)` returns
+one message's current line, so a live view can re-render only what changed.
+
+```go
+f := transcript.NewFolder(transcript.Options{Agent: "claude-code", CLIVersion: "0.5.1"})
+touched, err := f.Apply(records)
+if err != nil {
+	return err
+}
+for _, id := range touched {
+	if line, ok := f.Line(id); ok {
+		render(id, line)
+	}
+}
+```
+
+A record's `id` is the fold key: unique and stable within a session. The line
+prints `sourceId`, the agent's own message ID, which can differ from the key
+when the agent reuses an ID for a later, separate message.
+
+For Claude Code, Cursor and Droid, `Convert` runs an adapter that turns the
+native transcript into records and then folds them, so a checkpoint's
+`transcript.jsonl` and a live session folded from the same records match byte
+for byte. The other converters still write lines directly.

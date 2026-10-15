@@ -1,15 +1,14 @@
 // Package transcript converts native agent transcripts into the Entire Transcript
-// Format (also called compact or unified transcripts) and decodes that format
-// into typed lines (Decode, Parse). The format is specified in README.md. This
+// Format (also called compact or unified transcripts), decodes that format
+// into typed lines (Decode, Parse), and folds transcript records into it
+// (Fold, Folder). The format is specified in README.md. This
 // API is versioned with the CLI and may change; consumers should pin a version.
 package transcript
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 )
 
@@ -42,20 +41,6 @@ func newTranscriptLine(opts Options) transcriptLine {
 		Agent:      opts.Agent,
 		CLIVersion: opts.CLIVersion,
 	}
-}
-
-// toolResultJSON is the compact result object inlined into tool_use blocks.
-type toolResultJSON struct {
-	Output     string              `json:"output"`
-	Status     string              `json:"status"`
-	File       *toolResultFileJSON `json:"file,omitempty"`
-	MatchCount int                 `json:"matchCount,omitempty"`
-}
-
-// toolResultFileJSON carries structured file metadata from Read/Edit tool results.
-type toolResultFileJSON struct {
-	FilePath string `json:"filePath"`
-	NumLines int    `json:"numLines,omitempty"`
 }
 
 // userTextBlock is a text block within user message content.
@@ -206,8 +191,8 @@ func normalizeKind(raw map[string]json.RawMessage) string {
 // linePreprocessor transforms a parsed JSONL line before conversion.
 type linePreprocessor func(map[string]json.RawMessage) map[string]json.RawMessage
 
-// parsedEntry is an intermediate representation of a JSONL line used during
-// the two-pass compact conversion.
+// parsedEntry is an intermediate representation of a JSONL line, consumed by
+// jsonlAdapter.
 type parsedEntry struct {
 	kind         string // "user" or "assistant"
 	ts           json.RawMessage
@@ -227,101 +212,38 @@ func compactJSONL(content []byte, opts Options) ([]byte, error) {
 	return compactJSONLWith(content, opts, nil)
 }
 
+// compactJSONLWith runs the records adapter over the whole transcript and
+// folds the records, so checkpoints and live streams share one fold.
 func compactJSONLWith(content []byte, opts Options, preprocess linePreprocessor) ([]byte, error) {
-	base := newTranscriptLine(opts)
-
-	// Pass 1: parse all lines into intermediate entries.
-	entries, err := parseJSONLEntries(content, preprocess)
+	a := newJSONLAdapter(preprocess)
+	records := a.Feed(content)
+	records = append(records, a.Flush()...)
+	out, err := Fold(records, opts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("folding transcript records: %w", err)
 	}
-
-	// Pass 2: merge and emit.
-	var result []byte
-	for i := 0; i < len(entries); i++ {
-		e := entries[i]
-
-		switch e.kind {
-		case TypeAssistant:
-			// Merge consecutive assistant entries with the same message ID.
-			merged := e
-			for i+1 < len(entries) && entries[i+1].kind == TypeAssistant && entries[i+1].id == e.id {
-				i++
-				merged = mergeAssistantEntries(merged, entries[i])
-			}
-
-			// Look ahead for user tool_result entries to inline.
-			if i+1 < len(entries) && entries[i+1].kind == TypeUser && hasToolResults(entries[i+1]) {
-				userEntry := entries[i+1]
-				merged = inlineToolResults(merged, userEntry)
-				i++ // consume the user tool_result entry
-
-				// If the consumed user entry also had text or image content, emit it
-				// as a separate user line after the assistant.
-				if userEntry.userText != "" || len(userEntry.userImages) > 0 {
-					emitAssistant(&result, base, merged)
-					emitUser(&result, base, userEntry)
-					continue
-				}
-			}
-
-			if isEmptyContentArray(merged.content) {
-				continue
-			}
-
-			emitAssistant(&result, base, merged)
-
-		case TypeUser:
-			// User entries that are purely tool results were already consumed
-			// by the assistant look-ahead above. If we reach one here it was
-			// not preceded by an assistant with a matching tool_use, so emit
-			// it only if it has text or image content.
-			if hasToolResults(e) && e.userText == "" && len(e.userImages) == 0 {
-				continue
-			}
-			emitUser(&result, base, e)
-		}
-	}
-
-	return result, nil
+	return out, nil
 }
 
-func emitAssistant(result *[]byte, base transcriptLine, e parsedEntry) {
-	line := base
-	line.Type = TypeAssistant
-	line.TS = e.ts
-	line.ID = e.id
-	line.InputTokens = e.inputTokens
-	line.OutputTokens = e.outputTokens
-	line.Content = e.content
-	appendLine(result, line)
-}
-
-func emitUser(result *[]byte, base transcriptLine, e parsedEntry) {
+// userContentBlocks builds a user line's content: a text block carrying the
+// prompt ID (kept even when empty if there are no images), then the images
+// verbatim.
+func userContentBlocks(e parsedEntry) (json.RawMessage, error) {
 	var blocks []json.RawMessage
-
-	// Text block (with optional prompt ID).
 	if e.userText != "" || len(e.userImages) == 0 {
 		b, err := json.Marshal(userTextBlock{ID: e.userID, Text: e.userText})
 		if err != nil {
-			return
+			return nil, fmt.Errorf("marshaling user text block: %w", err)
 		}
 		blocks = append(blocks, b)
 	}
-
-	// Image blocks passed through verbatim.
 	blocks = append(blocks, e.userImages...)
 
 	contentJSON, err := json.Marshal(blocks)
 	if err != nil {
-		return
+		return nil, fmt.Errorf("marshaling user content: %w", err)
 	}
-
-	line := base
-	line.Type = TypeUser
-	line.TS = e.ts
-	line.Content = contentJSON
-	appendLine(result, line)
+	return contentJSON, nil
 }
 
 // appendLine marshals a transcriptLine and appends it (with newline) to result.
@@ -332,32 +254,6 @@ func appendLine(result *[]byte, line transcriptLine) {
 	}
 	*result = append(*result, b...)
 	*result = append(*result, '\n')
-}
-
-// parseJSONLEntries parses all JSONL lines into intermediate entries,
-// filtering dropped types and malformed lines.
-func parseJSONLEntries(content []byte, preprocess linePreprocessor) ([]parsedEntry, error) {
-	reader := bufio.NewReader(bytes.NewReader(content))
-	var entries []parsedEntry
-
-	for {
-		lineBytes, err := reader.ReadBytes('\n')
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("reading JSONL line: %w", err)
-		}
-
-		if len(bytes.TrimSpace(lineBytes)) > 0 {
-			if e, ok := parseLine(lineBytes, preprocess); ok {
-				entries = append(entries, e)
-			}
-		}
-
-		if err == io.EOF {
-			break
-		}
-	}
-
-	return entries, nil
 }
 
 // parseLine converts a single JSONL line into a parsedEntry.
@@ -440,44 +336,19 @@ func mergeAssistantEntries(a, b parsedEntry) parsedEntry {
 	return merged
 }
 
-// inlineToolResults adds "result" fields to matching tool_use blocks in the
-// assistant entry's content, using outputs from user tool_result entries.
-func inlineToolResults(assistant, user parsedEntry) parsedEntry {
-	var blocks []map[string]json.RawMessage
-	if json.Unmarshal(assistant.content, &blocks) != nil || len(blocks) == 0 {
-		return assistant
-	}
-
-	for _, tr := range user.toolResults {
-		// Find the tool_use block matching this tool_use_id.
-		idx := -1
-		for i := len(blocks) - 1; i >= 0; i-- {
-			if unquote(blocks[i]["type"]) == ContentTypeToolUse {
-				if tr.toolUseID == "" || unquote(blocks[i]["id"]) == tr.toolUseID {
-					idx = i
-					break
-				}
-			}
-		}
-		// No matching tool_use block: do not attach a result to unrelated content.
-		if idx == -1 {
-			continue
-		}
-
-		blocks[idx]["result"] = buildToolResult(tr)
-	}
-
-	if data, err := json.Marshal(blocks); err == nil {
-		assistant.content = data
-	}
-
-	return assistant
-}
-
 // buildToolResult constructs the compact result object for a tool_use block,
 // including optional rich metadata (file, matchCount) when available.
 func buildToolResult(tr toolResultEntry) json.RawMessage {
-	r := toolResultJSON{
+	b, err := json.Marshal(toolResult(tr))
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// toolResult converts a parsed tool result into the compact result shape.
+func toolResult(tr toolResultEntry) *ToolResult {
+	r := &ToolResult{
 		Output:     tr.output,
 		Status:     ToolStatusSuccess,
 		MatchCount: tr.matchCount,
@@ -486,16 +357,12 @@ func buildToolResult(tr toolResultEntry) json.RawMessage {
 		r.Status = ToolStatusError
 	}
 	if tr.file != nil {
-		r.File = &toolResultFileJSON{
+		r.File = &ToolResultFile{
 			FilePath: tr.file.filePath,
 			NumLines: tr.file.numLines,
 		}
 	}
-	b, err := json.Marshal(r)
-	if err != nil {
-		return nil
-	}
-	return b
+	return r
 }
 
 // extractUsageTokens extracts input_tokens and output_tokens from a Claude
