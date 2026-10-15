@@ -1037,6 +1037,104 @@ func TestRemoveHooks_AfterToolWrapperRestoresTool(t *testing.T) {
 	}
 }
 
+// With no user hook to give back, uninstall leaves the tool's wrapper running
+// the placeholder, never a copy of Entire's hook, including in a layout an
+// earlier release left and no install has reclaimed yet.
+func TestRemoveHooks_AfterToolWrapperWithoutUserHook(t *testing.T) {
+	t.Parallel()
+	spec := specFor(t, "commit-msg")
+	wrapper := toolWrapper("commit-msg", "/dev/null")
+	for name, setup := range map[string]func(f *hooksFixture){
+		"before Entire reinstalled": func(f *hooksFixture) {
+			f.install(spec)
+			f.toolInstall(wrapper)
+		},
+		"after Entire reinstalled": func(f *hooksFixture) {
+			f.install(spec)
+			f.toolInstall(wrapper)
+			f.install(spec)
+		},
+		"earlier release already chained to the wrapper": func(f *hooksFixture) {
+			f.write("commit-msg", generateChainedContent(spec.content, spec.name))
+			f.write("commit-msg"+backupSuffix, wrapper)
+			f.write("commit-msg.tool-old", spec.content)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newHooksFixture(t)
+			setup(f)
+
+			if _, err := removeHooks(context.Background(), f.lockRoot, f.root, f.dir, restoreLegacy); err != nil {
+				t.Fatalf("removeHooks: %v", err)
+			}
+
+			assertHooks(t, f, map[string]string{"commit-msg": wrapper, "commit-msg.tool-old": noopMovedHook})
+			for _, name := range []string{"commit-msg" + backupSuffix, "commit-msg.tool-old" + backupSuffix} {
+				if f.exists(name) {
+					t.Errorf("%s left behind", name)
+				}
+			}
+		})
+	}
+}
+
+// The install notice names the user's hook only when the moved copy holds it,
+// and names the older copies a placeholder may have left the user's hook among.
+func TestWrapperReclaimNotice(t *testing.T) {
+	t.Parallel()
+	older := []string{"commit-msg.pre-entire.20261001T170405Z"}
+	for name, tc := range map[string]struct {
+		r          wrapperReclaim
+		older      []string
+		want, deny []string
+	}{
+		"user hook": {
+			r:     wrapperReclaim{userHook: []string{"commit-msg.tool-old"}},
+			older: older,
+			want:  []string{"commit-msg.tool-old", "then your own hook"},
+			deny:  []string{"no longer run"},
+		},
+		"placeholder": {
+			r:    wrapperReclaim{placeholder: []string{"commit-msg.tool-old"}},
+			want: []string{"commit-msg.tool-old", "does nothing"},
+			deny: []string{"your own hook", "no longer run"},
+		},
+		"placeholder with older copies": {
+			r:     wrapperReclaim{placeholder: []string{"commit-msg.tool-old"}},
+			older: older,
+			want:  []string{"does nothing", "no longer run: " + older[0]},
+			deny:  []string{"then your own hook"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := tc.r.notice("commit-msg", tc.older)
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("notice %q lacks %q", got, w)
+				}
+			}
+			for _, d := range tc.deny {
+				if strings.Contains(got, d) {
+					t.Errorf("notice %q says %q", got, d)
+				}
+			}
+		})
+	}
+}
+
+// olderCopiesOf lists only the named hook's older backups.
+func TestOlderCopiesOf(t *testing.T) {
+	t.Parallel()
+	f := newHooksFixture(t)
+	f.write("commit-msg"+backupSuffix+".20261001T170405Z", userHookV1)
+	f.write("prepare-commit-msg"+backupSuffix+".20261001T170405Z", userHookV1)
+	if got := olderCopiesOf(f.root, "commit-msg"); !slices.Equal(got, []string{"commit-msg" + backupSuffix + ".20261001T170405Z"}) {
+		t.Errorf("olderCopiesOf = %v", got)
+	}
+}
+
 // A copy whose write fails must not leave a partial hook behind: keepOlderCopy
 // writes straight to the final name, which would read as a complete version.
 func TestCopyHookFile_FailedWriteLeavesNoPartialFile(t *testing.T) { //nolint:paralleltest // replaces writeHookCopy

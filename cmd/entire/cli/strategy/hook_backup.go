@@ -387,7 +387,7 @@ func reclaimFromPreCommit(root *os.Root, hook string) (bool, error) {
 	}
 	userHookInBackup := hookFileExists(root, backup) &&
 		!isPreCommitWrapper(root, backup, hook) && !carriesEntireMarker(root, backup)
-	err := moveUserHookInto(root, hook, legacy, userHookInBackup, func() error {
+	_, err := moveUserHookInto(root, hook, legacy, userHookInBackup, func() error {
 		if err := root.Remove(legacy); err != nil {
 			return fmt.Errorf("remove Entire's %s: %w", legacy, err)
 		}
@@ -402,32 +402,33 @@ func reclaimFromPreCommit(root *os.Root, hook string) (bool, error) {
 // it finds onto moved again. userHookInBackup says .pre-entire holds the
 // user's hook rather than the wrapper; it is cleared, so the wrapper can be
 // backed up there. With no user hook anywhere, empty decides what moved holds.
-func moveUserHookInto(root *os.Root, hook, moved string, userHookInBackup bool, empty func() error) error {
+// Reports whether moved now holds the user's hook.
+func moveUserHookInto(root *os.Root, hook, moved string, userHookInBackup bool, empty func() error) (bool, error) {
 	backup, keep := hook+backupSuffix, moved+backupSuffix
 	if userHookInBackup {
 		if err := replaceWithCopy(root, backup, keep); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if !hookFileExists(root, keep) {
-		return empty()
+		return false, empty()
 	}
 	if err := replaceWithCopy(root, keep, moved); err != nil {
-		return err
+		return false, err
 	}
 	if userHookInBackup {
 		// Now held by moved and the keep copy; frees .pre-entire for the wrapper.
 		if err := root.Remove(backup); err != nil {
-			return fmt.Errorf("remove %s: %w", backup, err)
+			return false, fmt.Errorf("remove %s: %w", backup, err)
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // noopMovedHook replaces Entire's hook in a file a hook manager's wrapper runs
 // by name when there is no user hook to put there. The file stays because the
 // wrapper may run it without checking that it exists.
-const noopMovedHook = "#!/bin/sh\n# Placeholder left by Entire: another hook manager runs this file, and Entire's hook now runs before that manager's.\nexit 0\n"
+const noopMovedHook = "#!/bin/sh\n# Left by Entire for another hook manager's wrapper to run. It does nothing, and can be deleted once that manager no longer runs it.\nexit 0\n"
 
 // movedHookCopies lists the <hook>.<suffix> files a hook manager other than
 // pre-commit may have moved Entire's hook to: not the backup, its older or
@@ -468,13 +469,13 @@ func runsByName(root *os.Root, name, moved string) bool {
 // the wrapper: the moved copy is Entire's hook again, run a second time. The
 // user's hook those releases rotated away cannot be told from any other older
 // copy, so it stays where it is. Reports the moved copies it changed.
-func reclaimFromWrappers(root *os.Root, hook string) ([]string, error) {
+func reclaimFromWrappers(root *os.Root, hook string) (wrapperReclaim, error) {
+	var reclaimed wrapperReclaim
 	moved, err := movedHookCopies(root, hook)
 	if err != nil {
-		return nil, err
+		return reclaimed, err
 	}
 	backup := hook + backupSuffix
-	var reclaimed []string
 	for _, m := range moved {
 		if !carriesEntireMarker(root, m) {
 			continue
@@ -488,16 +489,60 @@ func reclaimFromWrappers(root *os.Root, hook string) ([]string, error) {
 		default:
 			continue
 		}
-		err := moveUserHookInto(root, hook, m, userHookInBackup, func() error {
+		userHook, err := moveUserHookInto(root, hook, m, userHookInBackup, func() error {
 			_, err := writeHookFile(root, m, noopMovedHook)
 			return err
 		})
 		if err != nil {
 			return reclaimed, err
 		}
-		reclaimed = append(reclaimed, m)
+		if userHook {
+			reclaimed.userHook = append(reclaimed.userHook, m)
+		} else {
+			reclaimed.placeholder = append(reclaimed.placeholder, m)
+		}
 	}
 	return reclaimed, nil
+}
+
+// wrapperReclaim is what reclaimFromWrappers changed: the moved copies that
+// now hold the user's hook, and those that now hold noopMovedHook.
+type wrapperReclaim struct {
+	userHook, placeholder []string
+}
+
+func (r wrapperReclaim) changed() bool {
+	return len(r.userHook) > 0 || len(r.placeholder) > 0
+}
+
+// notice tells the user what reclaimFromWrappers changed for hook. older are
+// hook's older backups: with a placeholder in the moved copy, the user's hook
+// may be one of them, rotated away by a release before reclaimFromWrappers.
+func (r wrapperReclaim) notice(hook string, older []string) string {
+	var b strings.Builder
+	if len(r.userHook) > 0 {
+		fmt.Fprintf(&b, "[entire] Another hook manager had moved Entire's %s hook to %s; Entire's hook runs first again, then that manager's, then your own hook.\n",
+			hook, strings.Join(r.userHook, ", "))
+	}
+	if len(r.placeholder) > 0 {
+		fmt.Fprintf(&b, "[entire] Another hook manager had moved Entire's %s hook to %s; Entire's hook runs first again, then that manager's, which now runs a hook that does nothing there.\n",
+			hook, strings.Join(r.placeholder, ", "))
+		if len(older) > 0 {
+			fmt.Fprintf(&b, "[entire] Older copies of your %s hook no longer run: %s\n", hook, strings.Join(older, ", "))
+		}
+	}
+	return b.String()
+}
+
+// olderCopiesOf lists hook's older backups; a listing failure yields none.
+func olderCopiesOf(root *os.Root, hook string) []string {
+	copies, err := olderHookCopies(root)
+	if err != nil {
+		return nil
+	}
+	return slices.DeleteFunc(copies, func(c string) bool {
+		return !strings.HasPrefix(c, hook+backupSuffix+".")
+	})
 }
 
 // refreshMovedEntireHooks rewrites copies of Entire's hook that a hook
@@ -563,7 +608,9 @@ func restoreLegacy(root *os.Root, hook string) error {
 
 // restoreWrapped undoes reclaimFromWrappers on uninstall: each file a hook
 // manager's wrapper runs by name gets the user's hook back if the manager
-// moved Entire's onto it, and the keep copy goes.
+// moved Entire's onto it, and the keep copy goes. A moved copy of Entire's
+// hook that no install has reclaimed yet becomes noopMovedHook, so the wrapper
+// the caller restores does not go on running Entire's hook.
 func restoreWrapped(root *os.Root, hook string) error {
 	moved, err := movedHookCopies(root, hook)
 	if err != nil {
@@ -584,6 +631,11 @@ func restoreWrapped(root *os.Root, hook string) error {
 			} else {
 				_, err = writeHookFile(root, m, noopMovedHook)
 			}
+		case carriesEntireMarker(root, m) && carriesEntireMarker(root, hook) && runsByName(root, backup, m):
+			// An earlier release already chained to the wrapper, which the
+			// caller restores to the hook path. The user's hook it rotated away
+			// cannot be told from any other older copy.
+			_, err = writeHookFile(root, m, noopMovedHook)
 		case keepExists && sameHookFile(root, keep, m):
 			err = root.Remove(keep)
 		}

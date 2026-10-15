@@ -780,9 +780,15 @@ func installHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string,
 		if err != nil {
 			return installedCount, fmt.Errorf("failed to take %s back from the hook manager that moved it: %w", spec.name, err)
 		}
-		if len(wrapped) > 0 {
-			fmt.Fprintf(stderrWriter, "[entire] Another hook manager had moved Entire's %s hook to %s; Entire's hook runs first again, then that manager's, then your own hook.\n", spec.name, strings.Join(wrapped, ", "))
-			logging.Info(ctx, "git hook reclaimed from a hook manager's wrapper", slog.String("hook", spec.name), slog.String("copies", strings.Join(wrapped, ",")))
+		if wrapped.changed() {
+			var older []string
+			if len(wrapped.placeholder) > 0 {
+				older = olderCopiesOf(root, spec.name)
+			}
+			fmt.Fprint(stderrWriter, wrapped.notice(spec.name, older))
+			logging.Info(ctx, "git hook reclaimed from a hook manager's wrapper", slog.String("hook", spec.name),
+				slog.String("user_hook_copies", strings.Join(wrapped.userHook, ",")),
+				slog.String("placeholder_copies", strings.Join(wrapped.placeholder, ",")))
 		}
 
 		// Back up existing non-Entire hooks. A symlinked hook is one of those:
@@ -958,7 +964,7 @@ func removeHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string, 
 		hookExists := class != hookAbsent
 
 		if err := restore(root, hook); err != nil {
-			removeErrors = append(removeErrors, fmt.Sprintf("restore %s%s: %v", hook, legacySuffix, err))
+			removeErrors = append(removeErrors, fmt.Sprintf("restore copies of %s: %v", hook, err))
 			continue // leave this hook's files as they are, so a retry can finish
 		}
 		// pre-commit reinstalled over Entire's hook: its wrapper is at the path
