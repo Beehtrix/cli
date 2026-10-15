@@ -2,14 +2,15 @@ package cli
 
 import (
 	"context"
-	"github.com/entireio/cli/cmd/entire/cli/proclive"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+	"github.com/entireio/cli/cmd/entire/cli/proclive"
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/stretchr/testify/require"
@@ -45,7 +46,8 @@ func TestSaveAttachSessionState_KeepsTokenOffsetMovedMeanwhile(t *testing.T) {
 		// quietFor is how long the session has had no interaction.
 		quietFor time.Duration
 		// owner is the session's recorded agent process; "" records none,
-		// "dead" an exited one and "alive" this test process.
+		// "alive" this test process and "dead" this process
+		// with a different start time, which reads as an exited one.
 		owner         string
 		wantStart     int
 		wantPendingOK bool
@@ -89,13 +91,16 @@ func TestSaveAttachSessionState_KeepsTokenOffsetMovedMeanwhile(t *testing.T) {
 				CheckpointTokenUsage: &agent.TokenUsage{OutputTokens: tc.pendingOnDisk},
 				LastCheckpointID:     tc.checkpointOnDisk,
 			}
-			switch tc.owner {
-			case "dead":
-				onDisk.Owner = &proclive.Identity{PID: os.Getpid(), Start: "bogus-start-fingerprint"}
-			case "alive":
-				owner, ok := proclive.ResolveOwner()
+			if tc.owner != "" {
+				owner, ok := proclive.IdentityOf(os.Getpid())
 				if !ok {
-					continue // no stable process owner resolvable in this environment
+					if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+						t.Fatalf("%s: cannot fingerprint the test process", tc.name)
+					}
+					continue // process liveness is unknown on this platform
+				}
+				if tc.owner == "dead" {
+					owner.Start = "not-" + owner.Start
 				}
 				onDisk.Owner = &owner
 			}
