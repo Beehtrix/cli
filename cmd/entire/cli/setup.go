@@ -1833,7 +1833,11 @@ func runRemoveAgent(ctx context.Context, w io.Writer, name string) error {
 		return runRemoveRetiredGeminiHooks(ctx, w)
 	}
 
-	discoverNamedExternalAgent(ctx, types.AgentName(name))
+	// Unlike discoverNamedExternalAgent, keep the error: a plugin that is on
+	// $PATH but cannot register would otherwise read as a misspelled name.
+	if err := external.DiscoverAndRegisterNamedAlways(ctx, types.AgentName(name)); err != nil {
+		return fmt.Errorf("agent %s: %w", name, err)
+	}
 	ag, err := agent.Get(types.AgentName(name))
 	if err != nil {
 		printWrongAgentError(w, name)

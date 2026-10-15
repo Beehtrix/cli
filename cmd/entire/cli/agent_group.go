@@ -108,7 +108,9 @@ Examples:
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
-			discoverNamedExternalAgent(cmd.Context(), types.AgentName(name))
+			if err := external.DiscoverAndRegisterNamedAlways(cmd.Context(), types.AgentName(name)); err != nil {
+				return fmt.Errorf("agent %s: %w", name, err)
+			}
 			ag, err := agent.Get(types.AgentName(name))
 			if err != nil {
 				printWrongAgentError(cmd.OutOrStdout(), name)

@@ -196,3 +196,38 @@ func TestRunAgentList_DoesNotRunPluginsWithoutOptIn(t *testing.T) {
 		t.Errorf("agent list executed a plugin without external_agents enabled, exec log:\n%s", log)
 	}
 }
+
+// TestAgentAdd_ReportsBrokenExternalAgent pins that a plugin on $PATH whose
+// info call fails is reported as such, not as a misspelled agent name.
+func TestAgentAdd_ReportsBrokenExternalAgent(t *testing.T) {
+	// Cannot use t.Parallel: mutates $PATH and cwd.
+	const agentName = "ext-agent-broken-test"
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	setupTestRepo(t)
+	writeSettings(t, testSettingsEnabled)
+	externalDir := t.TempDir()
+	script := "#!/bin/sh\necho 'plugin exploded' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(externalDir, "entire-agent-"+agentName), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", externalDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cmd := newAgentAddCmd()
+	cmd.SetArgs([]string{agentName})
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stdout)
+	cmd.SetContext(context.Background())
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatalf("agent add of a broken plugin succeeded\noutput:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "Unknown agent") || strings.Contains(err.Error(), "wrong agent name") {
+		t.Errorf("broken plugin reported as a misspelled name: %v\noutput:\n%s", err, stdout.String())
+	}
+	if !strings.Contains(err.Error(), agentName) {
+		t.Errorf("error should name the agent, got: %v", err)
+	}
+}
