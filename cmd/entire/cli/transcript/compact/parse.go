@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/entireio/cli/transcript"
+	transcriptlib "github.com/entireio/cli/transcript"
 )
 
 // Retain every original wire field so the CLI reader's validation is unchanged.
@@ -74,7 +74,7 @@ func BuildCondensedEntries(content []byte) ([]CondensedEntry, error) {
 		}
 
 		switch line.Type {
-		case transcript.TypeUser:
+		case transcriptlib.TypeUser:
 			var parts []string
 			for _, block := range blocks {
 				var text string
@@ -83,10 +83,10 @@ func BuildCondensedEntries(content []byte) ([]CondensedEntry, error) {
 				}
 			}
 			if len(parts) > 0 {
-				entries = append(entries, CondensedEntry{Type: transcript.TypeUser, Content: strings.Join(parts, "\n")})
+				entries = append(entries, CondensedEntry{Type: transcriptlib.TypeUser, Content: strings.Join(parts, "\n")})
 			}
 
-		case transcript.TypeAssistant:
+		case transcriptlib.TypeAssistant:
 			for _, block := range blocks {
 				var blockType string
 				if err := json.Unmarshal(block["type"], &blockType); err != nil {
@@ -97,7 +97,7 @@ func BuildCondensedEntries(content []byte) ([]CondensedEntry, error) {
 				case "text":
 					var text string
 					if err := json.Unmarshal(block["text"], &text); err == nil && text != "" {
-						entries = append(entries, CondensedEntry{Type: transcript.TypeAssistant, Content: text})
+						entries = append(entries, CondensedEntry{Type: transcriptlib.TypeAssistant, Content: text})
 					}
 				case "tool_use":
 					var toolName string
