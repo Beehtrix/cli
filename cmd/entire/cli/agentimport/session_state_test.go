@@ -97,7 +97,7 @@ func TestRun_WritesSessionStateExceptDryRun(t *testing.T) {
 				files: []SessionFile{{Path: transcript, SessionID: sid}},
 				turns: []Turn{{UUID: "a", Prompt: "hello", CreatedAt: time.Now().Add(-time.Hour)}},
 			}
-			if _, err := Run(ctx, repo, imp, Options{RepoRoot: dir, Now: time.Now(), DryRun: tc.dryRun}); err != nil {
+			if _, err := Run(ctx, repo, imp, Options{LinkCommitSHA: repoHeadSHA(t, repo), RepoRoot: dir, Now: time.Now(), DryRun: tc.dryRun}); err != nil {
 				t.Fatalf("Run: %v", err)
 			}
 
@@ -113,7 +113,7 @@ func TestRun_WritesSessionStateExceptDryRun(t *testing.T) {
 }
 
 func TestWriteSessionState_CreatesListableImportedState(t *testing.T) {
-	importRepo(t)
+	dir := importRepo(t)
 	ctx := context.Background()
 	started := time.Now().Add(-48 * time.Hour)
 	ended := started.Add(30 * time.Minute)
@@ -123,7 +123,7 @@ func TestWriteSessionState_CreatesListableImportedState(t *testing.T) {
 		{UUID: "b", Prompt: "latest prompt", Model: "claude-x", CreatedAt: ended, Tokens: &types.TokenUsage{InputTokens: 3, OutputTokens: 2}},
 	}
 
-	if err := writeSessionState(ctx, fakeImporter{}, sf, turns); err != nil {
+	if err := writeSessionState(ctx, fakeImporter{}, sf, turns, DeriveCheckpointID(sf.SessionID, "b"), dir); err != nil {
 		t.Fatalf("writeSessionState: %v", err)
 	}
 
@@ -155,12 +155,12 @@ func TestWriteSessionState_CreatesListableImportedState(t *testing.T) {
 }
 
 func TestWriteSessionState_CollapsesAndTruncatesLastPrompt(t *testing.T) {
-	importRepo(t)
+	dir := importRepo(t)
 	ctx := context.Background()
 
 	longPrompt := "please   fix\n\n\tthe   login   bug " + strings.Repeat("x", 300)
 	sf := SessionFile{Path: "session.jsonl", SessionID: "claude-long-prompt-session"}
-	if err := writeSessionState(ctx, fakeImporter{}, sf, []Turn{{UUID: "a", Prompt: longPrompt, CreatedAt: time.Now()}}); err != nil {
+	if err := writeSessionState(ctx, fakeImporter{}, sf, []Turn{{UUID: "a", Prompt: longPrompt, CreatedAt: time.Now()}}, DeriveCheckpointID(sf.SessionID, "a"), dir); err != nil {
 		t.Fatalf("writeSessionState: %v", err)
 	}
 
@@ -177,7 +177,7 @@ func TestWriteSessionState_CollapsesAndTruncatesLastPrompt(t *testing.T) {
 }
 
 func TestWriteSessionState_DoesNotClobberLiveSession(t *testing.T) {
-	importRepo(t)
+	dir := importRepo(t)
 	ctx := context.Background()
 
 	const sid = "claude-live-session"
@@ -190,7 +190,7 @@ func TestWriteSessionState_DoesNotClobberLiveSession(t *testing.T) {
 	}
 
 	sf := SessionFile{Path: "session.jsonl", SessionID: sid}
-	if err := writeSessionState(ctx, fakeImporter{}, sf, []Turn{{UUID: "a", Prompt: "p", CreatedAt: time.Now()}}); err != nil {
+	if err := writeSessionState(ctx, fakeImporter{}, sf, []Turn{{UUID: "a", Prompt: "p", CreatedAt: time.Now()}}, DeriveCheckpointID(sf.SessionID, "a"), dir); err != nil {
 		t.Fatalf("writeSessionState: %v", err)
 	}
 
@@ -201,12 +201,12 @@ func TestWriteSessionState_DoesNotClobberLiveSession(t *testing.T) {
 }
 
 func TestWriteSessionState_SurvivesListingWhenOld(t *testing.T) {
-	importRepo(t)
+	dir := importRepo(t)
 	ctx := context.Background()
 
 	old := time.Now().Add(-30 * 24 * time.Hour) // 30 days > 7-day stale threshold
 	sf := SessionFile{Path: "session.jsonl", SessionID: "claude-old-session"}
-	if err := writeSessionState(ctx, fakeImporter{}, sf, []Turn{{UUID: "a", Prompt: "p", CreatedAt: old}}); err != nil {
+	if err := writeSessionState(ctx, fakeImporter{}, sf, []Turn{{UUID: "a", Prompt: "p", CreatedAt: old}}, DeriveCheckpointID(sf.SessionID, "a"), dir); err != nil {
 		t.Fatalf("writeSessionState: %v", err)
 	}
 

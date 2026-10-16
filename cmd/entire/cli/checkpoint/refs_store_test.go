@@ -160,19 +160,6 @@ func TestGitRefsStore_BackfillFetchesMissingRef(t *testing.T) {
 				assert.Equal(t, []byte("finalized"), content.Transcript)
 			},
 		},
-		"attribution": {
-			makeReq: func(cid id.CheckpointID) WriteRequest {
-				return CheckpointAttribution{CheckpointID: cid, Attribution: &Attribution{AgentLines: 3}}
-			},
-			verify: func(t *testing.T, store *gitRefsStore, cid id.CheckpointID) {
-				t.Helper()
-				summary, err := store.Read(context.Background(), cid)
-				require.NoError(t, err)
-				require.NotNil(t, summary)
-				require.NotNil(t, summary.CombinedAttribution)
-				assert.Equal(t, 3, summary.CombinedAttribution.AgentLines)
-			},
-		},
 	}
 
 	for name, tc := range backfills {
@@ -570,6 +557,28 @@ func TestHydrateListedCheckpointInfo_MatchesLocalList(t *testing.T) {
 	assert.Equal(t, local, hydrated)
 }
 
+// A remote-discovered stub carries no links until hydrated; hydration must
+// copy them, as local List does, or a commit linked by attach in another clone
+// looks unlinked.
+func TestHydrateListedCheckpointInfo_CopiesLinkedCommits(t *testing.T) {
+	t.Parallel()
+
+	store := newRefsStore(t)
+	cid := id.MustCheckpointID("01KVBJCWYA4YW6J5M9GP655HZN")
+	links := []LinkedCommit{{SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Repo: "github/o/r"}}
+	require.NoError(t, store.Write(context.Background(), Session{
+		CheckpointID:  cid,
+		SessionID:     "sess-linked",
+		Strategy:      "manual-commit",
+		Transcript:    redact.AlreadyRedacted([]byte("transcript")),
+		LinkedCommits: links,
+	}))
+
+	hydrated := HydrateListedCheckpointInfo(context.Background(), store, remoteDiscoveredInfo(cid))
+	assert.Equal(t, links, hydrated.LinkedCommits)
+	assert.Equal(t, []id.CheckpointID{cid}, CheckpointsLinkedTo([]CheckpointInfo{hydrated}, links[0].SHA))
+}
+
 func TestGitRefsStore_WriteAllVariantsAndRead(t *testing.T) {
 	t.Parallel()
 	store := newRefsStore(t)
@@ -586,9 +595,6 @@ func TestGitRefsStore_WriteAllVariantsAndRead(t *testing.T) {
 	require.NoError(t, store.Write(ctx, SessionSummary{
 		CheckpointID: cid, Summary: &Summary{Intent: "intent-x", Outcome: "outcome-y"},
 	}))
-	require.NoError(t, store.Write(ctx, CheckpointAttribution{
-		CheckpointID: cid, Attribution: &Attribution{AgentLines: 7, AgentPercentage: 70},
-	}))
 
 	// The per-checkpoint ref exists at the sharded name.
 	_, err := store.repo.Reference(mustRefName(t, cid), true)
@@ -598,8 +604,6 @@ func TestGitRefsStore_WriteAllVariantsAndRead(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, summary)
 	require.Len(t, summary.Sessions, 1)
-	require.NotNil(t, summary.CombinedAttribution)
-	assert.Equal(t, 7, summary.CombinedAttribution.AgentLines)
 
 	content, err := store.ReadSessionContent(ctx, cid, 0)
 	require.NoError(t, err)
@@ -729,9 +733,6 @@ func TestGitRefsStore_BackfillUnknownCheckpointNotFound(t *testing.T) {
 	err = store.Write(ctx, SessionSummary{CheckpointID: cid, Summary: &Summary{Intent: "x"}})
 	require.ErrorIs(t, err, ErrCheckpointNotFound)
 
-	err = store.Write(ctx, CheckpointAttribution{CheckpointID: cid, Attribution: &Attribution{AgentLines: 1}})
-	require.ErrorIs(t, err, ErrCheckpointNotFound)
-
 	// Read of an absent checkpoint is (nil, nil) per the contract.
 	summary, err := store.Read(ctx, cid)
 	require.NoError(t, err)
@@ -763,26 +764,29 @@ func TestGitRefsStore_WriteRefusesCanceledContext(t *testing.T) {
 		"a write refused for cancellation must not leave a checkpoint ref behind")
 }
 
-// TestGitRefsStore_EnqueuesForPushDuringShutdown pins that a ref written during
-// shutdown is still queued for push — see enqueueForPush for why dropping the
-// record would strand the checkpoint locally forever.
-func TestGitRefsStore_EnqueuesForPushDuringShutdown(t *testing.T) {
+// TestGitRefsStore_EnqueuesAfterCancellationFollowingCAS pins that cancellation
+// after a successful ref update does not drop the push-queue record.
+func TestGitRefsStore_EnqueuesAfterCancellationFollowingCAS(t *testing.T) {
 	t.Parallel()
 	store := newRefsStore(t)
 	cid := id.MustCheckpointID("a1b2c3d4e5f6")
+	refName := mustRefName(t, cid)
 
 	head, err := store.repo.Head()
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	repoRoot, _, err := repositoryDirs(store.repo)
+	require.NoError(t, err)
+	require.NoError(t, casUpdateRef(ctx, repoRoot, refName, head.Hash(), plumbing.ZeroHash))
 
-	require.NoError(t, store.setRef(ctx, cid, head.Hash()))
+	cancel()
+	store.enqueueForPush(ctx, refName)
 
 	q, err := PushQueueForRepo(context.Background(), store.repo)
 	require.NoError(t, err)
 	refs, err := q.Drain()
 	require.NoError(t, err)
-	assert.Contains(t, refs, mustRefName(t, cid),
-		"a ref written during shutdown must still be queued for push")
+	assert.Contains(t, refs, refName,
+		"a successful CAS must still be queued when cancellation follows it")
 }

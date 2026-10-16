@@ -34,7 +34,6 @@ func TestSHA256Repository_EnableAndFirstCheckpoint(t *testing.T) {
 	// git-refs.
 	output := env.RunCLI(
 		"enable",
-		"--no-github",
 		"--agent", agentClaudeCode,
 		"--telemetry=false",
 		"--checkpoint-backend", "branch",
@@ -73,11 +72,11 @@ func TestSHA256Repository_EnableAndFirstCheckpoint(t *testing.T) {
 		t.Fatalf("session StepCount after first checkpoint = %#v, want 1", state)
 	}
 
-	shadowBranch := env.GetShadowBranchNameForCommit(initialHead)
-	shadowHead := gitOutput(t, env.RepoDir, "rev-parse", shadowBranch)
-	requireHexLen(t, "shadow checkpoint commit", shadowHead)
+	// The recorded turn-end content hash is in the repository's object format.
+	recorded := env.AssertTurnEndRecorded(sess.ID, "main.go")
+	requireHexLen(t, "recorded file hash", recorded.TouchedFileHashes["main.go"])
 
-	env.GitCommitWithShadowHooks("Add SHA-256 main", "main.go")
+	env.GitCommitWithHooks("Add SHA-256 main", "main.go")
 	userHead := gitOutput(t, env.RepoDir, "rev-parse", "HEAD")
 	requireHexLen(t, "user commit", userHead)
 	if userHead == initialHead {
@@ -123,16 +122,7 @@ func requireGitSHA256Support(t *testing.T) {
 func gitOutput(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 
-	cmd := exec.Command("git", args...) //nolint:noctx // test helper
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	cmd.Env = testutil.GitIsolatedEnv()
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
-	}
-	return strings.TrimSpace(string(output))
+	return strings.TrimSpace(testutil.RunGit(t, dir, args...))
 }
 
 const sha256HexLen = 64

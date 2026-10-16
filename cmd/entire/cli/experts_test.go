@@ -15,47 +15,55 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/experimental"
 
 	"charm.land/lipgloss/v2"
+	"github.com/entireio/cli/cmd/entire/cli/auth"
 	"github.com/entireio/cli/cmd/entire/cli/palette"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/internal/coreapi"
 )
 
-// expertsTestRepoULID is the id the fake resolves "acme/widget" to via the
-// accessible-repo list, so path assertions can reference the retargeted
+// expertsTestRepoULID is the processing placement id the fake control plane
+// resolves "acme/widget" to, so path assertions can reference the retargeted
 // /api/v1/repos/{id}/experts route.
 const expertsTestRepoULID = "0123456789ABCDEFGHJKMNPQRS"
 
-var defaultExpertsReposBody = `{"repos":[{"id":"` + expertsTestRepoULID + `","full_name":"acme/widget"}],"from_db":true}`
+const (
+	expertsTestClusterSlug = "cell1"
+	expertsTestClusterHost = "us.entire.io"
+	expertsTestCellAPIURL  = "https://cell.example.test"
+)
 
-type fakeExpertsClient struct {
-	status     int
-	body       string
-	reposBody  string   // GET /api/v1/repos body; defaults to acme/widget -> expertsTestRepoULID
-	reposPages []string // when set, paginated GET /api/v1/repos responses in order
-
-	gotPath     string
-	gotBody     any
-	gotGetPath  string
-	gotGetPaths []string
+func expertsTestCluster() coreapi.Cluster {
+	return coreapi.Cluster{
+		Slug:         expertsTestClusterSlug,
+		Jurisdiction: "us",
+		PublicUrl:    "https://" + expertsTestClusterHost,
+		ApiUrl:       coreapi.NewOptString(expertsTestCellAPIURL),
+	}
 }
 
-// Get serves the accessible-repo discovery list used to resolve owner/repo -> ULID.
-func (f *fakeExpertsClient) Get(_ context.Context, path string) (*http.Response, error) {
-	f.gotGetPath = path
-	f.gotGetPaths = append(f.gotGetPaths, path)
-	var body string
-	switch {
-	case len(f.reposPages) > 0:
-		body = f.reposPages[0]
-		f.reposPages = f.reposPages[1:]
-	case f.reposBody != "":
-		body = f.reposBody
-	default:
-		body = defaultExpertsReposBody
+// withExpertsFakeCellCore wires the control-plane resolution both --repo forms
+// need: resolveRepoCellPlacement for owner/repo ("acme/widget" -> placement id
+// expertsTestRepoULID on expertsTestClusterSlug), and resolveRepoCellTarget for
+// a bare ULID (GetRepo -> expertsTestClusterHost).
+func withExpertsFakeCellCore(t *testing.T) *fakeCellCore {
+	t.Helper()
+	f := &fakeCellCore{
+		repos: reposOutput(repoIndexFixture("acme/widget", expertsTestRepoULID,
+			placementFixture{id: expertsTestRepoULID, slug: expertsTestClusterSlug})),
+		clusters: []coreapi.Cluster{expertsTestCluster()},
+		repo:     &coreapi.Repo{ID: expertsTestRepoULID, ClusterHost: coreapi.NewOptString(expertsTestClusterHost)},
 	}
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Body:       io.NopCloser(strings.NewReader(body)),
-	}, nil
+	withFakeCellCore(t, f)
+	return f
+}
+
+type fakeExpertsClient struct {
+	status int
+	body   string
+
+	gotPath   string
+	gotBody   any
+	gotTarget *auth.CellTarget
 }
 
 func (f *fakeExpertsClient) Post(_ context.Context, path string, body any) (*http.Response, error) {
@@ -69,6 +77,18 @@ func (f *fakeExpertsClient) Post(_ context.Context, path string, body any) (*htt
 		StatusCode: status,
 		Body:       io.NopCloser(strings.NewReader(f.body)),
 	}, nil
+}
+
+// withExpertsFakeClient wires the entire-api cell client seam to fake, and the
+// control plane so both --repo forms (owner/repo, ULID) resolve successfully.
+func withExpertsFakeClient(t *testing.T, fake *fakeExpertsClient) {
+	t.Helper()
+	withExpertsFakeCellCore(t)
+	restore := setExpertsClientFactoryForTest(t, func(_ context.Context, _ bool, target *auth.CellTarget) (expertsAPIClient, error) {
+		fake.gotTarget = target
+		return fake, nil
+	})
+	t.Cleanup(restore)
 }
 
 func expertsSuccessBody() string {
@@ -139,7 +159,9 @@ func TestExpertsCommandIsExperimentalAndListedInLabs(t *testing.T) {
 
 func TestExpertsCommandSendsQueryAndPrintsJSON(t *testing.T) {
 	fake := &fakeExpertsClient{body: expertsSuccessBody()}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
+	cellFake := withExpertsFakeCellCore(t)
+	restore := setExpertsClientFactoryForTest(t, func(_ context.Context, _ bool, target *auth.CellTarget) (expertsAPIClient, error) {
+		fake.gotTarget = target
 		return fake, nil
 	})
 	defer restore()
@@ -153,12 +175,16 @@ func TestExpertsCommandSendsQueryAndPrintsJSON(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("execute experts: %v", err)
 	}
-	if fake.gotPath != expertsReposListPath+"/"+expertsTestRepoULID+"/experts" {
+	if fake.gotPath != expertsAPIReposPath+"/"+expertsTestRepoULID+"/experts" {
 		t.Fatalf("path = %q", fake.gotPath)
 	}
-	if fake.gotGetPath != expertsReposListPath {
-		t.Fatalf("owner/repo should resolve via GET %s, got %q", expertsReposListPath, fake.gotGetPath)
+	if cellFake.lastListReposParams.Filter.Or("") != "acme/widget" {
+		t.Fatalf("control-plane repo lookup Filter = %q, want acme/widget", cellFake.lastListReposParams.Filter.Or(""))
 	}
+	if fake.gotTarget == nil || fake.gotTarget.BaseURL != expertsTestCellAPIURL {
+		t.Fatalf("cell target = %#v", fake.gotTarget)
+	}
+
 	body, ok := fake.gotBody.(expertsRequest)
 	if !ok {
 		t.Fatalf("body type = %T", fake.gotBody)
@@ -184,10 +210,7 @@ func TestExpertsCommandSendsQueryAndPrintsJSON(t *testing.T) {
 
 func TestExpertsCommandPrintsAgentCenteredEvidence(t *testing.T) {
 	fake := &fakeExpertsClient{body: expertsSuccessBody()}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
+	withExpertsFakeClient(t, fake)
 
 	root := NewRootCmd()
 	var out bytes.Buffer
@@ -261,10 +284,7 @@ func TestExpertsCommandUsesStagedFilesAsScopes(t *testing.T) {
 	t.Cleanup(paths.ClearWorktreeRootCache)
 
 	fake := &fakeExpertsClient{body: `{"repo_full_name":"acme/widget","scopes":["billing/webhooks/sender.go"],"query":null,"branch":"main","source":"db","profiles":[]}`}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
+	withExpertsFakeClient(t, fake)
 
 	root := NewRootCmd()
 	var out bytes.Buffer
@@ -303,10 +323,7 @@ func TestExpertsCommandUsesStagedDeletionsAsScopes(t *testing.T) {
 	t.Cleanup(paths.ClearWorktreeRootCache)
 
 	fake := &fakeExpertsClient{body: `{"repo_full_name":"acme/widget","scopes":["billing/webhooks/sender.go"],"query":null,"branch":"main","source":"db","profiles":[]}`}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
+	withExpertsFakeClient(t, fake)
 
 	root := NewRootCmd()
 	var out bytes.Buffer
@@ -343,10 +360,7 @@ func TestExpertsCommandResolvesRepoRootPathFromSubdirectory(t *testing.T) {
 	t.Cleanup(paths.ClearWorktreeRootCache)
 
 	fake := &fakeExpertsClient{body: `{"repo_full_name":"acme/widget","scopes":["cmd/entire/cli/experts.go"],"query":null,"branch":"main","source":"db","profiles":[]}`}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
+	withExpertsFakeClient(t, fake)
 
 	root := NewRootCmd()
 	var out bytes.Buffer
@@ -385,10 +399,7 @@ func TestExpertsCommandResolvesCWDRelativePathFromSubdirectory(t *testing.T) {
 	t.Cleanup(paths.ClearWorktreeRootCache)
 
 	fake := &fakeExpertsClient{body: `{"repo_full_name":"acme/widget","scopes":["cmd/entire/cli/experts.go"],"query":null,"branch":"main","source":"db","profiles":[]}`}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
+	withExpertsFakeClient(t, fake)
 
 	root := NewRootCmd()
 	var out bytes.Buffer
@@ -410,10 +421,7 @@ func TestExpertsCommandResolvesCWDRelativePathFromSubdirectory(t *testing.T) {
 
 func TestExpertsCommandTreatsPathLikeRepoOverrideArgAsScope(t *testing.T) {
 	fake := &fakeExpertsClient{body: `{"repo_full_name":"acme/widget","scopes":["api/deleted.go"],"query":null,"branch":"main","source":"db","profiles":[]}`}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
+	withExpertsFakeClient(t, fake)
 
 	root := NewRootCmd()
 	var out bytes.Buffer
@@ -443,10 +451,7 @@ func TestExpertsCommandRelativizesAbsoluteDeletedPathScope(t *testing.T) {
 	t.Cleanup(paths.ClearWorktreeRootCache)
 
 	fake := &fakeExpertsClient{body: `{"repo_full_name":"acme/widget","scopes":["api/deleted.go"],"query":null,"branch":"main","source":"db","profiles":[]}`}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
+	withExpertsFakeClient(t, fake)
 
 	root := NewRootCmd()
 	var out bytes.Buffer
@@ -489,10 +494,7 @@ func TestExpertsCommandRelativizesDeletedPathScopeFromSubdirectory(t *testing.T)
 	t.Cleanup(paths.ClearWorktreeRootCache)
 
 	fake := &fakeExpertsClient{body: `{"repo_full_name":"acme/widget","scopes":["cmd/entire/cli/deleted.go"],"query":null,"branch":"main","source":"db","profiles":[]}`}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
+	withExpertsFakeClient(t, fake)
 
 	root := NewRootCmd()
 	var out bytes.Buffer
@@ -528,10 +530,7 @@ func TestExpertsCommandAcceptsCaseInsensitiveRepoOverrideForLocalScope(t *testin
 	t.Cleanup(paths.ClearWorktreeRootCache)
 
 	fake := &fakeExpertsClient{body: `{"repo_full_name":"acme/widget","scopes":["cmd/"],"query":null,"branch":"main","source":"db","profiles":[]}`}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
+	withExpertsFakeClient(t, fake)
 
 	root := NewRootCmd()
 	var out bytes.Buffer
@@ -568,11 +567,8 @@ func TestExpertsCommandRejectsMismatchedRepoOverrideForLocalScope(t *testing.T) 
 	paths.ClearWorktreeRootCache()
 	t.Cleanup(paths.ClearWorktreeRootCache)
 
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return &fakeExpertsClient{}, nil
-	})
-	defer restore()
-
+	// The mismatch is caught before cell resolution runs, so no control-plane
+	// or entire-api client seam is needed here.
 	root := NewRootCmd()
 	var out bytes.Buffer
 	root.SetOut(&out)
@@ -587,10 +583,7 @@ func TestExpertsCommandRejectsMismatchedRepoOverrideForLocalScope(t *testing.T) 
 
 func TestExpertsCommandDoesNotRewritePathScope503AsCodeSearch(t *testing.T) {
 	fake := &fakeExpertsClient{status: http.StatusServiceUnavailable, body: `{"error":"Database unavailable"}`}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
+	withExpertsFakeClient(t, fake)
 
 	root := NewRootCmd()
 	var out bytes.Buffer
@@ -613,10 +606,7 @@ func TestExpertsCommandDoesNotRewritePathScope503AsCodeSearch(t *testing.T) {
 // (not the raw "fetch experts: API error" wrap).
 func TestExpertsCommandQuery503ShowsCodeSearchMessage(t *testing.T) {
 	fake := &fakeExpertsClient{status: http.StatusServiceUnavailable, body: `{"error":"Service Unavailable"}`}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
+	withExpertsFakeClient(t, fake)
 
 	root := NewRootCmd()
 	var out bytes.Buffer
@@ -656,46 +646,11 @@ func TestParseGitStagedScopeLinesNormalizesCRLF(t *testing.T) {
 	}
 }
 
-func TestResolveExpertsRepoIDPaginatesAccessibleRepoList(t *testing.T) {
-	const otherULID = "0123456789ABCDEFGHJKMNPR"
-	fake := &fakeExpertsClient{
-		reposPages: []string{
-			`{"repos":[{"id":"` + otherULID + `","full_name":"other/repo"}],"next_page_token":"page2"}`,
-			`{"repos":[{"id":"` + expertsTestRepoULID + `","full_name":"acme/widget"}]}`,
-		},
-		body: `{"repo_full_name":"acme/widget","scopes":["api/x.go"],"query":null,"branch":"main","source":"db","profiles":[]}`,
-	}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
-		return fake, nil
-	})
-	defer restore()
-
-	root := NewRootCmd()
-	var out bytes.Buffer
-	root.SetOut(&out)
-	root.SetErr(&out)
-	root.SetArgs([]string{"experts", "api/x.go", "--repo", "acme/widget", "--json"})
-
-	if err := root.Execute(); err != nil {
-		t.Fatalf("execute experts with paginated repo list: %v", err)
-	}
-	if len(fake.gotGetPaths) != 2 {
-		t.Fatalf("GET paths = %#v, want two paginated requests", fake.gotGetPaths)
-	}
-	if fake.gotGetPaths[0] != expertsReposListPath {
-		t.Fatalf("first GET = %q", fake.gotGetPaths[0])
-	}
-	if fake.gotGetPaths[1] != expertsReposListPath+"?page_token=page2" {
-		t.Fatalf("second GET = %q", fake.gotGetPaths[1])
-	}
-	if fake.gotPath != expertsReposListPath+"/"+expertsTestRepoULID+"/experts" {
-		t.Fatalf("path = %q", fake.gotPath)
-	}
-}
-
-func TestExpertsCommandAcceptsRepoULIDWithoutResolution(t *testing.T) {
+func TestExpertsCommandAcceptsRepoULIDWithoutRepoIndexLookup(t *testing.T) {
 	fake := &fakeExpertsClient{body: `{"repo_full_name":"acme/widget","scopes":["api/x.go"],"query":null,"branch":"main","source":"db","profiles":[]}`}
-	restore := setExpertsClientFactoryForTest(t, func(context.Context, bool, string, string) (expertsAPIClient, error) {
+	cellFake := withExpertsFakeCellCore(t)
+	restore := setExpertsClientFactoryForTest(t, func(_ context.Context, _ bool, target *auth.CellTarget) (expertsAPIClient, error) {
+		fake.gotTarget = target
 		return fake, nil
 	})
 	defer restore()
@@ -709,12 +664,158 @@ func TestExpertsCommandAcceptsRepoULIDWithoutResolution(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("execute experts with ULID repo: %v", err)
 	}
-	// A ULID --repo addresses the data API directly — no accessible-repo lookup.
-	if fake.gotGetPath != "" {
-		t.Fatalf("a ULID --repo should skip resolution, but GET %q was called", fake.gotGetPath)
+	// A ULID --repo addresses the data API directly — no control-plane
+	// repo-index lookup (that's the owner/repo-only path).
+	if cellFake.lastListReposParams.Filter.Or("") != "" {
+		t.Fatalf("a ULID --repo should skip the repo-index lookup, but Filter=%q was set", cellFake.lastListReposParams.Filter.Or(""))
 	}
-	if fake.gotPath != expertsReposListPath+"/"+expertsTestRepoULID+"/experts" {
-		t.Fatalf("path = %q, want %s/%s/experts", fake.gotPath, expertsReposListPath, expertsTestRepoULID)
+	if fake.gotPath != expertsAPIReposPath+"/"+expertsTestRepoULID+"/experts" {
+		t.Fatalf("path = %q, want %s/%s/experts", fake.gotPath, expertsAPIReposPath, expertsTestRepoULID)
+	}
+	if fake.gotTarget == nil || fake.gotTarget.BaseURL != expertsTestCellAPIURL {
+		t.Fatalf("cell target = %#v, want BaseURL %s", fake.gotTarget, expertsTestCellAPIURL)
+	}
+}
+
+// TestExpertsCommandRepoNotOnboarded covers the not-onboarded shape of
+// cell-placement resolution failure surfacing through renderRepoNotOnboarded
+// rather than a raw/double-wrapped error.
+func TestExpertsCommandRepoNotOnboarded(t *testing.T) {
+	withFakeCellCore(t, &fakeCellCore{
+		repos: reposOutput(), // zero rows: not onboarded
+	})
+
+	root := NewRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"experts", "api/x.go", "--repo", "acme/widget"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected an error for a not-onboarded repo")
+	}
+	if !strings.Contains(out.String(), "not onboarded to Entire") {
+		t.Fatalf("expected the not-onboarded message, got:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "resolve experts cell") {
+		t.Fatalf("not-onboarded should render its own message, not the raw wrap:\n%s", out.String())
+	}
+}
+
+// TestExpertsCommandFailedPlacement covers the failed/suspended-placement
+// shape of cell-placement resolution failure, distinct from not-onboarded.
+func TestExpertsCommandFailedPlacement(t *testing.T) {
+	withFakeCellCore(t, &fakeCellCore{
+		repos: reposOutput(repoIndexFixture("acme/widget", expertsTestRepoULID,
+			placementFixture{id: expertsTestRepoULID, slug: expertsTestClusterSlug, status: coreapi.RepoPlacementStatusFailed})),
+		clusters: []coreapi.Cluster{expertsTestCluster()},
+	})
+
+	root := NewRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"experts", "api/x.go", "--repo", "acme/widget"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected an error for a failed placement")
+	}
+	if !strings.Contains(err.Error(), "processing placement is failed") {
+		t.Fatalf("expected the failed-placement message, got: %v\nout:\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "not onboarded to Entire") {
+		t.Fatalf("a failed placement is not the not-onboarded case:\n%s", out.String())
+	}
+}
+
+// TestParseExpertsRepo pins the --repo grammar and its `.git` handling: the
+// suffix is never part of a name, so both spellings the flag accepts drop it —
+// which is what keeps --repo agreeing with the pair resolveExpertsRepo derives
+// from origin; see TestResolveExpertsRepo_NativeOriginRoundTripsThroughRepoFlag.
+func TestParseExpertsRepo(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{name: "bare pair passes through", in: "acme/widget", want: "acme/widget"},
+		{name: "bare pair drops the decoration", in: "audit1/foo.git", want: "audit1/foo"},
+		{name: "gh triple drops the forge", in: "gh/acme/widget", want: "acme/widget"},
+		{name: "gh triple drops the decoration", in: "gh/acme/widget.git", want: "acme/widget"},
+		{name: "surrounding slashes are ignored", in: "/gh/acme/widget.git/", want: "acme/widget"},
+		{name: "a gh name that is only the suffix is refused", in: "gh/acme/.git", wantErr: true},
+		{name: "a bare name that is only the suffix is refused", in: "acme/.git", wantErr: true},
+		// The trim can MANUFACTURE a dot-only name out of one that was not, and
+		// the result reaches placement resolution. Refused on both spellings.
+		{name: "a name the trim turns dot-only is refused", in: "acme/..git", wantErr: true},
+		{name: "a gh name the trim turns dot-only is refused", in: "gh/acme/..git", wantErr: true},
+		{name: "a name the trim turns double-dot is refused", in: "acme/...git", wantErr: true},
+		{name: "a dot-only name as typed is refused", in: "acme/..", wantErr: true},
+		// --repo has to agree with the pair resolveExpertsRepo derives from
+		// origin, and an origin URL is where an uppercase suffix actually
+		// comes from. A case-sensitive drop made the two spellings of the
+		// same repository disagree.
+		{name: "bare pair drops an uppercase suffix", in: "audit1/foo.GIT", want: "audit1/foo"},
+		{name: "gh triple drops a mixed-case suffix", in: "gh/acme/widget.Git", want: "acme/widget"},
+		{name: "a longer dotted extension survives", in: "acme/widget.gitignore", want: "acme/widget.gitignore"},
+		{name: "an uppercase suffix alone is refused", in: "acme/.GIT", wantErr: true},
+		{name: "an uppercase suffix the trim turns dot-only is refused", in: "acme/..GIT", wantErr: true},
+		{name: "a non-gh triple is not a pair", in: "et/audit1/foo", wantErr: true},
+		{name: "one segment is not a pair", in: "widget", wantErr: true},
+		{name: "empty is refused", in: "", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := parseExpertsRepo(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseExpertsRepo(%q) = %q, want an error", tc.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseExpertsRepo(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("parseExpertsRepo(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveExpertsRepo_NativeOriginRoundTripsThroughRepoFlag states the
+// guarantee the two trims have to agree on: the pair `entire experts` derives
+// from a native origin must survive being passed back as --repo. The origin
+// here spells the `.git` alias, so the two paths only agree if both drop it —
+// one keeping it would make the same command name two repositories.
+//
+// Not parallel: t.Chdir points ResolveRemoteRepo at the fixture repo.
+func TestResolveExpertsRepo_NativeOriginRoundTripsThroughRepoFlag(t *testing.T) {
+	dir := t.TempDir()
+	runExpertsGit(t, dir, "init")
+	runExpertsGit(t, dir, "remote", "add", "origin", "entire://cell1.entire.io/et/audit1/foo.git")
+	t.Chdir(dir)
+	paths.ClearWorktreeRootCache()
+	t.Cleanup(paths.ClearWorktreeRootCache)
+
+	fromOrigin, err := resolveExpertsRepo(context.Background(), "")
+	if err != nil {
+		t.Fatalf("resolveExpertsRepo from origin: %v", err)
+	}
+	if fromOrigin != "audit1/foo" {
+		t.Fatalf("origin resolved to %q, want %q", fromOrigin, "audit1/foo")
+	}
+
+	fromFlag, err := resolveExpertsRepo(context.Background(), fromOrigin)
+	if err != nil {
+		t.Fatalf("resolveExpertsRepo from --repo %q: %v", fromOrigin, err)
+	}
+	if fromFlag != fromOrigin {
+		t.Errorf("--repo %q resolved to %q; the flag and the origin must name one repo", fromOrigin, fromFlag)
 	}
 }
 
@@ -726,4 +827,14 @@ func runExpertsGit(t *testing.T, dir string, args ...string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, out)
 	}
+}
+
+func setExpertsClientFactoryForTest(
+	t interface{ Helper() },
+	fn func(context.Context, bool, *auth.CellTarget) (expertsAPIClient, error),
+) func() {
+	t.Helper()
+	prev := newExpertsAPIClient
+	newExpertsAPIClient = fn
+	return func() { newExpertsAPIClient = prev }
 }

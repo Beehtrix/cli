@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -34,7 +35,7 @@ func ParseExportSession(data []byte) (*ExportSession, error) {
 
 // parseExportSessionFromFile reads a file and parses its contents as an ExportSession.
 func parseExportSessionFromFile(path string) (*ExportSession, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // path from agent hook/session state
+	data, err := agent.ReadTranscriptFile(path)
 	if err != nil {
 		return nil, err //nolint:wrapcheck // caller adds context or checks os.IsNotExist
 	}
@@ -91,7 +92,7 @@ func (a *OpenCodeAgent) GetTranscriptPosition(path string) (int, error) {
 }
 
 // ExtractModifiedFilesFromOffset extracts files modified by tool calls from the given message offset.
-func (a *OpenCodeAgent) ExtractModifiedFilesFromOffset(path string, startOffset int) ([]string, int, error) {
+func (a *OpenCodeAgent) ExtractModifiedFilesFromOffset(_ context.Context, path string, startOffset int) ([]string, int, error) {
 	session, err := parseExportSessionFromFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -267,7 +268,7 @@ func ExtractAllUserPrompts(data []byte) ([]string, error) {
 // ExtractPrompts extracts user prompts from an OpenCode export transcript starting
 // at the given message offset.
 func (a *OpenCodeAgent) ExtractPrompts(sessionRef string, fromOffset int) ([]string, error) {
-	data, err := os.ReadFile(sessionRef) //nolint:gosec // path comes from validated agent session state
+	data, err := agent.ReadTranscriptFile(sessionRef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read opencode transcript for prompt extraction: %w", err)
 	}

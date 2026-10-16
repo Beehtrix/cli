@@ -11,46 +11,47 @@ import (
 
 func TestBuildApprovalRequestRequiresMessageForRequestChanges(t *testing.T) {
 	t.Parallel()
-	if _, err := buildApprovalRequest("REQUEST_CHANGES", "  "); err == nil {
-		t.Error("REQUEST_CHANGES without message should be rejected")
+	if _, err := buildApprovalRequest("request_changes", "  "); err == nil {
+		t.Error("request_changes without message should be rejected")
 	}
-	req, err := buildApprovalRequest("REQUEST_CHANGES", "please fix")
+	req, err := buildApprovalRequest("request_changes", "please fix")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if req.Event != "REQUEST_CHANGES" || req.Body != "please fix" {
+	if req.Event != "request_changes" || req.Body != "please fix" {
 		t.Fatalf("req = %#v", req)
 	}
 }
 
 func TestBuildApprovalRequestApproveAllowsEmptyMessage(t *testing.T) {
 	t.Parallel()
-	req, err := buildApprovalRequest("APPROVE", "")
+	req, err := buildApprovalRequest("approve", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if req.Event != "APPROVE" || req.Body != "" {
+	if req.Event != "approve" || req.Body != "" {
 		t.Fatalf("req = %#v", req)
 	}
 }
 
 func TestTrailApprovalsPath(t *testing.T) {
 	t.Parallel()
-	got := trailApprovalsPath("gh", "acme", "widgets", 7)
-	if !strings.HasSuffix(got, "/7/approvals") {
-		t.Fatalf("path = %q, want .../7/approvals suffix", got)
+	const basePath = "/api/v1/repos/native-repo-id/trails"
+	got := trailApprovalsPath(basePath, 7)
+	if got != basePath+"/7/approvals" {
+		t.Fatalf("path = %q, want %q", got, basePath+"/7/approvals")
 	}
 }
 
 func TestTrailApprovalCmdsHaveExpectedFlags(t *testing.T) {
 	t.Parallel()
-	if newTrailApproveCmd().Flags().Lookup("message") == nil {
+	if newTrailApproveCmd(legacyTrailMode).Flags().Lookup("message") == nil {
 		t.Error("approve missing --message")
 	}
-	if newTrailRequestChangesCmd().Flags().Lookup("message") == nil {
+	if newTrailRequestChangesCmd(legacyTrailMode).Flags().Lookup("message") == nil {
 		t.Error("request-changes missing --message")
 	}
-	if newTrailApprovalsCmd().Flags().Lookup("json") == nil {
+	if newTrailApprovalsCmd(legacyTrailMode).Flags().Lookup("json") == nil {
 		t.Error("approvals missing --json")
 	}
 }

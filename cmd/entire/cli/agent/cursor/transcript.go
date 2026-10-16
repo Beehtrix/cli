@@ -2,14 +2,17 @@ package cursor
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"slices"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
-	"github.com/entireio/cli/cmd/entire/cli/textutil"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
+	transcriptlib "github.com/entireio/cli/transcript"
 )
 
 // Compile-time interface assertion.
@@ -64,32 +67,32 @@ func (c *CursorAgent) ExtractPrompts(sessionRef string, fromOffset int) ([]strin
 
 	var prompts []string
 	for i := range lines {
-		if lines[i].Type != transcript.TypeUser {
+		if lines[i].Type != transcriptlib.TypeUser {
 			continue
 		}
+		// ExtractUserContent already strips IDE tags; stripping again is not a
+		// no-op now that the <timestamp> strip is position-anchored.
 		content := transcript.ExtractUserContent(lines[i].Message)
 		if content != "" {
-			prompts = append(prompts, textutil.StripIDEContextTags(content))
+			prompts = append(prompts, content)
 		}
 	}
 	return prompts, nil
 }
 
-// ExtractSummary extracts the last assistant message as a session summary.
-func (c *CursorAgent) ExtractSummary(sessionRef string) (string, error) {
-	data, err := os.ReadFile(sessionRef) //nolint:gosec // Path comes from agent hook input
-	if err != nil {
-		return "", fmt.Errorf("failed to read transcript: %w", err)
-	}
+// ExtractModifiedFiles extracts the files modified by Cursor tool calls in the
+// given transcript lines, in first-seen order and deduplicated.
+//
+// Cursor records tool_use content blocks in the same shape as Claude Code
+// (message.content[i].type == "tool_use", with name and input), so this mirrors
+// claudecode.ExtractModifiedFiles. The divergences are the tool names and the
+// input key — see FileModificationTools and toolInput.
+func ExtractModifiedFiles(lines []transcript.Line) []string {
+	seen := make(map[string]bool)
+	var files []string
 
-	lines, parseErr := transcript.ParseFromBytes(data)
-	if parseErr != nil {
-		return "", fmt.Errorf("failed to parse transcript: %w", parseErr)
-	}
-
-	// Walk backward to find last assistant text block
-	for i := len(lines) - 1; i >= 0; i-- {
-		if lines[i].Type != transcript.TypeAssistant {
+	for i := range lines {
+		if lines[i].Type != transcriptlib.TypeAssistant {
 			continue
 		}
 		var msg transcript.AssistantMessage
@@ -97,17 +100,44 @@ func (c *CursorAgent) ExtractSummary(sessionRef string) (string, error) {
 			continue
 		}
 		for _, block := range msg.Content {
-			if block.Type == transcript.ContentTypeText && block.Text != "" {
-				return block.Text, nil
+			if block.Type != transcriptlib.ContentTypeToolUse {
+				continue
 			}
+			if !slices.Contains(FileModificationTools, block.Name) {
+				continue
+			}
+			var input toolInput
+			if err := json.Unmarshal(block.Input, &input); err != nil {
+				continue
+			}
+			if input.Path == "" || seen[input.Path] {
+				continue
+			}
+			seen[input.Path] = true
+			files = append(files, input.Path)
 		}
 	}
-	return "", nil
+	return files
 }
 
-// ExtractModifiedFilesFromOffset returns no modified files for Cursor and a constant
-// position of 0, because Cursor transcripts do not contain tool_use blocks.
-// File detection relies on git status and hook-provided modified_files instead.
-func (c *CursorAgent) ExtractModifiedFilesFromOffset(_ string, _ int) ([]string, int, error) {
-	return nil, 0, nil
+// ExtractModifiedFilesFromOffset extracts files modified by tool calls appearing at
+// or after startOffset, and returns the transcript's current line count.
+//
+// A missing transcript is not an error: Cursor reports transcript_path as null in
+// CLI mode, so ResolveSessionFile predicts a path that may not exist yet, and this
+// runs on capture paths that must fail open (matching GetTranscriptPosition).
+func (c *CursorAgent) ExtractModifiedFilesFromOffset(_ context.Context, path string, startOffset int) ([]string, int, error) {
+	if path == "" {
+		return nil, 0, nil
+	}
+
+	lines, total, err := transcript.ParseFromFileAtLineWithTotal(path, startOffset)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, 0, nil
+		}
+		return nil, 0, fmt.Errorf("failed to parse transcript: %w", err)
+	}
+
+	return ExtractModifiedFiles(lines), total, nil
 }

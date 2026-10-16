@@ -5,24 +5,25 @@ package integration
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
-// claudeImportFixture is a two-turn Claude transcript used to verify enable-time import.
-const claudeImportFixture = `{"type":"user","uuid":"u1","timestamp":"2026-06-20T00:00:00Z","message":{"role":"user","content":"first"}}
-{"type":"assistant","uuid":"a1","message":{"id":"m1","model":"claude-x","content":[{"type":"text","text":"ok"}],"usage":{"output_tokens":5}}}
-{"type":"user","uuid":"u2","timestamp":"2026-06-20T00:01:00Z","message":{"role":"user","content":"second"}}
-`
-
 // writeClaudeHistory drops a discoverable two-turn Claude transcript for the
-// env's repo, so a first-time enable has something to offer to import.
+// env's repo, so a first-time enable has something to offer to import. The
+// transcript records the repo as its cwd, as import discovery requires.
 func writeClaudeHistory(t *testing.T, env *TestEnv) {
 	t.Helper()
+	content := strings.Join([]string{
+		`{"type":"user","uuid":"u1","cwd":` + claudeFixtureCwdJSON(t, env.RepoDir) + `,"timestamp":"2026-06-20T00:00:00Z","message":{"role":"user","content":"first"}}`,
+		`{"type":"assistant","uuid":"a1","message":{"id":"m1","model":"claude-x","content":[{"type":"text","text":"ok"}],"usage":{"output_tokens":5}}}`,
+		`{"type":"user","uuid":"u2","timestamp":"2026-06-20T00:01:00Z","message":{"role":"user","content":"second"}}`,
+	}, "\n") + "\n"
 	require.NoError(t, os.WriteFile(
 		filepath.Join(env.ClaudeProjectDir, "sess1.jsonl"),
-		[]byte(claudeImportFixture), 0o644))
+		[]byte(content), 0o644))
 }
 
 // freshRepoEnv builds a repo with an initial commit but WITHOUT Entire enabled,
@@ -134,22 +135,26 @@ func TestEnableOffersImport_NotOfferedOnReEnable(t *testing.T) {
 		"re-enable must not run import at all; got: %s", second)
 }
 
-// TestEnable_RoutesLoggingToLogFile pins that `entire enable` initializes file
-// logging like every other command — see the logging.Init call in enable's
-// RunE for why its absence put operational warnings on the user's terminal
-// instead of in the log.
-func TestEnable_RoutesLoggingToLogFile(t *testing.T) {
+// TestEnable_KeepsOperationalLogsOffTheTerminal pins the regression that made
+// enable build a logger at all: without one, its operational lines landed on the
+// user's terminal mid-flow instead of in .entire/logs.
+//
+// It cannot assert the log file exists. The file is created on the first line
+// written, and enable's happy path logs nothing — so requiring it here only ever
+// proved a logger had been constructed, not that anything was routed.
+func TestEnable_KeepsOperationalLogsOffTheTerminal(t *testing.T) {
 	t.Parallel()
 	env := freshRepoEnv(t)
-	logPath := filepath.Join(env.RepoDir, ".entire", "logs", "entire.log")
-
-	// Nothing has run in this repo yet, so the log file's existence after
-	// enable can only come from enable itself.
-	require.NoFileExists(t, logPath)
 
 	out := env.RunCLI("enable", "--agent", agentClaudeCode, "--telemetry=false")
 	require.Contains(t, out, "Ready.", "enable should complete; got: %s", out)
-	require.FileExists(t, logPath, "enable should route its logging to .entire/logs; got output: %s", out)
+
+	// slog's text handler, which is where a line goes when no logger is
+	// installed. Its shape is level-then-message: "INFO msg key=value".
+	for _, marker := range []string{"level=INFO", "level=WARN", "level=DEBUG", "component="} {
+		require.NotContains(t, out, marker,
+			"enable put an operational log line on the terminal; got: %s", out)
+	}
 }
 
 // TestEnable_RejectedInvocationLeavesRepoUntouched pins that enable's logging
@@ -173,4 +178,33 @@ func TestEnable_RejectedInvocationLeavesRepoUntouched(t *testing.T) {
 		require.NoDirExists(t, filepath.Join(env.RepoDir, ".entire"),
 			"%s: a rejected enable must not create .entire/; got: %s", tc.name, out)
 	}
+}
+
+// TestEnableOffersImport_AnchorlessRepoSkipsWithoutFailingEnable is the
+// end-to-end half of the optional-import contract: every imported checkpoint
+// needs a validated anchor commit, and a repo with no commit cannot produce
+// one, so the import is skipped — but enable itself must still succeed.
+//
+// This has to drive the real binary. The unit-level cousin calls
+// runSelectedImports directly, and that function returns nothing, so it is
+// structurally incapable of showing whether enable would have survived. Only
+// an exit code can say that.
+func TestEnableOffersImport_AnchorlessRepoSkipsWithoutFailingEnable(t *testing.T) {
+	t.Parallel()
+	env := NewTestEnv(t)
+	env.InitRepo() // Deliberately no commit: nothing to anchor an import to.
+	writeClaudeHistory(t, env)
+
+	// --import-history is set to make the intent explicit, not because the
+	// branch depends on it: the anchor gate runs above the opt-in check, so an
+	// anchorless repo prints the same thing either way. What this pins is that
+	// enable SURVIVES, which no unit test can show — its cousin calls a
+	// function returning nothing.
+	out, err := env.RunCLIWithError("enable", "--agent", agentClaudeCode, "--import-history", "--telemetry=false")
+	require.NoError(t, err, "an unanchorable import must not fail enable; got: %s", out)
+	require.Contains(t, out, "Ready.", "enable should still complete; got: %s", out)
+	require.Contains(t, out, "skipping agent history import", "the skip must be reported; got: %s", out)
+	require.Contains(t, out, "entire import <agent>", "the skip must name the way back in; got: %s", out)
+	require.NotContains(t, out, "Imported ", "nothing was imported; got: %s", out)
+	require.False(t, env.CheckpointsPresentLocally(), "a skipped import must write no checkpoints")
 }

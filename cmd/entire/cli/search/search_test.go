@@ -3,6 +3,7 @@ package search
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,123 +12,12 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/api"
 )
 
-const testOwner = "entirehq"
-const testRepo = "entire.io"
 const testCPID = "cp1"
 
 // writeTestJSON writes raw JSON to a response writer, ignoring write errors (test helper).
 func writeTestJSON(w http.ResponseWriter, jsonStr string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(jsonStr)) //nolint:errcheck // test helper
-}
-
-// -- ParseGitHubRemote tests --
-
-func TestParseGitHubRemote_SSH(t *testing.T) {
-	t.Parallel()
-	owner, repo, err := ParseGitHubRemote("git@github.com:entirehq/entire.io.git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if owner != testOwner || repo != testRepo {
-		t.Errorf("got %s/%s, want %s/%s", owner, repo, testOwner, testRepo)
-	}
-}
-
-func TestParseGitHubRemote_HTTPS(t *testing.T) {
-	t.Parallel()
-	owner, repo, err := ParseGitHubRemote("https://github.com/entirehq/entire.io.git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if owner != testOwner || repo != testRepo {
-		t.Errorf("got %s/%s, want %s/%s", owner, repo, testOwner, testRepo)
-	}
-}
-
-func TestParseGitHubRemote_HTTPSNoGit(t *testing.T) {
-	t.Parallel()
-	owner, repo, err := ParseGitHubRemote("https://github.com/entirehq/entire.io")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if owner != testOwner || repo != testRepo {
-		t.Errorf("got %s/%s, want %s/%s", owner, repo, testOwner, testRepo)
-	}
-}
-
-func TestParseGitHubRemote_Invalid(t *testing.T) {
-	t.Parallel()
-	_, _, err := ParseGitHubRemote("   ")
-	if err == nil || err.Error() != "empty remote URL" {
-		t.Errorf("expected 'empty remote URL' for blank input, got %v", err)
-	}
-
-	_, _, err = ParseGitHubRemote("not-a-url")
-	if err == nil {
-		t.Error("expected error for invalid URL")
-	}
-}
-
-func TestParseGitHubRemote_SSHProtocol(t *testing.T) {
-	t.Parallel()
-	owner, repo, err := ParseGitHubRemote("ssh://git@github.com/entirehq/entire.io.git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if owner != testOwner || repo != testRepo {
-		t.Errorf("got %s/%s, want %s/%s", owner, repo, testOwner, testRepo)
-	}
-}
-
-func TestParseGitHubRemote_SSHProtocolNoGit(t *testing.T) {
-	t.Parallel()
-	owner, repo, err := ParseGitHubRemote("ssh://git@github.com/entirehq/entire.io")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if owner != testOwner || repo != testRepo {
-		t.Errorf("got %s/%s, want %s/%s", owner, repo, testOwner, testRepo)
-	}
-}
-
-func TestParseGitHubRemote_NonGitHubSSH(t *testing.T) {
-	t.Parallel()
-	_, _, err := ParseGitHubRemote("git@gitlab.com:entirehq/entire.io.git")
-	if err == nil {
-		t.Error("expected error for non-GitHub SSH remote")
-	}
-}
-
-func TestParseGitHubRemote_NonGitHubHTTPS(t *testing.T) {
-	t.Parallel()
-	_, _, err := ParseGitHubRemote("https://gitlab.com/entirehq/entire.io.git")
-	if err == nil {
-		t.Error("expected error for non-GitHub HTTPS remote")
-	}
-}
-
-func TestParseGitHubRemote_RejectsExtraPathSegments(t *testing.T) {
-	t.Parallel()
-	for _, remoteURL := range []string{
-		"https://github.com/entirehq/entire.io/extra.git",
-		"entire://aws-us-east-2.entire.io/gh/entirehq/entire.io/extra",
-	} {
-		if _, _, err := ParseGitHubRemote(remoteURL); err == nil {
-			t.Errorf("expected error for malformed remote %q, got none", remoteURL)
-		}
-	}
-}
-
-func TestParseGitHubRemote_EntireMirror(t *testing.T) {
-	t.Parallel()
-	owner, repo, err := ParseGitHubRemote("entire://aws-us-east-2.entire.io/gh/entirehq/entire.io")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if owner != testOwner || repo != testRepo {
-		t.Errorf("got %s/%s, want %s/%s", owner, repo, testOwner, testRepo)
-	}
 }
 
 // -- Search() tests --
@@ -148,6 +38,14 @@ func TestCellV4_ErrorJSON(t *testing.T) {
 	}
 	if got := err.Error(); got != "search service error (401): Invalid token" {
 		t.Errorf("error = %q, want 'search service error (401): Invalid token'", got)
+	}
+	// Outcome telemetry classifies by status code, so the error must be typed.
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("error is %T, want *HTTPStatusError", err)
+	}
+	if statusErr.StatusCode != http.StatusUnauthorized {
+		t.Errorf("StatusCode = %d, want %d", statusErr.StatusCode, http.StatusUnauthorized)
 	}
 }
 
@@ -221,6 +119,12 @@ func TestCellV4_ErrorFieldOn200(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "user not found") {
 		t.Errorf("error = %q, want message containing 'user not found'", err.Error())
+	}
+	// Outcome telemetry classifies a 200-with-error-field as a server
+	// failure, so the error must be typed.
+	var malformedErr *MalformedResponseError
+	if !errors.As(err, &malformedErr) {
+		t.Fatalf("error is %T, want *MalformedResponseError", err)
 	}
 }
 
@@ -409,6 +313,63 @@ func TestSearch_ResultAccessors(t *testing.T) {
 	}
 }
 
+// TestResultID_SessionFallsBackToCheckpointID pins the ENT-1595 display id:
+// a server-folded legacy session has no sessionId, so ResultID falls back to its
+// checkpointId — giving the row a real id in the TUI and compact JSON instead of
+// a blank one. (Cross-cell dedupe uses DedupID, not ResultID; see below.)
+func TestResultID_SessionFallsBackToCheckpointID(t *testing.T) {
+	t.Parallel()
+	legacy := Result{Type: TypeSession, Session: &SessionResult{SessionID: "", MatchedCheckpointID: "cp-9"}}
+	if got := legacy.ResultID(); got != "cp-9" {
+		t.Errorf("legacy session ResultID = %q, want checkpointId cp-9", got)
+	}
+	// A real session still keys on its sessionId even with a checkpoint anchor.
+	normal := Result{Type: TypeSession, Session: &SessionResult{SessionID: "sess-1", MatchedCheckpointID: "cp-1"}}
+	if got := normal.ResultID(); got != "sess-1" {
+		t.Errorf("real session ResultID = %q, want sess-1", got)
+	}
+}
+
+// TestDedupID_RepoQualifiesCheckpointScopedIDs pins the fix for the repo-scoped
+// checkpoint-id collision: checkpoint ids are unique only within a repo, so both
+// a raw checkpoint row and a folded legacy session's checkpoint fallback are
+// repo-qualified (and lowercased) in the dedupe key. Two repos' rows sharing a
+// checkpoint id must NOT collapse; ResultID stays the raw id for display.
+func TestDedupID_RepoQualifiesCheckpointScopedIDs(t *testing.T) {
+	t.Parallel()
+	// Legacy session: same checkpoint id, different repos → distinct dedupe keys.
+	sa := Result{Type: TypeSession, Session: &SessionResult{SessionID: "", MatchedCheckpointID: "cp-dup", Org: "acme", Repo: "backend"}}
+	sb := Result{Type: TypeSession, Session: &SessionResult{SessionID: "", MatchedCheckpointID: "cp-dup", Org: "acme", Repo: "frontend"}}
+	if sa.DedupID() == sb.DedupID() {
+		t.Errorf("legacy sessions with same checkpointId in different repos collide: %q", sa.DedupID())
+	}
+	if got := sa.ResultID(); got != "cp-dup" {
+		t.Errorf("ResultID = %q, want raw cp-dup for display", got)
+	}
+	// Checkpoint rows get the same treatment (they key on a raw, repo-scoped id).
+	ca := Result{Type: TypeCheckpoint, Checkpoint: &CheckpointResult{ID: "cp-dup", Org: "acme", Repo: "backend"}}
+	cb := Result{Type: TypeCheckpoint, Checkpoint: &CheckpointResult{ID: "cp-dup", Org: "acme", Repo: "frontend"}}
+	if ca.DedupID() == cb.DedupID() {
+		t.Errorf("checkpoints with same id in different repos collide: %q", ca.DedupID())
+	}
+	// Commit rows too: the same SHA lives in a fork and its upstream (two repos).
+	ma := Result{Type: TypeCommit, Commit: &CommitResult{CommitSHA: "sha-dup", Org: "acme", Repo: "backend"}}
+	mb := Result{Type: TypeCommit, Commit: &CommitResult{CommitSHA: "sha-dup", Org: "acme", Repo: "fork"}}
+	if ma.DedupID() == mb.DedupID() {
+		t.Errorf("same commit SHA in a fork and its upstream collide: %q", ma.DedupID())
+	}
+	// Casing skew across cells (git remote vs repo index) must still dedupe.
+	cUpper := Result{Type: TypeCheckpoint, Checkpoint: &CheckpointResult{ID: "cp-dup", Org: "acme", Repo: "Backend"}}
+	if ca.DedupID() != cUpper.DedupID() {
+		t.Errorf("casing skew leaks a duplicate: %q vs %q", ca.DedupID(), cUpper.DedupID())
+	}
+	// A real session's DedupID is just its sessionId (no repo qualification).
+	normal := Result{Type: TypeSession, Session: &SessionResult{SessionID: "sess-1", Org: "acme", Repo: "backend"}}
+	if got := normal.DedupID(); got != "sess-1" {
+		t.Errorf("real session DedupID = %q, want sess-1", got)
+	}
+}
+
 func TestSearch_ResultJSONRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -455,6 +416,35 @@ func TestSearch_ResultJSONRoundTrip(t *testing.T) {
 	}
 	if decoded.Meta.Score != 0.5 {
 		t.Errorf("decoded score = %f", decoded.Meta.Score)
+	}
+}
+
+// TestSearch_MetaDecodesRerankScore guards that query-serve's rerankScore is
+// actually parsed off the wire — the cross-cell merge orders tier 0/1 by it, so
+// a dropped field silently reverts the CLI to pre-rerank ordering.
+func TestSearch_MetaDecodesRerankScore(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"type":"commit","data":{"commitSha":"abc123","org":"o","repo":"r"},"searchMeta":{"matchType":"both","score":6,"tier":1,"rerankScore":0.42,"bm25Score":6}}`
+	var r Result
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Meta.RerankScore == nil {
+		t.Fatal("rerankScore decoded as nil, want 0.42")
+	}
+	if *r.Meta.RerankScore != 0.42 {
+		t.Errorf("decoded rerankScore = %f, want 0.42", *r.Meta.RerankScore)
+	}
+
+	// Absent rerankScore must stay nil (a cell whose rerank fell back), not 0,
+	// so rerankOf can distinguish "unscored" from a genuine 0 score.
+	var noRerank Result
+	if err := json.Unmarshal([]byte(`{"type":"commit","data":{"commitSha":"d","org":"o","repo":"r"},"searchMeta":{"score":1,"tier":1}}`), &noRerank); err != nil {
+		t.Fatal(err)
+	}
+	if noRerank.Meta.RerankScore != nil {
+		t.Errorf("absent rerankScore = %v, want nil", *noRerank.Meta.RerankScore)
 	}
 }
 

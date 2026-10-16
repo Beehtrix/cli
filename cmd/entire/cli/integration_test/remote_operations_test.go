@@ -120,6 +120,7 @@ func TestPrePush_PushDisabledSkipsCheckpoints(t *testing.T) {
 		env.CheckpointStore = backend
 
 		bareDir := env.SetupBareRemote()
+		barePublish := env.SetupNamedBareRemote("publish")
 
 		// Configure push_sessions: false
 		env.PatchSettings(map[string]any{
@@ -142,6 +143,17 @@ func TestPrePush_PushDisabledSkipsCheckpoints(t *testing.T) {
 		// Checkpoints should NOT be on remote
 		if env.CheckpointsPresentOnRemote(bareDir) {
 			t.Error("checkpoints should NOT be on remote when push_sessions is false")
+		}
+
+		// A gated push (non-elected remote) must ALSO stay hint-silent: the
+		// pushDisabled return precedes the single-remote gate, and a hint
+		// telling a user who disabled pushing that checkpoints are "waiting"
+		// would be advice that cannot help them.
+		if out := env.RunPrePushOutput("publish"); strings.Contains(out, "checkpoint_push_remote") {
+			t.Errorf("push_sessions=false must suppress the gated-push hint; output:\n%s", out)
+		}
+		if env.CheckpointsPresentOnRemote(barePublish) {
+			t.Error("checkpoints should NOT be on the gated remote when push_sessions is false")
 		}
 	})
 }
@@ -280,7 +292,7 @@ func createCheckpointedCommit(t *testing.T, env *TestEnv, prompt, fileName, file
 		t.Fatalf("SimulateStop failed: %v", err)
 	}
 
-	env.GitCommitWithShadowHooks(commitMsg, fileName)
+	env.GitCommitWithHooks(commitMsg, fileName)
 
 	return env.LatestCheckpointID()
 }
@@ -605,7 +617,7 @@ func TestGracefulDegradation_UnreachableCheckpointRemoteOnCloneIsSilent(t *testi
 		// (origin is a local path, can't parse it), so it falls back to pushing to origin.
 		cloneEnv.WriteFile("clone.go", "package clone")
 		cloneEnv.GitAdd("clone.go")
-		cloneEnv.GitCommitWithShadowHooks("Clone work", "clone.go")
+		cloneEnv.GitCommitWithHooks("Clone work", "clone.go")
 		cloneEnv.RunPrePush("origin")
 
 		// Verify that the session actually created a local checkpoint despite the
@@ -669,22 +681,10 @@ func TestResume_FetchesPrimaryBranchFullyWithFilteredFetches(t *testing.T) {
 	// locally so it only exists on the remote. This forces resume to fetch it.
 	cloneEnv := env.CloneFrom(bareDir)
 
-	ctx := t.Context()
-
 	// Detach HEAD so we can delete the feature branch.
-	cmd := exec.CommandContext(ctx, "git", "checkout", "--detach")
-	cmd.Dir = cloneEnv.RepoDir
-	cmd.Env = testutil.GitIsolatedEnv()
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("detach HEAD: %v\n%s", err, output)
-	}
+	testutil.RunGit(t, cloneEnv.RepoDir, "checkout", "--detach")
 
-	cmd = exec.CommandContext(ctx, "git", "branch", "-D", "feature/test-branch")
-	cmd.Dir = cloneEnv.RepoDir
-	cmd.Env = testutil.GitIsolatedEnv()
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("delete feature branch: %v\n%s", err, output)
-	}
+	testutil.RunGit(t, cloneEnv.RepoDir, "branch", "-D", "feature/test-branch")
 
 	cloneEnv.setGitConfigBaseline()
 
@@ -738,7 +738,8 @@ func TestResume_FetchesPrimaryBranchFullyWithFilteredFetches(t *testing.T) {
 // listCheckpointsInDir reads checkpoint IDs from the metadata branch tree.
 // This intentionally uses a separate implementation (git ls-tree) rather than
 // the production ListCheckpoints() to avoid testing the code with itself.
-// The sharded directory structure is documented in CLAUDE.md.
+// The sharded directory structure is documented in
+// docs/architecture/sessions-and-checkpoints.md.
 func listCheckpointsInDir(t *testing.T, repoDir string) []string {
 	t.Helper()
 

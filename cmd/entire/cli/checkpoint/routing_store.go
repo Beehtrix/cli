@@ -23,11 +23,13 @@ import (
 //     a git-branch primary the branch is authoritative for hex, so refs is not
 //     consulted.
 //
-// List unions both backends (disjoint ID spaces). Creates (Session) are NOT
+// List unions both backends (disjoint ID spaces). Fresh creates (Session) are NOT
 // kind-routed: they go to the configured primary (+ mirrors) via writer, since
 // a new checkpoint's ID is already minted to match the primary's format (see
-// checkpoint.GenerateCheckpointID). Backfills update an existing checkpoint,
-// so they follow the same store order as reads, though only
+// checkpoint.GenerateCheckpointID). ReservedSession writes preserve the backend
+// chosen before an interrupted write; when a migrated copy already exists in the
+// read-preferred backend, they update that copy too. Backfills update an existing
+// checkpoint, so they follow the same store order as reads, though only
 // ErrCheckpointNotFound falls through (stricter than reads) — see Write.
 type kindRoutingStore struct {
 	writer      PersistentStore // configured primary + mirrors (fanout); handles Write
@@ -188,6 +190,45 @@ func (s *kindRoutingStore) ReadSessionMetadataAndPrompts(ctx context.Context, ch
 	return mp.meta, mp.prompts, err
 }
 
+// ListTasks routes like the session reads: a checkpoint that is absent from
+// (or errors in) a non-final store falls through to the next.
+func (s *kindRoutingStore) ListTasks(ctx context.Context, checkpointID id.CheckpointID) ([]TaskEntry, error) {
+	return firstResolved(s.readOrder(checkpointID),
+		func(st PersistentStore) ([]TaskEntry, error) {
+			return st.ListTasks(ctx, checkpointID)
+		},
+		sessionNotFound[[]TaskEntry],
+	)
+}
+
+// taskTranscriptResult carries a definitive per-store answer through
+// firstResolved, which otherwise falls through on any error.
+type taskTranscriptResult struct {
+	transcript []byte
+	err        error
+}
+
+// ReadTaskTranscript routes like ListTasks, except that a store which holds the
+// checkpoint answers definitively: "no such task" or "no transcript stored"
+// from the store that has the checkpoint must not fall through and be
+// reported by the next store as "checkpoint not found".
+func (s *kindRoutingStore) ReadTaskTranscript(ctx context.Context, checkpointID id.CheckpointID, toolUseID string) ([]byte, error) {
+	res, err := firstResolved(s.readOrder(checkpointID),
+		func(st PersistentStore) (taskTranscriptResult, error) {
+			transcript, readErr := st.ReadTaskTranscript(ctx, checkpointID, toolUseID)
+			if errors.Is(readErr, ErrTaskNotFound) || errors.Is(readErr, ErrNoTranscript) {
+				return taskTranscriptResult{err: readErr}, nil
+			}
+			return taskTranscriptResult{transcript: transcript}, readErr //nolint:wrapcheck // in-package store error surfaced verbatim
+		},
+		func(taskTranscriptResult, error) bool { return false },
+	)
+	if err != nil {
+		return nil, err
+	}
+	return res.transcript, res.err
+}
+
 // Write routes a create (Session) to the configured primary (+ mirrors): a new
 // checkpoint's ID is already minted to match the primary's format (see
 // checkpoint.GenerateCheckpointID). Backfills target an EXISTING checkpoint,
@@ -204,6 +245,9 @@ func (s *kindRoutingStore) ReadSessionMetadataAndPrompts(ctx context.Context, ch
 // whose ref exists only remotely is fetched and backfilled in place rather
 // than falling through to the fallback store.
 func (s *kindRoutingStore) Write(ctx context.Context, req WriteRequest) error {
+	if reserved, ok := req.(ReservedSession); ok {
+		return s.writeReservedSession(ctx, reserved)
+	}
 	checkpointID, isBackfill := backfillTarget(req)
 	if !isBackfill {
 		return s.writer.Write(ctx, req) //nolint:wrapcheck // primary error is the operation's error, surfaced verbatim
@@ -235,9 +279,67 @@ func (s *kindRoutingStore) Write(ctx context.Context, req WriteRequest) error {
 	return err //nolint:wrapcheck // ErrCheckpointNotFound from the final store, surfaced verbatim
 }
 
+func (s *kindRoutingStore) writeReservedSession(ctx context.Context, req ReservedSession) error {
+	checkpointID := WriteOptions(req).CheckpointID
+	if s.primaryType != BackendTypeGitBranch && s.primaryType != BackendTypeGitRefs {
+		// An unrecognised primary tells us nothing about which backend minted the
+		// ID, and picking one anyway would bypass the configured primary and all of
+		// its mirrors. readOrder's default arm makes the same call for reads.
+		return s.writer.Write(ctx, req) //nolint:wrapcheck // primary error is the operation's error, surfaced verbatim
+	}
+	target := s.branch
+	targetType := BackendTypeGitBranch
+	if checkpointID.Kind() == id.KindULID {
+		target = s.refs
+		targetType = BackendTypeGitRefs
+	}
+	if targetType == s.primaryType {
+		return s.writer.Write(ctx, req) //nolint:wrapcheck // primary error is the operation's error, surfaced verbatim
+	}
+
+	readTarget := s.readOrder(checkpointID)[0]
+	updateReadTarget := false
+	if readTarget != target {
+		existing, err := readTarget.Read(ctx, checkpointID)
+		switch {
+		case err != nil:
+			// Not fatal. readOrder puts this store ahead of target for this ID, and
+			// firstResolved falls through a non-final store that errors, so the
+			// target write below still resolves through normal reads. The cost of
+			// skipping the update is a migrated copy left stale — the same lag the
+			// mirror fan-out contract already permits — whereas failing here would
+			// abandon a condensation over a transient fetch error in the backend the
+			// checkpoint is not even stored in.
+			logging.Warn(ctx, "checkpoint: reserved session could not check the read-preferred backend; writing the ID's backend only",
+				slog.String("checkpoint_id", checkpointID.String()),
+				slog.String("primary_backend", s.primaryType),
+				slog.String("error", err.Error()))
+		default:
+			updateReadTarget = existing != nil
+		}
+	}
+	if err := target.Write(ctx, req); err != nil {
+		return err //nolint:wrapcheck // target error is the operation's error, surfaced verbatim
+	}
+	if updateReadTarget {
+		// Update the readable copy directly. The original target may itself be a
+		// configured mirror, so re-entering writer fan-out would write it twice;
+		// other best-effort mirrors are allowed to lag by the fan-out contract.
+		if err := readTarget.Write(ctx, req); err != nil {
+			return err //nolint:wrapcheck // read-preferred copy must not remain stale after a successful retry
+		}
+	}
+	logging.Info(ctx, "checkpoint: reserved session written to original backend after primary changed",
+		slog.String("checkpoint_id", checkpointID.String()),
+		slog.String("target_backend", targetType),
+		slog.String("primary_backend", s.primaryType),
+		slog.Bool("updated_existing_read_target", updateReadTarget))
+	return nil
+}
+
 // backfillTarget returns the checkpoint ID a backfill request updates.
-// ok is false for Session (a create) and unknown request types, which are not
-// kind-routed.
+// ok is false for Session and ReservedSession (creates) and unknown request
+// types, which are not routed by backfillOrder.
 //
 // WriteRequest is a closed union: any new backfill-shaped request type MUST be
 // added to this switch, or it silently gets create routing — primary-only, no
@@ -248,8 +350,6 @@ func backfillTarget(req WriteRequest) (id.CheckpointID, bool) {
 	case SessionTranscript:
 		return r.CheckpointID, true
 	case SessionSummary:
-		return r.CheckpointID, true
-	case CheckpointAttribution:
 		return r.CheckpointID, true
 	default:
 		return id.EmptyCheckpointID, false

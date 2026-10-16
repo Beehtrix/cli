@@ -22,7 +22,7 @@ Both backends are **git-backed** — they store the committed record in the repo
 
 Checkpoint storage is pluggable. The topology is a single **primary** plus zero or more **mirrors**:
 
-- **Primary** — the source of truth. It serves all reads and writes, and the full checkpoint lifecycle (resume bootstrap, `doctor` reconcile, `explain` tree reads, push, cleanup, pre-push OPF) drives *its* record.
+- **Primary** — the source of truth. It serves all reads and writes, and the full checkpoint lifecycle (resume bootstrap, `doctor` reconcile, `explain` tree reads, push, cleanup) drives *its* record.
 - **Mirror** — an independent backend that receives best-effort **write fan-out** only. Reads never come from a mirror.
 
 Backends register in `checkpoint/registry.go`. Each carries a `gitBacked` capability:
@@ -34,7 +34,7 @@ Backends register in `checkpoint/registry.go`. Each carries a `gitBacked` capabi
 
 Only a git-backed backend can be the primary, because the lifecycle paths above operate through the repo and its refs; a non-git-backed backend has no such ref to drive them. The two built-in backends — `git-branch` and `git-refs` — are **both** git-backed and are registered directly in the built-in registry map. The `Register()` entry point is for non-git-backed (mirror-only) backends and is used in practice only by test-only backends, so a production binary can never select an unregistered one.
 
-A **one-of-each-type** rule permits two distinct git-backed backends in the same topology. Note, though, that the branch→refs migration deliberately does **not** run `git-branch` as a mirror of `git-refs`. Cross-format compatibility comes from read routing plus the version policy — every reader (CLI, entire.io, entire-api) reads refs first and falls back to the branch — not from dual-writing the same checkpoint into both backends (see [Migration and coexistence](#migration-and-coexistence)). Mirroring stays available as a general mechanism, primarily for non-git-backed targets (e.g. a filesystem store).
+A **one-of-each-type** rule permits two distinct git-backed backends in the same topology. Note, though, that the branch→refs migration deliberately does **not** run `git-branch` as a mirror of `git-refs`. Cross-format compatibility comes from read routing — every reader (CLI, entire.io, entire-api) reads refs first and falls back to the branch — not from dual-writing the same checkpoint into both backends (see [Migration and coexistence](#migration-and-coexistence)). Mirroring stays available as a general mechanism, primarily for non-git-backed targets (e.g. a filesystem store).
 
 ## Ref layout and sharding
 
@@ -67,7 +67,7 @@ IDs are minted by `checkpoint.GenerateCheckpointID`, which picks the format from
 
 The git-refs store (`gitRefsStore`, `checkpoint/refs_store.go`) shares the checkpoint-subtree machinery with the git-branch store via an embedded `*treeWriter`. Both build the exact same checkpoint subtree; they differ only in the **base path** they write it at and in **where the result is committed**. The git-branch store writes each checkpoint under its shard prefix `<id[:2]>/<id[2:]>/` inside the single `v1` tree, so many checkpoints share one tree. The git-refs store writes with **no prefix** (an empty base path), so the checkpoint subtree *is* the root of that checkpoint's own commit tree, and the commit is the tip of a per-checkpoint ref rather than a subtree of the v1 branch.
 
-Every persistent write (`WriteSession`, and the `Backfill*` operations for transcript / summary / attribution) follows the same shape:
+Every persistent write (`WriteSession`, and the `Backfill*` operations for transcript / summary) follows the same shape:
 
 1. **Resolve the ref's current tip.** Creates (`WriteSession`) use the local-only `refBase`: a missing ref → `(ZeroHash, nil)`, so the first write to a checkpoint becomes an **orphan commit**. The `Backfill*` operations use `refBaseForBackfill`, which first on-demand fetches a locally-missing ref (when a ref fetcher is configured — the checkpoint may have been written or migrated on another machine); a ref still absent after the fetch surfaces as `ErrCheckpointNotFound` rather than orphaning, and a fetch failure surfaces as a real error, never as absence. A real lookup failure (IO/corruption) is surfaced, never silently treated as "new checkpoint".
 2. **Build the updated checkpoint subtree** from the existing tree plus the new content (shared `treeWriter` logic).
@@ -102,14 +102,74 @@ Rewrites are atomic (temp file + rename under the lock) so a concurrent reader n
 1. **Drains** the queue.
 2. **Partitions** the drained refs into those that still exist locally and stale ones (dropped from the queue).
 3. **Batch-pushes** the existing refs in one network round-trip (`batchPushRefs`, `strategy/push_common.go`).
-4. On success, **removes** the pushed refs from the queue and runs shadow-branch cleanup.
+4. On success, **removes** the pushed refs from the queue.
 5. On a batch failure (typically a non-fast-forward rejection), **falls back to per-ref recovery** (`pushCheckpointRefWithRecovery`) and removes from the queue only the refs that land.
+
+Confirmed remote policy/hook rejections skip fetch/replay: replay cannot fix a
+policy block and would needlessly rewrite local commits if the ref already exists
+remotely. Other failures still attempt recovery; a failed recovery preserves the
+original push error as the primary cause with its fetch/replay error wrapped
+alongside it, rather than assuming divergence. Confirmed remote rejections surface
+one bounded warning per flush naming a ref and Git's reason
+(including push-protection guidance). The warning explicitly labels the reason as
+one example because other queued refs may have different failures (all are logged).
+Terminal diagnostics preserve Git's line breaks and indentation; log errors stay
+single-line. Both forms use the existing output cap and push-target URL masking,
+without additional secret redaction of the remote's diagnostic output. Plain non-fast-forward recovery stays quiet;
+SSH authentication failures retain their dedicated hint. Failures remain queued
+and **never fail the user's git push**.
+
+The fallback is bounded. It runs under a `checkpointFlushBudget` context deadline — so an expired budget cuts a ref that is already hung rather than waiting out its own `checkpointPushBudget` first — and additionally stops after `maxConsecutiveRefPushFailures` refs fail in a row. Either way it never aborts before at least one ref has been attempted. A remote that is refusing or unreachable fails every ref the same way, and each ref in the fallback costs at least one network round-trip, so walking a large queue to the end turns one failed push into an apparently hung one for minutes or hours. Skipped refs stay queued and go out on the next push, and a success resets the consecutive count so one blocked checkpoint does not strand the refs queued behind it. The abort prints one line naming what stopped the retry and how many refs remain.
+
+An early abort also rotates that flush's failures to the back of the queue (`PushQueue.Rotate`). The queue drains in first-seen order, so without it a prefix that always fails — five checkpoints blocked by a ruleset, say — is retried in the same order on every push and the healthy refs behind it are never attempted at all. Rotation is skipped after an interruption, where the failures say nothing about the refs.
+
+Two diagnostics make a wholesale failure readable. The batch error is logged before the fallback runs: the per-ref retries re-derive a *rejection* reason, but a transport failure — an unreachable remote, a stalled connection — matches none of them, so without that line the cause reached neither the terminal nor `.entire/logs`. And `remote.Fetch` now annotates its error with git's own output — redacted and capped by the same `errWithGitOutput` helper the push path uses — instead of the strategy layer substituting that output for the error, which reported a contentless `fetch failed:` per ref whenever git was killed before writing anything.
 
 ### Non-force, fast-forward-only
 
 All checkpoint-ref pushes are **fast-forward-only — never a force push.** There is no server-side ref protection, so a force push risks silently clobbering a checkpoint written elsewhere. Per-checkpoint refs normally advance by fast-forward (append-only per-checkpoint history), so this is the common case.
 
 When a push *is* rejected as non-fast-forward — genuine divergence, e.g. the same checkpoint was written on two machines — recovery **fetches the remote ref and replays the local-only commits on top** (`fetchAndRebaseRefCommon`), then retries. After the replay the local ref is a fast-forward over the remote, so the retry is *still* non-force and the remote commit is preserved as an ancestor rather than overwritten. A genuine cherry-pick conflict (both sides rewrote the same file, e.g. root `metadata.json`) leaves the ref queued — degrading to the safe state, never forcing.
+
+**The deliberate exception: `entire checkpoint delete`.** Deleting a checkpoint
+pushes `:<ref>` with `--force-with-lease=<ref>:<oid>`, where `<oid>` is what
+`ls-remote` reported moments earlier. That is a non-fast-forward update by
+definition, so it is confined to the one ref, runs only on an explicit user
+command (agents are told never to run it unprompted), and is leased so a copy
+another clone pushed since the probe is never removed unseen. Each remote is
+resolved to one concrete URL first (push destination, `checkpoint_remote` push
+and fetch URLs, and every read candidate's fetch and first push URL), so the
+probe, the lease, and the push address the same repository.
+
+The local ref is deleted (compare-and-swap) and dropped from the push queue
+before any remote: pre-push drains the queue and pushes refs that exist locally,
+so remote-first ordering would let a concurrent push put it back. Each remote's
+per-checkpoint ref (not its `v1` branch) is then re-checked once with
+`ls-remote` and its delete retried if a push had already re-landed it. A lease
+that fails as stale is re-probed: when the ref is already gone (the same
+repository reached through a second URL spelling, say) the outcome is
+"absent", not a failure. A remote that refuses is reported with an
+`entire checkpoint delete <id> --remote <name>` retry command; the local copy is
+not restored, and a remote-only delete (no local copy) is allowed. The ID is
+also recorded in the git common dir's deleted-checkpoints list
+(`entire-deleted-checkpoints.json`), which `prepare-commit-msg` uses to drop the
+ID's trailer on an amend and which migration skips. Other clones still holding
+the ref can push it back; remote tombstones are deferred.
+
+A checkpoint on the `v1` branch is deleted per remote by fetching that
+remote's branch tip into a temporary ref, committing the subtree's removal on
+it, and pushing with a lease on the fetched tip (a fast-forward). Local `v1`
+commits are never pushed by a delete, so unpushed data stays local. The remote-tracking `v1` ref of each named
+remote whose fetch URL is the target is advanced to the pushed tip (or to the
+fetched tip when the checkpoint was already gone there) so read fallbacks and
+migration stop seeing the checkpoint. The content remains in the branch's
+history. The local `v1` removal is a commit the next pre-push sends to every
+`v1` push destination, so on the git-branch primary a delete that leaves one
+out is refused before any write if it holds a copy or cannot be reached. After
+pushing the removal to a destination, local `v1` is rebuilt on the pushed
+commit (unpushed local commits replayed) so the branches do not diverge, but
+only when the two removal commits are the whole divergence, and only for the
+first destination reached.
 
 ### On-demand fetch (reads and backfill writes)
 
@@ -125,12 +185,12 @@ A checkpoint written on another machine has no local ref. When a read — or a b
 To close that gap `List` supports **opt-in remote discovery**:
 
 - The caller marks the context with `WithRemoteListDiscovery` (set only on explicit, user-facing enumeration — `entire checkpoint list` and the branch `explain` view — never the per-turn commit hook, so routine local listings stay network-free).
-- A **remote ref lister** injected by the CLI runs a single `git ls-remote refs/entire/checkpoints/*` — **names only, no object transfer** — against the checkpoint remote.
+- A **remote ref lister** injected by the CLI runs `git ls-remote refs/entire/checkpoints/*` — **names only, no object transfer** — against the checkpoint remote(s) (see the scoping below).
 - Each advertised ref that has no local ref yet is added to the result as a not-yet-hydrated `CheckpointInfo`. Its `CreatedAt` is recovered from the ULID timestamp in the ref name, so it sorts by real recency without a fetch; the rest of its contents are **hydrated lazily on the next read** via the on-demand ref fetch (and, on the branch `explain` / `checkpoint list` path, eagerly for the truncated display set so `--session` filters see real SessionIDs).
 
 **Surfacing vs discovery:** storage-level `List` can return remote-only stubs, but the branch view (`getBranchCheckpoints`) only surfaces a discovered checkpoint when an `Entire-Checkpoint` trailer for that ID is present in the scanned local commit range. Discovery therefore helps only after the user has pulled the branch commits that carry those trailers — it does not invent branch entries from remote refs alone.
 
-Enumeration is **checkpoint-remote-scoped** and **stricter than the on-demand read fetch**: with a `checkpoint_remote` configured it queries the resolved checkpoint URL (`remote.FetchURL`, which can fall through to origin in edge cases); with **none** configured the lister returns no refs and `List` stays local-only — unlike by-ID reads, which fall back to origin when nothing is configured. Discovery is also **best-effort and additive**: an `ls-remote` failure or a short timeout (a few seconds — this path must not turn a previously-local listing into a long hang when the remote is unreachable) logs, warns on stderr, and returns the local results rather than failing the whole listing. URL resolution and `ls-remote` run from the worktree root so repo-local git config applies.
+**Where enumeration looks:** with a dedicated `checkpoint_remote` configured it queries the resolved checkpoint URL (`remote.FetchURL`, which can fall through to origin in edge cases) — unchanged single-target behavior. With **none** configured it ls-remotes **every checkpoint read candidate** — the elected checkpoint sync remote, then `origin` when it differs (`strategy.CheckpointReadRemotes`) — and **merges the listings**, a union deduped by ref name, so a second machine discovers refs-native checkpoints in the default setup without any dedicated store. Merging, not first-non-empty, is deliberate: per-checkpoint refs land on whichever remote the pre-push hook fired for, so *disjoint* refs on origin coexisting with refs on the elected remote are realistic, and first-non-empty would shadow one side. Each candidate gets its own short timeout so a hung elected remote cannot starve the legacy tier. One candidate failing logs at debug and does not block the others; when every candidate fails, the lister returns the first error so `List` warns on stderr and then stays local-only. Discovery is **best-effort and additive**: partial failure still returns the merged reachable results, while total failure remains visible without failing the whole listing. URL resolution and `ls-remote` run from the worktree root so repo-local git config applies.
 
 ## Kind routing and coexistence
 
@@ -146,9 +206,9 @@ Enumeration is **checkpoint-remote-scoped** and **stricter than the on-demand re
 - The `firstResolved` helper tries stores in priority order; a non-final store that reports absent *or* errors falls through to the next, so a transient git-refs fetch error cannot hide a checkpoint that resolves on the branch. The final store's result (hit, absent, or error) is returned verbatim.
 - The optional `AuthorReader` capability (`explain` relies on it) is preserved and routed by the same rules when both read stores provide it.
 - **Creates (`Session`) are not kind-routed.** They target the configured primary (+ mirrors); the minted ID already matches the primary's format.
-- **Backfills (`SessionSummary`, `SessionTranscript`, `CheckpointAttribution`) are kind-routed.** They update an *existing* checkpoint, which may live in either backend, so they follow the read order above, falling through to the next store only on `ErrCheckpointNotFound` (stricter than reads — a hard error aborts rather than risking a forked write). A backfill landing on the primary still fans out to mirrors; one landing on a fallback store skips mirrors (mirrors follow the primary) and logs the routing decision.
+- **Backfills (`SessionSummary`, `SessionTranscript`) are kind-routed.** They update an *existing* checkpoint, which may live in either backend, so they follow the read order above, falling through to the next store only on `ErrCheckpointNotFound` (stricter than reads — a hard error aborts rather than risking a forked write). A backfill landing on the primary still fans out to mirrors; one landing on a fallback store skips mirrors (mirrors follow the primary) and logs the routing decision.
 
-All general read paths — resume, explain, attribution, blame, tokens, attach — inherit this routing for free through `checkpoint.Open`; there is no per-command config knob.
+All general read paths — resume, explain, blame, why, tokens, attach — inherit this routing for free through `checkpoint.Open`; there is no per-command config knob.
 
 ## Configuration and rollout
 
@@ -163,6 +223,7 @@ Backend selection lives in the `checkpoints` block of settings (`settings/checkp
 ```
 
 - `primary.type` is required. When the whole block is absent, the layer defaults to the **git-branch** backend with no mirrors — so existing repos are unchanged.
+- **A first-time `entire enable` writes `git-refs` explicitly, with no prompt.** Both setup paths do it — the interactive flow and the non-interactive `--agent` flow — via `resolveFirstRunCheckpointBackend` / `firstRunCheckpointBackendDefault` (`setup.go`). There is deliberately **no setup question**: storage topology is not answerable at first-run, so the recommended backend is written silently and `git-branch` is reachable only by typing `--checkpoint-backend branch`. The one case that writes nothing is an active `ENTIRE_CHECKPOINTS_PRIMARY`, since the env fully replaces the settings block and persisting a default would only record diverging config.
 - `settings.local.json`'s `checkpoints` block **replaces** the one in `settings.json` wholesale (this is a selection config, not a deep-merged document).
 - Config loading is **fail-soft**: a missing file, a whole-file JSON syntax error, or unrelated invalid fields all resolve to "no config" → default git-branch. It errors *only* when a present `checkpoints` block is itself invalid.
 - Unknown fields are rejected (`DisallowUnknownFields`) to surface typos. The trade-off: adding a `checkpoints` field is a coordinated rollout — ship the reader before any writer emits the field.
@@ -177,19 +238,8 @@ The switch is a **primary flip**, not a dual-write phase. There is no "run both 
 
 | State | `primary` | Behavior |
 |-------|-----------|----------|
-| **Config-less fallback** | `git-branch` | Hex checkpoints on the `v1` branch; unchanged legacy behavior for repos set up before the git-refs default (new setups write an explicit primary — `git-refs` as the recommended pick unless the setup question chose branch) |
+| **Config-less fallback** | `git-branch` | Hex checkpoints on the `v1` branch; unchanged legacy behavior for repos set up before the git-refs default. A repo reaches this state only by predating that default (or by having its `checkpoints` block removed) — a first-time `entire enable` always writes an explicit primary |
 | **Refs-only** | `git-refs` | New checkpoints are ULIDs written as per-checkpoint refs; pre-existing hex/`v1` checkpoints stay readable via the read-routing fallback |
-
-## Checkpoint version and policy
-
-Checkpoint formats are named `<family>-v<major>` and validated in `checkpointpolicy/format.go`:
-
-| Format | Family | Written by |
-|--------|--------|------------|
-| `branch-v1` | `branch` | git-branch backend |
-| `refs-v1` | `refs` | git-refs backend |
-
-Both are in the CLI's read **and** write sets. The repo-wide checkpoint policy (`refs/entire/policies/checkpoint`, `checkpoint_version` / `checkpoint_min_version`) gates which formats a client may write and nudges upgrades; see [Sessions and Checkpoints → Checkpoint Policy](sessions-and-checkpoints.md#checkpoint-policy).
 
 ## Migration and coexistence
 
@@ -197,12 +247,12 @@ The read-routing rules above are what make a hex-on-branch repo and a ULID-in-re
 
 Concretely, flipping the primary to git-refs means new checkpoints are ULIDs stored as per-checkpoint refs, while every checkpoint already written to the `v1` branch stays exactly where it is and keeps resolving through the branch fallback. This works because **every reader routes the same way — refs first (for both ID formats), branch fallback for the legacy format** — not just the CLI but also entire.io and entire-api. So a repo can move to refs-only on the remote without keeping the `v1` branch alive for any reader's benefit.
 
-A mixed fleet is fine and needs no special handling:
+A mixed fleet works, with one limitation:
 
 - A **modern** CLI (or the server) on git-refs primary reads everything: ULID/refs checkpoints directly, and older hex/`v1` checkpoints via the fallback.
-- An **old** CLI keeps writing hex checkpoints to the `v1` branch, and everyone modern still reads those. It simply **cannot read** newer ULID/refs checkpoints — which is the intended behavior: it fails closed, and the [version policy](#checkpoint-version-and-policy) (`checkpoint_min_version`) turns that into an explicit "upgrade" nudge rather than a silent half-working state.
+- An **old** CLI keeps writing hex checkpoints to the `v1` branch, and everyone modern still reads those. Reading ULID/refs checkpoints requires a CLI with git-refs support; an old CLI does not see them.
 
-This is why running `git-branch` as a *mirror* of git-refs is **not** part of the migration: it would dual-write every checkpoint into both backends to keep `v1` populated, but no reader needs that — read routing already covers both formats, and the "old client can't read the new format" case is a feature, not something to paper over.
+This is why running `git-branch` as a *mirror* of git-refs is **not** part of the migration: it would dual-write every checkpoint into both backends to keep `v1` populated, but no reader needs that — read routing already covers both formats, and an old client not reading the new format is an accepted consequence rather than something to paper over. It is now a **silent** one: the `checkpoint_min_version` policy that used to turn it into an explicit "upgrade" nudge was removed with the checkpoint policy feature, and nothing replaced it. An old CLI in a refs-primary repo sees a partial history and is told nothing.
 
 When checkpoints *are* actively migrated from the branch into refs (a path that is tooling-only today, not an official flow), they are written under `RefName(hexID)` — i.e. **hex-named refs** — which is why a hex ID under a git-refs primary is looked up in refs first and only then falls back to the branch.
 
@@ -217,13 +267,13 @@ When checkpoints *are* actively migrated from the branch into refs (a path that 
 | `checkpoint/pushqueue.go` | Flock JSONL push-discovery queue |
 | `checkpoint/routing_store.go` | `kindRoutingStore` — id-kind read + backfill-write routing across both backends |
 | `checkpoint/id/id.go` | `ShardFor`, `Kind`/`KindOf`, ID generation |
-| `checkpointpolicy/format.go` | `branch-v1` / `refs-v1` format families and read/write sets |
 | `settings/checkpoints.go` | `checkpoints` block parsing + env override |
 | `strategy/manual_commit_push.go` | Pre-push: drain queue, batch push, per-ref recovery |
 | `strategy/push_common.go` | `batchPushRefs`, `pushCheckpointRefWithRecovery`, fetch+replay |
+| `strategy/checkpoint_delete*.go` | `entire checkpoint delete`: read-only plan, leased per-remote deletes |
+| `checkpoint/deleted_list.go` | Local deleted-checkpoints list in the git common dir |
 
 ## Known limitations and deferred work
 
-- **Storage-level `List` is local-only by default**, with **opt-in remote discovery** for user-facing enumeration (see [List and remote discovery](#list-and-remote-discovery)): an `ls-remote` of `refs/entire/checkpoints/*` surfaces checkpoints written on another machine, hydrated lazily on read. It is scoped to a configured `checkpoint_remote` and kept off the per-turn hook hot path.
-- **OPF (OpenAI Privacy Filter) at pre-push is git-branch-only for now.** The per-ref push does not run OPF re-redaction; that is deferred until after the store lands. See `strategy/manual_commit_opf_rewrite.go` and [security-and-privacy.md](../security-and-privacy.md).
+- **Storage-level `List` is local-only by default**, with **opt-in remote discovery** for user-facing enumeration (see [List and remote discovery](#list-and-remote-discovery)): an `ls-remote` of `refs/entire/checkpoints/*` surfaces checkpoints written on another machine, hydrated lazily on read. It queries the dedicated `checkpoint_remote` when one is configured, else the checkpoint read candidates with merged listings, and is kept off the per-turn hook hot path.
 - **The "ULIDs never land on the branch" invariant is not yet enforced at write time.** A config flip or a missing `ENTIRE_CHECKPOINTS_PRIMARY` in an amending environment could, in principle, condense a ULID checkpoint onto the `v1` branch, which readers (routing ULIDs to refs only) would then fail to find. Because git-branch is *not* a mirror of git-refs (see [Migration and coexistence](#migration-and-coexistence)), a ULID reaching the git-branch write path is unambiguously a bug — so enforcing this is a straightforward reject at that write path, not a topology-role-aware check.

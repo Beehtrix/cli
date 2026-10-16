@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/entireio/cli/internal/entireclient/contexts"
 	"github.com/entireio/cli/internal/entireclient/tokenstore"
+	"github.com/entireio/cli/internal/entireclient/userdirs"
 )
 
 // testCoreURL is the login server every context in this file is recorded
@@ -32,8 +34,8 @@ func seedAccountWithJurisdictionTokens(t *testing.T, handle string, audiences ..
 	}
 
 	for _, audience := range audiences {
-		if err := RememberJurisdictionAudience(name, audience); err != nil {
-			t.Fatalf("RememberJurisdictionAudience(%q): %v", audience, err)
+		if err := rememberJurisdictionAudience(name, audience); err != nil {
+			t.Fatalf("rememberJurisdictionAudience(%q): %v", audience, err)
 		}
 		if err := tokenstore.Set(tokenstore.JurisdictionService(audience), handle, "juri-jwt"); err != nil {
 			t.Fatalf("seed jurisdiction token for %q: %v", audience, err)
@@ -130,23 +132,6 @@ func TestRemoveContext_LeavesOtherAccountsJurisdictionTokens(t *testing.T) {
 	}
 }
 
-// TestRemoveCurrentContext_DeletesJurisdictionTokens covers the default
-// `entire logout` path (active context, not selected by name).
-func TestRemoveCurrentContext_DeletesJurisdictionTokens(t *testing.T) {
-	t.Setenv("ENTIRE_CONFIG_DIR", t.TempDir())
-	t.Cleanup(tokenstore.UseFileBackendForTesting(filepath.Join(t.TempDir(), "tokens.json")))
-
-	const audience = "https://eu.example.io"
-	seedLoginWithJurisdictionTokens(t, audience)
-
-	if err := RemoveCurrentContext(); err != nil {
-		t.Fatalf("RemoveCurrentContext: %v", err)
-	}
-	if v, err := tokenstore.Get(tokenstore.JurisdictionService(audience), "alice"); !errors.Is(err, tokenstore.ErrNotFound) {
-		t.Fatalf("jurisdiction token survived logout: value=%q err=%v", v, err)
-	}
-}
-
 // TestRemoveContext_SkipsBlankRecordedAudience covers a hand-edited or
 // corrupted contexts.json: a blank audience would resolve to the bare service
 // prefix, so it must be skipped rather than looked up, and it must not stop the
@@ -224,50 +209,6 @@ func TestRemoveContext_JurisdictionDeleteFailureAbortsLogout(t *testing.T) {
 	}
 }
 
-func TestRememberJurisdictionAudience(t *testing.T) {
-	cfgDir := t.TempDir()
-	t.Setenv("ENTIRE_CONFIG_DIR", cfgDir)
-	t.Cleanup(tokenstore.UseFileBackendForTesting(filepath.Join(t.TempDir(), "tokens.json")))
-
-	exp := time.Now().Add(time.Hour).Unix()
-	name, err := RecordLoginContext(makeJWT(t, fmt.Sprintf(`{"iss":%q,"handle":"alice","exp":%d}`, testCoreURL, exp)), testRefreshToken, true)
-	if err != nil {
-		t.Fatalf("RecordLoginContext: %v", err)
-	}
-
-	// Recorded once, trailing slash trimmed so the audience matches the
-	// keyring service name the writer and logout both derive.
-	if err := RememberJurisdictionAudience(name, "https://eu.example.io/"); err != nil {
-		t.Fatalf("first record: %v", err)
-	}
-	// Idempotent: the same audience (in either spelling) doesn't duplicate.
-	if err := RememberJurisdictionAudience(name, "https://eu.example.io"); err != nil {
-		t.Fatalf("duplicate record: %v", err)
-	}
-	if err := RememberJurisdictionAudience(name, "https://au.example.io"); err != nil {
-		t.Fatalf("second audience: %v", err)
-	}
-
-	f, err := contexts.Load(cfgDir)
-	if err != nil {
-		t.Fatalf("load contexts: %v", err)
-	}
-	got := f.Find(name).JurisdictionAudiences
-	want := []string{"https://eu.example.io", "https://au.example.io"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("recorded audiences = %v, want %v", got, want)
-	}
-
-	// A context that isn't there can't be recorded against — the caller must
-	// not then persist a token no logout could find.
-	if err := RememberJurisdictionAudience("nope", "https://eu.example.io"); err == nil {
-		t.Fatal("want error for an unknown context")
-	}
-	if err := RememberJurisdictionAudience(name, "  "); err == nil {
-		t.Fatal("want error for a blank audience")
-	}
-}
-
 // TestRecordLoginContext_ReloginKeepsJurisdictionAudiences guards the upsert:
 // re-logging in replaces the context entry, but the jurisdiction tokens in the
 // keychain (keyed by audience + handle, not by login session) survive it — so
@@ -296,4 +237,78 @@ func TestRecordLoginContext_ReloginKeepsJurisdictionAudiences(t *testing.T) {
 	if got := f.Find(name).JurisdictionAudiences; !slices.Equal(got, []string{audience}) {
 		t.Fatalf("recorded audiences after re-login = %v, want [%s]", got, audience)
 	}
+}
+
+// Contexts reports the ACTING identity (honouring --context/$ENTIRE_CONTEXT) while
+// StoredContexts reports the PERSISTED default. `logout` sweeps StoredContexts,
+// so an override naming a missing context must not fail it.
+//
+// Mutates the process-wide override and env, so no t.Parallel.
+func TestContextsVsStoredContexts_OverrideScope(t *testing.T) {
+	const (
+		defaultCtx  = "prod"    // the stored current_context
+		overrideCtx = "staging" // selected for one invocation
+	)
+	cfgDir := t.TempDir()
+	t.Setenv("ENTIRE_CONFIG_DIR", cfgDir)
+	t.Cleanup(tokenstore.UseFileBackendForTesting(filepath.Join(t.TempDir(), "tokens.json")))
+	t.Setenv(contexts.EnvContextVar, "")
+
+	if err := contexts.Save(cfgDir, &contexts.File{
+		CurrentContext: defaultCtx,
+		Contexts: []*contexts.Context{
+			{Name: defaultCtx, CoreURL: testCoreURL, Handle: "me", KeychainService: "kc:prod"},
+			{Name: overrideCtx, CoreURL: "https://staging.example.com", Handle: "me", KeychainService: "kc:staging"},
+		},
+	}); err != nil {
+		t.Fatalf("seed contexts: %v", err)
+	}
+
+	contexts.SetFlagOverrideForTest(t, overrideCtx)
+
+	if _, acting, err := Contexts(); err != nil || acting != overrideCtx {
+		t.Fatalf("Contexts() acting = %q, %v; want staging (the override)", acting, err)
+	}
+	all, stored, err := StoredContexts()
+	if err != nil || stored != defaultCtx {
+		t.Fatalf("StoredContexts() stored = %q, %v; want prod (the persisted default)", stored, err)
+	}
+	if len(all) != 2 || all[0].Name != defaultCtx {
+		t.Fatalf("StoredContexts() list = %v, want the saved contexts in on-disk order", all)
+	}
+
+	// The regression: an override naming a context that no longer exists must not
+	// stop StoredContexts from answering "is a default still set?".
+	contexts.SetFlagOverrideForTest(t, "deleted-by-logout")
+	if _, _, err := Contexts(); err == nil {
+		t.Fatal("Contexts() should fail on an override naming no saved context")
+	}
+	if got, stored, err := StoredContexts(); err != nil || stored != defaultCtx || len(got) != 2 {
+		t.Fatalf("StoredContexts() = %v/%q, %v; must ignore the override entirely", got, stored, err)
+	}
+}
+
+// rememberJurisdictionAudience adds audience to context `name`'s
+// JurisdictionAudiences, recreating the state that releases which persisted
+// jurisdiction tokens left behind, so logout's cleanup of it stays covered.
+// Idempotent: an already-recorded audience rewrites nothing.
+func rememberJurisdictionAudience(name, audience string) error {
+	aud := strings.TrimRight(strings.TrimSpace(audience), "/")
+	if name == "" || aud == "" {
+		return errors.New("context name and jurisdiction audience are both required")
+	}
+	if err := contexts.Modify(userdirs.Config(), func(f *contexts.File) (bool, error) {
+		c := f.Find(name)
+		if c == nil {
+			return false, fmt.Errorf("no login context named %q", name)
+		}
+		if slices.Contains(c.JurisdictionAudiences, aud) {
+			return false, nil
+		}
+		c.JurisdictionAudiences = append(c.JurisdictionAudiences, aud)
+		return true, nil
+	}); err != nil {
+		return fmt.Errorf("record jurisdiction audience %q for context %q: %w", aud, name, err)
+	}
+	return nil
 }

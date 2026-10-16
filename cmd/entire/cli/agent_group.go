@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/agent/external"
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
@@ -16,7 +17,7 @@ import (
 // newAgentGroupCmd builds `entire agent`. Replaces `entire configure`.
 func newAgentGroupCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "agent",
+		Use:   cmdAgent,
 		Short: "Manage agent integrations (add, remove, list)",
 		Long: `Manage agent integrations in this repository.
 
@@ -57,7 +58,7 @@ func runAgentMenu(ctx context.Context, w io.Writer) error {
 
 func newAgentListCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "list",
+		Use:   cmdList,
 		Short: "List installed and available agents",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runAgentList(cmd.Context(), cmd.OutOrStdout())
@@ -66,6 +67,9 @@ func newAgentListCmd() *cobra.Command {
 }
 
 func runAgentList(ctx context.Context, w io.Writer) error {
+	// Gated: listing names no agent, so it may only run entire-agent-* binaries
+	// in a repo that opted into external_agents.
+	external.DiscoverAndRegister(ctx)
 	installed := GetAgentsWithHooksInstalled(ctx)
 	installedSet := make(map[types.AgentName]struct{}, len(installed))
 	for _, name := range installed {
@@ -89,7 +93,6 @@ func runAgentList(ctx context.Context, w io.Writer) error {
 }
 
 func newAgentAddCmd() *cobra.Command {
-	var localDev bool
 	var forceHooks bool
 	var searchSkill bool
 	var agentHelpSkill bool
@@ -101,17 +104,19 @@ func newAgentAddCmd() *cobra.Command {
 
 Examples:
   entire agent add claude-code
-  entire agent add gemini`,
+  entire agent add codex`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
+			if err := external.DiscoverAndRegisterNamedAlways(cmd.Context(), types.AgentName(name)); err != nil {
+				return fmt.Errorf("agent %s: %w", name, err)
+			}
 			ag, err := agent.Get(types.AgentName(name))
 			if err != nil {
 				printWrongAgentError(cmd.OutOrStdout(), name)
 				return NewSilentError(errors.New("wrong agent name"))
 			}
 			opts := EnableOptions{
-				LocalDev:       localDev,
 				ForceHooks:     forceHooks,
 				SearchSkill:    searchSkill,
 				AgentHelpSkill: agentHelpSkill,
@@ -121,7 +126,6 @@ Examples:
 		},
 	}
 
-	cmd.Flags().BoolVar(&localDev, "local-dev", false, "Install hooks in local-dev mode")
 	cmd.Flags().BoolVar(&forceHooks, "force", false, "Reinstall hooks even if already present")
 	cmd.Flags().BoolVar(&searchSkill, flagSearchSkill, false, "Install the optional Entire search skill")
 	cmd.Flags().BoolVar(&agentHelpSkill, flagAgentHelpSkill, false, "Install the stable Entire agent-help skill (points agents at `entire agent-help`)")

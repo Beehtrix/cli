@@ -5,18 +5,20 @@ on:
   push:
     branches:
       - main
+
+# Least privilege: every job here only reads the repository. The `test` gate job
+# below needs nothing at all and drops even this.
+permissions:
+  contents: read
+
 jobs:
   test-core:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Setup Keyring
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gnome-keyring
-          echo 'somecredstorepass' | gnome-keyring-daemon --unlock
       - uses: jdx/mise-action@f10502fc09dadecfefb962fff68ce77213930204 # v4
       - name: Core Tests
         env:
@@ -25,6 +27,7 @@ jobs:
 
   test-integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -33,19 +36,35 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Setup Keyring
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gnome-keyring
-          echo 'somecredstorepass' | gnome-keyring-daemon --unlock
       - uses: jdx/mise-action@f10502fc09dadecfefb962fff68ce77213930204 # v4
       - name: Integration Tests
         env:
           GO_TEST_PARALLEL: "16"
         run: mise run test:ci:integration:shard -- ${{ matrix.shard }}
 
+  test-codex-hooks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: jdx/mise-action@f10502fc09dadecfefb962fff68ce77213930204 # v4
+      - name: Install latest Codex CLI
+        shell: bash
+        env:
+          CODEX_NON_INTERACTIVE: "1"
+        run: |
+          curl -fsSL --compressed https://chatgpt.com/codex/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Codex app-server integration tests
+        env:
+          ENTIRE_TEST_REQUIRE_CODEX_APP_SERVER: "1"
+        run: go test -tags=integration -race -count=1 ./cmd/entire/cli/integration_test -run '^TestCodexAppServerHooksList_'
+
   test-canary:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       # Run the (no-cost, no-API) Vogon canary against each checkpoint backend so
@@ -56,15 +75,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Setup Keyring
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gnome-keyring
-          echo 'somecredstorepass' | gnome-keyring-daemon --unlock
       - uses: jdx/mise-action@f10502fc09dadecfefb962fff68ce77213930204 # v4
       - name: E2E Canary
         env:
           E2E_CHECKPOINT_STORE: ${{ matrix.checkpoint_store }}
+        run: mise run test:e2e:canary
+
+  # The Vogon canary on Windows: no API calls, so it runs on every PR. Vogon
+  # commits from a console with no window, as desktop agents do, which is the
+  # case a Windows-only prompt regression hangs on (#2725). The roger-roger
+  # lane stays on Linux; the canary script skips it here.
+  test-canary-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: jdx/mise-action@f10502fc09dadecfefb962fff68ce77213930204 # v4
+      - name: E2E Canary (Vogon)
+        shell: bash
         run: mise run test:e2e:canary
 
   test-windows:
@@ -84,10 +114,13 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    permissions: {}
     needs:
       - test-core
       - test-integration
+      - test-codex-hooks
       - test-canary
+      - test-canary-windows
       - test-windows
     if: ${{ always() }}
     steps:
@@ -95,5 +128,7 @@ jobs:
         run: |
           [ "${{ needs.test-core.result }}" = "success" ]
           [ "${{ needs.test-integration.result }}" = "success" ]
+          [ "${{ needs.test-codex-hooks.result }}" = "success" ]
           [ "${{ needs.test-canary.result }}" = "success" ]
+          [ "${{ needs.test-canary-windows.result }}" = "success" ]
           [ "${{ needs.test-windows.result }}" = "success" ]

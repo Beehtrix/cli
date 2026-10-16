@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -11,6 +13,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/entireio/cli/cmd/entire/cli/api"
+	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
@@ -62,12 +66,13 @@ func TestSanitizeTrailWorktreeName(t *testing.T) {
 func TestAppendIgnoreRule(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(t.TempDir(), "gitignore")
+	worktree := t.TempDir()
+	path := filepath.Join(worktree, ".gitignore")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	for i := range 2 {
-		appended, err := appendIgnoreRule(path)
+		appended, err := appendIgnoreRule(worktree)
 		if err != nil {
 			t.Fatalf("appendIgnoreRule: %v", err)
 		}
@@ -91,11 +96,12 @@ func TestAppendIgnoreRule(t *testing.T) {
 func TestAppendIgnoreRule_AddsNewlineBeforeRule(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(t.TempDir(), "gitignore")
+	worktree := t.TempDir()
+	path := filepath.Join(worktree, ".gitignore")
 	if err := os.WriteFile(path, []byte("node_modules"), 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	appended, err := appendIgnoreRule(path)
+	appended, err := appendIgnoreRule(worktree)
 	if err != nil {
 		t.Fatalf("appendIgnoreRule: %v", err)
 	}
@@ -114,16 +120,41 @@ func TestAppendIgnoreRule_AddsNewlineBeforeRule(t *testing.T) {
 func TestAppendIgnoreRule_MissingFileNoop(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(t.TempDir(), "gitignore")
-	appended, err := appendIgnoreRule(path)
+	worktree := t.TempDir()
+	appended, err := appendIgnoreRule(worktree)
 	if err != nil {
 		t.Fatalf("appendIgnoreRule: %v", err)
 	}
 	if appended {
 		t.Fatal("appendIgnoreRule appended = true, want false")
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(worktree, ".gitignore")); !os.IsNotExist(err) {
 		t.Fatalf("gitignore stat = %v, want not exist", err)
+	}
+}
+
+func TestAppendIgnoreRule_RejectsSymlinkedGitignore(t *testing.T) {
+	t.Parallel()
+
+	worktree := t.TempDir()
+	target := filepath.Join(worktree, ".env")
+	if err := os.WriteFile(target, []byte("SECRET=value\n"), 0o600); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	if err := os.Symlink(".env", filepath.Join(worktree, ".gitignore")); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	_, err := appendIgnoreRule(worktree)
+	if !errors.Is(err, osroot.ErrSymlinkedPath) {
+		t.Fatalf("appendIgnoreRule error = %v, want ErrSymlinkedPath", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(got) != "SECRET=value\n" {
+		t.Fatalf("target was modified: %q", got)
 	}
 }
 
@@ -428,7 +459,7 @@ func TestCheckoutReviewWorktree_CreatesWorktreeWithoutTrail(t *testing.T) {
 	t.Chdir(repoDir)
 
 	var out, errOut bytes.Buffer
-	worktreePath, err := checkoutReviewWorktree(context.Background(), &out, &errOut, "feature/review")
+	worktreePath, err := checkoutReviewWorktree(context.Background(), &out, &errOut, "feature/review", branchHeadForTest(t, "feature/review"), false)
 	if err != nil {
 		t.Fatalf("checkoutReviewWorktree: %v; stderr: %s", err, errOut.String())
 	}
@@ -454,7 +485,7 @@ func TestRemoveReviewTargetKeepsDirtyWorktree(t *testing.T) {
 	runGit(t, repoDir, "branch", "feature/dirty-review")
 	t.Chdir(repoDir)
 
-	worktreePath, err := checkoutReviewWorktree(context.Background(), io.Discard, io.Discard, "feature/dirty-review")
+	worktreePath, err := checkoutReviewWorktree(context.Background(), io.Discard, io.Discard, "feature/dirty-review", branchHeadForTest(t, "feature/dirty-review"), false)
 	if err != nil {
 		t.Fatalf("checkoutReviewWorktree: %v", err)
 	}
@@ -480,7 +511,7 @@ func TestCheckoutReviewWorktreeRejectsStaleExternalWorktree(t *testing.T) {
 	}
 	t.Chdir(repoDir)
 
-	_, err := checkoutReviewWorktree(context.Background(), io.Discard, io.Discard, "feature/stale-external")
+	_, err := checkoutReviewWorktree(context.Background(), io.Discard, io.Discard, "feature/stale-external", branchHeadForTest(t, "feature/stale-external"), false)
 	if err == nil || !strings.Contains(err.Error(), "git worktree prune") {
 		t.Fatalf("checkoutReviewWorktree error = %v, want stale worktree error", err)
 	}
@@ -737,5 +768,83 @@ func TestCheckoutTrailWorktree_UnknownBranch(t *testing.T) {
 	err := checkoutTrailWorktree(context.Background(), &out, &errOut, "feature/nope", false, 3)
 	if err == nil || !strings.Contains(err.Error(), "not found locally or on origin") {
 		t.Fatalf("error = %v, want branch-not-found", err)
+	}
+}
+
+// Branches of one project trail share its number, and sanitized branch names
+// are lossy, so the worktree directory takes the branch work's own number.
+// Not parallel: changes the working directory.
+func TestCheckoutTrailBranch_ProjectWorktreesUseBranchWorkNumber(t *testing.T) {
+	repoDir := newTrailWorktreeTestRepo(t)
+	runGit(t, repoDir, "branch", "feature/x")
+	runGit(t, repoDir, "branch", "feature-x")
+	t.Chdir(repoDir)
+
+	parent := &api.TrailParentReference{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", Number: 42}
+	for _, work := range []api.TrailResource{
+		{Number: 7, Branch: "feature/x", Parent: parent},
+		{Number: 8, Branch: "feature-x", Parent: parent},
+	} {
+		var out, errOut bytes.Buffer
+		if err := checkoutTrailBranch(context.Background(), &out, &errOut, &work, trailCheckoutOptions{Worktree: true}); err != nil {
+			t.Fatalf("checkout %s: %v; stderr: %s", work.Branch, err, errOut.String())
+		}
+		wantPath := filepath.Join(repoDir, ".entire", "worktrees", fmt.Sprintf("trail-%d-feature-x", work.Number))
+		if got := currentBranchInDir(t, wantPath); got != work.Branch {
+			t.Fatalf("worktree %s branch = %q, want %q", wantPath, got, work.Branch)
+		}
+	}
+}
+
+func branchHeadForTest(t *testing.T, branch string) string {
+	t.Helper()
+	return gitOutputInDir(t, ".", "rev-parse", "refs/heads/"+branch)
+}
+
+// A branch that moved after the trust gate pinned it must not be checked out:
+// the add stops before any file is written and the worktree is removed.
+func TestCheckoutReviewWorktreeRejectsMovedBranch(t *testing.T) {
+	repoDir := newTrailWorktreeTestRepo(t)
+	runGit(t, repoDir, "branch", "feature/moved")
+	t.Chdir(repoDir)
+	pinned := branchHeadForTest(t, "feature/moved")
+	testutil.WriteFile(t, repoDir, "new.txt", "x")
+	testutil.GitAdd(t, repoDir, "new.txt")
+	testutil.GitCommit(t, repoDir, "move main")
+	runGit(t, repoDir, "branch", "-f", "feature/moved", "HEAD")
+
+	_, err := checkoutReviewWorktree(context.Background(), io.Discard, io.Discard, "feature/moved", pinned, true)
+	if err == nil || !strings.Contains(err.Error(), "moved to a different commit") {
+		t.Fatalf("checkoutReviewWorktree error = %v, want moved-branch error", err)
+	}
+	if _, err := os.Stat(defaultReviewWorktreePath(repoDir, "feature/moved")); !os.IsNotExist(err) {
+		t.Fatalf("worktree for a moved branch was left behind (stat err %v)", err)
+	}
+}
+
+// A branch that moves after the pin check must still leave only the pinned
+// commit's files on disk: the checkout names the pin, not HEAD.
+func TestCheckoutReviewWorktreeChecksOutPinNotMovedHead(t *testing.T) {
+	repoDir := newTrailWorktreeTestRepo(t)
+	runGit(t, repoDir, "branch", "feature/race")
+	t.Chdir(repoDir)
+	pinned := branchHeadForTest(t, "feature/race")
+	beforePinnedReviewCheckout = func(string) {
+		testutil.WriteFile(t, repoDir, "unapproved.txt", "x")
+		testutil.GitAdd(t, repoDir, "unapproved.txt")
+		testutil.GitCommit(t, repoDir, "move after pin check")
+		runGit(t, repoDir, "update-ref", "refs/heads/feature/race", "HEAD")
+	}
+	t.Cleanup(func() { beforePinnedReviewCheckout = nil })
+
+	worktreePath, err := checkoutReviewWorktree(context.Background(), io.Discard, io.Discard, "feature/race", pinned, true)
+	if err != nil {
+		t.Fatalf("checkoutReviewWorktree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(worktreePath, "unapproved.txt")); !os.IsNotExist(err) {
+		t.Fatalf("file from the unapproved commit was checked out (stat err %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(worktreePath, "README.md")); err != nil {
+		t.Fatalf("pinned commit's files missing: %v", err)
 	}
 }

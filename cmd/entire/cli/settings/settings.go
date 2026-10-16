@@ -9,18 +9,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/entireio/cli/cmd/entire/cli/entiredir"
+	"github.com/entireio/cli/cmd/entire/cli/gitdir"
 	"github.com/entireio/cli/cmd/entire/cli/internal/flock"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
+	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/redact"
@@ -31,6 +34,13 @@ const (
 	EntireSettingsFile = ".entire/settings.json"
 	// EntireSettingsLocalFile is the path to the local settings override file (not committed)
 	EntireSettingsLocalFile = ".entire/settings.local.json"
+
+	// SettingsName and SettingsLocalName name the same two files relative to
+	// the .entire root, which is the coordinate every read and write of them
+	// uses. The repo-relative spellings above stay for display, git paths, and
+	// tracked-file checks.
+	SettingsName      = "settings.json"
+	SettingsLocalName = "settings.local.json"
 	// ClonePreferencesFile is the path inside the git common dir for clone-local preferences.
 	ClonePreferencesFile = "entire/preferences.json"
 )
@@ -44,6 +54,13 @@ func WithWorktreeRoot(ctx context.Context, worktreeRoot string) context.Context 
 		return ctx
 	}
 	return context.WithValue(ctx, worktreeRootContextKey{}, filepath.Clean(worktreeRoot))
+}
+
+// WorktreeRoot returns the explicit worktree root carried by ctx. Consumers
+// that combine settings resolution with repo-local git commands use this to
+// keep both operations scoped to the same repository.
+func WorktreeRoot(ctx context.Context) (string, bool) {
+	return worktreeRootFromContext(ctx)
 }
 
 func worktreeRootFromContext(ctx context.Context) (string, bool) {
@@ -61,12 +78,38 @@ const (
 
 // EntireSettings represents the .entire/settings.json configuration
 type EntireSettings struct {
+	// localLayerRejection records why .entire/settings.local.json was ignored.
+	// Unexported so it never serializes. Surfaced via LocalLayerRejection.
+	localLayerRejection string
+
+	// symlinkedAgentDirsRejection records why some or all of
+	// allow_symlinked_agent_dirs was dropped.
+	symlinkedAgentDirsRejection string
+
+	// externalAgentsRejection records why an external_agents grant was
+	// dropped by the trust gate, for the consumer to report. Unexported so it
+	// never serializes — a rejected grant must not be written back to disk as
+	// if the user had turned it off. See enforceExternalAgentsTrust.
+	externalAgentsRejection string
+
+	// agentPromptRejections records agent instruction fields dropped by the
+	// trust gate, for the consumers to report. Unexported so they never
+	// serialize — a rejected instruction must not be written back to disk as
+	// if the user had removed it. See enforceAgentPromptTrust.
+	agentPromptRejections []AgentPromptRejection
+
 	// Enabled indicates whether Entire is active. When false, CLI commands
 	// show a disabled message and hooks exit silently. Defaults to true.
 	Enabled bool `json:"enabled"`
 
-	// LocalDev indicates whether to use "go run" instead of the "entire" binary
-	// This is used for development when the binary is not installed
+	// Deprecated: no longer used, and deliberately not read anywhere — not even
+	// merged from an override (see mergeScalarFields). Kept so the strict loader
+	// (DisallowUnknownFields) still accepts a "local_dev" key in settings files
+	// written before it was removed.
+	//
+	// It let a tracked settings file decide that hooks run repo content; see
+	// agent.LegacyLocalDevHookScript for the full rationale. Do not reintroduce a
+	// setting that influences hook command generation.
 	LocalDev bool `json:"local_dev,omitempty"`
 
 	// LogLevel sets the logging verbosity (debug, info, warn, error).
@@ -111,9 +154,25 @@ type EntireSettings struct {
 	// `entire review`.
 	ReviewFixAgent string `json:"review_fix_agent,omitempty"`
 
-	// Investigate holds configuration for `entire investigate`. Empty means
-	// `entire investigate` triggers the first-run picker.
-	Investigate *InvestigateConfig `json:"investigate,omitempty"`
+	// Deprecated: `entire investigate` moved to the entire-investigate plugin,
+	// which owns its configuration in .entire/investigate.local.json. This
+	// field is no longer read by anything.
+	//
+	// It is kept, and kept as a raw message, so the strict loader
+	// (DisallowUnknownFields) still accepts an "investigate" key left behind in
+	// an existing settings file. Dropping it outright would make settings
+	// unloadable — and so the whole CLI unusable — in every repository that
+	// still has one. Same reasoning as LocalDev above. Do not reintroduce a
+	// typed struct here: the plugin parses its own file.
+	//
+	// Any well-formed JSON value is accepted and none of it is interpreted.
+	// That is the whole contract — the shape of an old investigate block is
+	// not this CLI's business any more, and validating it would re-couple the
+	// two. Well-formed is not a promise this field makes, it is one the
+	// decoder has already kept: a json.RawMessage is only ever populated by a
+	// decoder that scanned the value to find its end, so malformed content
+	// fails the surrounding settings parse long before it reaches here.
+	Investigate json.RawMessage `json:"investigate,omitempty"`
 
 	// CommitLinking controls how commits are linked to agent sessions.
 	// "always" = auto-link without prompting, "prompt" = ask on each commit.
@@ -122,7 +181,30 @@ type EntireSettings struct {
 
 	// ExternalAgents enables discovery and registration of external agent
 	// plugins (entire-agent-* binaries on $PATH). Defaults to false.
+	//
+	// Discovery executes what it finds, so Load() honors a true value only
+	// when it is developer-owned — set in an untracked
+	// .entire/settings.local.json — and resets it to false otherwise. See
+	// enforceExternalAgentsTrust. Readers that obtain settings by any route
+	// other than Load() (LoadFromFile, LoadFromBytes) get the ungated value
+	// and must not scan $PATH on it.
 	ExternalAgents bool `json:"external_agents,omitempty"`
+
+	// AllowSymlinkedAgentDirs lists worktree-relative agent config directories
+	// (".claude", ".codex/…") whose symlinks Entire may follow instead of
+	// refusing. Defaults to empty, which is the strict behaviour.
+	//
+	// A list rather than a boolean, on purpose: a flag would disable the whole
+	// class, where naming a path is the user saying which arrangement is theirs.
+	// Entries are checked against the directories actually derivable from the
+	// agents' hook-config paths, so `.entire` and `.git/hooks` cannot be
+	// spelled here at all.
+	//
+	// Following a link means writing where it points, so Load() honors this only
+	// from an untracked .entire/settings.local.json, the same gate as
+	// ExternalAgents. See enforceSymlinkedAgentDirsTrust and
+	// agent.SetVouchedSymlinkedDirs.
+	AllowSymlinkedAgentDirs []string `json:"allow_symlinked_agent_dirs,omitempty"`
 
 	// SummaryGeneration stores provider preferences for explain --generate.
 	// This is separate from strategy_options.summarize, which controls
@@ -177,6 +259,20 @@ type ClonePreferences struct {
 	// user can re-enable by editing this file or deleting the key.
 	ReviewMigrationDismissed bool `json:"review_migration_dismissed,omitempty"`
 
+	// CheckpointRemoteClaimDeclined records the `provider:repo` the user
+	// declined when `entire enable` offered to claim a refused
+	// checkpoint_remote, so the confirm prompt is asked once per store
+	// instead of on every run. Only the prompt is one-shot: the line saying
+	// the store is being ignored still prints every time, because that is
+	// the condition the user has to be able to discover.
+	//
+	// The declined value rather than a bool, because a repo that later
+	// configures a DIFFERENT store is a new question. Clone preferences
+	// rather than settings.local.json, so declining once covers every
+	// worktree of the clone and so a committed file can never suppress the
+	// prompt.
+	CheckpointRemoteClaimDeclined string `json:"checkpoint_remote_claim_declined,omitempty"`
+
 	// TrailsEnabled caches whether trails are enabled for this repository on the
 	// API. Pointer shape distinguishes "unknown/not refreshed yet" (nil) from a
 	// definitive false. This is clone-local and not committed so hook-time agent
@@ -202,7 +298,7 @@ type ClonePreferences struct {
 // checkpoint summaries generated by explain --generate.
 type SummaryGenerationSettings struct {
 	// Provider is the selected summary provider agent name
-	// (for example "claude-code", "codex", "gemini", or "pi").
+	// (for example "claude-code", "codex", or "pi").
 	Provider string `json:"provider,omitempty"`
 
 	// Model is an optional model hint passed to the selected provider.
@@ -257,13 +353,31 @@ type RedactionSettings struct {
 	CustomRedactions map[string]string `json:"custom_redactions,omitempty"`
 
 	// OpenAIPrivacyFilter is the optional 8th redaction layer (opt-in).
-	// See docs/security-and-privacy.md.
+	//
+	// Deprecated: the OpenAI Privacy Filter will be removed in a future
+	// release. Existing configurations keep working until then; do not build
+	// new behavior on it.
 	OpenAIPrivacyFilter *OPFSettings `json:"openai_privacy_filter,omitempty"`
 
 	// ExternalizeImages opts into lifting inline base64 images out of transcripts
 	// into the checkpoint's assets/ store (off by default). Restore re-injects
 	// them regardless of this flag.
 	ExternalizeImages bool `json:"externalize_images,omitempty"`
+
+	// Betterleaks toggles the betterleaks scanner engine (layer 2 of the
+	// redaction stack). Omitted, or present with `enabled` omitted, means
+	// enabled. Honored from the committed settings file only; ignored in
+	// settings.local.json.
+	Betterleaks *ScannerSettings `json:"betterleaks,omitempty"`
+
+	// Goredact toggles the goredact scanner engine. Omitted, or present
+	// with `enabled` omitted, means disabled. Same committed-file-only rule.
+	Goredact *ScannerSettings `json:"goredact,omitempty"`
+}
+
+// ScannerSettings toggles one secret-scanner engine.
+type ScannerSettings struct {
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 // PIISettings configures PII detection categories.
@@ -285,10 +399,23 @@ type PIISettings struct {
 // future user who tries to set it. Adding the field again should land in
 // lockstep with the runtime enforcement.
 type OPFSettings struct {
-	Enabled        bool            `json:"enabled,omitempty"`
-	Categories     map[string]bool `json:"categories,omitempty"`
-	Command        string          `json:"command,omitempty"`
-	TimeoutSeconds int             `json:"timeout_seconds,omitempty"`
+	Enabled    bool            `json:"enabled,omitempty"`
+	Categories map[string]bool `json:"categories,omitempty"`
+
+	// Command is executed, so Load() honors it only when it is
+	// developer-owned — set in an untracked .entire/settings.local.json — and
+	// resets it to "" otherwise. See enforceOPFCommandTrust. Readers that
+	// obtain settings by any route other than Load() (LoadFromFile,
+	// LoadFromBytes) get the ungated value and must not pass it to exec.
+	Command        string `json:"command,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+
+	// rejectedCommand/rejectionReason record a Command dropped by the trust
+	// gate, for the consumer to report on stderr. Unexported so they never
+	// serialize — a rejected command must not be written back to disk as if
+	// the user had unset it. See enforceOPFCommandTrust.
+	rejectedCommand string
+	rejectionReason string
 
 	// PromptDefault controls whether the pre-push hook asks the user
 	// before running OPF. "" (default) and "ask" both surface the
@@ -296,6 +423,17 @@ type OPFSettings struct {
 	// "always" runs without asking. ENTIRE_OPF=yes|no on the push
 	// invocation overrides this setting per-push.
 	PromptDefault string `json:"prompt_default,omitempty"`
+}
+
+// CommandRejection reports a Command that Load dropped as untrusted: the
+// original value, why it was rejected, and whether a rejection happened.
+// Callers that configure the OPF runtime should surface this — it is the only
+// signal the user's configured binary is being ignored.
+func (o *OPFSettings) CommandRejection() (command, reason string, rejected bool) {
+	if o == nil || o.rejectionReason == "" {
+		return "", "", false
+	}
+	return o.rejectedCommand, o.rejectionReason, true
 }
 
 // Valid PromptDefault values. Empty == OPFPromptAsk.
@@ -347,6 +485,11 @@ func (s *EntireSettings) SummaryTimeoutValue() time.Duration {
 // ReviewProfileConfig is intentionally small: the review package owns built-in
 // default task text for conventional profile names like "general".
 type ReviewProfileConfig struct {
+	// Task is the canonical instruction every reviewer agent receives, so it
+	// gets the same provenance gate as ReviewConfig.Prompt: Load() honors it
+	// only from a developer-owned layer and resets it to "" otherwise, at
+	// which point review falls back to its built-in task text for
+	// conventional profile names. See enforceAgentPromptTrust.
 	Task   string                  `json:"task,omitempty"`
 	Agents map[string]ReviewConfig `json:"agents,omitempty"`
 	// Judge is the single agent (plus optional model) that consolidates the
@@ -394,6 +537,13 @@ type ReviewConfig struct {
 	// Prompt, when non-empty, carries saved agent-specific instructions. It is
 	// appended after the profile task (and after any Skills); it is not a
 	// verbatim replacement for the whole review prompt.
+	//
+	// The instructions reach agents spawned with approval checks disabled, so
+	// Load() honors this field only from a developer-owned layer (clone-local
+	// preferences, or an untracked .entire/settings.local.json) and resets it
+	// to "" otherwise. See enforceAgentPromptTrust. Readers that obtain
+	// settings by any route other than Load() (LoadFromFile, LoadFromBytes)
+	// get the ungated value and must not hand it to an agent.
 	Prompt string `json:"prompt,omitempty"`
 }
 
@@ -402,43 +552,75 @@ func (c ReviewConfig) IsZero() bool {
 	return c.Agent == "" && c.Model == "" && len(c.Skills) == 0 && c.Prompt == ""
 }
 
-// InvestigateConfig holds the configuration for `entire investigate`.
-// Unlike ReviewConfig, investigate runs the same shared prompt across
-// all configured agents, so the schema is a flat agent list with global
-// loop knobs rather than per-agent skill lists.
-type InvestigateConfig struct {
-	// Agents is the ordered list of agent names to round-robin during the loop.
-	Agents []string `json:"agents,omitempty"`
-
-	// MaxTurns is the per-agent turn budget. Defaults to 2 when zero
-	// (see investigate.defaultMaxTurns).
-	MaxTurns int `json:"max_turns,omitempty"`
-
-	// Quorum is the count of `approve` stances needed to terminate the loop.
-	// Zero means "all agents must approve" (matches marvin's default).
-	Quorum int `json:"quorum,omitempty"`
-
-	// AlwaysPrompt is appended to every turn's composed prompt, parallel
-	// to ReviewConfig.Prompt.
-	AlwaysPrompt string `json:"always_prompt,omitempty"`
+// LocalLayerRejection reports why .entire/settings.local.json was ignored, or
+// "" when it was applied (or absent). A tracked local file is not local: it
+// arrives by cloning, so honoring it would let one developer's overrides —
+// including ones that pick binaries to execute — apply to everyone.
+func (s *EntireSettings) LocalLayerRejection() string {
+	if s == nil {
+		return ""
+	}
+	return s.localLayerRejection
 }
 
-// IsZero reports whether the config is effectively unset.
-func (c *InvestigateConfig) IsZero() bool {
-	if c == nil {
+// ExternalAgentsRejection reports why Load dropped an external_agents grant as
+// untrusted, and whether a rejection happened. Callers that would otherwise
+// scan $PATH should surface it — it is the only signal that a setting the user
+// can see in their settings file is not in effect.
+func (s *EntireSettings) ExternalAgentsRejection() (reason string, rejected bool) {
+	if s == nil || s.externalAgentsRejection == "" {
+		return "", false
+	}
+	return s.externalAgentsRejection, true
+}
+
+// SymlinkedAgentDirsRejection reports why Load dropped some or all of
+// allow_symlinked_agent_dirs, and whether a rejection happened.
+//
+// Surfaced for the same reason as ExternalAgentsRejection: without it, a grant
+// that was refused and a setting the user never wrote look identical from the
+// outside, since both end with Entire refusing the link.
+func (s *EntireSettings) SymlinkedAgentDirsRejection() (reason string, rejected bool) {
+	if s == nil || s.symlinkedAgentDirsRejection == "" {
+		return "", false
+	}
+	return s.symlinkedAgentDirsRejection, true
+}
+
+// BetterleaksEnabled reports whether the betterleaks scanner runs.
+// Default (nil settings, nil redaction, nil scanner, nil enabled): true.
+func (s *EntireSettings) BetterleaksEnabled() bool {
+	if s == nil || s.Redaction == nil || s.Redaction.Betterleaks == nil || s.Redaction.Betterleaks.Enabled == nil {
 		return true
 	}
-	return len(c.Agents) == 0 && c.MaxTurns == 0 && c.Quorum == 0 && c.AlwaysPrompt == ""
+	return *s.Redaction.Betterleaks.Enabled
 }
 
-// InvestigateConfig returns the configured investigate config. Returns nil
-// when no configuration is present; callers should check IsZero (or guard
-// for nil) to decide whether configuration is present.
-func (s *EntireSettings) InvestigateConfig() *InvestigateConfig {
-	if s == nil {
-		return nil
+// GoredactEnabled reports whether the goredact scanner runs.
+// Default: false.
+func (s *EntireSettings) GoredactEnabled() bool {
+	if s == nil || s.Redaction == nil || s.Redaction.Goredact == nil || s.Redaction.Goredact.Enabled == nil {
+		return false
 	}
-	return s.Investigate
+	return *s.Redaction.Goredact.Enabled
+}
+
+// ErrScannerConfig marks scanner-configuration failures. Consumers use
+// errors.Is to distinguish these (fail-closed) from ordinary settings
+// problems (warn-and-default).
+var ErrScannerConfig = errors.New("invalid redaction scanner configuration")
+
+// validateScannerSettings enforces the fail-closed rule: at least one secret
+// scanner must be enabled. This runs only on merged settings (see
+// loadMergedSettings) — never in the per-file loaders — because those loaders
+// serve display/inspection consumers reading a single file in isolation
+// (entire status via LoadFromFile, investigate via LoadFromBytes), and a
+// local file may legally contain scanner keys that are inert even after merge.
+func validateScannerSettings(s *EntireSettings) error {
+	if !s.BetterleaksEnabled() && !s.GoredactEnabled() {
+		return fmt.Errorf("%w: at least one secret scanner must be enabled; re-enable redaction.betterleaks or enable redaction.goredact", ErrScannerConfig)
+	}
+	return nil
 }
 
 // Load loads the Entire settings from .entire/settings.json, then applies
@@ -451,7 +633,10 @@ func Load(ctx context.Context) (*EntireSettings, error) {
 		return loadForWorktreeRoot(ctx, worktreeRoot)
 	}
 
-	settingsFileAbs, localSettingsFileAbs := settingsAbsPaths(ctx)
+	settingsFileAbs, localSettingsFileAbs, err := settingsAbsPaths(ctx)
+	if err != nil {
+		return nil, err
+	}
 	preferencesFileAbs := ""
 	if path, prefErr := ClonePreferencesPath(ctx); prefErr == nil {
 		preferencesFileAbs = path
@@ -465,22 +650,27 @@ func Load(ctx context.Context) (*EntireSettings, error) {
 			slog.String("error", prefErr.Error()))
 	}
 
-	return loadMergedSettings(settingsFileAbs, preferencesFileAbs, localSettingsFileAbs)
+	return loadMergedSettings(ctx, settingsFileAbs, preferencesFileAbs, localSettingsFileAbs)
 }
 
-// settingsAbsPaths resolves the base and local settings file paths relative to
-// the current working directory, falling back to the relative path when
-// absolute resolution fails.
-func settingsAbsPaths(ctx context.Context) (base, local string) {
-	base, err := paths.AbsPath(ctx, EntireSettingsFile)
+// settingsAbsPaths resolves the base and local settings file paths against the
+// repository anchor. Resolution failures are returned rather than converted to
+// cwd-relative paths: doing the latter can select a different .entire from a
+// subdirectory precisely when Git could not establish which repository owns it.
+func settingsAbsPaths(ctx context.Context) (base, local string, err error) {
+	// entiredir.PathTo, not paths.AbsPath: both files live under .entire, and
+	// entiredir owns the one anchor for that directory. AbsPath's failure mode
+	// here was a relative path that then resolved against the process's own
+	// directory, which is the thing the anchor exists to prevent.
+	base, err = entiredir.PathTo(ctx, EntireSettingsFile)
 	if err != nil {
-		base = EntireSettingsFile // Fallback to relative
+		return "", "", fmt.Errorf("resolve project settings path: %w", err)
 	}
-	local, err = paths.AbsPath(ctx, EntireSettingsLocalFile)
+	local, err = entiredir.PathTo(ctx, EntireSettingsLocalFile)
 	if err != nil {
-		local = EntireSettingsLocalFile // Fallback to relative
+		return "", "", fmt.Errorf("resolve local settings path: %w", err)
 	}
-	return base, local
+	return base, local, nil
 }
 
 // worktreeSettingsPaths resolves the base and local settings file paths under
@@ -498,7 +688,7 @@ func loadForWorktreeRoot(ctx context.Context, worktreeRoot string) (*EntireSetti
 		logging.Debug(ctx, "clone preferences path unresolved; skipping preferences layer",
 			slog.String("error", prefErr.Error()))
 	}
-	return loadMergedSettings(settingsFileAbs, preferencesFileAbs, localSettingsFileAbs)
+	return loadMergedSettings(ctx, settingsFileAbs, preferencesFileAbs, localSettingsFileAbs)
 }
 
 func clonePreferencesPathForWorktreeRoot(ctx context.Context, worktreeRoot string) (string, error) {
@@ -515,39 +705,81 @@ func clonePreferencesPathForWorktreeRoot(ctx context.Context, worktreeRoot strin
 	return filepath.Join(filepath.Clean(commonDir), ClonePreferencesFile), nil
 }
 
-func loadMergedSettings(settingsFileAbs, preferencesFileAbs, localSettingsFileAbs string) (*EntireSettings, error) {
+// worktreeRootOfSettingsFile recovers the worktree root a settings path was
+// built from: settingsAbsPaths joins <root>/.entire/<file>, so the root is two
+// levels up. Used only as the KEY the vouched-symlink policy is scoped by, never
+// as a base for I/O, so the derived-path rule in CLAUDE.md does not apply -- an
+// inconsistent key costs a refused symlink, which is the safe direction.
+func worktreeRootOfSettingsFile(settingsFileAbs string) string {
+	if settingsFileAbs == "" {
+		return ""
+	}
+	return filepath.Dir(filepath.Dir(settingsFileAbs))
+}
+
+func loadMergedSettings(ctx context.Context, settingsFileAbs, preferencesFileAbs, localSettingsFileAbs string) (*EntireSettings, error) {
 	// Load base settings
 	settings, err := loadFromFile(settingsFileAbs)
 	if err != nil {
 		return nil, fmt.Errorf("reading settings file: %w", err)
 	}
 
+	var preferences *ClonePreferences
 	if preferencesFileAbs != "" {
-		preferences, err := loadClonePreferencesFromFile(preferencesFileAbs)
+		preferences, err = loadClonePreferencesFromFile(preferencesFileAbs)
 		if err != nil {
 			return nil, fmt.Errorf("reading clone preferences file: %w", err)
 		}
 		applyClonePreferences(settings, preferences)
 	}
 
-	// Apply local overrides if they exist
+	// Apply local overrides if they exist — but only from a file that is
+	// genuinely local. See localLayerTrackedReason.
 	localData, err := readConfined(localSettingsFileAbs)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("reading local settings file: %w", err)
 		}
 		// Local file doesn't exist, continue without overrides
-	} else {
-		if err := mergeJSON(settings, localData); err != nil {
-			return nil, fmt.Errorf("merging local settings: %w", err)
-		}
+	} else if classifyLocalSettings(ctx, localSettingsFileAbs) == localTracked {
+		// Dropped only on PROOF that the file is tracked. Discarding every
+		// local setting because a repository could not be read would be a
+		// worse failure than the one being guarded against — the exec-bearing
+		// OPF command applies the stricter policy for itself.
+		settings.localLayerRejection = localLayerTrackedReason
+		localData = nil
+	} else if err := mergeJSON(settings, localData); err != nil {
+		return nil, fmt.Errorf("merging local settings: %w", err)
 	}
+
+	// openai_privacy_filter.command is executed, so it is honored only from a
+	// local file positively verified as this developer's own. external_agents
+	// grants execution of every entire-agent-* binary on $PATH, so it gets the
+	// same gate. Agent instruction fields (review prompts and profile tasks)
+	// are appended verbatim to prompts of agents spawned with approval checks
+	// disabled, so they get the same provenance requirement, with clone-local
+	// preferences as an additional trusted layer. `investigate.always_prompt`
+	// was gated here too until investigate moved to the entire-investigate
+	// plugin; the plugin applies the equivalent check to its own config file,
+	// and the deprecated `investigate` key left in settings is not read.
+	enforceOPFCommandTrust(ctx, settings, localSettingsFileAbs, localData)
+	enforceExternalAgentsTrust(ctx, settings, localSettingsFileAbs, localData)
+	enforceAgentPromptTrust(ctx, settings, localSettingsFileAbs, localData, preferences)
+	// allow_symlinked_agent_dirs decides where Entire writes an agent's hook
+	// config, so it gets the same gate, and then installs the surviving set as
+	// the process-wide policy.
+	enforceSymlinkedAgentDirsTrust(ctx, settings, localSettingsFileAbs, localData)
+	applyVouchedAgentDirs(settings, worktreeRootOfSettingsFile(settingsFileAbs))
 
 	// Re-validate after merge. Individual files are validated by loadFromFile,
 	// but mergeJSON patches fields independently and can produce combinations
 	// (e.g. model without provider when the local override sets only a model
 	// on top of a base with no provider) that neither file alone contained.
 	if err := settings.SummaryGeneration.Validate(); err != nil {
+		return nil, fmt.Errorf("merged settings invalid: %w", err)
+	}
+
+	if err := validateScannerSettings(settings); err != nil {
 		return nil, fmt.Errorf("merged settings invalid: %w", err)
 	}
 
@@ -579,6 +811,12 @@ func LoadProjectRaw(ctx context.Context) (path string, raw map[string]json.RawMe
 	return loadRaw(ctx, EntireSettingsFile, "project")
 }
 
+// LoadLocalRaw reads the raw local file and is deliberately UNGATED: it is the
+// read half of read-modify-write for every caller that saves the file back, so
+// hiding a tracked file here would make those writers clobber its other keys.
+// Readers that need the "is this the developer's own choice?" guarantee must
+// apply the tracked check themselves — see CheckpointRemoteIsLocalOnly.
+//
 // LoadLocalRaw reads .entire/settings.local.json as a generic JSON object,
 // mirroring LoadProjectRaw for the per-developer overrides file. Returns
 // exists=false (and an empty raw map) when the file does not exist — the
@@ -594,9 +832,9 @@ func LoadLocalRaw(ctx context.Context) (path string, raw map[string]json.RawMess
 // "local") only differentiates error wording so failures name the file
 // actually being read.
 func loadRaw(ctx context.Context, file, label string) (path string, raw map[string]json.RawMessage, exists bool, err error) {
-	path, err = paths.AbsPath(ctx, file)
+	path, err = entiredir.PathTo(ctx, file)
 	if err != nil {
-		path = file
+		return "", nil, false, fmt.Errorf("resolve %s settings path: %w", label, err)
 	}
 	data, readErr := readConfined(path)
 	if readErr != nil {
@@ -633,19 +871,15 @@ func SaveLocalRaw(path string, raw map[string]json.RawMessage) error {
 
 // saveRaw writes a generic JSON settings object atomically (temp file +
 // rename). label matches loadRaw's error-wording convention.
-func saveRaw(path, label string, raw map[string]json.RawMessage) error {
+func saveRaw(filePath, label string, raw map[string]json.RawMessage) error {
 	data, err := jsonutil.MarshalIndentWithNewline(raw, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal %s settings: %w", label, err)
 	}
-	// Ensure the parent directory exists, mirroring the struct save path
-	// (saveToFile). Without this, the raw save path fails in a repo that has
-	// never created .entire/ — e.g. a bare `entire disable` in a fresh repo,
-	// which resolves to a raw flip before any directory is created.
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return fmt.Errorf("creating %s settings directory: %w", label, err)
-	}
-	if err := jsonutil.WriteFileAtomic(path, data, 0o644); err != nil {
+	// writeConfinedAtomic creates the parent directory, which matters in a repo
+	// that has never created .entire/ — e.g. a bare `entire disable` in a fresh
+	// repo, which resolves to a raw flip before any directory exists.
+	if err := writeConfinedAtomic(filePath, data, 0o644); err != nil {
 		return fmt.Errorf("writing %s settings: %w", label, err)
 	}
 	return nil
@@ -695,39 +929,177 @@ func LoadFromBytes(data []byte) (*EntireSettings, error) {
 	return s, nil
 }
 
-// readConfined reads filePath through an os.Root anchored at its parent
-// directory. The root confines the open to that directory, so the read cannot
-// be redirected outside it by a swapped or symlinked path between resolution and
-// open (TOCTOU) — unlike a bare os.ReadFile of an absolute path. A symlink that
-// escapes the directory surfaces as a non-ENOENT error. Callers must classify
-// "missing" with errors.Is(err, fs.ErrNotExist) rather than os.IsNotExist,
-// since the returned errors are wrapped.
+// readConfined reads filePath through an os.Root, refusing outright to read it
+// if it is a symbolic link.
+//
+// The root confines the open to its directory, so the read cannot be redirected
+// outside it by a swapped or symlinked path between resolution and open
+// (TOCTOU) — unlike a bare os.ReadFile of an absolute path. Callers must
+// classify "missing" with errors.Is(err, fs.ErrNotExist) rather than
+// os.IsNotExist, since the returned errors are wrapped.
+//
+// WHICH root is chosen by where the path is, not by whether an open succeeded:
+// a path under .entire is read through the shared root every other .entire
+// consumer uses, and a permission failure there must surface rather than
+// silently retry through a second root. The other branch is not a weaker path
+// but a different directory — this same function also reads clone preferences
+// out of the git common dir, which .entire has no claim on.
+//
+// Confinement alone is NOT the invariant, which is why readConfinedIn also
+// Lstats. Entire's config files are never read through a link, wherever it
+// points, and os.Root leaves two gaps against that:
+//
+//   - A RELATIVE link whose target stays inside the directory is followed
+//     without complaint. `.entire/settings.local.json -> planted.json` is the
+//     case that matters: that file names the command Entire executes at
+//     pre-push, so following it hands the far end a say in what runs.
+//   - A DANGLING link surfaces as ENOENT, which every caller here reads as
+//     "absent" and answers with default settings. A planted
+//     `.entire/settings.json -> missing.json` therefore made Entire silently
+//     ignore the project's settings rather than fail.
+//
+// An absolute target, and a relative one that escapes, were already refused —
+// but as "path escapes from parent", which describes neither the cause nor the
+// fix. All four now give the same verdict and the same remedy.
+//
+// This overlaps paths.ValidateEntireDirAt, which rejects a symlinked entry in
+// `.entire` before a command runs at all. The duplication is deliberate: that
+// guard hangs off the root pre-run and cli.LoadEntireSettings, while eighteen
+// files call settings.Load directly — the strategy hook paths among them — and
+// this is the read those callers have in common.
 func readConfined(filePath string) ([]byte, error) {
+	// Branch on WHERE the path is, not on whether the open succeeded: a
+	// permission failure inside .entire must surface, not silently retry
+	// through a second root.
+	if _, _, underEntire := entiredir.Split(filePath); !underEntire {
+		return readConfinedOutsideEntire(filePath)
+	}
+
+	// A relative path is resolved against the process's directory, which is what
+	// "relative" means and what LoadFromFile's callers pass deliberately. The
+	// anchor rule entiredir enforces is about code that DERIVES a .entire path
+	// (see settingsAbsPaths, which now goes through entiredir.PathTo); it is not
+	// a reason to refuse a path a caller handed us.
+	filePath, err := filepath.Abs(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve settings path: %w", err)
+	}
+
+	root, name, err := entiredir.OpenPathForRead(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("open settings dir: %w", err)
+	}
+	return readConfinedIn(root, name, filePath)
+}
+
+// readConfinedOutsideEntire reads the clone-preferences file, which lives in the
+// git common dir rather than under .entire, through that directory's shared
+// root.
+//
+// The fallback anchors on the file's own parent, and that is the one shape this
+// codebase otherwise refuses — see the "an os.Root's base must be a trusted
+// path" rule. It is allowed here for the same reason tokenstore's is: the paths
+// that reach it are ones the CALLER named (the explicit-path settings tests, and
+// LoadFromFile's callers), so their parent directory is the caller's choice too
+// and there is no separate trusted base to prefer. It never applies to a path
+// Entire derived — those are placed under a common dir by clonePreferencesRoot
+// above, or under .entire by readConfined's other branch.
+func readConfinedOutsideEntire(filePath string) ([]byte, error) {
+	if root, name, err := clonePreferencesRoot(filePath); err == nil {
+		return readConfinedIn(root, name, filePath)
+	}
+
 	root, err := os.OpenRoot(filepath.Dir(filePath))
 	if err != nil {
 		return nil, fmt.Errorf("open settings dir: %w", err)
 	}
 	defer root.Close()
 
-	f, err := root.Open(filepath.Base(filePath))
-	if err != nil {
-		return nil, fmt.Errorf("open settings file: %w", err)
-	}
-	defer f.Close()
+	return readConfinedIn(root, filepath.Base(filePath), filePath)
+}
 
-	data, err := io.ReadAll(f)
+// readConfinedIn is the one read every readConfined branch performs: refuse a
+// symlink, open, re-validate against the race, then read.
+//
+// It exists so the refusal cannot be true of one branch and not another. It was
+// briefly true of only one: the .entire branch read straight through
+// osroot.ReadFile, which follows an in-root symlink silently — precisely the
+// `.entire/settings.local.json -> planted.json` case the check exists for.
+//
+// filePath is carried alongside name only for the error text: name is relative
+// to a root the caller cannot see, and the user needs the path they can act on.
+func readConfinedIn(root *os.Root, name, filePath string) ([]byte, error) {
+	data, err := osroot.ReadFileNoFollow(root, name)
 	if err != nil {
-		return nil, fmt.Errorf("read settings file: %w", err)
+		if errors.Is(err, osroot.ErrSymlinkedPath) {
+			//nolint:wrapcheck // sentinel surfaces verbatim for the caller's errors.Is; callers add the reading-context prefix
+			return nil, paths.SymlinkedEntryError(filePath)
+		}
+		return nil, fmt.Errorf("read settings file %s: %w", filePath, err)
 	}
 	return data, nil
+}
+
+// writeConfinedAtomic is readConfined's write half: an atomic write through the
+// shared .entire root, or through the git common dir's root for the clone
+// preferences file. It creates the parent directory, which for a .entire path
+// means the root itself.
+//
+// The non-.entire branch used to be a plain os.MkdirAll plus an unrooted atomic
+// write, which made the two halves asymmetric for no reason: readConfined
+// already resolved that same file through clonePreferencesRoot. A write is the
+// half that matters more, so it gets the same root.
+func writeConfinedAtomic(filePath string, data []byte, perm fs.FileMode) error {
+	// Same branch-on-location rule as readConfined.
+	if _, _, underEntire := entiredir.Split(filePath); !underEntire {
+		return writeClonePreferencesAtomic(filePath, data, perm)
+	}
+
+	// Same relative-path handling as readConfined.
+	filePath, err := filepath.Abs(filePath)
+	if err != nil {
+		return fmt.Errorf("resolve settings path: %w", err)
+	}
+
+	root, name, err := entiredir.OpenPath(filePath)
+	if err != nil {
+		return fmt.Errorf("creating settings directory: %w", err)
+	}
+	if dir := path.Dir(name); dir != "." {
+		if err := osroot.MkdirAllNoSymlink(root, dir, 0o750); err != nil {
+			return fmt.Errorf("creating settings directory: %w", err)
+		}
+	}
+	return jsonutil.WriteFileAtomicIn(root, name, data, perm) //nolint:wrapcheck // caller names the file being written
+}
+
+// writeClonePreferencesAtomic writes a file that lives in the git common dir
+// rather than under .entire, through that directory's root.
+//
+// A path clonePreferencesRoot cannot place inside a common dir keeps the plain
+// unrooted write: the callers that reach it name a file directly (explicit-path
+// tests, and `entire disable` in a directory with no repository), and there is
+// no boundary to enforce for a path the caller chose itself.
+func writeClonePreferencesAtomic(filePath string, data []byte, perm fs.FileMode) error {
+	root, name, err := clonePreferencesRoot(filePath)
+	if err != nil {
+		if mkErr := os.MkdirAll(filepath.Dir(filePath), 0o750); mkErr != nil {
+			return fmt.Errorf("creating settings directory: %w", mkErr)
+		}
+		return jsonutil.WriteFileAtomic(filePath, data, perm) //nolint:wrapcheck // caller names the file being written
+	}
+	if dir := path.Dir(name); dir != "." {
+		if err := osroot.MkdirAllNoSymlink(root, dir, 0o750); err != nil {
+			return fmt.Errorf("creating settings directory: %w", err)
+		}
+	}
+	return jsonutil.WriteFileAtomicIn(root, name, data, perm) //nolint:wrapcheck // caller names the file being written
 }
 
 // loadFromFile loads settings from a specific file path.
 // Returns default settings if the file doesn't exist.
 func loadFromFile(filePath string) (*EntireSettings, error) {
-	settings := &EntireSettings{
-		Enabled: true, // Default to enabled
-	}
+	settings := &EntireSettings{Enabled: true}
 
 	data, err := readConfined(filePath)
 	if err != nil {
@@ -793,17 +1165,12 @@ func saveClonePreferencesToFile(prefs *ClonePreferences, filePath string) error 
 	if prefs == nil {
 		prefs = &ClonePreferences{}
 	}
-	dir := filepath.Dir(filePath)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return fmt.Errorf("creating preferences directory: %w", err)
-	}
-
 	data, err := jsonutil.MarshalIndentWithNewline(prefs, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling preferences: %w", err)
 	}
 
-	if err := jsonutil.WriteFileAtomic(filePath, data, 0o644); err != nil {
+	if err := writeClonePreferencesAtomic(filePath, data, 0o644); err != nil {
 		return fmt.Errorf("writing preferences file: %w", err)
 	}
 	return nil
@@ -833,10 +1200,19 @@ func mergeReviewProfiles(base, src map[string]ReviewProfileConfig) map[string]Re
 }
 
 func modifyClonePreferencesFile(filePath string, fn func(*ClonePreferences) error) error {
-	if err := os.MkdirAll(filepath.Dir(filePath), 0o750); err != nil {
-		return fmt.Errorf("creating preferences directory: %w", err)
+	// Clone preferences live in the git common dir, not under .entire, so the
+	// directory and lock go through gitdir's root for that clone. Resolving from
+	// the file's own path keeps the ClonePreferencesPath API unchanged.
+	root, name, err := clonePreferencesRoot(filePath)
+	if err != nil {
+		return err
 	}
-	release, err := flock.Acquire(filePath + ".lock")
+	if dir := path.Dir(name); dir != "." {
+		if err := osroot.MkdirAllNoSymlink(root, dir, 0o750); err != nil {
+			return fmt.Errorf("creating preferences directory: %w", err)
+		}
+	}
+	release, err := flock.AcquireIn(root, name+".lock")
 	if err != nil {
 		return fmt.Errorf("lock preferences file: %w", err)
 	}
@@ -850,6 +1226,37 @@ func modifyClonePreferencesFile(filePath string, fn func(*ClonePreferences) erro
 		return err
 	}
 	return saveClonePreferencesToFile(prefs, filePath)
+}
+
+// clonePreferencesRoot returns the git common dir's root and the preferences
+// file's name inside it.
+//
+// The common dir is recovered by removing ClonePreferencesFile from the end of
+// filePath, not by walking up a fixed number of parents. Both produce the same
+// string today; the difference is what happens when they are wrong. The old
+// filepath.Dir(filepath.Dir(abs)) form silently anchored one directory too high
+// or too low the moment ClonePreferencesFile gained or lost a component, and it
+// made gitdir.OpenPathIn's containment check vacuous — the base was derived from
+// the very path being checked against it, so `rel` was "entire/preferences.json"
+// by construction and the check could never fire. Trimming a compile-time
+// constant is a shape assertion instead: a path that is not
+// <git-common-dir>/entire/preferences.json is refused rather than opened
+// somewhere else.
+func clonePreferencesRoot(filePath string) (*os.Root, string, error) {
+	abs, err := filepath.Abs(filePath)
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve preferences path: %w", err)
+	}
+	suffix := string(filepath.Separator) + filepath.FromSlash(ClonePreferencesFile)
+	commonDir, ok := strings.CutSuffix(abs, suffix)
+	if !ok || commonDir == "" {
+		return nil, "", fmt.Errorf("%q is not a %s inside a git common dir", filePath, ClonePreferencesFile)
+	}
+	root, name, err := gitdir.OpenPathIn(commonDir, abs)
+	if err != nil {
+		return nil, "", fmt.Errorf("open git common dir: %w", err)
+	}
+	return root, name, nil
 }
 
 func applyClonePreferences(settings *EntireSettings, prefs *ClonePreferences) {
@@ -935,19 +1342,16 @@ func mergeJSON(settings *EntireSettings, data []byte) error {
 	return nil
 }
 
-// mergeInvestigate replaces the investigate config from the override (whole-object
-// replacement, parallel to how summary_generation is handled but simpler — the
-// investigate schema is small and lacks per-field merge semantics).
+// mergeInvestigate carries a deprecated "investigate" key across the merge
+// unparsed. Nothing reads the value; the merge exists so an override layer
+// that still carries the key produces the same settings object as before,
+// rather than the key silently reappearing from a lower layer.
 func mergeInvestigate(settings *EntireSettings, raw map[string]json.RawMessage) error {
 	investigateRaw, ok := raw["investigate"]
 	if !ok {
 		return nil
 	}
-	var cfg InvestigateConfig
-	if err := unmarshalField("investigate", investigateRaw, &cfg); err != nil {
-		return err
-	}
-	settings.Investigate = &cfg
+	settings.Investigate = investigateRaw
 	return nil
 }
 
@@ -956,9 +1360,8 @@ func mergeScalarFields(settings *EntireSettings, raw map[string]json.RawMessage)
 	if err := mergeRawBool(raw, "enabled", &settings.Enabled); err != nil {
 		return err
 	}
-	if err := mergeRawBool(raw, "local_dev", &settings.LocalDev); err != nil {
-		return err
-	}
+	// "local_dev" is deliberately absent — a deprecated no-op, see
+	// EntireSettings.LocalDev.
 	if err := mergeRawBool(raw, "absolute_git_hook_path", &settings.AbsoluteGitHookPath); err != nil {
 		return err
 	}
@@ -986,6 +1389,29 @@ func mergeScalarFields(settings *EntireSettings, raw map[string]json.RawMessage)
 	if err := mergeRawInt(raw, "summary_timeout_seconds", &settings.SummaryTimeoutSeconds); err != nil {
 		return err
 	}
+	if err := mergeRawStringSlice(raw, "allow_symlinked_agent_dirs", &settings.AllowSymlinkedAgentDirs); err != nil {
+		return err
+	}
+	return nil
+}
+
+// mergeRawStringSlice replaces dst when key is present, rather than appending.
+//
+// Replacement is the only sensible merge for allow_symlinked_agent_dirs: the
+// list is the complete set of directories this developer vouches for, and
+// appending would let the project layer contribute entries to a grant only the
+// local layer is trusted to make. An explicit empty list therefore means
+// "vouch for nothing", which is a thing a user can want to say.
+func mergeRawStringSlice(raw map[string]json.RawMessage, key string, dst *[]string) error {
+	v, ok := raw[key]
+	if !ok {
+		return nil
+	}
+	var parsed []string
+	if err := json.Unmarshal(v, &parsed); err != nil {
+		return fmt.Errorf("parsing %s: %w", key, err)
+	}
+	*dst = parsed
 	return nil
 }
 
@@ -1157,6 +1583,16 @@ func mergeRedaction(dst *RedactionSettings, data json.RawMessage) error {
 		}
 		dst.ExternalizeImages = v
 	}
+
+	// Scanner engine selection affects everyone who reads the repo's
+	// checkpoints, so it is honored from the committed settings file only.
+	for _, k := range []string{"betterleaks", "goredact"} {
+		if _, ok := raw[k]; ok {
+			slog.Warn("redaction scanner settings are ignored in settings.local.json; set them in .entire/settings.json",
+				slog.String("key", "redaction."+k))
+		}
+	}
+
 	return nil
 }
 
@@ -1292,26 +1728,66 @@ func mergeStringMap(dst *map[string]string, raw json.RawMessage, field string) e
 // This checks if .entire/settings.json exists.
 // Use this to avoid creating files/directories in repos where Entire was never enabled.
 func IsSetUp(ctx context.Context) bool {
-	settingsFileAbs, err := paths.AbsPath(ctx, EntireSettingsFile)
+	return entireFileExists(ctx, SettingsName)
+}
+
+// FilesPresent reports whether each settings file exists, keeping an access
+// failure distinct from absence. IsSetUp and IsSetUpLocal collapse both into
+// false, which is right for a gate but wrong for `entire status`, whose whole
+// job is to say why it cannot see something.
+func FilesPresent(ctx context.Context) (project, local bool, err error) {
+	root, err := entiredir.OpenForRead(ctx)
 	if err != nil {
-		return false
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("cannot access %s: %w", paths.EntireDir, err)
 	}
-	_, err = os.Lstat(settingsFileAbs)
-	return err == nil
+	project, err = fileExists(root, SettingsName)
+	if err != nil {
+		return false, false, fmt.Errorf("cannot access project settings file: %w", err)
+	}
+	local, err = fileExists(root, SettingsLocalName)
+	if err != nil {
+		return false, false, fmt.Errorf("cannot access local settings file: %w", err)
+	}
+	return project, local, nil
+}
+
+func fileExists(root *os.Root, name string) (bool, error) {
+	if _, err := root.Lstat(name); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err //nolint:wrapcheck // caller names the file
+	}
+	return true, nil
+}
+
+// IsSetUpLocal returns true if .entire/settings.local.json exists. Callers that
+// pick a write target need the two scopes separately, which IsSetUpAny folds
+// together.
+func IsSetUpLocal(ctx context.Context) bool {
+	return entireFileExists(ctx, SettingsLocalName)
 }
 
 // IsSetUpAny returns true if Entire has been set up in the current repository,
 // checking both .entire/settings.json and .entire/settings.local.json.
 // Use this to detect any prior setup, even if only local settings exist.
 func IsSetUpAny(ctx context.Context) bool {
-	if IsSetUp(ctx) {
-		return true
-	}
-	localFileAbs, err := paths.AbsPath(ctx, EntireSettingsLocalFile)
+	return IsSetUp(ctx) || IsSetUpLocal(ctx)
+}
+
+// entireFileExists reports whether name exists directly under .entire. Lstat,
+// not Stat: a settings file that is a dangling symlink still counts as "set up"
+// here, exactly as it did before, and the root refuses to follow one out of
+// .entire regardless.
+func entireFileExists(ctx context.Context, name string) bool {
+	root, err := entiredir.OpenForRead(ctx)
 	if err != nil {
 		return false
 	}
-	_, err = os.Lstat(localFileAbs)
+	_, err = root.Lstat(name)
 	return err == nil
 }
 
@@ -1347,6 +1823,15 @@ func IsFilteredFetchesEnabled(ctx context.Context) bool {
 		return false
 	}
 	return s.IsFilteredFetchesEnabled()
+}
+
+// IsTelemetryEnabled reports whether the user opted in to anonymous usage
+// analytics. Telemetry is opt-in: an absent key means no, so every tracker
+// call site must gate on this rather than on Telemetry being non-nil. Does not
+// consider ENTIRE_TELEMETRY_OPTOUT — the trackers honor that env opt-out
+// themselves (telemetry.IsEnvOptedOut).
+func (s *EntireSettings) IsTelemetryEnabled() bool {
+	return s != nil && s.Telemetry != nil && *s.Telemetry
 }
 
 // IsSummarizeEnabled checks if auto-summarize is enabled in settings.
@@ -1424,28 +1909,54 @@ func (s *EntireSettings) HasCheckpointRemoteKey() bool {
 // present in .entire/settings.local.json.
 //
 // That file is gitignored and per-clone, so a checkpoint_remote living there
-// cannot have arrived by cloning or forking someone else's project — it is this
-// developer's own explicit choice. Callers use this to distinguish "I configured
-// where my checkpoints go" from "I inherited a committed setting that points at
-// the upstream project's checkpoint repo".
+// is this developer's own explicit choice. Callers use this to distinguish
+// "I configured where my checkpoints go" from "I inherited a committed setting
+// that points at the upstream project's checkpoint repo".
 //
-// Best-effort: an unreadable or malformed local file reports false, which is the
-// conservative answer (callers then fall back to weaker ownership signals).
+// The filename alone does not establish that — see localLayerTrackedReason.
+// This reads the file directly rather than through Load, so it repeats the
+// tracked check the loader applies to the local layer —
+// without it, the ownership signal this gates could be inherited from the very
+// upstream it is meant to distinguish.
+//
+// The DEEP (index AND HEAD) check, like the OPF command and unlike the layer
+// as a whole: this predicate overrides the checkpoint-remote ownership check
+// on both directions of checkpoint traffic, so being wrong means routing
+// session transcripts to a repository we cannot confirm is ours, not losing a
+// preference. The cost falls only on repos that actually have a local file
+// with the key, and the probe is memoized per process.
+//
+// Best-effort: an unreadable, malformed, or unverifiable local file reports
+// false, which is the conservative answer (callers then fall back to weaker
+// ownership signals).
 func CheckpointRemoteIsLocalOnly(ctx context.Context) bool {
-	_, raw, exists, err := LoadLocalRaw(ctx)
+	path, raw, exists, err := LoadLocalRaw(ctx)
 	if err != nil || !exists {
 		return false
 	}
-	optionsRaw, ok := raw["strategy_options"]
-	if !ok {
+	if !rawHasKey(raw, "strategy_options", "checkpoint_remote") {
 		return false
 	}
-	var options map[string]json.RawMessage
-	if err := json.Unmarshal(optionsRaw, &options); err != nil {
-		return false
+	return classifyLocalSettingsDeep(ctx, path) == localOwn
+}
+
+// CheckpointRemoteLocalClaimRejection explains why writing a local declaration
+// cannot establish ownership. Check both index and HEAD, even before the local
+// file exists, so a staged removal cannot turn inherited settings into consent.
+func CheckpointRemoteLocalClaimRejection(ctx context.Context) string {
+	path, _, _, err := LoadLocalRaw(ctx)
+	if err != nil {
+		return "Cannot read .entire/settings.local.json; fix the local settings file before confirming this checkpoint store"
 	}
-	_, ok = options["checkpoint_remote"]
-	return ok
+	switch classifyLocalSettingsDeep(ctx, path) {
+	case localTracked:
+		return ".entire/settings.local.json is tracked in the index or HEAD, so it is not your own untracked settings file. Untrack it, commit its removal from Git, and keep your local copy ignored before confirming this checkpoint store"
+	case localUnverifiable:
+		return "Cannot verify that .entire/settings.local.json is your own untracked settings file; fix repository access before confirming this checkpoint store"
+	case localOwn:
+		return ""
+	}
+	return ""
 }
 
 // GetCheckpointRemote returns the configured checkpoint remote.
@@ -1472,6 +1983,67 @@ func (s *EntireSettings) GetCheckpointRemote() *CheckpointRemoteConfig {
 		return nil
 	}
 	return &CheckpointRemoteConfig{Provider: provider, Repo: repo}
+}
+
+// SetCheckpointPushRemoteLocal records an explicit clone-local checkpoint push
+// remote, preserving unrelated local fields and leaving project settings alone.
+// The caller must validate that name identifies an existing git remote.
+// It returns false without writing when the same local override is effective.
+func SetCheckpointPushRemoteLocal(ctx context.Context, name string) (bool, error) {
+	if name == "" {
+		return false, errors.New("checkpoint push remote name must not be empty")
+	}
+	effective, err := Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	if reason := effective.LocalLayerRejection(); reason != "" {
+		return false, fmt.Errorf("cannot set checkpoint push remote: local settings ignored: %s", reason)
+	}
+	path, raw, _, err := LoadLocalRaw(ctx)
+	if err != nil {
+		return false, err
+	}
+	if raw == nil {
+		return false, errors.New("local settings must be a JSON object")
+	}
+	options := map[string]json.RawMessage{}
+	if data, exists := raw["strategy_options"]; exists {
+		if err := json.Unmarshal(data, &options); err != nil {
+			return false, fmt.Errorf("parsing local strategy_options: %w", err)
+		}
+		if options == nil {
+			return false, errors.New("local strategy_options must be a JSON object")
+		}
+	}
+	if data, exists := options["checkpoint_push_remote"]; exists {
+		var current string
+		if err := json.Unmarshal(data, &current); err != nil {
+			return false, fmt.Errorf("parsing local checkpoint_push_remote: %w", err)
+		}
+		if current == name && effective.GetCheckpointPushRemote() == name {
+			return false, nil
+		}
+	}
+	options["checkpoint_push_remote"], err = json.Marshal(name)
+	if err != nil {
+		return false, fmt.Errorf("encoding checkpoint push remote: %w", err)
+	}
+	raw["strategy_options"], err = json.Marshal(options)
+	if err != nil {
+		return false, fmt.Errorf("encoding local strategy_options: %w", err)
+	}
+	if err := SaveLocalRaw(path, raw); err != nil {
+		return false, err
+	}
+	effective, err = Load(ctx)
+	if err != nil {
+		return true, fmt.Errorf("verifying checkpoint push remote: %w", err)
+	}
+	if effective.GetCheckpointPushRemote() != name || effective.LocalLayerRejection() != "" {
+		return true, errors.New("saved local checkpoint push remote is not effective")
+	}
+	return true, nil
 }
 
 // GetCheckpointPushRemote returns the configured checkpoint push remote name.
@@ -1556,15 +2128,9 @@ func SaveLocal(ctx context.Context, settings *EntireSettings) error {
 // saveToFile saves settings to the specified file path.
 func saveToFile(ctx context.Context, settings *EntireSettings, filePath string) error {
 	// Get absolute path for the file
-	filePathAbs, err := paths.AbsPath(ctx, filePath)
+	filePathAbs, err := entiredir.PathTo(ctx, filePath)
 	if err != nil {
-		filePathAbs = filePath // Fallback to relative
-	}
-
-	// Ensure directory exists
-	dir := filepath.Dir(filePathAbs)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return fmt.Errorf("creating settings directory: %w", err)
+		return fmt.Errorf("resolving settings path: %w", err)
 	}
 
 	data, err := jsonutil.MarshalIndentWithNewline(settings, "", "  ")
@@ -1572,7 +2138,7 @@ func saveToFile(ctx context.Context, settings *EntireSettings, filePath string) 
 		return fmt.Errorf("marshaling settings: %w", err)
 	}
 
-	if err := jsonutil.WriteFileAtomic(filePathAbs, data, 0o644); err != nil {
+	if err := writeConfinedAtomic(filePathAbs, data, 0o644); err != nil {
 		return fmt.Errorf("writing settings file: %w", err)
 	}
 	return nil

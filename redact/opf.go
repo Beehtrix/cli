@@ -27,6 +27,11 @@ type OPFConfig struct {
 	Command    string // path or name of the opf binary; "" defaults to "opf"
 	Timeout    int    // seconds; 0 defaults to 30
 
+	// Logger receives OPF runtime-failure diagnostics. nil means
+	// slog.Default(); the CLI injects its entry-point-initialized logger
+	// so warnings land in .entire/logs/.
+	Logger *slog.Logger
+
 	// runtime is private and constructed by ConfigurePrivacyFilter.
 	// Tests inject a fake via ConfigurePrivacyFilterWithRuntime.
 	runtime opfRuntime
@@ -96,6 +101,43 @@ func getOPFConfig() *OPFConfig {
 func OPFEnabled() bool {
 	cfg := getOPFConfig()
 	return cfg != nil && cfg.Enabled
+}
+
+// ErrOPFNoEnabledCategories is returned by BatchBytesWithPrivacyFilter
+// — the trailer-stamping path — when OPF is enabled but the effective
+// category set is empty (categories omitted, {}, all-false, or only
+// unknown keys). The model scan cannot run in this state; succeeding
+// silently would let the caller attest OPF ran (Entire-OPF-Applied
+// trailer) when it never did. The non-batched entry points (detectOPF,
+// JSONLContentWithPrivacyFilter) still fall back silently in this
+// state because their callers do not attest that OPF ran.
+var ErrOPFNoEnabledCategories = errors.New(
+	"redaction.openai_privacy_filter is enabled but no detection category is enabled; " +
+		"enable at least one category (e.g. \"private_person\": true) under " +
+		"redaction.openai_privacy_filter.categories in .entire/settings.json " +
+		"(or .entire/settings.local.json), or set enabled: false")
+
+// errOPFNilRuntime guards the trailer-stamping batch path against a
+// config that is enabled but carries no runtime. Unreachable through
+// ConfigurePrivacyFilter, which always constructs the shell-out
+// runtime; only ConfigurePrivacyFilterWithRuntime can produce it. The
+// no-silent-regex-only guarantee must hold by construction, not by
+// that property of the config lifecycle.
+var errOPFNilRuntime = errors.New(
+	"openai privacy filter is enabled but has no runtime; " +
+		"refusing regex-only output on the trailer-stamping path")
+
+// OPFMisconfiguredNoCategories reports whether OPF is enabled for this
+// process with an empty effective category set — the state described by
+// ErrOPFNoEnabledCategories. The pre-push flow checks this twice: when
+// resolving the run/skip decision (so the user is never prompted to run
+// a scan that cannot run) and again at the start of the rewrite (so
+// direct callers fail closed too). Explicit opt-outs (ENTIRE_OPF=no,
+// prompt_default: never) still resolve to skip and push regex-only
+// content without the trailer.
+func OPFMisconfiguredNoCategories() bool {
+	cfg := getOPFConfig()
+	return cfg != nil && cfg.Enabled && len(enabledCategories(cfg)) == 0
 }
 
 // OPFBreakerTripped reports whether the per-process OPF circuit breaker
@@ -260,7 +302,7 @@ func handleOPFFailure(ctx context.Context, cfg *OPFConfig, err error) {
 	if !opfBreakerTripped.CompareAndSwap(false, true) {
 		return
 	}
-	slog.WarnContext(ctx, "OpenAI Privacy Filter call failed; disabling for the rest of this process",
+	loggerOrDefault(cfg.Logger).WarnContext(ctx, "OpenAI Privacy Filter call failed; disabling for the rest of this process",
 		slog.String("component", "redaction"),
 		slog.String("command", cfg.Command),
 		slog.String("error", err.Error()),
@@ -343,8 +385,9 @@ func (s *shellOut) Redact(ctx context.Context, text string, categories []string)
 // RedactBatch sends multiple inputs to opf as a single shell-out, joined
 // with opfBatchSeparator. Internal newlines and separator collisions in inputs
 // are flattened to spaces (1-byte → 1-byte, offsets stay valid). opf emits one
-// JSON object covering the whole concatenated text; spans are partitioned back
-// per input via partitionIndex. Spans crossing a separator boundary are dropped.
+// JSON object covering the whole concatenated text; spans are mapped back
+// per input via splitBatchSpan. A span that crosses a separator is split, and
+// each input it overlaps receives its own piece.
 //
 // Errors deliberately do NOT include stdout or stderr content — OPF can
 // echo input fragments to either stream when misconfigured, and the error
@@ -435,16 +478,13 @@ func (s *shellOut) RedactBatch(ctx context.Context, inputs []string, categories 
 		if byteStart < 0 || byteEnd < 0 {
 			continue
 		}
-		idx := partitionIndex(starts, byteStart, byteEnd, opfBatchSeparator)
-		if idx < 0 {
-			continue
+		for _, piece := range splitBatchSpan(starts, len(batched), byteStart, byteEnd, len(opfBatchSeparator)) {
+			out[piece.input] = append(out[piece.input], Span{
+				Start: piece.start,
+				End:   piece.end,
+				Label: p.Label,
+			})
 		}
-		base := starts[idx]
-		out[idx] = append(out[idx], Span{
-			Start: byteStart - base,
-			End:   byteEnd - base,
-			Label: p.Label,
-		})
 	}
 	return out, nil
 }
@@ -533,32 +573,38 @@ func charToByteOffset(s string, charOff int) int {
 	return byteOff
 }
 
-// partitionIndex returns the input index that contains [spanStart, spanEnd)
-// within the concatenated batch, or -1 if the region crosses a separator
-// boundary or is outside any input. starts[i] is the byte offset where
-// inputs[i] begins; each input ends at starts[i+1] - len(sep), or at the
-// end of the batched string for the last input.
-func partitionIndex(starts []int, spanStart, spanEnd int, sep string) int {
+// batchSpanPiece is the part of one detected span that falls inside a single
+// batch input, in byte offsets relative to that input.
+type batchSpanPiece struct {
+	input      int
+	start, end int
+}
+
+// splitBatchSpan maps [spanStart, spanEnd) in the concatenated batch onto every
+// input it overlaps. starts[i] is the byte offset where inputs[i] begins; each
+// input ends at starts[i+1] - sepLen, or at batchedLen for the last one.
+//
+// A span crossing a separator is split rather than dropped. The model reads the
+// batch as continuous text, so it can join the end of one input and the start
+// of the next into one entity ("Claude Code" + "Alice Johnson" read as "Code
+// Alice Johnson"). Dropping that span would leave both inputs unredacted while
+// the caller stamps Entire-OPF-Applied; splitting it can at worst also redact a
+// word next to the boundary. Bytes that fall only on a separator belong to no
+// input and yield no piece.
+func splitBatchSpan(starts []int, batchedLen, spanStart, spanEnd, sepLen int) []batchSpanPiece {
 	if spanStart < 0 || spanEnd <= spanStart {
-		return -1
+		return nil
 	}
-	for i := range starts {
-		base := starts[i]
-		var end int
+	var pieces []batchSpanPiece
+	for i, base := range starts {
+		end := batchedLen
 		if i+1 < len(starts) {
-			end = starts[i+1] - len(sep)
-		} else {
-			// Last input — no upper bound tracked. Accept any span that
-			// starts >= base; the caller's bounds-check on the returned
-			// span's byte offsets covers the runaway case.
-			end = 1 << 31
+			end = starts[i+1] - sepLen
 		}
-		if spanStart >= base && spanEnd <= end {
-			return i
-		}
-		if spanStart < base {
-			return -1
+		lo, hi := max(spanStart, base), min(spanEnd, end)
+		if lo < hi {
+			pieces = append(pieces, batchSpanPiece{input: i, start: lo - base, end: hi - base})
 		}
 	}
-	return -1
+	return pieces
 }

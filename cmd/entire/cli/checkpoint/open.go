@@ -24,6 +24,13 @@ type OpenOptions struct {
 	// reads local-only; ignored by the git-branch backend.
 	RefFetcher RefFetchFunc
 
+	// MetadataBranchFetcher is the CLI-level v1-metadata-branch fetcher, used by
+	// the git-branch backend to resolve a metadata branch missing both locally
+	// and on origin (the shape a fresh clone with a dedicated checkpoint_remote
+	// has). nil leaves reads local-only; ignored by the git-refs backend. Wire it
+	// only on foreground read paths — see MetadataBranchFetchFunc.
+	MetadataBranchFetcher MetadataBranchFetchFunc
+
 	// RemoteRefLister is the CLI-level checkpoint-ref enumerator, used by the
 	// git-refs backend's List to discover checkpoints present on the checkpoint
 	// remote but not yet local (see RemoteRefListFunc). It only fires on a
@@ -32,8 +39,18 @@ type OpenOptions struct {
 	RemoteRefLister RemoteRefListFunc
 
 	// Refs overrides the default committed-ref topology. A non-nil value wins,
-	// e.g. attach pins reads to Primary via PrimaryAsRead().
+	// e.g. attach pins reads to Primary via PrimaryAsLocalRead().
 	Refs *PersistentRefs
+
+	// ReadRemotes is the ordered checkpoint read-candidate chain (elected sync
+	// remote first, then the legacy origin tier). The checkpoint package
+	// cannot resolve the election itself, so cli/strategy callers inject it
+	// here (strategy.CheckpointReadRemotes). The git-branch store's committed
+	// reads consult these remotes' tracking refs after the local tree, selecting
+	// by requested checkpoint rather than branch existence. This is a pure read;
+	// local refs are never written from the chain. nil keeps the legacy
+	// origin-only fallback.
+	ReadRemotes []string
 }
 
 // PrimaryIsRefs reports whether the configured primary backend is the git-refs
@@ -44,14 +61,14 @@ func PrimaryIsRefs(cfg *settings.CheckpointsConfig) bool {
 	return cfg != nil && cfg.Primary.Type == BackendTypeGitRefs
 }
 
-// Stores is the facade returned by Open: the persistent store plus the git-only
-// ephemeral (shadow-branch) capability and resolved committed-ref topology.
+// Stores is the facade returned by Open: the persistent store plus the
+// resolved committed-ref topology.
 type Stores struct {
 	// Persistent is the committed store that serves permanent reads and writes.
 	Persistent PersistentStore
 
-	ephemeral EphemeralStore
-	refs      PersistentRefs
+	refs          PersistentRefs
+	primaryIsRefs bool
 }
 
 // Open resolves the checkpoint storage topology and constructs the backing
@@ -65,11 +82,19 @@ type Stores struct {
 // like settings.Load: from the context's worktree root if set, else relative to
 // the current working directory — not from repo. Callers opening a repository
 // that is not the cwd should wrap ctx with that worktree root (as dispatch does).
-// Resolution is fail-soft: a missing or unreadable settings file yields the
+// Resolution is fail-soft about settings CONTENT: a missing settings file, a
+// whole-file JSON syntax error, or unrelated invalid fields all yield the
 // default git-branch backend with no mirrors, preserving default behavior.
+//
+// It is not fail-soft about which repository this is. A worktree root that will
+// not resolve is returned as an error rather than defaulted, because the backend
+// choice would then be made for a repo we could not identify — and the settings
+// file that names it is the one we failed to find. That failure is unreachable
+// from a command in practice: the root pre-run refuses to run at all when the
+// worktree root does not resolve. LoadCheckpointsConfig draws the same line.
 func Open(ctx context.Context, repo *git.Repository, opts OpenOptions) (*Stores, error) {
 	refs := resolveOpenRefs(ctx, opts)
-	env := OpenEnv{Repo: repo, BlobFetcher: opts.BlobFetcher, RefFetcher: opts.RefFetcher, RemoteRefLister: opts.RemoteRefLister, Refs: refs}
+	env := OpenEnv{Repo: repo, BlobFetcher: opts.BlobFetcher, RefFetcher: opts.RefFetcher, RemoteRefLister: opts.RemoteRefLister, MetadataBranchFetcher: opts.MetadataBranchFetcher, Refs: refs, ReadRemotes: opts.ReadRemotes}
 
 	cfg, err := settings.LoadCheckpointsConfig(ctx)
 	if err != nil {
@@ -98,9 +123,9 @@ func Open(ctx context.Context, repo *git.Repository, opts OpenOptions) (*Stores,
 	}
 
 	return &Stores{
-		Persistent: newKindRoutingStore(writer, branchStore, refsStore, primaryType),
-		ephemeral:  newEphemeralStore(repo, refs),
-		refs:       refs,
+		Persistent:    newKindRoutingStore(writer, branchStore, refsStore, primaryType),
+		refs:          refs,
+		primaryIsRefs: primaryType == BackendTypeGitRefs,
 	}, nil
 }
 
@@ -195,8 +220,11 @@ func resolveOpenRefs(ctx context.Context, opts OpenOptions) PersistentRefs {
 	return ResolveRefs(ctx)
 }
 
-// Ephemeral returns the git-backed shadow-branch (temporary) store.
-func (s *Stores) Ephemeral() EphemeralStore { return s.ephemeral }
-
 // Refs returns the resolved committed-ref topology.
 func (s *Stores) Refs() PersistentRefs { return s.refs }
+
+// PrimaryIsRefs reports whether these stores write new checkpoints to the git-refs
+// primary, i.e. whether a new checkpoint ID must be a ULID (see
+// GenerateCheckpointID). It reflects the config Open resolved, so a caller that
+// derives its own IDs matches the store it writes to.
+func (s *Stores) PrimaryIsRefs() bool { return s.primaryIsRefs }

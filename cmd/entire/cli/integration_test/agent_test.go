@@ -12,9 +12,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
 	"github.com/entireio/cli/cmd/entire/cli/agent/factoryaidroid"
-	"github.com/entireio/cli/cmd/entire/cli/agent/geminicli"
 	_ "github.com/entireio/cli/cmd/entire/cli/agent/opencode" // Register OpenCode agent
-	"github.com/entireio/cli/cmd/entire/cli/transcript"
 )
 
 // TestAgentDetection verifies agent detection and default behavior.
@@ -109,18 +107,21 @@ func TestAgentHookInstallation(t *testing.T) {
 			t.Fatal("claude-code agent does not implement HookSupport")
 		}
 
-		count, err := hookAgent.InstallHooks(context.Background(), false, false)
+		count, err := hookAgent.InstallHooks(context.Background(), false)
 		if err != nil {
 			t.Fatalf("InstallHooks() error = %v", err)
 		}
 
-		// Should install 7 hooks: SessionStart, SessionEnd, Stop, UserPromptSubmit, PreToolUse[Task], PostToolUse[Task], PostToolUse[TodoWrite]
-		if count != 7 {
-			t.Errorf("InstallHooks() count = %d, want 7", count)
+		// Should install 10 hooks: SessionStart, SessionEnd, Stop, StopFailure,
+		// SubagentStart[workflow-subagent], SubagentStop, UserPromptSubmit,
+		// PreToolUse[Agent], PostToolUse[Agent], PostToolUse[Skill].
+		// post-todo is no longer installed.
+		if count != 10 {
+			t.Errorf("InstallHooks() count = %d, want 10", count)
 		}
 
 		// Verify hooks are installed
-		if !hookAgent.AreHooksInstalled(context.Background()) {
+		if !hooksInstalledNow(t, hookAgent) {
 			t.Error("AreHooksInstalled() = false after InstallHooks()")
 		}
 
@@ -130,14 +131,15 @@ func TestAgentHookInstallation(t *testing.T) {
 			t.Error("settings.json was not created")
 		}
 
-		// Verify permissions.deny contains metadata deny rule
+		// The metadata deny rule is retired: setup must not install one.
+		// See agent.MetadataDenyRule.
 		data, err := os.ReadFile(settingsPath)
 		if err != nil {
 			t.Fatalf("failed to read settings.json: %v", err)
 		}
 		content := string(data)
-		if !strings.Contains(content, "Read(./.entire/metadata/**)") {
-			t.Error("settings.json should contain permissions.deny rule for .entire/metadata/**")
+		if strings.Contains(content, "Read(./.entire/metadata/**)") {
+			t.Error("settings.json should not contain a permissions.deny rule for .entire/metadata/**")
 		}
 	})
 
@@ -155,50 +157,18 @@ func TestAgentHookInstallation(t *testing.T) {
 		hookAgent, _ := agent.AsHookSupport(ag)
 
 		// First install
-		_, err = hookAgent.InstallHooks(context.Background(), false, false)
+		_, err = hookAgent.InstallHooks(context.Background(), false)
 		if err != nil {
 			t.Fatalf("first InstallHooks() error = %v", err)
 		}
 
 		// Second install should be idempotent
-		count, err := hookAgent.InstallHooks(context.Background(), false, false)
+		count, err := hookAgent.InstallHooks(context.Background(), false)
 		if err != nil {
 			t.Fatalf("second InstallHooks() error = %v", err)
 		}
 		if count != 0 {
 			t.Errorf("second InstallHooks() count = %d, want 0 (idempotent)", count)
-		}
-	})
-
-	t.Run("localDev mode delegates to entire-dev script", func(t *testing.T) {
-		// Not parallel - uses os.Chdir
-		env := NewTestEnv(t)
-		env.InitRepo()
-
-		t.Chdir(env.RepoDir)
-
-		ag, err := agent.Get(agentClaudeCode)
-		if err != nil {
-			t.Fatalf("Get(claude-code) error = %v", err)
-		}
-		hookAgent, _ := agent.AsHookSupport(ag)
-
-		_, err = hookAgent.InstallHooks(context.Background(), true, false) // localDev = true
-		if err != nil {
-			t.Fatalf("InstallHooks(localDev=true) error = %v", err)
-		}
-
-		// Read settings and verify commands delegate to scripts/entire-dev,
-		// which handles compile-on-demand with a PATH-binary fallback.
-		settingsPath := filepath.Join(env.RepoDir, ".claude", claudecode.ClaudeSettingsFileName)
-		data, err := os.ReadFile(settingsPath)
-		if err != nil {
-			t.Fatalf("failed to read settings.json: %v", err)
-		}
-
-		content := string(data)
-		if !strings.Contains(content, "scripts/entire-dev") {
-			t.Error("localDev hooks should delegate to scripts/entire-dev, but settings.json doesn't contain it")
 		}
 	})
 }
@@ -320,513 +290,6 @@ func TestAgentSessionOperations(t *testing.T) {
 	})
 }
 
-// TestClaudeCodeHelperMethods verifies Claude-specific helper methods.
-func TestClaudeCodeHelperMethods(t *testing.T) {
-	t.Parallel()
-
-	t.Run("TruncateAtUUID truncates transcript", func(t *testing.T) {
-		t.Parallel()
-		env := NewTestEnv(t)
-
-		transcriptPath := filepath.Join(env.RepoDir, "transcript.jsonl")
-		content := `{"type":"user","uuid":"u1","message":{"content":"first"}}
-{"type":"assistant","uuid":"a1","message":{"content":[]}}
-{"type":"user","uuid":"u2","message":{"content":"second"}}
-{"type":"assistant","uuid":"a2","message":{"content":[]}}
-`
-		if err := os.WriteFile(transcriptPath, []byte(content), 0o644); err != nil {
-			t.Fatalf("failed to write transcript: %v", err)
-		}
-
-		ag, err := agent.Get(agentClaudeCode)
-		if err != nil {
-			t.Fatalf("agent.Get(claude-code) error = %v", err)
-		}
-		ccAgent, ok := ag.(*claudecode.ClaudeCodeAgent)
-		if !ok {
-			t.Fatalf("ag is not *claudecode.ClaudeCodeAgent, got %T", ag)
-		}
-
-		session, err := ag.ReadSession(&agent.HookInput{
-			SessionID:  "test",
-			SessionRef: transcriptPath,
-		})
-		if err != nil {
-			t.Fatalf("ReadSession() error = %v", err)
-		}
-
-		truncated, err := ccAgent.TruncateAtUUID(session, "a1")
-		if err != nil {
-			t.Fatalf("TruncateAtUUID() error = %v", err)
-		}
-
-		// Parse the truncated native data to verify
-		lines, err := transcript.ParseFromBytes(truncated.NativeData)
-		if err != nil {
-			t.Fatalf("ParseFromBytes() error = %v", err)
-		}
-		if len(lines) != 2 {
-			t.Errorf("truncated transcript has %d lines, want 2", len(lines))
-		}
-		if lines[len(lines)-1].UUID != "a1" {
-			t.Errorf("last line UUID = %q, want %q", lines[len(lines)-1].UUID, "a1")
-		}
-	})
-
-	t.Run("FindCheckpointUUID finds tool result", func(t *testing.T) {
-		t.Parallel()
-		env := NewTestEnv(t)
-
-		transcriptPath := filepath.Join(env.RepoDir, "transcript.jsonl")
-		content := `{"type":"assistant","uuid":"a1","message":{"content":[{"type":"tool_use","id":"tool-123"}]}}
-{"type":"user","uuid":"u1","message":{"content":[{"type":"tool_result","tool_use_id":"tool-123"}]}}
-`
-		if err := os.WriteFile(transcriptPath, []byte(content), 0o644); err != nil {
-			t.Fatalf("failed to write transcript: %v", err)
-		}
-
-		ag, err := agent.Get(agentClaudeCode)
-		if err != nil {
-			t.Fatalf("agent.Get(claude-code) error = %v", err)
-		}
-		ccAgent, ok := ag.(*claudecode.ClaudeCodeAgent)
-		if !ok {
-			t.Fatalf("ag is not *claudecode.ClaudeCodeAgent, got %T", ag)
-		}
-
-		session, err := ag.ReadSession(&agent.HookInput{
-			SessionID:  "test",
-			SessionRef: transcriptPath,
-		})
-		if err != nil {
-			t.Fatalf("ReadSession() error = %v", err)
-		}
-
-		uuid, found := ccAgent.FindCheckpointUUID(session, "tool-123")
-		if !found {
-			t.Error("FindCheckpointUUID() found = false, want true")
-		}
-		if uuid != "u1" {
-			t.Errorf("FindCheckpointUUID() uuid = %q, want %q", uuid, "u1")
-		}
-	})
-}
-
-// TestGeminiCLIAgentDetection verifies Gemini CLI agent detection.
-// Not parallel - contains subtests that use os.Chdir which is process-global.
-//
-//nolint:tparallel // subtests use t.Chdir; cannot be parallel
-func TestGeminiCLIAgentDetection(t *testing.T) {
-	t.Run("gemini agent is registered", func(t *testing.T) {
-		t.Parallel()
-
-		agents := agent.List()
-		found := false
-		for _, name := range agents {
-			if name == "gemini" {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("agent.List() = %v, want to contain 'gemini'", agents)
-		}
-	})
-
-	t.Run("gemini detects presence when .gemini exists", func(t *testing.T) {
-		// Not parallel - uses os.Chdir which is process-global
-		env := NewTestEnv(t)
-		env.InitRepo()
-
-		// Create .gemini/settings.json
-		geminiDir := filepath.Join(env.RepoDir, ".gemini")
-		if err := os.MkdirAll(geminiDir, 0o755); err != nil {
-			t.Fatalf("failed to create .gemini dir: %v", err)
-		}
-		settingsPath := filepath.Join(geminiDir, geminicli.GeminiSettingsFileName)
-		if err := os.WriteFile(settingsPath, []byte(`{"hooks":{}}`), 0o644); err != nil {
-			t.Fatalf("failed to write settings.json: %v", err)
-		}
-
-		// Change to repo dir for detection
-		t.Chdir(env.RepoDir)
-
-		ag, err := agent.Get("gemini")
-		if err != nil {
-			t.Fatalf("Get(gemini) error = %v", err)
-		}
-
-		present, err := ag.DetectPresence(context.Background())
-		if err != nil {
-			t.Fatalf("DetectPresence() error = %v", err)
-		}
-		if !present {
-			t.Error("DetectPresence() = false, want true when .gemini exists")
-		}
-	})
-}
-
-// TestGeminiCLIHookInstallation verifies hook installation via Gemini CLI agent interface.
-// Note: These tests cannot run in parallel because they use os.Chdir which affects the entire process.
-func TestGeminiCLIHookInstallation(t *testing.T) {
-	// Not parallel - tests use os.Chdir which is process-global
-
-	t.Run("installs all required hooks", testGeminiCLIInstallsAllHooks)
-	t.Run("idempotent - second install returns 0", testGeminiCLIIdempotentInstall)
-	t.Run("localDev mode delegates to entire-dev script", testGeminiCLILocalDevMode)
-	t.Run("production mode uses entire binary", testGeminiCLIProductionMode)
-	t.Run("force flag reinstalls hooks", testGeminiCLIForceReinstall)
-}
-
-func testGeminiCLIInstallsAllHooks(t *testing.T) {
-	// Not parallel - uses os.Chdir
-	env := NewTestEnv(t)
-	env.InitRepo()
-
-	// Change to repo dir
-	t.Chdir(env.RepoDir)
-
-	ag, err := agent.Get("gemini")
-	if err != nil {
-		t.Fatalf("Get(gemini) error = %v", err)
-	}
-
-	hookAgent, ok := agent.AsHookSupport(ag)
-	if !ok {
-		t.Fatal("gemini agent does not implement HookSupport")
-	}
-
-	count, err := hookAgent.InstallHooks(context.Background(), false, false)
-	if err != nil {
-		t.Fatalf("InstallHooks() error = %v", err)
-	}
-
-	// Should install 12 hooks: SessionStart, SessionEnd (exit+logout), BeforeAgent, AfterAgent,
-	// BeforeModel, AfterModel, BeforeToolSelection, BeforeTool, AfterTool, PreCompress, Notification
-	if count != 12 {
-		t.Errorf("InstallHooks() count = %d, want 12", count)
-	}
-
-	// Verify hooks are installed
-	if !hookAgent.AreHooksInstalled(context.Background()) {
-		t.Error("AreHooksInstalled() = false after InstallHooks()")
-	}
-
-	// Verify settings.json was created
-	settingsPath := filepath.Join(env.RepoDir, ".gemini", geminicli.GeminiSettingsFileName)
-	if _, err := os.Stat(settingsPath); os.IsNotExist(err) {
-		t.Error("settings.json was not created")
-	}
-
-	// Verify hooks structure in settings.json
-	data, err := os.ReadFile(settingsPath)
-	if err != nil {
-		t.Fatalf("failed to read settings.json: %v", err)
-	}
-	content := string(data)
-
-	// Verify all hook types are present
-	if !strings.Contains(content, "SessionStart") {
-		t.Error("settings.json should contain SessionStart hook")
-	}
-	if !strings.Contains(content, "SessionEnd") {
-		t.Error("settings.json should contain SessionEnd hook")
-	}
-	if !strings.Contains(content, "BeforeAgent") {
-		t.Error("settings.json should contain BeforeAgent hook")
-	}
-	if !strings.Contains(content, "AfterAgent") {
-		t.Error("settings.json should contain AfterAgent hook")
-	}
-	if !strings.Contains(content, "BeforeModel") {
-		t.Error("settings.json should contain BeforeModel hook")
-	}
-	if !strings.Contains(content, "AfterModel") {
-		t.Error("settings.json should contain AfterModel hook")
-	}
-	if !strings.Contains(content, "BeforeToolSelection") {
-		t.Error("settings.json should contain BeforeToolSelection hook")
-	}
-	if !strings.Contains(content, "BeforeTool") {
-		t.Error("settings.json should contain BeforeTool hook")
-	}
-	if !strings.Contains(content, "AfterTool") {
-		t.Error("settings.json should contain AfterTool hook")
-	}
-	if !strings.Contains(content, "PreCompress") {
-		t.Error("settings.json should contain PreCompress hook")
-	}
-	if !strings.Contains(content, "Notification") {
-		t.Error("settings.json should contain Notification hook")
-	}
-
-	// Verify hooksConfig is set
-	if !strings.Contains(content, "hooksConfig") {
-		t.Error("settings.json should contain hooksConfig.enabled")
-	}
-}
-
-func testGeminiCLIIdempotentInstall(t *testing.T) {
-	// Not parallel - uses os.Chdir
-	env := NewTestEnv(t)
-	env.InitRepo()
-
-	t.Chdir(env.RepoDir)
-
-	ag, err := agent.Get("gemini")
-	if err != nil {
-		t.Fatalf("Get(gemini) error = %v", err)
-	}
-	hookAgent, _ := agent.AsHookSupport(ag)
-
-	// First install
-	_, err = hookAgent.InstallHooks(context.Background(), false, false)
-	if err != nil {
-		t.Fatalf("first InstallHooks() error = %v", err)
-	}
-
-	// Second install should be idempotent
-	count, err := hookAgent.InstallHooks(context.Background(), false, false)
-	if err != nil {
-		t.Fatalf("second InstallHooks() error = %v", err)
-	}
-	if count != 0 {
-		t.Errorf("second InstallHooks() count = %d, want 0 (idempotent)", count)
-	}
-}
-
-func testGeminiCLILocalDevMode(t *testing.T) {
-	// Not parallel - uses os.Chdir
-	env := NewTestEnv(t)
-	env.InitRepo()
-
-	t.Chdir(env.RepoDir)
-
-	ag, err := agent.Get("gemini")
-	if err != nil {
-		t.Fatalf("Get(gemini) error = %v", err)
-	}
-	hookAgent, _ := agent.AsHookSupport(ag)
-
-	_, err = hookAgent.InstallHooks(context.Background(), true, false) // localDev = true
-	if err != nil {
-		t.Fatalf("InstallHooks(localDev=true) error = %v", err)
-	}
-
-	// Read settings and verify commands delegate to scripts/entire-dev
-	settingsPath := filepath.Join(env.RepoDir, ".gemini", geminicli.GeminiSettingsFileName)
-	data, err := os.ReadFile(settingsPath)
-	if err != nil {
-		t.Fatalf("failed to read settings.json: %v", err)
-	}
-
-	content := string(data)
-	if !strings.Contains(content, "scripts/entire-dev") {
-		t.Error("localDev hooks should delegate to scripts/entire-dev, but settings.json doesn't contain it")
-	}
-	if !strings.Contains(content, "$(git rev-parse --show-toplevel)") {
-		t.Error("localDev hooks should use '$(git rev-parse --show-toplevel)', but settings.json doesn't contain it")
-	}
-}
-
-func testGeminiCLIProductionMode(t *testing.T) {
-	// Not parallel - uses os.Chdir
-	env := NewTestEnv(t)
-	env.InitRepo()
-
-	t.Chdir(env.RepoDir)
-
-	ag, err := agent.Get("gemini")
-	if err != nil {
-		t.Fatalf("Get(gemini) error = %v", err)
-	}
-	hookAgent, _ := agent.AsHookSupport(ag)
-
-	_, err = hookAgent.InstallHooks(context.Background(), false, false) // localDev = false
-	if err != nil {
-		t.Fatalf("InstallHooks(localDev=false) error = %v", err)
-	}
-
-	// Read settings and verify commands use "entire" binary
-	settingsPath := filepath.Join(env.RepoDir, ".gemini", geminicli.GeminiSettingsFileName)
-	data, err := os.ReadFile(settingsPath)
-	if err != nil {
-		t.Fatalf("failed to read settings.json: %v", err)
-	}
-
-	content := string(data)
-	if !strings.Contains(content, "entire hooks gemini") {
-		t.Error("production hooks should use 'entire hooks gemini', but settings.json doesn't contain it")
-	}
-}
-
-func testGeminiCLIForceReinstall(t *testing.T) {
-	// Not parallel - uses os.Chdir
-	env := NewTestEnv(t)
-	env.InitRepo()
-
-	t.Chdir(env.RepoDir)
-
-	ag, err := agent.Get("gemini")
-	if err != nil {
-		t.Fatalf("Get(gemini) error = %v", err)
-	}
-	hookAgent, _ := agent.AsHookSupport(ag)
-
-	// First install
-	_, err = hookAgent.InstallHooks(context.Background(), false, false)
-	if err != nil {
-		t.Fatalf("first InstallHooks() error = %v", err)
-	}
-
-	// Force reinstall should return count > 0
-	count, err := hookAgent.InstallHooks(context.Background(), false, true) // force = true
-	if err != nil {
-		t.Fatalf("force InstallHooks() error = %v", err)
-	}
-	if count != 12 {
-		t.Errorf("force InstallHooks() count = %d, want 12", count)
-	}
-}
-
-// TestGeminiCLISessionOperations verifies ReadSession/Session via Gemini agent interface.
-func TestGeminiCLISessionOperations(t *testing.T) {
-	t.Parallel()
-
-	t.Run("ReadSession parses transcript and computes ModifiedFiles", func(t *testing.T) {
-		t.Parallel()
-		env := NewTestEnv(t)
-		env.InitRepo()
-
-		// Create a Gemini transcript file (JSON format)
-		// Gemini uses "type" field with values "user" or "gemini", and "toolCalls" array with "args"
-		transcriptPath := filepath.Join(env.RepoDir, "test-transcript.json")
-		transcriptContent := `{
-  "messages": [
-    {"type": "user", "content": "Fix the bug"},
-    {"type": "gemini", "content": "", "toolCalls": [{"name": "write_file", "args": {"file_path": "main.go"}}]},
-    {"type": "gemini", "content": "", "toolCalls": [{"name": "edit_file", "args": {"file_path": "util.go"}}]}
-  ]
-}`
-		if err := os.WriteFile(transcriptPath, []byte(transcriptContent), 0o644); err != nil {
-			t.Fatalf("failed to write transcript: %v", err)
-		}
-
-		ag, err := agent.Get("gemini")
-		if err != nil {
-			t.Fatalf("agent.Get(gemini) error = %v", err)
-		}
-		session, err := ag.ReadSession(&agent.HookInput{
-			SessionID:  testSessionID,
-			SessionRef: transcriptPath,
-		})
-		if err != nil {
-			t.Fatalf("ReadSession() error = %v", err)
-		}
-
-		// Verify session metadata
-		if session.SessionID != testSessionID {
-			t.Errorf("SessionID = %q, want %q", session.SessionID, testSessionID)
-		}
-		if session.AgentName != "gemini" {
-			t.Errorf("AgentName = %q, want %q", session.AgentName, "gemini")
-		}
-
-		// Verify NativeData is populated
-		if len(session.NativeData) == 0 {
-			t.Error("NativeData is empty, want transcript content")
-		}
-
-		// Verify ModifiedFiles computed
-		if len(session.ModifiedFiles) != 2 {
-			t.Errorf("ModifiedFiles = %v, want 2 files (main.go, util.go)", session.ModifiedFiles)
-		}
-	})
-
-	t.Run("Session writes NativeData to file", func(t *testing.T) {
-		t.Parallel()
-		env := NewTestEnv(t)
-		env.InitRepo()
-
-		ag, err := agent.Get("gemini")
-		if err != nil {
-			t.Fatalf("agent.Get(gemini) error = %v", err)
-		}
-
-		// First read a session
-		srcPath := filepath.Join(env.RepoDir, "src.json")
-		srcContent := `{"messages": [{"role": "user", "content": "hello"}]}`
-		if err := os.WriteFile(srcPath, []byte(srcContent), 0o644); err != nil {
-			t.Fatalf("failed to write source: %v", err)
-		}
-
-		session, err := ag.ReadSession(&agent.HookInput{
-			SessionID:  "test",
-			SessionRef: srcPath,
-		})
-		if err != nil {
-			t.Fatalf("ReadSession() error = %v", err)
-		}
-
-		// Write to a new location
-		dstPath := filepath.Join(env.RepoDir, "dst.json")
-		session.SessionRef = dstPath
-
-		if err := ag.WriteSession(context.Background(), session); err != nil {
-			t.Fatalf("WriteSession() error = %v", err)
-		}
-
-		// Verify file was written
-		data, err := os.ReadFile(dstPath)
-		if err != nil {
-			t.Fatalf("failed to read destination: %v", err)
-		}
-		if string(data) != srcContent {
-			t.Errorf("written content = %q, want %q", string(data), srcContent)
-		}
-	})
-
-	t.Run("Session rejects wrong agent", func(t *testing.T) {
-		t.Parallel()
-
-		ag, err := agent.Get("gemini")
-		if err != nil {
-			t.Fatalf("agent.Get(gemini) error = %v", err)
-		}
-
-		session := &agent.AgentSession{
-			SessionID:  "test",
-			AgentName:  "other-agent", // Wrong agent
-			SessionRef: "/tmp/test.json",
-			NativeData: []byte("data"),
-		}
-
-		err = ag.WriteSession(context.Background(), session)
-		if err == nil {
-			t.Error("WriteSession() should reject session from different agent")
-		}
-	})
-}
-
-// TestGeminiCLIHelperMethods verifies Gemini-specific helper methods.
-func TestGeminiCLIHelperMethods(t *testing.T) {
-	t.Parallel()
-
-	t.Run("FormatResumeCommand returns gemini --resume", func(t *testing.T) {
-		t.Parallel()
-
-		ag, err := agent.Get("gemini")
-		if err != nil {
-			t.Fatalf("agent.Get(gemini) error = %v", err)
-		}
-		cmd := ag.FormatResumeCommand("abc123")
-
-		if cmd != "gemini --resume abc123" {
-			t.Errorf("FormatResumeCommand() = %q, want %q", cmd, "gemini --resume abc123")
-		}
-	})
-}
-
 // --- Factory AI Droid Agent Tests ---
 
 // TestFactoryAIDroidAgentDetection verifies Factory AI Droid agent detection.
@@ -887,8 +350,7 @@ func TestFactoryAIDroidHookInstallation(t *testing.T) {
 
 	t.Run("installs all required hooks", testFactoryAIDroidInstallsAllHooks)
 	t.Run("idempotent - second install returns 0", testFactoryAIDroidIdempotentInstall)
-	t.Run("localDev mode delegates to entire-dev script", testFactoryAIDroidLocalDevMode)
-	t.Run("production mode uses entire binary", testFactoryAIDroidProductionMode)
+	t.Run("installed hooks invoke the entire binary", testFactoryAIDroidProductionMode)
 	t.Run("force flag reinstalls hooks", testFactoryAIDroidForceReinstall)
 }
 
@@ -911,7 +373,7 @@ func testFactoryAIDroidInstallsAllHooks(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	count, err := hookAgent.InstallHooks(ctx, false, false)
+	count, err := hookAgent.InstallHooks(ctx, false)
 	if err != nil {
 		t.Fatalf("InstallHooks() error = %v", err)
 	}
@@ -923,7 +385,7 @@ func testFactoryAIDroidInstallsAllHooks(t *testing.T) {
 	}
 
 	// Verify hooks are installed
-	if !hookAgent.AreHooksInstalled(ctx) {
+	if !hooksInstalledNow(t, hookAgent) {
 		t.Error("AreHooksInstalled() = false after InstallHooks()")
 	}
 
@@ -963,9 +425,10 @@ func testFactoryAIDroidInstallsAllHooks(t *testing.T) {
 		t.Error("settings.json should contain PreCompact hook")
 	}
 
-	// Verify permissions.deny contains metadata deny rule
-	if !strings.Contains(content, "Read(./.entire/metadata/**)") {
-		t.Error("settings.json should contain permissions.deny rule for .entire/metadata/**")
+	// The metadata deny rule is retired: setup must not install one.
+	// See agent.MetadataDenyRule.
+	if strings.Contains(content, "Read(./.entire/metadata/**)") {
+		t.Error("settings.json should not contain a permissions.deny rule for .entire/metadata/**")
 	}
 }
 
@@ -984,53 +447,18 @@ func testFactoryAIDroidIdempotentInstall(t *testing.T) {
 
 	ctx := context.Background()
 	// First install
-	_, err = hookAgent.InstallHooks(ctx, false, false)
+	_, err = hookAgent.InstallHooks(ctx, false)
 	if err != nil {
 		t.Fatalf("first InstallHooks() error = %v", err)
 	}
 
 	// Second install should be idempotent
-	count, err := hookAgent.InstallHooks(ctx, false, false)
+	count, err := hookAgent.InstallHooks(ctx, false)
 	if err != nil {
 		t.Fatalf("second InstallHooks() error = %v", err)
 	}
 	if count != 0 {
 		t.Errorf("second InstallHooks() count = %d, want 0 (idempotent)", count)
-	}
-}
-
-func testFactoryAIDroidLocalDevMode(t *testing.T) {
-	// Not parallel - uses os.Chdir
-	env := NewTestEnv(t)
-	env.InitRepo()
-
-	t.Chdir(env.RepoDir)
-
-	ag, err := agent.Get("factoryai-droid")
-	if err != nil {
-		t.Fatalf("Get(factoryai-droid) error = %v", err)
-	}
-	hookAgent, _ := agent.AsHookSupport(ag)
-
-	ctx := context.Background()
-	_, err = hookAgent.InstallHooks(ctx, true, false) // localDev = true
-	if err != nil {
-		t.Fatalf("InstallHooks(localDev=true) error = %v", err)
-	}
-
-	// Read settings and verify commands delegate to scripts/entire-dev
-	settingsPath := filepath.Join(env.RepoDir, ".factory", factoryaidroid.FactorySettingsFileName)
-	data, err := os.ReadFile(settingsPath)
-	if err != nil {
-		t.Fatalf("failed to read settings.json: %v", err)
-	}
-
-	content := string(data)
-	if !strings.Contains(content, "scripts/entire-dev") {
-		t.Error("localDev hooks should delegate to scripts/entire-dev, but settings.json doesn't contain it")
-	}
-	if !strings.Contains(content, "$(git rev-parse --show-toplevel)") {
-		t.Error("localDev hooks should use '$(git rev-parse --show-toplevel)', but settings.json doesn't contain it")
 	}
 }
 
@@ -1048,9 +476,9 @@ func testFactoryAIDroidProductionMode(t *testing.T) {
 	hookAgent, _ := agent.AsHookSupport(ag)
 
 	ctx := context.Background()
-	_, err = hookAgent.InstallHooks(ctx, false, false) // localDev = false
+	_, err = hookAgent.InstallHooks(ctx, false)
 	if err != nil {
-		t.Fatalf("InstallHooks(localDev=false) error = %v", err)
+		t.Fatalf("InstallHooks() error = %v", err)
 	}
 
 	// Read settings and verify commands use "entire" binary
@@ -1081,13 +509,13 @@ func testFactoryAIDroidForceReinstall(t *testing.T) {
 
 	ctx := context.Background()
 	// First install
-	_, err = hookAgent.InstallHooks(ctx, false, false)
+	_, err = hookAgent.InstallHooks(ctx, false)
 	if err != nil {
 		t.Fatalf("first InstallHooks() error = %v", err)
 	}
 
 	// Force reinstall should return count > 0
-	count, err := hookAgent.InstallHooks(ctx, false, true) // force = true
+	count, err := hookAgent.InstallHooks(ctx, true) // force = true
 	if err != nil {
 		t.Fatalf("force InstallHooks() error = %v", err)
 	}
@@ -1305,7 +733,7 @@ func TestOpenCodeHookInstallation(t *testing.T) {
 			t.Fatal("opencode agent does not implement HookSupport")
 		}
 
-		count, err := hookAgent.InstallHooks(context.Background(), false, false)
+		count, err := hookAgent.InstallHooks(context.Background(), false)
 		if err != nil {
 			t.Fatalf("InstallHooks() error = %v", err)
 		}
@@ -1316,7 +744,7 @@ func TestOpenCodeHookInstallation(t *testing.T) {
 		}
 
 		// Verify hooks are installed
-		if !hookAgent.AreHooksInstalled(context.Background()) {
+		if !hooksInstalledNow(t, hookAgent) {
 			t.Error("AreHooksInstalled() = false after InstallHooks()")
 		}
 
@@ -1341,13 +769,13 @@ func TestOpenCodeHookInstallation(t *testing.T) {
 		hookAgent, _ := agent.AsHookSupport(ag)
 
 		// First install
-		_, err = hookAgent.InstallHooks(context.Background(), false, false)
+		_, err = hookAgent.InstallHooks(context.Background(), false)
 		if err != nil {
 			t.Fatalf("first InstallHooks() error = %v", err)
 		}
 
 		// Second install should be idempotent
-		count, err := hookAgent.InstallHooks(context.Background(), false, false)
+		count, err := hookAgent.InstallHooks(context.Background(), false)
 		if err != nil {
 			t.Fatalf("second InstallHooks() error = %v", err)
 		}
@@ -1467,16 +895,20 @@ func TestOpenCodeHelperMethods(t *testing.T) {
 			t.Errorf("ProtectedDirs() = %v, want to contain '.opencode'", dirs)
 		}
 	})
+}
 
-	t.Run("IsPreview returns true", func(t *testing.T) {
-		t.Parallel()
+// hooksInstalledNow reports whether the agent's hooks are installed, failing the
+// test if it could not tell. Built-in agents read a local config file where
+// absent means absent, so an error here is a bug, not a state to tolerate.
+func hooksInstalledNow(t *testing.T, ag interface {
+	AreHooksInstalled(ctx context.Context) (bool, error)
+},
+) bool {
+	t.Helper()
 
-		ag, err := agent.Get("opencode")
-		if err != nil {
-			t.Fatalf("agent.Get(opencode) error = %v", err)
-		}
-		if !ag.IsPreview() {
-			t.Error("IsPreview() = false, want true")
-		}
-	})
+	installed, err := ag.AreHooksInstalled(context.Background())
+	if err != nil {
+		t.Fatalf("AreHooksInstalled() error = %v", err)
+	}
+	return installed
 }

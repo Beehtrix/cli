@@ -44,6 +44,7 @@ func TestSeam_GitPrimaryWithFsMirror(t *testing.T) {
 
 	ctx := context.Background()
 	cid := id.MustCheckpointID("a1b2c3d4e5f6")
+	reservedCID := id.MustCheckpointID("b1b2c3d4e5f6")
 	const sessionID = "sess-1"
 
 	// 1. Session: create the checkpoint.
@@ -53,35 +54,36 @@ func TestSeam_GitPrimaryWithFsMirror(t *testing.T) {
 		Prompts:    []string{"do the thing"}, FilesTouched: []string{"a.go"},
 		AuthorName: "Test", AuthorEmail: "test@example.com",
 	}))
-	// 2. SessionTranscript: replace transcript at stop time.
+	// 2. ReservedSession: create a checkpoint using a previously persisted ID.
+	require.NoError(t, stores.Persistent.Write(ctx, cp.ReservedSession{
+		CheckpointID: reservedCID, SessionID: "reserved-session", Strategy: "manual-commit",
+		Transcript: redact.AlreadyRedacted([]byte("reserved transcript")),
+		AuthorName: "Test", AuthorEmail: "test@example.com",
+	}))
+	// 3. SessionTranscript: replace transcript at stop time.
 	require.NoError(t, stores.Persistent.Write(ctx, cp.SessionTranscript{
 		CheckpointID: cid, SessionID: sessionID,
 		Transcript: redact.AlreadyRedacted([]byte("final transcript")),
 		Prompts:    []string{"do the thing"},
 	}))
-	// 3. SessionSummary: set the latest session's summary.
+	// 4. SessionSummary: set the latest session's summary.
 	require.NoError(t, stores.Persistent.Write(ctx, cp.SessionSummary{
 		CheckpointID: cid, Summary: &cp.Summary{Intent: "intent-x", Outcome: "outcome-y"},
 	}))
-	// 4. CheckpointAttribution: set combined attribution.
-	require.NoError(t, stores.Persistent.Write(ctx, cp.CheckpointAttribution{
-		CheckpointID: cid, Attribution: &cp.Attribution{AgentLines: 7, AgentPercentage: 70},
-	}))
-
 	// Reads resolve from the git primary.
 	t.Run("git primary", func(t *testing.T) {
-		assertAllVariants(t, stores.Persistent, cid)
+		assertAllVariants(t, stores.Persistent, cid, reservedCID)
 	})
 
 	// The fsstore mirror independently received every write.
 	t.Run("fs mirror", func(t *testing.T) {
 		mirror := New(mirrorDir)
-		assertAllVariants(t, mirror, cid)
+		assertAllVariants(t, mirror, cid, reservedCID)
 	})
 }
 
 // assertAllVariants verifies that all four writes are visible in a backend.
-func assertAllVariants(t *testing.T, store cp.PersistentStore, cid id.CheckpointID) {
+func assertAllVariants(t *testing.T, store cp.PersistentStore, cid, reservedCID id.CheckpointID) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -101,9 +103,9 @@ func assertAllVariants(t *testing.T, store cp.PersistentStore, cid id.Checkpoint
 	require.NotNil(t, meta.Summary)
 	assert.Equal(t, "intent-x", meta.Summary.Intent)
 
-	// CheckpointAttribution landed.
-	require.NotNil(t, summary.CombinedAttribution)
-	assert.Equal(t, 7, summary.CombinedAttribution.AgentLines)
+	reservedContent, err := store.ReadSessionContent(ctx, reservedCID, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("reserved transcript"), reservedContent.Transcript)
 }
 
 func writeMirrorSettings(t *testing.T, repoDir, mirrorDir string) {

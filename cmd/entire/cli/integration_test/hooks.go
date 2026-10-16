@@ -109,6 +109,21 @@ func (r *HookRunner) SimulateStop(sessionID, transcriptPath string) error {
 	return r.runHookWithInput("stop", input)
 }
 
+// SimulateStopFailure simulates Claude Code's StopFailure hook, which fires
+// instead of Stop when a turn ends on an API error.
+func (r *HookRunner) SimulateStopFailure(sessionID, transcriptPath, errorType string) error {
+	r.T.Helper()
+
+	input := map[string]string{
+		"session_id":      sessionID,
+		"transcript_path": transcriptPath,
+		"hook_event_name": "StopFailure",
+		"error":           errorType,
+	}
+
+	return r.runHookWithInput("stop-failure", input)
+}
+
 // SimulateSessionEnd simulates the Claude Code session-end hook.
 // This transitions a session from IDLE (or ACTIVE) to ENDED phase.
 func (r *HookRunner) SimulateSessionEnd(sessionID string) error {
@@ -165,23 +180,111 @@ type PostTaskInput struct {
 	TranscriptPath string
 	ToolUseID      string
 	AgentID        string
+	// Background, when true, sends the response Claude Code returns for an
+	// async launch (status "async_launched", isAsync) instead of a foreground
+	// completion (status "completed"). Real Agent calls rarely carry
+	// run_in_background, so the payload deliberately omits it either way.
+	Background bool
 }
 
 // SimulatePostTask simulates the PostToolUse[Task] hook.
 func (r *HookRunner) SimulatePostTask(input PostTaskInput) error {
 	r.T.Helper()
 
+	toolResponse := map[string]interface{}{
+		"status":  "completed",
+		"agentId": input.AgentID,
+	}
+	if input.Background {
+		toolResponse = map[string]interface{}{
+			"status":  "async_launched",
+			"isAsync": true,
+			"agentId": input.AgentID,
+		}
+	}
 	hookInput := map[string]interface{}{
 		"session_id":      input.SessionID,
 		"transcript_path": input.TranscriptPath,
 		"tool_use_id":     input.ToolUseID,
-		"tool_input":      map[string]string{},
-		"tool_response": map[string]string{
-			"agentId": input.AgentID,
-		},
+		"tool_name":       "Agent",
+		"tool_input":      map[string]interface{}{},
+		"tool_response":   toolResponse,
 	}
 
 	return r.runHookWithInput("post-task", hookInput)
+}
+
+// SubagentStartInput contains the input for Claude Code's SubagentStart hook.
+// Like SubagentStop it carries no tool_use_id; AgentType is what the installed
+// matcher filters on ("workflow-subagent" for agents a Workflow launched).
+type SubagentStartInput struct {
+	SessionID      string // Parent session ID.
+	TranscriptPath string // Parent session's transcript path.
+	AgentID        string
+	AgentType      string
+}
+
+// SimulateSubagentStart simulates Claude Code's SubagentStart hook, which fires
+// as each subagent launches. For a Workflow's agents it is the only launch
+// signal: the Workflow call's PostToolUse names a run, not its agents.
+func (r *HookRunner) SimulateSubagentStart(input SubagentStartInput) error {
+	r.T.Helper()
+
+	hookInput := map[string]interface{}{
+		"session_id":      input.SessionID,
+		"transcript_path": input.TranscriptPath,
+		"hook_event_name": "SubagentStart",
+		"agent_id":        input.AgentID,
+		"agent_type":      input.AgentType,
+	}
+
+	return r.runHookWithInput("subagent-start", hookInput)
+}
+
+// SimulateSubagentStart is a convenience method on TestEnv.
+func (env *TestEnv) SimulateSubagentStart(input SubagentStartInput) error {
+	env.T.Helper()
+	runner := NewHookRunner(env.RepoDir, env.ClaudeProjectDir, env.T)
+	return runner.SimulateSubagentStart(input)
+}
+
+// SubagentStopInput contains the input for the SubagentStop hook. There is no
+// ToolUseID: Claude Code's SubagentStop payload never carries one, so the
+// lifecycle must correlate on AgentID.
+type SubagentStopInput struct {
+	SessionID           string // Parent session ID.
+	TranscriptPath      string // Parent session's transcript path.
+	AgentID             string
+	AgentType           string // Optional; Claude Code sends it, e.g. "workflow-subagent".
+	AgentTranscriptPath string // Path to the subagent's own transcript.
+}
+
+// SimulateSubagentStop simulates Claude Code's SubagentStop hook: the true
+// completion signal for a subagent. For a background subagent it fires long
+// after the launch-time PostToolUse (post-task); for a foreground subagent it
+// fires just BEFORE that PostToolUse.
+func (r *HookRunner) SimulateSubagentStop(input SubagentStopInput) error {
+	r.T.Helper()
+
+	hookInput := map[string]interface{}{
+		"session_id":            input.SessionID,
+		"transcript_path":       input.TranscriptPath,
+		"hook_event_name":       "SubagentStop",
+		"agent_id":              input.AgentID,
+		"agent_transcript_path": input.AgentTranscriptPath,
+	}
+	if input.AgentType != "" {
+		hookInput["agent_type"] = input.AgentType
+	}
+
+	return r.runHookWithInput("subagent-stop", hookInput)
+}
+
+// SimulateSubagentStop is a convenience method on TestEnv.
+func (env *TestEnv) SimulateSubagentStop(input SubagentStopInput) error {
+	env.T.Helper()
+	runner := NewHookRunner(env.RepoDir, env.ClaudeProjectDir, env.T)
+	return runner.SimulateSubagentStop(input)
 }
 
 func (r *HookRunner) runHookWithInput(flag string, input interface{}) error {
@@ -385,6 +488,13 @@ func (env *TestEnv) SimulateStop(sessionID, transcriptPath string) error {
 	env.T.Helper()
 	runner := NewHookRunner(env.RepoDir, env.ClaudeProjectDir, env.T)
 	return runner.SimulateStop(sessionID, transcriptPath)
+}
+
+// SimulateStopFailure is a convenience method on TestEnv.
+func (env *TestEnv) SimulateStopFailure(sessionID, transcriptPath, errorType string) error {
+	env.T.Helper()
+	runner := NewHookRunner(env.RepoDir, env.ClaudeProjectDir, env.T)
+	return runner.SimulateStopFailure(sessionID, transcriptPath, errorType)
 }
 
 // SimulateSessionEnd is a convenience method on TestEnv.
@@ -622,7 +732,7 @@ func (r *CodexHookRunner) runCodexHook(hookName string, inputJSON []byte) error 
 	cmd := exec.CommandContext(context.Background(), getTestBinary(), "hooks", "codex", hookName)
 	cmd.Dir = r.RepoDir
 	cmd.Stdin = bytes.NewReader(inputJSON)
-	cmd.Env = testutil.GitIsolatedEnv()
+	cmd.Env = append(testutil.GitIsolatedEnv(), "ENTIRE_TEST_CODEX_SESSION_DIR="+filepath.Join(r.RepoDir, ".entire", "tmp"))
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -716,10 +826,17 @@ func (r *FactoryDroidHookRunner) runDroidHookInRepoDir(hookName string, inputJSO
 // SimulateUserPromptSubmit simulates the UserPromptSubmit hook for Factory Droid.
 func (r *FactoryDroidHookRunner) SimulateUserPromptSubmit(sessionID string) error {
 	r.T.Helper()
+	return r.SimulateUserPromptSubmitWithTranscript(sessionID, "")
+}
+
+// SimulateUserPromptSubmitWithTranscript simulates UserPromptSubmit with the
+// transcript path Droid reports, so turn start records the transcript offset.
+func (r *FactoryDroidHookRunner) SimulateUserPromptSubmitWithTranscript(sessionID, transcriptPath string) error {
+	r.T.Helper()
 
 	input := map[string]string{
 		"session_id":      sessionID,
-		"transcript_path": "",
+		"transcript_path": transcriptPath,
 		"prompt":          "test prompt",
 	}
 
@@ -768,33 +885,33 @@ func (s *FactoryDroidSession) CreateDroidTranscript(prompt string, changes []Fil
 
 	// User message with prompt
 	lines = append(lines, map[string]interface{}{
-		"type": "message",
+		"type": entryTypeMessage,
 		"id":   "m1",
 		"message": map[string]interface{}{
-			"role": "user",
+			"role": roleUser,
 			"content": []map[string]interface{}{
-				{"type": "text", "text": prompt},
+				{"type": blockTypeText, "text": prompt},
 			},
 		},
 	})
 
 	// Assistant message with tool uses
 	assistantContent := []interface{}{
-		map[string]interface{}{"type": "text", "text": "I'll help you with that."},
+		map[string]interface{}{"type": blockTypeText, "text": "I'll help you with that."},
 	}
 	for i, change := range changes {
 		assistantContent = append(assistantContent, map[string]interface{}{
-			"type":  "tool_use",
+			"type":  blockTypeToolUse,
 			"id":    fmt.Sprintf("toolu_%d", i+1),
 			"name":  "Write",
 			"input": map[string]string{"file_path": change.Path, "content": change.Content},
 		})
 	}
 	lines = append(lines, map[string]interface{}{
-		"type": "message",
+		"type": entryTypeMessage,
 		"id":   "m2",
 		"message": map[string]interface{}{
-			"role":    "assistant",
+			"role":    roleAssistant,
 			"content": assistantContent,
 		},
 	})
@@ -803,28 +920,28 @@ func (s *FactoryDroidSession) CreateDroidTranscript(prompt string, changes []Fil
 	toolResultContent := make([]map[string]interface{}, 0, len(changes))
 	for i := range changes {
 		toolResultContent = append(toolResultContent, map[string]interface{}{
-			"type":        "tool_result",
+			"type":        blockTypeToolResult,
 			"tool_use_id": fmt.Sprintf("toolu_%d", i+1),
 			"content":     "Success",
 		})
 	}
 	lines = append(lines, map[string]interface{}{
-		"type": "message",
+		"type": entryTypeMessage,
 		"id":   "m3",
 		"message": map[string]interface{}{
-			"role":    "user",
+			"role":    roleUser,
 			"content": toolResultContent,
 		},
 	})
 
 	// Final assistant message
 	lines = append(lines, map[string]interface{}{
-		"type": "message",
+		"type": entryTypeMessage,
 		"id":   "m4",
 		"message": map[string]interface{}{
-			"role": "assistant",
+			"role": roleAssistant,
 			"content": []map[string]interface{}{
-				{"type": "text", "text": "Done!"},
+				{"type": blockTypeText, "text": "Done!"},
 			},
 		},
 	})
@@ -849,11 +966,51 @@ func (s *FactoryDroidSession) CreateDroidTranscript(prompt string, changes []Fil
 	}
 }
 
+// MarkAsWorkerSession prepends the session_start entry Droid writes at the head
+// of a Worker transcript, naming the session and tool use that spawned it.
+// Droid dispatches Workers as detached sessions, so this line is what ties the
+// Worker's work back to its parent turn.
+//
+// Call after CreateDroidTranscript — it rewrites the file in place.
+func (s *FactoryDroidSession) MarkAsWorkerSession(parentSessionID, toolUseID, sessionTitle string) {
+	s.env.T.Helper()
+
+	existing, err := os.ReadFile(s.TranscriptPath)
+	if err != nil {
+		s.env.T.Fatalf("failed to read transcript to mark as worker: %v", err)
+	}
+
+	sessionStart, err := json.Marshal(map[string]interface{}{
+		"type":             "session_start",
+		"id":               s.ID,
+		"title":            "# Task Tool Invocation Subagent type: worker",
+		"sessionTitle":     sessionTitle,
+		"callingSessionId": parentSessionID,
+		"callingToolUseId": toolUseID,
+		"version":          2,
+	})
+	if err != nil {
+		s.env.T.Fatalf("failed to encode session_start: %v", err)
+	}
+
+	updated := append(append(sessionStart, '\n'), existing...)
+	if err := os.WriteFile(s.TranscriptPath, updated, 0o600); err != nil {
+		s.env.T.Fatalf("failed to write worker transcript: %v", err)
+	}
+}
+
 // SimulateFactoryDroidUserPromptSubmit is a convenience method on TestEnv.
 func (env *TestEnv) SimulateFactoryDroidUserPromptSubmit(sessionID string) error {
 	env.T.Helper()
 	runner := NewFactoryDroidHookRunner(env.RepoDir, env.T)
 	return runner.SimulateUserPromptSubmit(sessionID)
+}
+
+// SimulateFactoryDroidUserPromptSubmitWithTranscript is a convenience method on TestEnv.
+func (env *TestEnv) SimulateFactoryDroidUserPromptSubmitWithTranscript(sessionID, transcriptPath string) error {
+	env.T.Helper()
+	runner := NewFactoryDroidHookRunner(env.RepoDir, env.T)
+	return runner.SimulateUserPromptSubmitWithTranscript(sessionID, transcriptPath)
 }
 
 // SimulateFactoryDroidStop is a convenience method on TestEnv.
@@ -1024,11 +1181,11 @@ func (s *OpenCodeSession) CreateOpenCodeTranscript(prompt string, changes []File
 	s.messages = append(s.messages, map[string]interface{}{
 		"info": map[string]interface{}{
 			"id":   fmt.Sprintf("msg-%d", s.msgCounter),
-			"role": "user",
+			"role": roleUser,
 			"time": map[string]interface{}{"created": 1708300000 + s.msgCounter},
 		},
 		"parts": []map[string]interface{}{
-			{"type": "text", "text": prompt},
+			{"type": blockTypeText, "text": prompt},
 		},
 	})
 
@@ -1036,7 +1193,7 @@ func (s *OpenCodeSession) CreateOpenCodeTranscript(prompt string, changes []File
 	s.msgCounter++
 	var parts []map[string]interface{}
 	parts = append(parts, map[string]interface{}{
-		"type": "text",
+		"type": blockTypeText,
 		"text": "I'll help you with that.",
 	})
 	for i, change := range changes {
@@ -1052,14 +1209,14 @@ func (s *OpenCodeSession) CreateOpenCodeTranscript(prompt string, changes []File
 		})
 	}
 	parts = append(parts, map[string]interface{}{
-		"type": "text",
+		"type": blockTypeText,
 		"text": "Done!",
 	})
 
 	s.messages = append(s.messages, map[string]interface{}{
 		"info": map[string]interface{}{
 			"id":   fmt.Sprintf("msg-%d", s.msgCounter),
-			"role": "assistant",
+			"role": roleAssistant,
 			"time": map[string]interface{}{
 				"created":   1708300000 + s.msgCounter,
 				"completed": 1708300000 + s.msgCounter + 5,

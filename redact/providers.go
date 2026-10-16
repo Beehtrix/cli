@@ -1,6 +1,9 @@
 package redact
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // Provider-specific deterministic secret patterns.
 //
@@ -9,18 +12,19 @@ import "regexp"
 // credential formats the other secret layers don't reliably flag.
 //
 // The betterleaks layer's coverage of these differs per prefix (verified
-// against the vendored betterleaks v1.5.0 rule source):
+// against the upstream betterleaks v1.8.0 rule source):
 //   - sb_secret_: the supabase-project-api-key rule is a *composite* rule
-//     (RequiredRules: supabase-project-url) that only fires when a matching
-//     "*.supabase.co" URL is present in the same content, on top of an
+//     (a required supabase-project-url component, the 1.8.0 spelling of
+//     RequiredRules) that only fires when a matching "*.supabase.co" URL is
+//     present in the same content, on top of an exact 31-char body and an
 //     entropy<=4.0 filter. A secret captured on its own therefore passes
 //     straight through regardless of entropy.
 //   - sbp_: the supabase-management-token rule fires standalone (no
-//     RequiredRules), but only matches an exact 40-character lowercase body
-//     and is further filtered by entropy<=3.5 and a two-digit minimum. A
-//     high-entropy 40-char sbp_ token captured alone IS caught by
-//     betterleaks; what this layer adds for sbp_ is coverage of bodies at
-//     other lengths, lower entropy, or without two digits.
+//     required components), but only matches an exact 40-character
+//     lowercase body and is further filtered by entropy<=3.5 and a
+//     two-digit minimum. A high-entropy 40-char sbp_ token captured alone
+//     IS caught by betterleaks; what this layer adds for sbp_ is coverage
+//     of bodies at other lengths, lower entropy, or without two digits.
 //
 // Supabase (https://supabase.com/docs/guides/getting-started/api-keys):
 //   - sb_secret_...      secret API key (replaces the legacy service_role
@@ -69,6 +73,13 @@ var providerTokenPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`sbp_[a-z0-9_-]{20,}`),
 }
 
+// bareSKKeyPattern catches short sk- keys (e.g. LiteLLM virtual keys, sk- + 22
+// chars) that are too short for the entropy layer (#2728). The prefix must
+// follow a non-alphanumeric char ("_" included) or a literal JSON escape, so
+// "risk-" doesn't match; detectProviderTokens also requires a digit or
+// uppercase letter in the body.
+var bareSKKeyPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9]|\\[bfnrt]|\\u[0-9A-Fa-f]{4})(sk-[A-Za-z0-9_-]{20,})`)
+
 // detectProviderTokens returns tagged regions for every occurrence of a
 // known provider secret-token prefix in s. Regions use the empty label so
 // they render as the bare "REDACTED" token, consistent with the other
@@ -80,5 +91,15 @@ func detectProviderTokens(s string) []taggedRegion {
 			regions = append(regions, taggedRegion{region: region{loc[0], loc[1]}})
 		}
 	}
+	for _, loc := range bareSKKeyPattern.FindAllStringSubmatchIndex(s, -1) {
+		start, end := loc[2], loc[3]
+		if strings.ContainsFunc(s[start+len("sk-"):end], isDigitOrUpper) {
+			regions = append(regions, taggedRegion{region: region{start, end}})
+		}
+	}
 	return regions
+}
+
+func isDigitOrUpper(r rune) bool {
+	return ('0' <= r && r <= '9') || ('A' <= r && r <= 'Z')
 }

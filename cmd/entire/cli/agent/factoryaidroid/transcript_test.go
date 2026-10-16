@@ -1,12 +1,13 @@
 package factoryaidroid
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 
-	"github.com/entireio/cli/cmd/entire/cli/transcript"
+	transcriptlib "github.com/entireio/cli/transcript"
 )
 
 func TestParseDroidTranscript_NormalizesEnvelope(t *testing.T) {
@@ -30,16 +31,16 @@ func TestParseDroidTranscript_NormalizesEnvelope(t *testing.T) {
 	}
 
 	// First line should be normalized to type="user"
-	if lines[0].Type != transcript.TypeUser {
-		t.Errorf("lines[0].Type = %q, want %q", lines[0].Type, transcript.TypeUser)
+	if lines[0].Type != transcriptlib.TypeUser {
+		t.Errorf("lines[0].Type = %q, want %q", lines[0].Type, transcriptlib.TypeUser)
 	}
 	if lines[0].UUID != "m1" {
 		t.Errorf("lines[0].UUID = %q, want \"m1\"", lines[0].UUID)
 	}
 
 	// Second line should be normalized to type="assistant"
-	if lines[1].Type != transcript.TypeAssistant {
-		t.Errorf("lines[1].Type = %q, want %q", lines[1].Type, transcript.TypeAssistant)
+	if lines[1].Type != transcriptlib.TypeAssistant {
+		t.Errorf("lines[1].Type = %q, want %q", lines[1].Type, transcriptlib.TypeAssistant)
 	}
 	if lines[1].UUID != "m2" {
 		t.Errorf("lines[1].UUID = %q, want \"m2\"", lines[1].UUID)
@@ -76,11 +77,11 @@ func TestParseDroidTranscript_StartLineOffset(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("got %d lines from offset 2, want 2", len(lines))
 	}
-	if lines[0].Type != transcript.TypeAssistant {
-		t.Errorf("lines[0].Type = %q, want %q", lines[0].Type, transcript.TypeAssistant)
+	if lines[0].Type != transcriptlib.TypeAssistant {
+		t.Errorf("lines[0].Type = %q, want %q", lines[0].Type, transcriptlib.TypeAssistant)
 	}
-	if lines[1].Type != transcript.TypeUser {
-		t.Errorf("lines[1].Type = %q, want %q", lines[1].Type, transcript.TypeUser)
+	if lines[1].Type != transcriptlib.TypeUser {
+		t.Errorf("lines[1].Type = %q, want %q", lines[1].Type, transcriptlib.TypeUser)
 	}
 }
 
@@ -691,75 +692,6 @@ func TestExtractPrompts_WithOffset(t *testing.T) {
 	}
 }
 
-func TestExtractSummary(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	transcriptPath := tmpDir + "/transcript.jsonl"
-
-	writeJSONLFile(t, transcriptPath,
-		makeUserTextLine(t, "u1", "Fix the bug"),
-		makeAssistantTextLine(t, "a1", "Working on it..."),
-		makeUserTextLine(t, "u2", "Thanks"),
-		makeAssistantTextLine(t, "a2", "All done! The login bug is fixed."),
-	)
-
-	ag := &FactoryAIDroidAgent{}
-	summary, err := ag.ExtractSummary(transcriptPath)
-	if err != nil {
-		t.Fatalf("ExtractSummary() error = %v", err)
-	}
-
-	if summary != "All done! The login bug is fixed." {
-		t.Errorf("ExtractSummary() = %q, want %q", summary, "All done! The login bug is fixed.")
-	}
-}
-
-func TestExtractSummary_SkipsToolUseBlocks(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	transcriptPath := tmpDir + "/transcript.jsonl"
-
-	// Last assistant message has tool_use (no text), second-to-last has text
-	writeJSONLFile(t, transcriptPath,
-		makeUserTextLine(t, "u1", "Edit main.go"),
-		makeAssistantTextLine(t, "a1", "I updated the file."),
-		makeWriteToolLine(t, "a2", "/repo/main.go"),
-	)
-
-	ag := &FactoryAIDroidAgent{}
-	summary, err := ag.ExtractSummary(transcriptPath)
-	if err != nil {
-		t.Fatalf("ExtractSummary() error = %v", err)
-	}
-
-	// Should find "I updated the file." since the tool_use message has no text block
-	if summary != "I updated the file." {
-		t.Errorf("ExtractSummary() = %q, want %q", summary, "I updated the file.")
-	}
-}
-
-func TestExtractSummary_EmptyTranscript(t *testing.T) {
-	t.Parallel()
-
-	tmpDir := t.TempDir()
-	transcriptPath := tmpDir + "/transcript.jsonl"
-	if err := os.WriteFile(transcriptPath, []byte(""), 0o600); err != nil {
-		t.Fatalf("failed to write file: %v", err)
-	}
-
-	ag := &FactoryAIDroidAgent{}
-	summary, err := ag.ExtractSummary(transcriptPath)
-	if err != nil {
-		t.Fatalf("ExtractSummary() error = %v", err)
-	}
-
-	if summary != "" {
-		t.Errorf("ExtractSummary() = %q, want empty string", summary)
-	}
-}
-
 func TestParseDroidTranscript_MalformedLines(t *testing.T) {
 	t.Parallel()
 
@@ -781,11 +713,11 @@ func TestParseDroidTranscript_MalformedLines(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("got %d lines, want 2 (malformed lines should be silently skipped)", len(lines))
 	}
-	if lines[0].Type != transcript.TypeUser {
-		t.Errorf("lines[0].Type = %q, want %q", lines[0].Type, transcript.TypeUser)
+	if lines[0].Type != transcriptlib.TypeUser {
+		t.Errorf("lines[0].Type = %q, want %q", lines[0].Type, transcriptlib.TypeUser)
 	}
-	if lines[1].Type != transcript.TypeAssistant {
-		t.Errorf("lines[1].Type = %q, want %q", lines[1].Type, transcript.TypeAssistant)
+	if lines[1].Type != transcriptlib.TypeAssistant {
+		t.Errorf("lines[1].Type = %q, want %q", lines[1].Type, transcriptlib.TypeAssistant)
 	}
 }
 
@@ -843,7 +775,7 @@ func TestExtractModelFromTranscript_SettingsFile(t *testing.T) {
 		t.Fatalf("failed to write settings: %v", err)
 	}
 
-	model := ExtractModelFromTranscript(transcriptPath)
+	model := ExtractModelFromTranscript(context.Background(), transcriptPath)
 	if model != "Gemini-2.5-Pro-0" {
 		t.Errorf("ExtractModelFromTranscript() = %q, want %q", model, "Gemini-2.5-Pro-0")
 	}
@@ -865,7 +797,7 @@ func TestExtractModelFromTranscript_NoCustomPrefix(t *testing.T) {
 		t.Fatalf("failed to write settings: %v", err)
 	}
 
-	model := ExtractModelFromTranscript(transcriptPath)
+	model := ExtractModelFromTranscript(context.Background(), transcriptPath)
 	if model != "claude-opus-4-6" {
 		t.Errorf("ExtractModelFromTranscript() = %q, want %q", model, "claude-opus-4-6")
 	}
@@ -882,7 +814,7 @@ func TestExtractModelFromTranscript_NoSettingsFile(t *testing.T) {
 		t.Fatalf("failed to write transcript: %v", err)
 	}
 
-	model := ExtractModelFromTranscript(transcriptPath)
+	model := ExtractModelFromTranscript(context.Background(), transcriptPath)
 	if model != "" {
 		t.Errorf("ExtractModelFromTranscript() = %q, want empty", model)
 	}
@@ -904,7 +836,7 @@ func TestExtractModelFromTranscript_CorruptSettingsFile(t *testing.T) {
 		t.Fatalf("failed to write settings: %v", err)
 	}
 
-	model := ExtractModelFromTranscript(transcriptPath)
+	model := ExtractModelFromTranscript(context.Background(), transcriptPath)
 	if model != "" {
 		t.Errorf("ExtractModelFromTranscript() = %q, want empty for corrupt settings", model)
 	}
@@ -913,7 +845,7 @@ func TestExtractModelFromTranscript_CorruptSettingsFile(t *testing.T) {
 func TestExtractModelFromTranscript_EmptyPath(t *testing.T) {
 	t.Parallel()
 
-	model := ExtractModelFromTranscript("")
+	model := ExtractModelFromTranscript(context.Background(), "")
 	if model != "" {
 		t.Errorf("ExtractModelFromTranscript(\"\") = %q, want empty", model)
 	}

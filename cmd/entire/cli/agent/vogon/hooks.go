@@ -116,7 +116,7 @@ func parseSessionInfoEvent(stdin io.Reader, eventType agent.EventType) (*agent.E
 }
 
 // InstallHooks is a no-op — the vogon binary fires hooks directly.
-func (v *Agent) InstallHooks(_ context.Context, _ bool, _ bool) (int, error) {
+func (v *Agent) InstallHooks(_ context.Context, _ bool) (int, error) {
 	return 0, nil
 }
 
@@ -125,8 +125,8 @@ func (v *Agent) UninstallHooks(_ context.Context) error { return nil }
 
 // AreHooksInstalled returns false — vogon agent has no external hooks to install.
 // The vogon binary fires hooks directly via `entire hooks vogon <verb>`.
-func (v *Agent) AreHooksInstalled(_ context.Context) bool {
-	return false
+func (v *Agent) AreHooksInstalled(_ context.Context) (bool, error) {
+	return false, nil
 }
 
 // WriteHookResponse writes a plain text message to stdout.

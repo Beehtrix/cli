@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,6 +17,8 @@ import (
 	_ "github.com/entireio/cli/cmd/entire/cli/agent/claudecode" // register claude-code so its .claude protected dir is discoverable
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
+	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/entireio/cli/cmd/entire/cli/trailers"
@@ -32,20 +34,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
-func TestCheckpointType_Values(t *testing.T) {
-	// Verify the enum values are distinct
-	if Ephemeral == Persistent {
-		t.Error("Ephemeral and Persistent should have different values")
-	}
-
-	// Verify Ephemeral is the zero value (default for Type)
-	var defaultType Type
-	if defaultType != Ephemeral {
-		t.Errorf("expected zero value of Type to be Ephemeral, got %d", defaultType)
-	}
-}
-
-func TestCopyMetadataDir_SkipsSymlinks(t *testing.T) {
+func TestCopyMetadataDir_RefusesSymlinks(t *testing.T) {
 	// Create a temp directory for the test
 	tempDir := t.TempDir()
 
@@ -84,17 +73,16 @@ func TestCopyMetadataDir_SkipsSymlinks(t *testing.T) {
 	store := NewGitStore(repo, DefaultV1Refs())
 	entries := make(map[string]object.TreeEntry)
 
-	err = store.copyMetadataDir(context.Background(), metadataDir, "checkpoint/", entries)
-	if err != nil {
-		t.Fatalf("copyMetadataDir failed: %v", err)
+	err = store.copyMetadataDir(context.Background(), mustWalkRoot(t, metadataDir), "metadata", "checkpoint/", entries)
+	// The walk refuses rather than skipping: .entire/metadata is gitignored, so
+	// a link here cannot arrive with a checkout, and quietly dropping it would
+	// write a checkpoint missing session content with nobody told.
+	if !errors.Is(err, osroot.ErrSymlinkedPath) {
+		t.Fatalf("copyMetadataDir should refuse a symlinked entry, got: %v", err)
 	}
 
-	// Verify regular file was included
-	if _, ok := entries["checkpoint/regular.txt"]; !ok {
-		t.Error("regular.txt should be included in entries")
-	}
-
-	// Verify symlink was NOT included (security fix)
+	// Whatever it did before stopping, the symlink's target must not be in the
+	// tree — that is the property this test has always been about.
 	if _, ok := entries["checkpoint/sneaky-link"]; ok {
 		t.Error("symlink should NOT be included in entries - this would allow reading files outside the metadata directory")
 	}
@@ -119,7 +107,6 @@ var (
 func (fakePluginAgent) Name() types.AgentName                { return "terminalhire-plugin" }
 func (fakePluginAgent) Type() types.AgentType                { return "TerminalHire" }
 func (fakePluginAgent) Description() string                  { return "fake external plugin for tests" }
-func (fakePluginAgent) IsPreview() bool                      { return true }
 func (fakePluginAgent) ProtectedDirs() []string              { return []string{".terminalhire"} }
 func (fakePluginAgent) ProtectedFiles() []string             { return []string{".terminalhirerc"} }
 func (fakePluginAgent) GetSessionID(*agent.HookInput) string { return "" }
@@ -141,62 +128,6 @@ func (fakePluginAgent) ResolveSessionFile(dir, sid string) string               
 func (fakePluginAgent) ReadSession(*agent.HookInput) (*agent.AgentSession, error) { return nil, nil } //nolint:nilnil // test stub
 func (fakePluginAgent) WriteSession(context.Context, *agent.AgentSession) error   { return nil }
 func (fakePluginAgent) FormatResumeCommand(string) string                         { return "" }
-
-// TestCollectChangedFiles_ExcludesProtectedDirs verifies that the
-// first-checkpoint path keeps agent-protected dirs (e.g. .claude) and the
-// .entire infrastructure dir out of the checkpoint snapshot, while ordinary
-// untracked files are still captured. Regression for protected-dir content
-// leaking into the shadow tree on session start.
-func TestCollectChangedFiles_ExcludesProtectedDirs(t *testing.T) {
-	t.Parallel()
-
-	// Register an external-plugin-style agent so its protected dir/file join the
-	// AllProtectedDirs/AllProtectedFiles union alongside the built-in .claude.
-	// Registration is additive and concurrency-safe; no test asserts the exact set.
-	agent.Register("terminalhire-plugin", func() agent.Agent { return fakePluginAgent{} })
-
-	tempDir := t.TempDir()
-	// Resolve symlinks so the repo root matches git's resolved path.
-	// On macOS, t.TempDir() returns /var/... but git resolves to /private/var/...
-	tempDir, err := filepath.EvalSymlinks(tempDir)
-	require.NoError(t, err)
-
-	testutil.InitRepo(t, tempDir)
-	testutil.WriteFile(t, tempDir, "base.txt", "base")
-	testutil.GitAdd(t, tempDir, "base.txt")
-	testutil.GitCommit(t, tempDir, "init")
-
-	// Disable any global core.excludesFile so a developer/CI-runner gitignore
-	// convention (e.g. one that ignores .claude) can't mask the leak. The fix
-	// must exclude protected dirs on its own, independent of gitignore state.
-	cfgCmd := exec.CommandContext(context.Background(), "git", "config", "core.excludesFile", os.DevNull)
-	cfgCmd.Dir = tempDir
-	require.NoError(t, cfgCmd.Run())
-
-	// Planted untracked, non-gitignored files.
-	testutil.WriteFile(t, tempDir, ".claude/marker.txt", "MARKER-secret")         // built-in agent-protected dir
-	testutil.WriteFile(t, tempDir, ".terminalhire/profile.json", "MARKER-plugin") // plugin-protected dir
-	testutil.WriteFile(t, tempDir, ".terminalhirerc", "MARKER-plugin-file")       // plugin-protected file
-	testutil.WriteFile(t, tempDir, ".entire/state.json", "{}")                    // infrastructure
-	testutil.WriteFile(t, tempDir, "src/keep.txt", "user work")                   // ordinary
-
-	repo, err := git.PlainOpen(tempDir)
-	require.NoError(t, err)
-
-	result, err := collectChangedFiles(context.Background(), repo)
-	require.NoError(t, err)
-
-	require.NotContains(t, result.Changed, ".claude/marker.txt",
-		"built-in agent protected dir content must not be captured into the checkpoint")
-	require.NotContains(t, result.Changed, ".terminalhire/profile.json",
-		"external-plugin protected dir content must not be captured into the checkpoint")
-	require.NotContains(t, result.Changed, ".terminalhirerc",
-		"external-plugin protected file must not be captured into the checkpoint")
-	require.NotContains(t, result.Changed, ".entire/state.json",
-		"infrastructure dir must not be captured into the checkpoint")
-	require.Contains(t, result.Changed, "src/keep.txt",
-		"ordinary untracked files must still be captured")
-}
 
 // TestWriteCommitted_AgentField verifies that the Agent field is written
 // to both metadata.json and the commit message trailer.
@@ -389,132 +320,6 @@ func readLatestSessionMetadata(t *testing.T, repo *git.Repository, checkpointID 
 
 // Note: Tests for Agents array and SessionCount fields have been removed
 // as those fields were removed from Metadata in the simplification.
-
-// TestWriteTemporary_Deduplication verifies that WriteTemporary skips creating
-// a new commit when the tree hash matches the previous checkpoint.
-func TestWriteTemporary_Deduplication(t *testing.T) {
-	tempDir := t.TempDir()
-
-	// Initialize a git repository with an initial commit
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	// Create worktree and make initial commit
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	readmeFile := filepath.Join(tempDir, "README.md")
-	if err := os.WriteFile(readmeFile, []byte("# Test"), 0o644); err != nil {
-		t.Fatalf("failed to write README: %v", err)
-	}
-	if _, err := worktree.Add("README.md"); err != nil {
-		t.Fatalf("failed to add README: %v", err)
-	}
-	initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
-	})
-	if err != nil {
-		t.Fatalf("failed to commit: %v", err)
-	}
-
-	// Change to temp dir so paths.WorktreeRoot() works correctly
-	t.Chdir(tempDir)
-
-	// Create a test file that will be included in checkpoints
-	testFile := filepath.Join(tempDir, "test.go")
-	if err := os.WriteFile(testFile, []byte("package main\n"), 0o644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
-	}
-
-	// Create metadata directory
-	metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	// Create checkpoint store
-	store := newEphemeralStore(repo, DefaultV1Refs())
-
-	// First checkpoint should be created
-	baseCommit := initialCommit.String()
-	result1, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{"test.go"},
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "Checkpoint 1",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() first call error = %v", err)
-	}
-	if result1.Skipped {
-		t.Error("first checkpoint should not be skipped")
-	}
-	if result1.CommitHash == plumbing.ZeroHash {
-		t.Error("first checkpoint should have a commit hash")
-	}
-
-	// Second checkpoint with identical content should be skipped
-	result2, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{"test.go"},
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "Checkpoint 2",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: false,
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() second call error = %v", err)
-	}
-	if !result2.Skipped {
-		t.Error("second checkpoint with identical content should be skipped")
-	}
-	if result2.CommitHash != result1.CommitHash {
-		t.Errorf("skipped checkpoint should return previous commit hash, got %s, want %s",
-			result2.CommitHash, result1.CommitHash)
-	}
-
-	// Modify the file and create another checkpoint - should NOT be skipped
-	if err := os.WriteFile(testFile, []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
-		t.Fatalf("failed to modify test file: %v", err)
-	}
-
-	result3, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{"test.go"},
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "Checkpoint 3",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: false,
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() third call error = %v", err)
-	}
-	if result3.Skipped {
-		t.Error("third checkpoint with modified content should NOT be skipped")
-	}
-	if result3.CommitHash == result1.CommitHash {
-		t.Error("third checkpoint should have a different commit hash than first")
-	}
-}
 
 // setupBranchTestRepo creates a test repository with an initial commit.
 func setupBranchTestRepo(t *testing.T) (*git.Repository, plumbing.Hash) {
@@ -1030,6 +835,107 @@ func TestListCommitted_FallsBackToRemote(t *testing.T) {
 	}
 }
 
+// Regression (PR #1951 review): attach's local-presence gates require reads
+// that see ONLY the local primary branch — a checkpoint present solely on a
+// remote-tracking ref must read as absent, or attach would treat it as safe
+// to write and clobber the remote's sessions on push. The read chain's
+// per-checkpoint fall-through defeated that: a stale-but-existing local
+// branch fell through to origin's tracking tree and reported the checkpoint
+// present. PrimaryAsLocalRead pins reads to the local ref with no remote
+// tiers; the default chain keeps the fall-through for ordinary reads.
+func TestRead_PrimaryAsLocalRead_IgnoresRemoteTrackingPresence(t *testing.T) {
+	remoteDir := t.TempDir()
+	testutil.InitRepo(t, remoteDir)
+	remoteRepo, err := git.PlainOpen(remoteDir)
+	if err != nil {
+		t.Fatalf("failed to open remote repo: %v", err)
+	}
+	remoteWorktree, err := remoteRepo.Worktree()
+	if err != nil {
+		t.Fatalf("failed to get remote worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(remoteDir, "README.md"), []byte("# Test"), 0o644); err != nil {
+		t.Fatalf("failed to write README: %v", err)
+	}
+	if _, err := remoteWorktree.Add("README.md"); err != nil {
+		t.Fatalf("failed to add README: %v", err)
+	}
+	if _, err := remoteWorktree.Commit("Initial commit", &git.CommitOptions{
+		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
+	}); err != nil {
+		t.Fatalf("failed to create initial commit: %v", err)
+	}
+
+	remoteStore := NewGitStore(remoteRepo, DefaultV1Refs())
+	remoteOnlyID := id.MustCheckpointID("abcdef123456")
+	if err := remoteStore.Write(context.Background(), Session{
+		CheckpointID: remoteOnlyID,
+		SessionID:    "remote-only-session",
+		Strategy:     "manual-commit",
+		Transcript:   redact.AlreadyRedacted([]byte(`{"test": true}`)),
+		AuthorName:   "Test",
+		AuthorEmail:  "test@test.com",
+	}); err != nil {
+		t.Fatalf("failed to write checkpoint to remote: %v", err)
+	}
+
+	localDir := t.TempDir()
+	localRepo, err := git.PlainClone(localDir, &git.CloneOptions{URL: remoteDir})
+	if err != nil {
+		t.Fatalf("failed to clone repo: %v", err)
+	}
+	refSpec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", paths.MetadataBranchName, paths.MetadataBranchName)
+	if err := localRepo.Fetch(&git.FetchOptions{
+		RemoteName: "origin",
+		RefSpecs:   []config.RefSpec{config.RefSpec(refSpec)},
+	}); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+		t.Fatalf("failed to fetch metadata branch: %v", err)
+	}
+
+	// A stale LOCAL v1 branch: it exists (so a naive local-branch-exists gate
+	// passes) but holds a different checkpoint, not remoteOnlyID.
+	localStore := NewGitStore(localRepo, DefaultV1Refs())
+	localOnlyID := id.MustCheckpointID("fedcba654321")
+	if err := localStore.Write(context.Background(), Session{
+		CheckpointID: localOnlyID,
+		SessionID:    "local-session",
+		Strategy:     "manual-commit",
+		Transcript:   redact.AlreadyRedacted([]byte(`{"local": true}`)),
+		AuthorName:   "Test",
+		AuthorEmail:  "test@test.com",
+	}); err != nil {
+		t.Fatalf("failed to write local checkpoint: %v", err)
+	}
+
+	// Default chain: the remote-only checkpoint IS readable (fall-through).
+	chainSummary, err := localStore.Read(context.Background(), remoteOnlyID)
+	if err != nil {
+		t.Fatalf("chain Read() error = %v", err)
+	}
+	if chainSummary == nil {
+		t.Fatal("chain read should fall through to the remote-tracking tree")
+	}
+
+	// Local-pinned reads: the same checkpoint must be ABSENT.
+	pinnedStore := NewGitStore(localRepo, DefaultV1Refs().PrimaryAsLocalRead())
+	pinnedSummary, err := pinnedStore.Read(context.Background(), remoteOnlyID)
+	if err != nil && !errors.Is(err, ErrCheckpointNotFound) {
+		t.Fatalf("pinned Read() error = %v", err)
+	}
+	if pinnedSummary != nil {
+		t.Fatal("local-pinned read must not see a checkpoint that exists only on a remote-tracking ref")
+	}
+
+	// And the local checkpoint stays readable through the pin.
+	localSummary, err := pinnedStore.Read(context.Background(), localOnlyID)
+	if err != nil {
+		t.Fatalf("pinned Read(local) error = %v", err)
+	}
+	if localSummary == nil {
+		t.Fatal("local-pinned read must still serve locally present checkpoints")
+	}
+}
+
 // TestGetCheckpointAuthor verifies that GetCheckpointAuthor retrieves the
 // author of the commit that created the checkpoint on the entire/checkpoints/v1 branch.
 func TestGetCheckpointAuthor(t *testing.T) {
@@ -1196,6 +1102,137 @@ func TestWriteCommitted_MultipleSessionsSameCheckpoint(t *testing.T) {
 	if content1.Metadata.SessionID != "session-two" {
 		t.Errorf("session 1 SessionID = %q, want %q", content1.Metadata.SessionID, "session-two")
 	}
+}
+
+// sessionMetadataStore is the slice of the store surface the dedup tests
+// need. Both persistent backends satisfy it; testing each one directly (not
+// just the shared treeWriter) guards against a backend later shadowing or
+// de-embedding the shared write path.
+type sessionMetadataStore interface {
+	Write(ctx context.Context, req WriteRequest) error
+	ReadSessionMetadata(ctx context.Context, checkpointID id.CheckpointID, sessionIndex int) (*Metadata, error)
+}
+
+// TestWriteCommitted_DeduplicatesFilesTouched verifies the write boundary
+// enforces uniqueness on files_touched instead of trusting the caller. Every
+// known producer dedupes before writing, yet duplicated paths have reached the
+// permanent record in the wild until a session's metadata.json exceeded
+// GitHub's 100 MB blob limit and the checkpoints branch became unpushable —
+// so the invariant is enforced where the record is written, and verified
+// against each live backend rather than only the shared implementation.
+func TestWriteCommitted_DeduplicatesFilesTouched(t *testing.T) {
+	tests := []struct {
+		name     string
+		newStore func(repo *git.Repository) sessionMetadataStore
+	}{
+		{
+			name:     "git-branch store",
+			newStore: func(repo *git.Repository) sessionMetadataStore { return NewGitStore(repo, DefaultV1Refs()) },
+		},
+		{
+			name:     "git-refs store",
+			newStore: func(repo *git.Repository) sessionMetadataStore { return newGitRefsStore(repo) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, _ := setupBranchTestRepo(t)
+			store := tt.newStore(repo)
+			checkpointID := id.MustCheckpointID("c1c2c3c4c5c6")
+
+			err := store.Write(context.Background(), Session{
+				CheckpointID:     checkpointID,
+				SessionID:        "session-dup",
+				Strategy:         "manual-commit",
+				Transcript:       redact.AlreadyRedacted([]byte(`{"message": "dup session"}`)),
+				FilesTouched:     []string{"b.go", "a.go", "b.go", "a.go", "a.go"},
+				CheckpointsCount: 1,
+				AuthorName:       "Test Author",
+				AuthorEmail:      "test@example.com",
+			})
+			if err != nil {
+				t.Fatalf("Write() error = %v", err)
+			}
+
+			metadata, err := store.ReadSessionMetadata(context.Background(), checkpointID, 0)
+			if err != nil {
+				t.Fatalf("ReadSessionMetadata() error = %v", err)
+			}
+			want := []string{"a.go", "b.go"}
+			if !slices.Equal(metadata.FilesTouched, want) {
+				t.Errorf("FilesTouched = %v, want %v", metadata.FilesTouched, want)
+			}
+		})
+	}
+}
+
+// TestWriteCommitted_FilesTouchedPreservesEmptyVsNil pins the wire format of
+// files_touched, which is marshaled without omitempty: a non-nil empty input
+// must stay [] and a nil input must stay null. Normalizing at the write
+// boundary must not silently rewrite one into the other — readers outside Go
+// distinguish them. Asserted on the raw JSON because unmarshaling into
+// []string erases exactly the difference under test.
+func TestWriteCommitted_FilesTouchedPreservesEmptyVsNil(t *testing.T) {
+	tests := []struct {
+		name         string
+		filesTouched []string
+		want         string
+	}{
+		{name: "empty stays []", filesTouched: []string{}, want: `"files_touched": []`},
+		{name: "nil stays null", filesTouched: nil, want: `"files_touched": null`},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, _ := setupBranchTestRepo(t)
+			store := NewGitStore(repo, DefaultV1Refs())
+			checkpointID := id.MustCheckpointID(fmt.Sprintf("d%dd2d3d4d5d6", i))
+
+			err := store.Write(context.Background(), Session{
+				CheckpointID: checkpointID,
+				SessionID:    "session-empty",
+				Strategy:     "manual-commit",
+				Transcript:   redact.AlreadyRedacted([]byte(`{"message": "m"}`)),
+				FilesTouched: tt.filesTouched,
+				AuthorName:   "Test Author",
+				AuthorEmail:  "test@example.com",
+			})
+			if err != nil {
+				t.Fatalf("Write() error = %v", err)
+			}
+
+			raw := readRawSessionMetadata(t, repo, checkpointID)
+			if !strings.Contains(raw, tt.want) {
+				t.Errorf("session metadata JSON does not contain %q:\n%s", tt.want, raw)
+			}
+		})
+	}
+}
+
+// readRawSessionMetadata returns session 0's metadata.json contents verbatim
+// from the metadata branch, for tests asserting on the wire format itself.
+func readRawSessionMetadata(t *testing.T, repo *git.Repository, checkpointID id.CheckpointID) string {
+	t.Helper()
+	ref, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
+	if err != nil {
+		t.Fatalf("metadata branch reference: %v", err)
+	}
+	commit, err := repo.CommitObject(ref.Hash())
+	if err != nil {
+		t.Fatalf("metadata branch commit: %v", err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("metadata branch tree: %v", err)
+	}
+	file, err := tree.File(checkpointID.Path() + "/0/" + paths.MetadataFileName)
+	if err != nil {
+		t.Fatalf("session metadata not found: %v", err)
+	}
+	content, err := file.Contents()
+	if err != nil {
+		t.Fatalf("session metadata contents: %v", err)
+	}
+	return content
 }
 
 // TestWriteCommitted_Aggregation verifies that CheckpointSummary correctly
@@ -1530,59 +1567,6 @@ func TestReadLatestSessionContent(t *testing.T) {
 	}
 }
 
-// TestReadSessionContentByID verifies that ReadSessionContentByID can find
-// a session by its session ID rather than by index.
-func TestReadSessionContentByID(t *testing.T) {
-	repo, _ := setupBranchTestRepo(t)
-	store := NewGitStore(repo, DefaultV1Refs())
-	checkpointID := id.MustCheckpointID("010203040506")
-
-	// Write two sessions with distinct IDs
-	sessionIDs := []string{"unique-id-alpha", "unique-id-beta"}
-	for i, sid := range sessionIDs {
-		err := store.Write(context.Background(), Session{
-			CheckpointID:     checkpointID,
-			SessionID:        sid,
-			Strategy:         "manual-commit",
-			Transcript:       redact.AlreadyRedacted([]byte(fmt.Sprintf(`{"session_name": "%s"}`, sid))),
-			CheckpointsCount: 1,
-			AuthorName:       "Test Author",
-			AuthorEmail:      "test@example.com",
-		})
-		if err != nil {
-			t.Fatalf("WriteCommitted() session %d error = %v", i, err)
-		}
-	}
-
-	// Read by session ID
-	content, err := store.ReadSessionContentByID(context.Background(), checkpointID, "unique-id-beta")
-	if err != nil {
-		t.Fatalf("ReadSessionContentByID() error = %v", err)
-	}
-
-	if content.Metadata.SessionID != "unique-id-beta" {
-		t.Errorf("SessionID = %q, want %q", content.Metadata.SessionID, "unique-id-beta")
-	}
-	if !strings.Contains(string(content.Transcript), "unique-id-beta") {
-		t.Errorf("transcript should contain session name, got %s", string(content.Transcript))
-	}
-}
-
-// TestReadSessionContentByID_NotFound verifies that ReadSessionContentByID
-// returns an error when the session ID doesn't exist in the checkpoint.
-func TestReadSessionContentByID_NotFound(t *testing.T) {
-	store, checkpointID := writeSingleSession(t, "111213141516", "existing-session", `{"exists": true}`)
-
-	// Try to read non-existent session ID
-	_, err := store.ReadSessionContentByID(context.Background(), checkpointID, "nonexistent-session")
-	if err == nil {
-		t.Error("ReadSessionContentByID() should return error for non-existent session ID")
-	}
-	if !strings.Contains(err.Error(), "not found") {
-		t.Errorf("error should mention 'not found', got: %v", err)
-	}
-}
-
 // TestListCommitted_MultiSessionInfo verifies that List returns correct
 // information for checkpoints with multiple sessions.
 func TestListCommitted_MultiSessionInfo(t *testing.T) {
@@ -1844,1327 +1828,6 @@ func TestReadSessionContent_NonexistentCheckpoint(t *testing.T) {
 	_, err = store.ReadSessionContent(context.Background(), checkpointID, 0)
 	if !errors.Is(err, ErrCheckpointNotFound) {
 		t.Errorf("ReadSessionContent() error = %v, want ErrCheckpointNotFound", err)
-	}
-}
-
-// TestWriteTemporary_FirstCheckpoint_CapturesModifiedTrackedFiles verifies that
-// the first checkpoint captures modifications to tracked files that existed before
-// the agent made any changes (user's uncommitted work).
-func TestWriteTemporary_FirstCheckpoint_CapturesModifiedTrackedFiles(t *testing.T) {
-	tempDir := t.TempDir()
-
-	// Initialize a git repository with an initial commit containing README.md
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create and commit README.md with original content
-	readmeFile := filepath.Join(tempDir, "README.md")
-	originalContent := "# Original Content\n"
-	if err := os.WriteFile(readmeFile, []byte(originalContent), 0o644); err != nil {
-		t.Fatalf("failed to write README: %v", err)
-	}
-	if _, err := worktree.Add("README.md"); err != nil {
-		t.Fatalf("failed to add README: %v", err)
-	}
-	initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
-	})
-	if err != nil {
-		t.Fatalf("failed to commit: %v", err)
-	}
-
-	// Simulate user modifying README.md BEFORE agent starts (user's uncommitted work)
-	modifiedContent := "# Modified by User\n\nThis change was made before the agent started.\n"
-	if err := os.WriteFile(readmeFile, []byte(modifiedContent), 0o644); err != nil {
-		t.Fatalf("failed to modify README: %v", err)
-	}
-
-	// Change to temp dir so paths.WorktreeRoot() works correctly
-	t.Chdir(tempDir)
-
-	// Create metadata directory
-	metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	// Create checkpoint store and write first checkpoint
-	// Note: ModifiedFiles is empty because agent hasn't touched anything yet
-	// The first checkpoint should still capture README.md because it's modified in working dir
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	result, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{}, // Agent hasn't modified anything
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "First checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() error = %v", err)
-	}
-	if result.Skipped {
-		t.Error("first checkpoint should not be skipped")
-	}
-
-	// Verify the shadow branch commit contains the MODIFIED README.md content
-	commit, err := repo.CommitObject(result.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	// Find README.md in the tree
-	file, err := tree.File("README.md")
-	if err != nil {
-		t.Fatalf("README.md not found in checkpoint tree: %v", err)
-	}
-
-	content, err := file.Contents()
-	if err != nil {
-		t.Fatalf("failed to read README.md content: %v", err)
-	}
-
-	if content != modifiedContent {
-		t.Errorf("checkpoint should contain modified content\ngot:\n%s\nwant:\n%s", content, modifiedContent)
-	}
-}
-
-// TestWriteTemporary_PathNormalizationAndSkipping verifies that shadow branch writes
-// normalize absolute in-repo paths back to repo-relative tree entries and skip invalid
-// paths rather than encoding them into git trees.
-func TestWriteTemporary_PathNormalizationAndSkipping(t *testing.T) {
-	tests := []struct {
-		name          string
-		modifiedFiles func(repoRoot, mainFile string) []string
-		wantUpdated   bool
-	}{
-		{
-			name: "absolute in repo path is normalized",
-			modifiedFiles: func(_, mainFile string) []string {
-				return []string{mainFile}
-			},
-			wantUpdated: true,
-		},
-		{
-			name: "absolute outside repo path is skipped",
-			modifiedFiles: func(_, _ string) []string {
-				return []string{"C:/Users/rober/Vaults/Flowsign/main.go"}
-			},
-			wantUpdated: false,
-		},
-		{
-			name: "empty segment path is skipped",
-			modifiedFiles: func(_, _ string) []string {
-				return []string{"dir//main.go"}
-			},
-			wantUpdated: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tempDir := t.TempDir()
-			// Resolve symlinks so absolute paths match git's resolved repo root.
-			// On macOS, t.TempDir() returns /var/... but git resolves to /private/var/...
-			tempDir, err := filepath.EvalSymlinks(tempDir)
-			if err != nil {
-				t.Fatalf("failed to resolve symlinks: %v", err)
-			}
-
-			testutil.InitRepo(t, tempDir)
-			repo, err := git.PlainOpen(tempDir)
-			if err != nil {
-				t.Fatalf("failed to open git repo: %v", err)
-			}
-
-			worktree, err := repo.Worktree()
-			if err != nil {
-				t.Fatalf("failed to get worktree: %v", err)
-			}
-
-			mainFile := filepath.Join(tempDir, "main.go")
-			if err := os.WriteFile(mainFile, []byte("package main\n"), 0o644); err != nil {
-				t.Fatalf("failed to write main.go: %v", err)
-			}
-			if _, err := worktree.Add("main.go"); err != nil {
-				t.Fatalf("failed to add main.go: %v", err)
-			}
-			initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-				Author: &object.Signature{Name: "Test", Email: "test@test.com"},
-			})
-			if err != nil {
-				t.Fatalf("failed to commit: %v", err)
-			}
-
-			updatedContent := "package main\n\nfunc main() {}\n"
-			if err := os.WriteFile(mainFile, []byte(updatedContent), 0o644); err != nil {
-				t.Fatalf("failed to update main.go: %v", err)
-			}
-
-			t.Chdir(tempDir)
-
-			metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-			if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-				t.Fatalf("failed to create metadata dir: %v", err)
-			}
-			if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-				t.Fatalf("failed to write transcript: %v", err)
-			}
-
-			store := newEphemeralStore(repo, DefaultV1Refs())
-			result, err := store.Write(context.Background(), Step{
-				SessionID:      "test-session",
-				BaseCommit:     initialCommit.String(),
-				ModifiedFiles:  tt.modifiedFiles(tempDir, mainFile),
-				MetadataDir:    ".entire/metadata/test-session",
-				MetadataDirAbs: metadataDir,
-				CommitMessage:  "Checkpoint with path normalization",
-				AuthorName:     "Test",
-				AuthorEmail:    "test@test.com",
-			})
-			if err != nil {
-				t.Fatalf("WriteTemporary() error = %v", err)
-			}
-
-			commit, err := repo.CommitObject(result.CommitHash)
-			if err != nil {
-				t.Fatalf("failed to get commit object: %v", err)
-			}
-
-			tree, err := commit.Tree()
-			if err != nil {
-				t.Fatalf("failed to get tree: %v", err)
-			}
-
-			assertNoEmptyEntryNames(t, repo, commit.TreeHash, "")
-
-			file, err := tree.File("main.go")
-			if err != nil {
-				t.Fatalf("main.go not found in checkpoint tree: %v", err)
-			}
-
-			content, err := file.Contents()
-			if err != nil {
-				t.Fatalf("failed to read main.go content: %v", err)
-			}
-
-			wantContent := "package main\n"
-			if tt.wantUpdated {
-				wantContent = updatedContent
-			}
-			if content != wantContent {
-				t.Errorf("unexpected main.go content\ngot:\n%s\nwant:\n%s", content, wantContent)
-			}
-		})
-	}
-}
-
-// TestWriteTemporary_FirstCheckpoint_CapturesUntrackedFiles verifies that
-// the first checkpoint captures untracked files that exist in the working directory.
-func TestWriteTemporary_FirstCheckpoint_CapturesUntrackedFiles(t *testing.T) {
-	tempDir := t.TempDir()
-
-	// Initialize a git repository with an initial commit
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create and commit README.md
-	readmeFile := filepath.Join(tempDir, "README.md")
-	if err := os.WriteFile(readmeFile, []byte("# Test\n"), 0o644); err != nil {
-		t.Fatalf("failed to write README: %v", err)
-	}
-	if _, err := worktree.Add("README.md"); err != nil {
-		t.Fatalf("failed to add README: %v", err)
-	}
-	initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
-	})
-	if err != nil {
-		t.Fatalf("failed to commit: %v", err)
-	}
-
-	// Create an untracked file (simulating user creating a file before agent starts)
-	untrackedFile := filepath.Join(tempDir, "config.local.json")
-	untrackedContent := `{"key": "secret_value"}`
-	if err := os.WriteFile(untrackedFile, []byte(untrackedContent), 0o644); err != nil {
-		t.Fatalf("failed to write untracked file: %v", err)
-	}
-
-	// Change to temp dir so paths.WorktreeRoot() works correctly
-	t.Chdir(tempDir)
-
-	// Create metadata directory
-	metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	// Create checkpoint store and write first checkpoint
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	result, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{},
-		NewFiles:          []string{}, // NewFiles might be empty if this is truly "at session start"
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "First checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() error = %v", err)
-	}
-
-	// Verify the shadow branch commit contains the untracked file
-	commit, err := repo.CommitObject(result.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	// Find config.local.json in the tree
-	file, err := tree.File("config.local.json")
-	if err != nil {
-		t.Fatalf("untracked file config.local.json not found in checkpoint tree: %v", err)
-	}
-
-	content, err := file.Contents()
-	if err != nil {
-		t.Fatalf("failed to read config.local.json content: %v", err)
-	}
-
-	if content != untrackedContent {
-		t.Errorf("checkpoint should contain untracked file content\ngot:\n%s\nwant:\n%s", content, untrackedContent)
-	}
-}
-
-// TestWriteTemporary_PreservesSymlinkWithoutReadingTarget verifies that changed
-// worktree symlinks are snapshotted as git symlinks, not as the target contents.
-func TestWriteTemporary_PreservesSymlinkWithoutReadingTarget(t *testing.T) {
-	tests := []struct {
-		name              string
-		isFirstCheckpoint bool
-	}{
-		{
-			name:              "first checkpoint untracked symlink",
-			isFirstCheckpoint: true,
-		},
-		{
-			name:              "subsequent checkpoint new symlink",
-			isFirstCheckpoint: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tempDir := t.TempDir()
-			externalDir := t.TempDir()
-
-			repo, err := git.PlainInit(tempDir, false)
-			if err != nil {
-				t.Fatalf("failed to init git repo: %v", err)
-			}
-
-			worktree, err := repo.Worktree()
-			if err != nil {
-				t.Fatalf("failed to get worktree: %v", err)
-			}
-
-			readmeFile := filepath.Join(tempDir, "README.md")
-			if err := os.WriteFile(readmeFile, []byte("# Test\n"), 0o644); err != nil {
-				t.Fatalf("failed to write README: %v", err)
-			}
-			if _, err := worktree.Add("README.md"); err != nil {
-				t.Fatalf("failed to add README: %v", err)
-			}
-			initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-				Author: &object.Signature{Name: "Test", Email: "test@test.com"},
-			})
-			if err != nil {
-				t.Fatalf("failed to commit: %v", err)
-			}
-
-			secretContent := "SECRET DATA THAT MUST NOT ENTER CHECKPOINTS"
-			secretFile := filepath.Join(externalDir, "id_rsa")
-			if err := os.WriteFile(secretFile, []byte(secretContent), 0o600); err != nil {
-				t.Fatalf("failed to write external secret: %v", err)
-			}
-
-			linkPath := filepath.Join(tempDir, "leaked-key")
-			if err := os.Symlink(secretFile, linkPath); err != nil {
-				t.Skipf("cannot create symlink on this platform: %v", err)
-			}
-
-			t.Chdir(tempDir)
-
-			metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-			if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-				t.Fatalf("failed to create metadata dir: %v", err)
-			}
-			if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-				t.Fatalf("failed to write transcript: %v", err)
-			}
-
-			var newFiles []string
-			if !tt.isFirstCheckpoint {
-				newFiles = []string{"leaked-key"}
-			}
-
-			store := newEphemeralStore(repo, DefaultV1Refs())
-			result, err := store.Write(context.Background(), Step{
-				SessionID:         "test-session",
-				BaseCommit:        initialCommit.String(),
-				NewFiles:          newFiles,
-				MetadataDir:       ".entire/metadata/test-session",
-				MetadataDirAbs:    metadataDir,
-				CommitMessage:     "Checkpoint symlink",
-				AuthorName:        "Test",
-				AuthorEmail:       "test@test.com",
-				IsFirstCheckpoint: tt.isFirstCheckpoint,
-			})
-			if err != nil {
-				t.Fatalf("WriteTemporary() error = %v", err)
-			}
-
-			commit, err := repo.CommitObject(result.CommitHash)
-			if err != nil {
-				t.Fatalf("failed to get commit object: %v", err)
-			}
-			tree, err := commit.Tree()
-			if err != nil {
-				t.Fatalf("failed to get tree: %v", err)
-			}
-
-			entry, err := tree.FindEntry("leaked-key")
-			if err != nil {
-				t.Fatalf("leaked-key not found in checkpoint tree: %v", err)
-			}
-			if entry.Mode != filemode.Symlink {
-				t.Fatalf("leaked-key mode = %v, want %v", entry.Mode, filemode.Symlink)
-			}
-
-			file, err := tree.File("leaked-key")
-			if err != nil {
-				t.Fatalf("failed to get leaked-key file: %v", err)
-			}
-			content, err := file.Contents()
-			if err != nil {
-				t.Fatalf("failed to read leaked-key blob: %v", err)
-			}
-			if content != secretFile {
-				t.Fatalf("symlink blob content = %q, want link target %q", content, secretFile)
-			}
-			if content == secretContent {
-				t.Fatal("checkpoint stored symlink target contents instead of link target")
-			}
-		})
-	}
-}
-
-// TestWriteTemporary_FirstCheckpoint_ExcludesGitIgnoredFiles verifies that
-// the first checkpoint does NOT capture files that are in .gitignore.
-func TestWriteTemporary_FirstCheckpoint_ExcludesGitIgnoredFiles(t *testing.T) {
-	tempDir := t.TempDir()
-
-	// Initialize a git repository with an initial commit
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create .gitignore that ignores node_modules/
-	gitignoreFile := filepath.Join(tempDir, ".gitignore")
-	if err := os.WriteFile(gitignoreFile, []byte("node_modules/\n"), 0o644); err != nil {
-		t.Fatalf("failed to write .gitignore: %v", err)
-	}
-	if _, err := worktree.Add(".gitignore"); err != nil {
-		t.Fatalf("failed to add .gitignore: %v", err)
-	}
-
-	// Create and commit README.md
-	readmeFile := filepath.Join(tempDir, "README.md")
-	if err := os.WriteFile(readmeFile, []byte("# Test\n"), 0o644); err != nil {
-		t.Fatalf("failed to write README: %v", err)
-	}
-	if _, err := worktree.Add("README.md"); err != nil {
-		t.Fatalf("failed to add README: %v", err)
-	}
-	initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
-	})
-	if err != nil {
-		t.Fatalf("failed to commit: %v", err)
-	}
-
-	// Create node_modules/ directory with a file (should be ignored)
-	nodeModulesDir := filepath.Join(tempDir, "node_modules")
-	if err := os.MkdirAll(nodeModulesDir, 0o755); err != nil {
-		t.Fatalf("failed to create node_modules: %v", err)
-	}
-	ignoredFile := filepath.Join(nodeModulesDir, "some-package.js")
-	if err := os.WriteFile(ignoredFile, []byte("module.exports = {}"), 0o644); err != nil {
-		t.Fatalf("failed to write ignored file: %v", err)
-	}
-
-	// Change to temp dir so paths.WorktreeRoot() works correctly
-	t.Chdir(tempDir)
-
-	// Create metadata directory
-	metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	// Create checkpoint store and write first checkpoint
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	result, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{},
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "First checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() error = %v", err)
-	}
-
-	// Verify the shadow branch commit does NOT contain node_modules/
-	commit, err := repo.CommitObject(result.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	// node_modules/some-package.js should NOT be in the tree
-	_, err = tree.File("node_modules/some-package.js")
-	if err == nil {
-		t.Error("gitignored file node_modules/some-package.js should NOT be in checkpoint tree")
-	} else if !errors.Is(err, object.ErrFileNotFound) && !errors.Is(err, object.ErrEntryNotFound) {
-		t.Fatalf("expected node_modules/some-package.js to be absent (ErrFileNotFound/ErrEntryNotFound), got: %v", err)
-	}
-}
-
-// TestWriteTemporary_SubsequentCheckpoint_ExcludesGitIgnoredModifiedFiles verifies that
-// subsequent checkpoints (IsFirstCheckpoint=false) filter out gitignored files from
-// ModifiedFiles. This is a security-critical test: if an agent modifies a .env file
-// and reports it in its transcript, the .env file must NOT leak into the shadow branch.
-// See: https://techstackups.com/guides/entire-io-hands-on-what-it-actually-captures/#what-leaks-into-checkpoints
-func TestWriteTemporary_SubsequentCheckpoint_ExcludesGitIgnoredModifiedFiles(t *testing.T) {
-	tempDir := t.TempDir()
-
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	require.NoError(t, err)
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create .gitignore that ignores .env files
-	gitignoreContent := ".env\n*.secret\nnode_modules/\n"
-	if err := os.WriteFile(filepath.Join(tempDir, ".gitignore"), []byte(gitignoreContent), 0o644); err != nil {
-		t.Fatalf("failed to write .gitignore: %v", err)
-	}
-	if _, err := worktree.Add(".gitignore"); err != nil {
-		t.Fatalf("failed to add .gitignore: %v", err)
-	}
-
-	// Create and commit a tracked file
-	if err := os.WriteFile(filepath.Join(tempDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
-		t.Fatalf("failed to write main.go: %v", err)
-	}
-	if _, err := worktree.Add("main.go"); err != nil {
-		t.Fatalf("failed to add main.go: %v", err)
-	}
-	testutil.GitCommit(t, tempDir, "Initial commit")
-	headRef, err := repo.Head()
-	require.NoError(t, err)
-	initialCommit := headRef.Hash()
-
-	// Create gitignored files on disk (simulating an agent creating/modifying them)
-	if err := os.WriteFile(filepath.Join(tempDir, ".env"), []byte("API_KEY=sk-secret-1234\n"), 0o644); err != nil {
-		t.Fatalf("failed to write .env: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(tempDir, "db.secret"), []byte("password=hunter2\n"), 0o644); err != nil {
-		t.Fatalf("failed to write db.secret: %v", err)
-	}
-
-	// Also modify a tracked file (this SHOULD be captured)
-	if err := os.WriteFile(filepath.Join(tempDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
-		t.Fatalf("failed to modify main.go: %v", err)
-	}
-
-	t.Chdir(tempDir)
-
-	// Create metadata directory
-	metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	// Write first checkpoint to establish the shadow branch
-	firstResult, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{},
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "First checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("first WriteTemporary() error = %v", err)
-	}
-	require.False(t, firstResult.Skipped)
-
-	// Now write a subsequent checkpoint where the agent reports .env and db.secret
-	// as modified files (e.g., agent touched them during its turn).
-	// These gitignored files must NOT appear in the checkpoint tree.
-	result, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{"main.go", ".env", "db.secret"}, // Agent reports these
-		NewFiles:          []string{},
-		DeletedFiles:      []string{},
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "Second checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: false,
-	})
-	if err != nil {
-		t.Fatalf("second WriteTemporary() error = %v", err)
-	}
-
-	// Verify the checkpoint tree (use returned commit hash — works whether skipped or not)
-	commit, err := repo.CommitObject(result.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	// main.go SHOULD be in the tree (tracked file, legitimately modified)
-	_, err = tree.File("main.go")
-	if err != nil {
-		t.Errorf("main.go should be in checkpoint tree: %v", err)
-	}
-
-	// .env MUST NOT be in the tree (gitignored — contains API key)
-	_, err = tree.File(".env")
-	if err == nil {
-		t.Error("SECURITY: gitignored file .env leaked into checkpoint tree — API keys exposed on shadow branch")
-	}
-
-	// db.secret MUST NOT be in the tree (gitignored)
-	_, err = tree.File("db.secret")
-	if err == nil {
-		t.Error("SECURITY: gitignored file db.secret leaked into checkpoint tree — secrets exposed on shadow branch")
-	}
-}
-
-// TestWriteTemporary_SubsequentCheckpoint_ExcludesGitIgnoredNewFiles verifies that
-// subsequent checkpoints filter out gitignored files from NewFiles.
-func TestWriteTemporary_SubsequentCheckpoint_ExcludesGitIgnoredNewFiles(t *testing.T) {
-	tempDir := t.TempDir()
-
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	require.NoError(t, err)
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create .gitignore
-	if err := os.WriteFile(filepath.Join(tempDir, ".gitignore"), []byte(".env\n"), 0o644); err != nil {
-		t.Fatalf("failed to write .gitignore: %v", err)
-	}
-	if _, err := worktree.Add(".gitignore"); err != nil {
-		t.Fatalf("failed to add .gitignore: %v", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(tempDir, "README.md"), []byte("# Test\n"), 0o644); err != nil {
-		t.Fatalf("failed to write README: %v", err)
-	}
-	if _, err := worktree.Add("README.md"); err != nil {
-		t.Fatalf("failed to add README: %v", err)
-	}
-	testutil.GitCommit(t, tempDir, "Initial commit")
-	headRef, err := repo.Head()
-	require.NoError(t, err)
-	initialCommit := headRef.Hash()
-
-	// Create the gitignored file and a legitimate new file on disk
-	if err := os.WriteFile(filepath.Join(tempDir, ".env"), []byte("SECRET=abc123\n"), 0o644); err != nil {
-		t.Fatalf("failed to write .env: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(tempDir, "config.go"), []byte("package config\n"), 0o644); err != nil {
-		t.Fatalf("failed to write config.go: %v", err)
-	}
-
-	t.Chdir(tempDir)
-
-	metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	// First checkpoint
-	firstResult, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "First checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("first WriteTemporary() error = %v", err)
-	}
-	require.False(t, firstResult.Skipped)
-
-	// Subsequent checkpoint with .env reported as a new file
-	result, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{},
-		NewFiles:          []string{"config.go", ".env"}, // Agent created both
-		DeletedFiles:      []string{},
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "Second checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: false,
-	})
-	if err != nil {
-		t.Fatalf("second WriteTemporary() error = %v", err)
-	}
-
-	commit, err := repo.CommitObject(result.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	// config.go SHOULD be in the tree
-	_, err = tree.File("config.go")
-	if err != nil {
-		t.Errorf("config.go should be in checkpoint tree: %v", err)
-	}
-
-	// .env MUST NOT be in the tree
-	_, err = tree.File(".env")
-	if err == nil {
-		t.Error("SECURITY: gitignored file .env leaked into checkpoint tree via NewFiles")
-	}
-}
-
-// TestWriteTemporary_SubsequentCheckpoint_ExcludesNestedGitIgnoredFiles verifies that
-// gitignore patterns with directory wildcards (e.g., node_modules/) work for
-// subsequent checkpoints, not just the first checkpoint.
-func TestWriteTemporary_SubsequentCheckpoint_ExcludesNestedGitIgnoredFiles(t *testing.T) {
-	tempDir := t.TempDir()
-
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	require.NoError(t, err)
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(tempDir, ".gitignore"), []byte("node_modules/\n"), 0o644); err != nil {
-		t.Fatalf("failed to write .gitignore: %v", err)
-	}
-	if _, err := worktree.Add(".gitignore"); err != nil {
-		t.Fatalf("failed to add .gitignore: %v", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(tempDir, "index.js"), []byte("console.log('hello')\n"), 0o644); err != nil {
-		t.Fatalf("failed to write index.js: %v", err)
-	}
-	if _, err := worktree.Add("index.js"); err != nil {
-		t.Fatalf("failed to add index.js: %v", err)
-	}
-	testutil.GitCommit(t, tempDir, "Initial commit")
-	headRef, err := repo.Head()
-	require.NoError(t, err)
-	initialCommit := headRef.Hash()
-
-	// Create node_modules file on disk
-	if err := os.MkdirAll(filepath.Join(tempDir, "node_modules", "pkg"), 0o755); err != nil {
-		t.Fatalf("failed to create node_modules: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(tempDir, "node_modules", "pkg", "index.js"), []byte("module.exports = {}"), 0o644); err != nil {
-		t.Fatalf("failed to write node_modules file: %v", err)
-	}
-
-	t.Chdir(tempDir)
-
-	metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	// First checkpoint
-	firstResult, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "First checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("first WriteTemporary() error = %v", err)
-	}
-	require.False(t, firstResult.Skipped)
-
-	// Subsequent checkpoint with node_modules file reported as modified
-	result, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{"index.js", "node_modules/pkg/index.js"},
-		NewFiles:          []string{},
-		DeletedFiles:      []string{},
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "Second checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: false,
-	})
-	if err != nil {
-		t.Fatalf("second WriteTemporary() error = %v", err)
-	}
-
-	commit, err := repo.CommitObject(result.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	// index.js SHOULD be in the tree
-	_, err = tree.File("index.js")
-	if err != nil {
-		t.Errorf("index.js should be in checkpoint tree: %v", err)
-	}
-
-	// node_modules/pkg/index.js MUST NOT be in the tree
-	_, err = tree.File("node_modules/pkg/index.js")
-	if err == nil {
-		t.Error("SECURITY: gitignored file node_modules/pkg/index.js leaked into checkpoint tree")
-	}
-}
-
-// TestWriteTemporary_FirstCheckpoint_UserAndAgentChanges verifies that
-// the first checkpoint captures both user's pre-existing changes and agent changes.
-func TestWriteTemporary_FirstCheckpoint_UserAndAgentChanges(t *testing.T) {
-	tempDir := t.TempDir()
-
-	// Initialize a git repository with an initial commit
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create and commit README.md and main.go
-	readmeFile := filepath.Join(tempDir, "README.md")
-	if err := os.WriteFile(readmeFile, []byte("# Original\n"), 0o644); err != nil {
-		t.Fatalf("failed to write README: %v", err)
-	}
-	mainFile := filepath.Join(tempDir, "main.go")
-	if err := os.WriteFile(mainFile, []byte("package main\n"), 0o644); err != nil {
-		t.Fatalf("failed to write main.go: %v", err)
-	}
-	if _, err := worktree.Add("README.md"); err != nil {
-		t.Fatalf("failed to add README: %v", err)
-	}
-	if _, err := worktree.Add("main.go"); err != nil {
-		t.Fatalf("failed to add main.go: %v", err)
-	}
-	initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
-	})
-	if err != nil {
-		t.Fatalf("failed to commit: %v", err)
-	}
-
-	// User modifies README.md BEFORE agent starts
-	userModifiedContent := "# Modified by User\n"
-	if err := os.WriteFile(readmeFile, []byte(userModifiedContent), 0o644); err != nil {
-		t.Fatalf("failed to modify README: %v", err)
-	}
-
-	// Agent modifies main.go
-	agentModifiedContent := "package main\n\nfunc main() {\n\tprintln(\"Hello\")\n}\n"
-	if err := os.WriteFile(mainFile, []byte(agentModifiedContent), 0o644); err != nil {
-		t.Fatalf("failed to modify main.go: %v", err)
-	}
-
-	// Change to temp dir so paths.WorktreeRoot() works correctly
-	t.Chdir(tempDir)
-
-	// Create metadata directory
-	metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	// Create checkpoint - agent reports main.go as modified (from transcript)
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	result, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{"main.go"}, // Only agent-modified file in list
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "First checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() error = %v", err)
-	}
-
-	// Verify the checkpoint contains BOTH changes
-	commit, err := repo.CommitObject(result.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	// Check README.md has user's modification
-	readmeTreeFile, err := tree.File("README.md")
-	if err != nil {
-		t.Fatalf("README.md not found in tree: %v", err)
-	}
-	readmeContent, err := readmeTreeFile.Contents()
-	if err != nil {
-		t.Fatalf("failed to read README.md content: %v", err)
-	}
-	if readmeContent != userModifiedContent {
-		t.Errorf("README.md should have user's modification\ngot:\n%s\nwant:\n%s", readmeContent, userModifiedContent)
-	}
-
-	// Check main.go has agent's modification
-	mainTreeFile, err := tree.File("main.go")
-	if err != nil {
-		t.Fatalf("main.go not found in tree: %v", err)
-	}
-	mainContent, err := mainTreeFile.Contents()
-	if err != nil {
-		t.Fatalf("failed to read main.go content: %v", err)
-	}
-	if mainContent != agentModifiedContent {
-		t.Errorf("main.go should have agent's modification\ngot:\n%s\nwant:\n%s", mainContent, agentModifiedContent)
-	}
-}
-
-// TestWriteTemporary_FirstCheckpoint_CapturesUserDeletedFiles verifies that
-// the first checkpoint excludes files that the user deleted before the session started.
-func TestWriteTemporary_FirstCheckpoint_CapturesUserDeletedFiles(t *testing.T) {
-	tempDir := t.TempDir()
-
-	// Initialize a git repository with an initial commit
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create and commit two files
-	keepFile := filepath.Join(tempDir, "keep.txt")
-	if err := os.WriteFile(keepFile, []byte("keep this"), 0o644); err != nil {
-		t.Fatalf("failed to write keep.txt: %v", err)
-	}
-	deleteFile := filepath.Join(tempDir, "delete-me.txt")
-	if err := os.WriteFile(deleteFile, []byte("delete this"), 0o644); err != nil {
-		t.Fatalf("failed to write delete-me.txt: %v", err)
-	}
-
-	if _, err := worktree.Add("keep.txt"); err != nil {
-		t.Fatalf("failed to add keep.txt: %v", err)
-	}
-	if _, err := worktree.Add("delete-me.txt"); err != nil {
-		t.Fatalf("failed to add delete-me.txt: %v", err)
-	}
-
-	initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com", When: time.Now()},
-	})
-	if err != nil {
-		t.Fatalf("failed to create initial commit: %v", err)
-	}
-
-	// User deletes delete-me.txt BEFORE the session starts
-	if err := os.Remove(deleteFile); err != nil {
-		t.Fatalf("failed to delete file: %v", err)
-	}
-
-	// Change to temp dir so paths.WorktreeRoot() works correctly
-	t.Chdir(tempDir)
-
-	// Create metadata directory
-	metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	// Create checkpoint store and write first checkpoint
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	result, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{},
-		DeletedFiles:      []string{}, // No agent deletions
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "First checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() error = %v", err)
-	}
-
-	// Verify the checkpoint tree
-	commit, err := repo.CommitObject(result.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	// keep.txt should be in the tree (unchanged from HEAD)
-	if _, err := tree.File("keep.txt"); err != nil {
-		t.Errorf("keep.txt should be in checkpoint tree: %v", err)
-	}
-
-	// delete-me.txt should NOT be in the tree (user deleted it)
-	_, err = tree.File("delete-me.txt")
-	if err == nil {
-		t.Error("delete-me.txt should NOT be in checkpoint tree (user deleted it before session)")
-	} else if !errors.Is(err, object.ErrFileNotFound) && !errors.Is(err, object.ErrEntryNotFound) {
-		t.Fatalf("expected delete-me.txt to be absent (ErrFileNotFound/ErrEntryNotFound), got: %v", err)
-	}
-}
-
-// TestWriteTemporary_FirstCheckpoint_CapturesRenamedFiles verifies that
-// the first checkpoint captures renamed files correctly.
-func TestWriteTemporary_FirstCheckpoint_CapturesRenamedFiles(t *testing.T) {
-	tempDir := t.TempDir()
-
-	// Initialize a git repository with an initial commit
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create and commit a file
-	oldFile := filepath.Join(tempDir, "old-name.txt")
-	if err := os.WriteFile(oldFile, []byte("content"), 0o644); err != nil {
-		t.Fatalf("failed to write old-name.txt: %v", err)
-	}
-
-	if _, err := worktree.Add("old-name.txt"); err != nil {
-		t.Fatalf("failed to add old-name.txt: %v", err)
-	}
-
-	initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com", When: time.Now()},
-	})
-	if err != nil {
-		t.Fatalf("failed to create initial commit: %v", err)
-	}
-
-	// User renames the file using git mv BEFORE the session starts
-	// Using git mv ensures git reports this as R (rename) status, not separate D+A
-	cmd := exec.CommandContext(context.Background(), "git", "mv", "old-name.txt", "new-name.txt")
-	cmd.Dir = tempDir
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("failed to git mv: %v", err)
-	}
-
-	// Change to temp dir so paths.WorktreeRoot() works correctly
-	t.Chdir(tempDir)
-
-	// Create metadata directory
-	metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	// Create checkpoint store and write first checkpoint
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	result, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{},
-		DeletedFiles:      []string{},
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "First checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() error = %v", err)
-	}
-
-	// Verify the checkpoint tree
-	commit, err := repo.CommitObject(result.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	// new-name.txt should be in the tree
-	if _, err := tree.File("new-name.txt"); err != nil {
-		t.Errorf("new-name.txt should be in checkpoint tree: %v", err)
-	}
-
-	// old-name.txt should NOT be in the tree (renamed away)
-	_, err = tree.File("old-name.txt")
-	if err == nil {
-		t.Error("old-name.txt should NOT be in checkpoint tree (file was renamed)")
-	} else if !errors.Is(err, object.ErrFileNotFound) && !errors.Is(err, object.ErrEntryNotFound) {
-		t.Fatalf("expected old-name.txt to be absent (ErrFileNotFound/ErrEntryNotFound), got: %v", err)
-	}
-}
-
-// TestWriteTemporary_FirstCheckpoint_FilenamesWithSpaces verifies that
-// filenames with spaces are handled correctly.
-func TestWriteTemporary_FirstCheckpoint_FilenamesWithSpaces(t *testing.T) {
-	tempDir := t.TempDir()
-
-	// Initialize a git repository with an initial commit
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create and commit a simple file first
-	simpleFile := filepath.Join(tempDir, "simple.txt")
-	if err := os.WriteFile(simpleFile, []byte("simple"), 0o644); err != nil {
-		t.Fatalf("failed to write simple.txt: %v", err)
-	}
-
-	if _, err := worktree.Add("simple.txt"); err != nil {
-		t.Fatalf("failed to add simple.txt: %v", err)
-	}
-
-	initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com", When: time.Now()},
-	})
-	if err != nil {
-		t.Fatalf("failed to create initial commit: %v", err)
-	}
-
-	// User creates a file with spaces in the name
-	spacesFile := filepath.Join(tempDir, "file with spaces.txt")
-	if err := os.WriteFile(spacesFile, []byte("content with spaces"), 0o644); err != nil {
-		t.Fatalf("failed to write file with spaces: %v", err)
-	}
-
-	// Change to temp dir so paths.WorktreeRoot() works correctly
-	t.Chdir(tempDir)
-
-	// Create metadata directory
-	metadataDir := filepath.Join(tempDir, ".entire", "metadata", "test-session")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	// Create checkpoint store and write first checkpoint
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	result, err := store.Write(context.Background(), Step{
-		SessionID:         "test-session",
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{},
-		DeletedFiles:      []string{},
-		MetadataDir:       ".entire/metadata/test-session",
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "First checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() error = %v", err)
-	}
-
-	// Verify the checkpoint tree
-	commit, err := repo.CommitObject(result.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	// "file with spaces.txt" should be in the tree with correct name
-	if _, err := tree.File("file with spaces.txt"); err != nil {
-		t.Errorf("'file with spaces.txt' should be in checkpoint tree: %v", err)
 	}
 }
 
@@ -3620,6 +2283,48 @@ func TestWriteCommitted_RedactsPromptSecrets(t *testing.T) {
 	}
 }
 
+// ReviewPrompt and InvestigateTopic are free text written into metadata.json.
+// A review's prompt can be a session's first user prompt (session attach
+// --review), so it must get the same redaction as prompt.txt.
+func TestWriteCommitted_RedactsReviewPromptAndInvestigateTopic(t *testing.T) {
+	t.Parallel()
+	repo, _ := setupBranchTestRepo(t)
+	store := NewGitStore(repo, DefaultV1Refs())
+	checkpointID := id.MustCheckpointID("aabbccddeef3")
+
+	err := store.Write(context.Background(), Session{
+		CheckpointID:     checkpointID,
+		SessionID:        "redact-review-session",
+		Strategy:         "manual-commit",
+		Transcript:       redact.AlreadyRedacted([]byte(`{"msg":"safe"}`)),
+		ReviewPrompt:     "Deploy fails with 403. Config line is: key=" + awsKeyFixture + " -- why?",
+		InvestigateTopic: "Why does API_KEY=" + highEntropySecret + " get rejected?",
+		CheckpointsCount: 1,
+		AuthorName:       "Test Author",
+		AuthorEmail:      "test@example.com",
+	})
+	if err != nil {
+		t.Fatalf("WriteCommitted() error = %v", err)
+	}
+
+	content, err := store.ReadSessionContent(context.Background(), checkpointID, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionContent() error = %v", err)
+	}
+
+	for field, got := range map[string]string{
+		"ReviewPrompt":     content.Metadata.ReviewPrompt,
+		"InvestigateTopic": content.Metadata.InvestigateTopic,
+	} {
+		if strings.Contains(got, awsKeyFixture) || strings.Contains(got, highEntropySecret) {
+			t.Errorf("%s should not contain the secret after redaction, got %q", field, got)
+		}
+		if !strings.Contains(got, "REDACTED") {
+			t.Errorf("%s should contain REDACTED placeholder, got %q", field, got)
+		}
+	}
+}
+
 func TestCopyMetadataDir_RedactsSecrets(t *testing.T) {
 	tempDir := t.TempDir()
 
@@ -3649,7 +2354,7 @@ func TestCopyMetadataDir_RedactsSecrets(t *testing.T) {
 	store := NewGitStore(repo, DefaultV1Refs())
 	entries := make(map[string]object.TreeEntry)
 
-	if err := store.copyMetadataDir(context.Background(), metadataDir, "cp/", entries); err != nil {
+	if err := store.copyMetadataDir(context.Background(), mustWalkRoot(t, metadataDir), "metadata", "cp/", entries); err != nil {
 		t.Fatalf("copyMetadataDir() error = %v", err)
 	}
 
@@ -4134,38 +2839,172 @@ func TestUpdateSummary_RedactsSecrets(t *testing.T) {
 	}
 }
 
-func TestWriteCommitted_SubagentTranscript_JSONLFallback(t *testing.T) {
+// TestWriteCommitted_TaskPayload_MaterializesTranscriptAndMetadata is the core
+// #2058 regression: subagent task data used to die at condensation because no
+// producer ever set the old IsTask/ToolUseID route, leaving
+// writeTaskCheckpointEntries permanently unreachable. WriteOptions.Tasks
+// replaces that route; this proves a TaskPayload actually lands under the
+// checkpoint's tasks/<tool-use-id>/ subtree on both persistent backends —
+// which applySessionWrite backs identically (see writeTaskRecordEntries), so
+// covering both here guards against a backend later shadowing or
+// de-embedding that shared write path.
+func TestWriteCommitted_TaskPayload_MaterializesTranscriptAndMetadata(t *testing.T) {
+	tests := []struct {
+		name      string
+		newStore  func(repo *git.Repository) sessionMetadataStore
+		fetchTree func(t *testing.T, repo *git.Repository, cid id.CheckpointID) *FetchingTree
+	}{
+		{
+			name:     "git-branch store",
+			newStore: func(repo *git.Repository) sessionMetadataStore { return NewGitStore(repo, DefaultV1Refs()) },
+			fetchTree: func(t *testing.T, repo *git.Repository, cid id.CheckpointID) *FetchingTree {
+				t.Helper()
+				store := NewGitStore(repo, DefaultV1Refs())
+				tree, err := store.getCheckpointFetchingTree(context.Background(), cid)
+				if err != nil {
+					t.Fatalf("getCheckpointFetchingTree() error = %v", err)
+				}
+				return tree
+			},
+		},
+		{
+			name:     "git-refs store",
+			newStore: func(repo *git.Repository) sessionMetadataStore { return newGitRefsStore(repo) },
+			fetchTree: func(t *testing.T, repo *git.Repository, cid id.CheckpointID) *FetchingTree {
+				t.Helper()
+				store := newGitRefsStore(repo)
+				tree, err := store.checkpointTree(context.Background(), cid)
+				if err != nil {
+					t.Fatalf("checkpointTree() error = %v", err)
+				}
+				return tree
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, _ := setupBranchTestRepo(t)
+			store := tt.newStore(repo)
+			checkpointID := id.MustCheckpointID("aabbccddeef9")
+
+			redactedTranscript := `{"role":"assistant","content":"secret is ` + highEntropySecret + `"}` + "\n"
+			redacted, err := redact.JSONLBytes([]byte(redactedTranscript))
+			if err != nil {
+				t.Fatalf("redact.JSONLBytes() error = %v", err)
+			}
+
+			started := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+			completed := started.Add(2 * time.Minute)
+
+			err = store.Write(context.Background(), Session{
+				CheckpointID:     checkpointID,
+				SessionID:        "task-payload-session",
+				Strategy:         "manual-commit",
+				Transcript:       redact.AlreadyRedacted([]byte(`{"msg":"safe"}` + "\n")),
+				CheckpointsCount: 1,
+				AuthorName:       "Test Author",
+				AuthorEmail:      "test@example.com",
+				Tasks: []TaskPayload{
+					{
+						ToolUseID:       "toolu_test123",
+						AgentID:         "agent1",
+						SubagentType:    "explore",
+						TaskDescription: "look for the bug",
+						Transcript:      redacted,
+						Files:           []string{"a.go"},
+						StartedAt:       started,
+						CompletedAt:     completed,
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Write() error = %v", err)
+			}
+
+			tree := tt.fetchTree(t, repo, checkpointID)
+
+			agentPath := "tasks/toolu_test123/agent-agent1.jsonl"
+			file, err := tree.File(agentPath)
+			if err != nil {
+				t.Fatalf("task transcript should exist at %s: %v", agentPath, err)
+			}
+			content, err := file.Contents()
+			if err != nil {
+				t.Fatalf("failed to read task transcript: %v", err)
+			}
+			if strings.Contains(content, highEntropySecret) {
+				t.Error("task transcript should not contain the raw secret")
+			}
+			if !strings.Contains(content, "REDACTED") {
+				t.Error("task transcript should contain REDACTED placeholder")
+			}
+
+			taskJSONPath := "tasks/toolu_test123/task.json"
+			taskFile, err := tree.File(taskJSONPath)
+			if err != nil {
+				t.Fatalf("task.json should exist at %s: %v", taskJSONPath, err)
+			}
+			taskContent, err := taskFile.Contents()
+			if err != nil {
+				t.Fatalf("failed to read task.json: %v", err)
+			}
+			var meta TaskRecord
+			if err := json.Unmarshal([]byte(taskContent), &meta); err != nil {
+				t.Fatalf("failed to unmarshal task.json: %v", err)
+			}
+			if meta.ToolUseID != "toolu_test123" || meta.AgentID != "agent1" {
+				t.Errorf("task.json identifiers = %+v, want tool_use_id=toolu_test123 agent_id=agent1", meta)
+			}
+			if meta.SubagentType != "explore" || meta.TaskDescription != "look for the bug" {
+				t.Errorf("task.json labels = %+v, want subagent_type=explore task_description=%q", meta, "look for the bug")
+			}
+			if !slices.Equal(meta.Files, []string{"a.go"}) {
+				t.Errorf("task.json Files = %v, want [a.go]", meta.Files)
+			}
+			if !meta.StartedAt.Equal(started) || !meta.CompletedAt.Equal(completed) {
+				t.Errorf("task.json timestamps = started=%v completed=%v, want started=%v completed=%v",
+					meta.StartedAt, meta.CompletedAt, started, completed)
+			}
+			if meta.TranscriptUnavailableReason != "" {
+				t.Errorf("task.json TranscriptUnavailableReason = %q, want empty", meta.TranscriptUnavailableReason)
+			}
+		})
+	}
+}
+
+// TestWriteCommitted_TaskPayload_UnavailableTranscript_RecordsReasonWithoutJSONL
+// covers the "missing/unreadable transcript" half of the materializer contract:
+// an empty TaskPayload.Transcript must still produce task.json (with the
+// unavailable reason recorded so the pointer is not silently lost) but no
+// agent-<id>.jsonl, and the rest of the checkpoint (the session's own
+// transcript) must be unaffected.
+func TestWriteCommitted_TaskPayload_UnavailableTranscript_RecordsReasonWithoutJSONL(t *testing.T) {
 	t.Parallel()
 	repo, _ := setupBranchTestRepo(t)
 	store := NewGitStore(repo, DefaultV1Refs())
-	checkpointID := id.MustCheckpointID("aabbccddeef9")
-
-	// Create a temp file with invalid JSONL containing a secret
-	tmpDir := t.TempDir()
-	transcriptPath := filepath.Join(tmpDir, "agent.jsonl")
-	invalidJSONL := "this is not valid JSON but has a secret " + highEntropySecret + " in it"
-	if err := os.WriteFile(transcriptPath, []byte(invalidJSONL), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
+	checkpointID := id.MustCheckpointID("aabbccddeefa")
 
 	err := store.Write(context.Background(), Session{
-		CheckpointID:           checkpointID,
-		SessionID:              "jsonl-fallback-session",
-		Strategy:               "manual-commit",
-		Transcript:             redact.AlreadyRedacted([]byte(`{"msg":"safe"}` + "\n")),
-		CheckpointsCount:       1,
-		AuthorName:             "Test Author",
-		AuthorEmail:            "test@example.com",
-		IsTask:                 true,
-		ToolUseID:              "toolu_test123",
-		AgentID:                "agent1",
-		SubagentTranscriptPath: transcriptPath,
+		CheckpointID:     checkpointID,
+		SessionID:        "task-payload-unavailable-session",
+		Strategy:         "manual-commit",
+		Transcript:       redact.AlreadyRedacted([]byte(`{"msg":"session transcript intact"}` + "\n")),
+		CheckpointsCount: 1,
+		AuthorName:       "Test Author",
+		AuthorEmail:      "test@example.com",
+		Tasks: []TaskPayload{
+			{
+				ToolUseID:                   "toolu_missing",
+				AgentID:                     "agent2",
+				TranscriptUnavailableReason: "transcript path unresolvable",
+			},
+		},
 	})
 	if err != nil {
-		t.Fatalf("WriteCommitted() error = %v", err)
+		t.Fatalf("Write() error = %v", err)
 	}
 
-	// Read back the subagent transcript from the tree
 	ref, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
 	if err != nil {
 		t.Fatalf("failed to get branch ref: %v", err)
@@ -4179,89 +3018,169 @@ func TestWriteCommitted_SubagentTranscript_JSONLFallback(t *testing.T) {
 		t.Fatalf("failed to get tree: %v", err)
 	}
 
-	agentPath := checkpointID.Path() + "/tasks/toolu_test123/agent-agent1.jsonl"
-	file, err := tree.File(agentPath)
-	if err != nil {
-		t.Fatalf("subagent transcript should exist at %s (JSONL fallback should not drop it): %v", agentPath, err)
+	agentPath := checkpointID.Path() + "/tasks/toolu_missing/agent-agent2.jsonl"
+	if _, err := tree.File(agentPath); err == nil {
+		t.Errorf("agent-agent2.jsonl should not exist when Transcript is nil, but was found at %s", agentPath)
 	}
 
-	content, err := file.Contents()
+	taskJSONPath := checkpointID.Path() + "/tasks/toolu_missing/task.json"
+	taskFile, err := tree.File(taskJSONPath)
 	if err != nil {
-		t.Fatalf("failed to read subagent transcript: %v", err)
+		t.Fatalf("task.json should exist at %s: %v", taskJSONPath, err)
+	}
+	taskContent, err := taskFile.Contents()
+	if err != nil {
+		t.Fatalf("failed to read task.json: %v", err)
+	}
+	var meta TaskRecord
+	if err := json.Unmarshal([]byte(taskContent), &meta); err != nil {
+		t.Fatalf("failed to unmarshal task.json: %v", err)
+	}
+	if meta.TranscriptUnavailableReason != "transcript path unresolvable" {
+		t.Errorf("task.json TranscriptUnavailableReason = %q, want %q", meta.TranscriptUnavailableReason, "transcript path unresolvable")
 	}
 
-	// Verify the transcript was stored (not dropped) and secret was redacted
-	if content == "" {
-		t.Error("subagent transcript should not be empty")
+	// The session's own transcript must be unaffected by the unavailable task transcript.
+	sessionContent, err := store.ReadSessionContent(context.Background(), checkpointID, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionContent() error = %v", err)
 	}
-	if strings.Contains(content, highEntropySecret) {
-		t.Error("subagent transcript should not contain the secret after fallback redaction")
-	}
-	if !strings.Contains(content, "REDACTED") {
-		t.Error("subagent transcript should contain REDACTED from fallback redaction")
+	if !strings.Contains(string(sessionContent.Transcript), "session transcript intact") {
+		t.Errorf("session transcript = %q, want it to contain %q", sessionContent.Transcript, "session transcript intact")
 	}
 }
 
-func TestWriteTemporaryTask_SubagentTranscript_RedactsSecrets(t *testing.T) {
-	// Cannot use t.Parallel() because t.Chdir is required for paths.WorktreeRoot()
-	tempDir := t.TempDir()
+// TestWriteCommitted_TaskDescriptionRedacted: task.json's task_description is
+// the agent's free text for the Task call and is pushed with the checkpoint,
+// so the writer must redact it like the summary fields — the transcript beside
+// it is pre-redacted by condensation, but the description used to be copied
+// verbatim. A low-entropy AWS-key shaped secret keeps this deterministic on
+// the regex-only pipeline.
+//
+// Table-driven across both persistent backends. They share one writer
+// (treeWriter.writeTaskRecordEntry, embedded by GitStore and gitRefsStore), so
+// this pins that sharing rather than guarding two implementations: if a future
+// change gives either store its own task-record path, the redaction has to
+// come with it.
+func TestWriteCommitted_TaskDescriptionRedacted(t *testing.T) {
+	t.Parallel()
 
-	// Initialize a git repository with an initial commit
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
+	tests := []struct {
+		name      string
+		newStore  func(repo *git.Repository) sessionMetadataStore
+		fetchTree func(t *testing.T, repo *git.Repository, cid id.CheckpointID) *FetchingTree
+	}{
+		{
+			name:     "git-branch store",
+			newStore: func(repo *git.Repository) sessionMetadataStore { return NewGitStore(repo, DefaultV1Refs()) },
+			fetchTree: func(t *testing.T, repo *git.Repository, cid id.CheckpointID) *FetchingTree {
+				t.Helper()
+				store := NewGitStore(repo, DefaultV1Refs())
+				tree, err := store.getCheckpointFetchingTree(context.Background(), cid)
+				if err != nil {
+					t.Fatalf("getCheckpointFetchingTree() error = %v", err)
+				}
+				return tree
+			},
+		},
+		{
+			name:     "git-refs store",
+			newStore: func(repo *git.Repository) sessionMetadataStore { return newGitRefsStore(repo) },
+			fetchTree: func(t *testing.T, repo *git.Repository, cid id.CheckpointID) *FetchingTree {
+				t.Helper()
+				store := newGitRefsStore(repo)
+				tree, err := store.checkpointTree(context.Background(), cid)
+				if err != nil {
+					t.Fatalf("checkpointTree() error = %v", err)
+				}
+				return tree
+			},
+		},
 	}
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			repo, _ := setupBranchTestRepo(t)
+			store := tt.newStore(repo)
+			checkpointID := id.MustCheckpointID("aabbccddeefc")
+
+			err := store.Write(context.Background(), Session{
+				CheckpointID:     checkpointID,
+				SessionID:        "task-description-session",
+				Strategy:         "manual-commit",
+				Transcript:       redact.AlreadyRedacted([]byte(`{"msg":"safe"}` + "\n")),
+				CheckpointsCount: 1,
+				AuthorName:       "Test Author",
+				AuthorEmail:      "test@example.com",
+				Tasks: []TaskPayload{
+					{
+						ToolUseID:       "toolu_desc",
+						AgentID:         "agent3",
+						SubagentType:    "general-purpose",
+						TaskDescription: "rotate key=" + awsKeyFixture + " in staging",
+						Transcript:      redact.AlreadyRedacted([]byte(`{"msg":"child"}` + "\n")),
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Write() error = %v", err)
+			}
+
+			tree := tt.fetchTree(t, repo, checkpointID)
+
+			taskJSONPath := "tasks/toolu_desc/task.json"
+			taskFile, err := tree.File(taskJSONPath)
+			if err != nil {
+				t.Fatalf("task.json should exist at %s: %v", taskJSONPath, err)
+			}
+			taskContent, err := taskFile.Contents()
+			if err != nil {
+				t.Fatalf("failed to read task.json: %v", err)
+			}
+			if strings.Contains(taskContent, awsKeyFixture) {
+				t.Errorf("task.json still carries the secret: %s", taskContent)
+			}
+			var meta TaskRecord
+			if err := json.Unmarshal([]byte(taskContent), &meta); err != nil {
+				t.Fatalf("failed to unmarshal task.json: %v", err)
+			}
+			if !strings.Contains(meta.TaskDescription, "REDACTED") || !strings.HasPrefix(meta.TaskDescription, "rotate key=") {
+				t.Errorf("task_description = %q, want the secret replaced in place", meta.TaskDescription)
+			}
+			if meta.SubagentType != "general-purpose" {
+				t.Errorf("subagent_type = %q, want it untouched", meta.SubagentType)
+			}
+		})
 	}
-	readmeFile := filepath.Join(tempDir, "README.md")
-	if err := os.WriteFile(readmeFile, []byte("# Test"), 0o644); err != nil {
-		t.Fatalf("failed to write README: %v", err)
-	}
-	if _, err := worktree.Add("README.md"); err != nil {
-		t.Fatalf("failed to add README: %v", err)
-	}
-	initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
+}
+
+// TestWriteCommitted_NoTasks_NoTaskDirectory guards the no-op path: an empty
+// Tasks slice (every session before subagent-work durability landed, and
+// every ordinary session with no subagent work) must not create a tasks/
+// subtree at all.
+func TestWriteCommitted_NoTasks_NoTaskDirectory(t *testing.T) {
+	t.Parallel()
+	repo, _ := setupBranchTestRepo(t)
+	store := NewGitStore(repo, DefaultV1Refs())
+	checkpointID := id.MustCheckpointID("aabbccddeefb")
+
+	err := store.Write(context.Background(), Session{
+		CheckpointID:     checkpointID,
+		SessionID:        "no-tasks-session",
+		Strategy:         "manual-commit",
+		Transcript:       redact.AlreadyRedacted([]byte(`{"msg":"safe"}` + "\n")),
+		CheckpointsCount: 1,
+		AuthorName:       "Test Author",
+		AuthorEmail:      "test@example.com",
 	})
 	if err != nil {
-		t.Fatalf("failed to commit: %v", err)
+		t.Fatalf("Write() error = %v", err)
 	}
 
-	t.Chdir(tempDir)
-
-	// Create a temp file with invalid JSONL containing a secret
-	transcriptPath := filepath.Join(tempDir, "agent-transcript.jsonl")
-	invalidJSONL := "this is not valid JSON but has a secret " + highEntropySecret + " in it"
-	if err := os.WriteFile(transcriptPath, []byte(invalidJSONL), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	_, err = store.Write(context.Background(), TaskStep{
-		SessionID:              "test-session",
-		BaseCommit:             baseCommit,
-		ToolUseID:              "toolu_test456",
-		AgentID:                "agent1",
-		SubagentTranscriptPath: transcriptPath,
-		CheckpointUUID:         "test-uuid",
-		CommitMessage:          "Task checkpoint",
-		AuthorName:             "Test",
-		AuthorEmail:            "test@test.com",
-	})
+	ref, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
 	if err != nil {
-		t.Fatalf("WriteTemporaryTask() error = %v", err)
-	}
-
-	// Find the shadow branch and read the subagent transcript
-	shadowBranch := ShadowBranchNameForCommit(baseCommit, "")
-	ref, err := repo.Reference(plumbing.NewBranchReferenceName(shadowBranch), true)
-	if err != nil {
-		t.Fatalf("failed to get shadow branch ref: %v", err)
+		t.Fatalf("failed to get branch ref: %v", err)
 	}
 	commit, err := repo.CommitObject(ref.Hash())
 	if err != nil {
@@ -4272,65 +3191,57 @@ func TestWriteTemporaryTask_SubagentTranscript_RedactsSecrets(t *testing.T) {
 		t.Fatalf("failed to get tree: %v", err)
 	}
 
-	agentPath := paths.EntireMetadataDir + "/test-session/tasks/toolu_test456/agent-agent1.jsonl"
-	file, err := tree.File(agentPath)
-	if err != nil {
-		t.Fatalf("subagent transcript should exist at %s: %v", agentPath, err)
-	}
-
-	content, err := file.Contents()
-	if err != nil {
-		t.Fatalf("failed to read subagent transcript: %v", err)
-	}
-
-	// Verify the transcript was stored (not dropped) and secret was redacted
-	if content == "" {
-		t.Error("subagent transcript should not be empty")
-	}
-	if strings.Contains(content, highEntropySecret) {
-		t.Error("subagent transcript on shadow branch should not contain the secret after redaction")
-	}
-	if !strings.Contains(content, "REDACTED") {
-		t.Error("subagent transcript on shadow branch should contain REDACTED")
+	if _, err := tree.Tree(checkpointID.Path() + "/tasks"); err == nil {
+		t.Error("tasks/ subtree should not exist when Tasks is empty")
 	}
 }
 
-func TestAddDirectoryToChanges_PathTraversal(t *testing.T) {
+// TestMetadataDirectoryWalkerSkipsInterruptedAtomicWrites pins the fix for a
+// hook killed between jsonutil.CreateTempIn and its Rename. The orphan temp
+// file sits in the session's metadata directory, which is walked wholesale into
+// every checkpoint tree, so without the filter it is redacted, committed, and
+// pushed forever after — and "full.jsonl.<hex>.tmp" is read back as a transcript
+// CHUNK whenever the hex starts with a digit.
+func TestMetadataDirectoryWalkerSkipsInterruptedAtomicWrites(t *testing.T) {
 	t.Parallel()
 	tempDir := t.TempDir()
 
 	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
+	repo, err := gitrepo.OpenPath(tempDir)
 	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
+		t.Fatalf("failed to open repo: %v", err)
 	}
 
-	// Create a directory structure where the relative path could escape
 	metadataDir := filepath.Join(tempDir, "metadata")
-	subDir := filepath.Join(metadataDir, "sub")
-	if err := os.MkdirAll(subDir, 0o755); err != nil {
+	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
 		t.Fatalf("failed to create dirs: %v", err)
 	}
-
-	// Create a regular file — should be included
-	regularFile := filepath.Join(subDir, "data.txt")
-	if err := os.WriteFile(regularFile, []byte("safe content"), 0o644); err != nil {
-		t.Fatalf("failed to write file: %v", err)
+	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("failed to write transcript: %v", err)
+	}
+	// The hex deliberately begins with a digit: that is the shape ParseChunkIndex
+	// used to accept as chunk 123.
+	orphan := "full.jsonl.123abcdef0123456.tmp"
+	if err := os.WriteFile(filepath.Join(metadataDir, orphan), []byte("partial"), 0o600); err != nil {
+		t.Fatalf("failed to write orphan temp: %v", err)
 	}
 
-	changes, err := addDirectoryToChanges(context.Background(), repo, metadataDir, ".entire/metadata/session")
-	if err != nil {
-		t.Fatalf("addDirectoryToChanges failed: %v", err)
+	entries := map[string]object.TreeEntry{}
+	writer := &treeWriter{repo: repo}
+	if err := writer.copyMetadataDir(context.Background(), mustWalkRoot(t, metadataDir), "metadata", "session", entries); err != nil {
+		t.Fatalf("copyMetadataDir failed: %v", err)
 	}
-
-	// Verify the regular file was included with correct path
-	expectedPath := filepath.ToSlash(filepath.Join(".entire/metadata/session", "sub", "data.txt"))
-	if len(changes) != 1 || changes[0].Path != expectedPath {
-		t.Errorf("expected one change at %q, got %#v", expectedPath, changes)
+	for path := range entries {
+		if strings.Contains(path, orphan) {
+			t.Errorf("copyMetadataDir staged the interrupted write %q", path)
+		}
+	}
+	if len(entries) != 1 {
+		t.Errorf("expected only the transcript in the tree, got %#v", entries)
 	}
 }
 
-func TestMetadataDirectoryWalkersAllowDotDotPrefixedNames(t *testing.T) {
+func TestMetadataDirectoryWalkerAllowsDotDotPrefixedNames(t *testing.T) {
 	t.Parallel()
 	tempDir := t.TempDir()
 
@@ -4349,331 +3260,13 @@ func TestMetadataDirectoryWalkersAllowDotDotPrefixedNames(t *testing.T) {
 
 	expectedPath := filepath.ToSlash(filepath.Join("checkpoint", "..generated", "schema.json"))
 
-	changes, err := addDirectoryToChanges(context.Background(), repo, metadataDir, "checkpoint")
-	if err != nil {
-		t.Fatalf("addDirectoryToChanges failed: %v", err)
-	}
-	if len(changes) != 1 || changes[0].Path != expectedPath {
-		t.Fatalf("expected one change at %q, got %#v", expectedPath, changes)
-	}
-
 	committedEntries := make(map[string]object.TreeEntry)
 	store := NewGitStore(repo, DefaultV1Refs())
-	if err := store.copyMetadataDir(context.Background(), metadataDir, "checkpoint/", committedEntries); err != nil {
+	if err := store.copyMetadataDir(context.Background(), mustWalkRoot(t, metadataDir), "metadata", "checkpoint/", committedEntries); err != nil {
 		t.Fatalf("copyMetadataDir failed: %v", err)
 	}
 	if _, ok := committedEntries[expectedPath]; !ok {
 		t.Fatalf("expected committed entry at %q, got entries: %v", expectedPath, committedEntries)
-	}
-}
-
-func TestAddDirectoryToChanges_SkipsSymlinks(t *testing.T) {
-	t.Parallel()
-	tempDir := t.TempDir()
-
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	// Create metadata directory
-	metadataDir := filepath.Join(tempDir, "metadata")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-
-	// Create a regular file
-	regularFile := filepath.Join(metadataDir, "regular.txt")
-	if err := os.WriteFile(regularFile, []byte("regular content"), 0o644); err != nil {
-		t.Fatalf("failed to create regular file: %v", err)
-	}
-
-	// Create a sensitive file outside the metadata directory
-	sensitiveFile := filepath.Join(tempDir, "sensitive.txt")
-	if err := os.WriteFile(sensitiveFile, []byte("SECRET DATA"), 0o644); err != nil {
-		t.Fatalf("failed to create sensitive file: %v", err)
-	}
-
-	// Create a symlink inside metadata directory pointing to the sensitive file
-	symlinkPath := filepath.Join(metadataDir, "sneaky-link")
-	if err := os.Symlink(sensitiveFile, symlinkPath); err != nil {
-		t.Fatalf("failed to create symlink: %v", err)
-	}
-
-	changes, err := addDirectoryToChanges(context.Background(), repo, metadataDir, "checkpoint/")
-	if err != nil {
-		t.Fatalf("addDirectoryToChanges failed: %v", err)
-	}
-
-	paths := make(map[string]bool, len(changes))
-	for _, c := range changes {
-		paths[c.Path] = true
-	}
-
-	// Verify regular file was included
-	if !paths["checkpoint/regular.txt"] {
-		t.Error("regular.txt should be included in changes")
-	}
-
-	// Verify symlink was NOT included
-	if paths["checkpoint/sneaky-link"] {
-		t.Error("symlink should NOT be included in changes — this would allow reading files outside the metadata directory")
-	}
-
-	if len(changes) != 1 {
-		t.Errorf("expected 1 change, got %d", len(changes))
-	}
-}
-
-func TestAddDirectoryToChanges_SkipsSymlinkedDirectories(t *testing.T) {
-	t.Parallel()
-	tempDir := t.TempDir()
-
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	// Create metadata directory with a regular file
-	metadataDir := filepath.Join(tempDir, "metadata")
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-	regularFile := filepath.Join(metadataDir, "regular.txt")
-	if err := os.WriteFile(regularFile, []byte("regular content"), 0o644); err != nil {
-		t.Fatalf("failed to create regular file: %v", err)
-	}
-
-	// Create an external directory with sensitive files
-	externalDir := filepath.Join(tempDir, "external-secrets")
-	if err := os.MkdirAll(externalDir, 0o755); err != nil {
-		t.Fatalf("failed to create external dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(externalDir, "secret.txt"), []byte("SECRET DATA"), 0o644); err != nil {
-		t.Fatalf("failed to create secret file: %v", err)
-	}
-
-	// Create a symlink to the external directory inside metadata
-	symlinkDir := filepath.Join(metadataDir, "evil-dir-link")
-	if err := os.Symlink(externalDir, symlinkDir); err != nil {
-		t.Fatalf("failed to create directory symlink: %v", err)
-	}
-
-	changes, err := addDirectoryToChanges(context.Background(), repo, metadataDir, "checkpoint/")
-	if err != nil {
-		t.Fatalf("addDirectoryToChanges failed: %v", err)
-	}
-
-	paths := make(map[string]bool, len(changes))
-	for _, c := range changes {
-		paths[c.Path] = true
-	}
-
-	// Verify regular file was included
-	if !paths["checkpoint/regular.txt"] {
-		t.Error("regular.txt should be included in changes")
-	}
-
-	// Verify files from the symlinked directory were NOT included
-	if paths["checkpoint/evil-dir-link/secret.txt"] {
-		t.Error("files inside symlinked directory should NOT be included — this would allow reading files outside the metadata directory")
-	}
-
-	if len(changes) != 1 {
-		t.Errorf("expected 1 change (regular.txt only), got %d: %v", len(changes), changes)
-	}
-}
-
-// TestWriteTemporaryTask_PreservesSymlinkWithoutReadingTarget verifies that task
-// checkpoints use the same symlink-safe blob path as session checkpoints.
-func TestWriteTemporaryTask_PreservesSymlinkWithoutReadingTarget(t *testing.T) {
-	tempDir := t.TempDir()
-	externalDir := t.TempDir()
-
-	repo, err := git.PlainInit(tempDir, false)
-	if err != nil {
-		t.Fatalf("failed to init git repo: %v", err)
-	}
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(tempDir, "README.md"), []byte("# Test\n"), 0o644); err != nil {
-		t.Fatalf("failed to write README: %v", err)
-	}
-	if _, err := worktree.Add("README.md"); err != nil {
-		t.Fatalf("failed to add README: %v", err)
-	}
-	initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
-	})
-	if err != nil {
-		t.Fatalf("failed to commit: %v", err)
-	}
-
-	secretContent := "SECRET DATA THAT MUST NOT ENTER TASK CHECKPOINTS"
-	secretFile := filepath.Join(externalDir, "token")
-	if err := os.WriteFile(secretFile, []byte(secretContent), 0o600); err != nil {
-		t.Fatalf("failed to write external secret: %v", err)
-	}
-
-	linkPath := filepath.Join(tempDir, "reported-link")
-	if err := os.Symlink(secretFile, linkPath); err != nil {
-		t.Skipf("cannot create symlink on this platform: %v", err)
-	}
-
-	t.Chdir(tempDir)
-
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	writeRes, err := store.Write(context.Background(), TaskStep{
-		SessionID:      "test-session",
-		BaseCommit:     initialCommit.String(),
-		ToolUseID:      "toolu_symlink123",
-		AgentID:        "agent1",
-		ModifiedFiles:  []string{"reported-link"},
-		CheckpointUUID: "test-uuid",
-		CommitMessage:  "Task checkpoint",
-		AuthorName:     "Test",
-		AuthorEmail:    "test@test.com",
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporaryTask() error = %v", err)
-	}
-
-	commit, err := repo.CommitObject(writeRes.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	entry, err := tree.FindEntry("reported-link")
-	if err != nil {
-		t.Fatalf("reported-link not found in task checkpoint tree: %v", err)
-	}
-	if entry.Mode != filemode.Symlink {
-		t.Fatalf("reported-link mode = %v, want %v", entry.Mode, filemode.Symlink)
-	}
-
-	file, err := tree.File("reported-link")
-	if err != nil {
-		t.Fatalf("failed to get reported-link file: %v", err)
-	}
-	content, err := file.Contents()
-	if err != nil {
-		t.Fatalf("failed to read reported-link blob: %v", err)
-	}
-	if content != secretFile {
-		t.Fatalf("symlink blob content = %q, want link target %q", content, secretFile)
-	}
-	if content == secretContent {
-		t.Fatal("task checkpoint stored symlink target contents instead of link target")
-	}
-}
-
-// TestWriteTemporaryTask_ExcludesGitIgnoredFiles verifies that task (subagent)
-// checkpoints also filter out gitignored files. This is the same vulnerability as
-// the WriteTemporary path — a subagent that touches .env must not leak it into the
-// shadow branch.
-func TestWriteTemporaryTask_ExcludesGitIgnoredFiles(t *testing.T) {
-	tempDir := t.TempDir()
-
-	testutil.InitRepo(t, tempDir)
-	repo, err := git.PlainOpen(tempDir)
-	if err != nil {
-		t.Fatalf("failed to open git repo: %v", err)
-	}
-
-	worktree, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create .gitignore that ignores .env
-	if err := os.WriteFile(filepath.Join(tempDir, ".gitignore"), []byte(".env\n"), 0o644); err != nil {
-		t.Fatalf("failed to write .gitignore: %v", err)
-	}
-	if _, err := worktree.Add(".gitignore"); err != nil {
-		t.Fatalf("failed to add .gitignore: %v", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(tempDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
-		t.Fatalf("failed to write main.go: %v", err)
-	}
-	if _, err := worktree.Add("main.go"); err != nil {
-		t.Fatalf("failed to add main.go: %v", err)
-	}
-	initialCommit, err := worktree.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com"},
-	})
-	if err != nil {
-		t.Fatalf("failed to commit: %v", err)
-	}
-
-	// Create gitignored .env file and a legitimate file on disk
-	if err := os.WriteFile(filepath.Join(tempDir, ".env"), []byte("API_KEY=sk-secret-1234\n"), 0o644); err != nil {
-		t.Fatalf("failed to write .env: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(tempDir, "handler.go"), []byte("package main\n\nfunc handler() {}\n"), 0o644); err != nil {
-		t.Fatalf("failed to write handler.go: %v", err)
-	}
-
-	t.Chdir(tempDir)
-
-	// Create subagent transcript file
-	transcriptPath := filepath.Join(tempDir, "agent-transcript.jsonl")
-	if err := os.WriteFile(transcriptPath, []byte(`{"role":"assistant","content":"done"}`+"\n"), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	store := newEphemeralStore(repo, DefaultV1Refs())
-	baseCommit := initialCommit.String()
-
-	// Write task checkpoint where subagent reports .env as modified
-	writeRes, err := store.Write(context.Background(), TaskStep{
-		SessionID:              "test-session",
-		BaseCommit:             baseCommit,
-		ToolUseID:              "toolu_test789",
-		AgentID:                "agent1",
-		ModifiedFiles:          []string{"handler.go", ".env"}, // Subagent reports both
-		NewFiles:               []string{},
-		DeletedFiles:           []string{},
-		SubagentTranscriptPath: transcriptPath,
-		CheckpointUUID:         "test-uuid",
-		CommitMessage:          "Task checkpoint",
-		AuthorName:             "Test",
-		AuthorEmail:            "test@test.com",
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporaryTask() error = %v", err)
-	}
-
-	commit, err := repo.CommitObject(writeRes.CommitHash)
-	if err != nil {
-		t.Fatalf("failed to get commit object: %v", err)
-	}
-
-	tree, err := commit.Tree()
-	if err != nil {
-		t.Fatalf("failed to get tree: %v", err)
-	}
-
-	// handler.go SHOULD be in the tree
-	_, err = tree.File("handler.go")
-	if err != nil {
-		t.Errorf("handler.go should be in task checkpoint tree: %v", err)
-	}
-
-	// .env MUST NOT be in the tree
-	_, err = tree.File(".env")
-	if err == nil {
-		t.Error("SECURITY: gitignored file .env leaked into task checkpoint tree — secrets exposed on shadow branch via subagent")
 	}
 }
 
@@ -4803,9 +3396,9 @@ func TestRedactBlobBytes_JSONMetadata(t *testing.T) {
 
 	meta := Metadata{
 		Kind:         "agent_review",
-		ReviewPrompt: "credential leak: key=AKIAYRWQG5EJLPZLBYNP",
+		ReviewPrompt: "credential leak: key=" + awsKeyFixture,
 		Summary: &Summary{
-			Intent: "leak: key=AKIAYRWQG5EJLPZLBYNP",
+			Intent: "leak: key=" + awsKeyFixture,
 		},
 	}
 	b, err := json.Marshal(meta)
@@ -4813,8 +3406,11 @@ func TestRedactBlobBytes_JSONMetadata(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	got := RedactBlobBytes(context.Background(), b, "metadata.json", false)
-	if strings.Contains(string(got), "AKIAYRWQG5EJLPZLBYNP") {
+	got, err := RedactBlobBytes(context.Background(), b, "metadata.json", false)
+	if err != nil {
+		t.Fatalf("RedactBlobBytes() error = %v", err)
+	}
+	if strings.Contains(string(got), awsKeyFixture) {
 		t.Errorf("expected AWS key redacted in metadata.json blob, got %s", string(got))
 	}
 	if !strings.Contains(string(got), "REDACTED") {
@@ -4828,6 +3424,42 @@ func TestRedactBlobBytes_JSONMetadata(t *testing.T) {
 	}
 	if roundTripped["kind"] != "agent_review" {
 		t.Errorf(`expected "kind":"agent_review" preserved after redaction, got %v`, roundTripped["kind"])
+	}
+}
+
+// TestRedactBlobBytes_ScannerDegraded pins both directions of the sentinel
+// dispatch: a JSON-shaped path fails closed under a degraded sole scanner,
+// while a plain path still falls through to infallible redact.Bytes.
+func TestRedactBlobBytes_ScannerDegraded(t *testing.T) {
+	// No t.Parallel: mutates redact's process-global scanner state.
+	redact.WithScannerDegradedSole(t)
+
+	content := []byte(`{"msg":"hello"}` + "\n")
+	got, err := RedactBlobBytes(context.Background(), content, "full.jsonl", false)
+	if !errors.Is(err, redact.ErrScannerDegraded) {
+		t.Fatalf("RedactBlobBytes(.jsonl) error = %v, want ErrScannerDegraded", err)
+	}
+	if got != nil {
+		t.Errorf("RedactBlobBytes(.jsonl) content = %q, want nil under degradation", got)
+	}
+
+	// Non-JSON paths never hit the JSON-aware branch, so they stay infallible
+	// even while the flag is set — the sentinel is confined to transcript-shaped
+	// blobs whose only scanner produced no coverage. The AWS-key shaped secret
+	// is caught by the always-on regex layers, independent of scanner selection.
+	secretContent := []byte("credential leak: key=" + awsKeyFixture)
+	got, err = RedactBlobBytes(context.Background(), secretContent, "prompt.txt", false)
+	if err != nil {
+		t.Fatalf("RedactBlobBytes(.txt) error = %v, want nil", err)
+	}
+	if want := redact.Bytes(secretContent); string(got) != string(want) {
+		t.Errorf("RedactBlobBytes(.txt) = %q, want redact.Bytes output %q", got, want)
+	}
+	if strings.Contains(string(got), awsKeyFixture) {
+		t.Error("RedactBlobBytes(.txt) left the secret unredacted")
+	}
+	if !strings.Contains(string(got), "REDACTED") {
+		t.Error("RedactBlobBytes(.txt) should contain REDACTED placeholder")
 	}
 }
 
@@ -5105,4 +3737,17 @@ func TestWriteCommitted_CodexSanitizesTranscriptFromPath(t *testing.T) {
 	require.Contains(t, got, "hello", "conversation content was lost")
 	require.Len(t, strings.Split(strings.TrimRight(got, "\n"), "\n"), 3,
 		"stored transcript must stay line-aligned with the rollout")
+}
+
+// mustWalkRoot opens metadataDir's parent as an os.Root, standing in for the
+// shared .entire root the production walkers are handed. The directory's own
+// name is passed alongside it, exactly as entiredir.Name would produce.
+func mustWalkRoot(t *testing.T, metadataDir string) *os.Root {
+	t.Helper()
+	root, err := os.OpenRoot(filepath.Dir(metadataDir))
+	if err != nil {
+		t.Fatalf("os.OpenRoot(%s): %v", filepath.Dir(metadataDir), err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	return root
 }

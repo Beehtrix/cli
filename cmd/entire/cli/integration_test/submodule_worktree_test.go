@@ -3,12 +3,14 @@
 package integration
 
 import (
+	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
 
@@ -21,7 +23,7 @@ import (
 //
 // It builds a real submodule, points the harness at the submodule worktree, and
 // drives the real hook binary end-to-end (user-prompt-submit, a file change, and
-// stop). It then asserts a rewind point exists — i.e. session init succeeded and
+// stop). It then asserts a pending checkpoint exists — i.e. session init succeeded and
 // a checkpoint was saved for work done inside the submodule.
 func TestSubmoduleWorktree_SessionCreatesCheckpoint(t *testing.T) {
 	t.Parallel()
@@ -36,12 +38,7 @@ func TestSubmoduleWorktree_SessionCreatesCheckpoint(t *testing.T) {
 
 	runGit := func(dir string, args ...string) {
 		t.Helper()
-		cmd := exec.CommandContext(t.Context(), "git", args...)
-		cmd.Dir = dir
-		cmd.Env = testutil.GitIsolatedEnv()
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git -C %s %v: %v\n%s", dir, args, err, out)
-		}
+		testutil.RunGit(t, dir, args...)
 	}
 	writeFileAt := func(path, content string) {
 		t.Helper()
@@ -108,11 +105,20 @@ func TestSubmoduleWorktree_SessionCreatesCheckpoint(t *testing.T) {
 		t.Fatalf("stop: %v", err)
 	}
 
-	// End-to-end proof via the real `checkpoint rewind --list`: a checkpoint was
-	// created for the work done inside the submodule. Without the fix, session
-	// init failed on the submodule gitdir, so no checkpoint (and no rewind point)
-	// exists.
-	if points := env.GetRewindPoints(); len(points) == 0 {
-		t.Fatal("no rewind point after a session inside a submodule — session init failed on the submodule gitdir, so no checkpoint was created")
+	// End-to-end proof: the turn end recorded the work done inside the
+	// submodule in session state, which lives in the submodule's git common
+	// dir (.git/modules/<name>). Without the fix, session init failed on the
+	// submodule gitdir, so no state (and no pending work) exists.
+	commonDir := gitOutput(t, sub, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	data, err := os.ReadFile(filepath.Join(commonDir, "entire-sessions", session.ID+".json"))
+	if err != nil {
+		t.Fatalf("no session state after a session inside a submodule — session init failed on the submodule gitdir: %v", err)
+	}
+	var state strategy.SessionState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("parse session state: %v", err)
+	}
+	if state.StepCount == 0 || !slices.Contains(state.FilesTouched, "app.txt") {
+		t.Fatalf("expected a recorded turn-end step touching app.txt, got StepCount=%d FilesTouched=%v", state.StepCount, state.FilesTouched)
 	}
 }

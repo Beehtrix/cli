@@ -3,13 +3,14 @@
 package integration
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
-	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
@@ -189,7 +190,7 @@ func TestExplain_BranchListingShowsCheckpointsAndPrompts(t *testing.T) {
 	err = env.SimulateStop(session.ID, session.TranscriptPath)
 	require.NoError(t, err)
 
-	env.GitCommitWithShadowHooks("Implement user authentication", "auth.go")
+	env.GitCommitWithHooks("Implement user authentication", "auth.go")
 
 	// `entire explain` (no flags) should show the branch listing with the checkpoint.
 	output, err := env.RunCLIWithError("checkpoint", "explain")
@@ -271,7 +272,7 @@ func TestExplain_CheckpointFetchDoesNotRewindLocalAheadBranch(t *testing.T) {
 	env.WriteFile("a.go", "package a")
 	env.GitAdd("a.go")
 	require.NoError(t, env.SimulateStop(sessionA.ID, transcriptA))
-	env.GitCommitWithShadowHooks("Add module A", "a.go")
+	env.GitCommitWithHooks("Add module A", "a.go")
 	env.RunPrePush("origin")
 
 	// Checkpoint B: commit locally, DO NOT push. Local entire/checkpoints/v1 is
@@ -284,7 +285,7 @@ func TestExplain_CheckpointFetchDoesNotRewindLocalAheadBranch(t *testing.T) {
 	env.WriteFile("b.go", "package b")
 	env.GitAdd("b.go")
 	require.NoError(t, env.SimulateStop(sessionB.ID, transcriptB))
-	env.GitCommitWithShadowHooks("Add module B", "b.go")
+	env.GitCommitWithHooks("Add module B", "b.go")
 
 	checkpointB := env.GetLatestCheckpointID()
 	require.NotEmpty(t, checkpointB, "should have a checkpoint ID for B")
@@ -334,9 +335,47 @@ func TestExplain_CheckpointSucceedsAfterTreelessFetch(t *testing.T) {
 	cloneDir := setupTreelessClone(t, bareURL, "+refs/heads/"+paths.MetadataBranchName+":refs/heads/"+paths.MetadataBranchName)
 	requireBlobMissing(t, cloneDir, checkpointID)
 
-	output := runExplainInDir(t, cloneDir, checkpointID)
+	var output string
+	if runtime.GOOS == windowsGOOS {
+		output = runExplainInDir(t, cloneDir, checkpointID)
+	} else {
+		gitEnv, catFileTrace := traceCatFileLazyFetchEnv(t)
+		stdout, stderr, commandErr := runEntire(t, gitEnv, cloneDir, "checkpoint", "explain", "--checkpoint", checkpointID)
+		trace, traceErr := os.ReadFile(catFileTrace)
+		require.NoError(t, traceErr)
+		require.NoError(t, commandErr, "explain failed\nstdout: %s\nstderr: %s\ncat-file trace: %s", stdout, stderr, trace)
+		output = stdout + stderr
+
+		traceLines := strings.Split(strings.TrimSpace(string(trace)), "\n")
+		require.Contains(t, traceLines, "--batch-check\t1", "missing-blob probes must disable lazy fetch")
+		require.NotContains(t, traceLines, "-e\t1", "missing-blob probes must be batched, not one cat-file per blob")
+		for _, line := range traceLines {
+			require.True(t, strings.HasSuffix(line, "\t1"), "cat-file ran without lazy fetch disabled: %q", line)
+		}
+	}
 	require.Contains(t, output, "Treeless v1 prompt",
 		"explain should succeed and surface the prompt despite blobs being absent locally")
+}
+
+func traceCatFileLazyFetchEnv(t *testing.T) ([]string, string) {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	require.NoError(t, err)
+
+	binDir := t.TempDir()
+	tracePath := filepath.Join(t.TempDir(), "cat-file-env")
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "cat-file" ]; then
+	printf '%%s\t%%s\n' "$2" "$GIT_NO_LAZY_FETCH" >> %q
+fi
+exec %q "$@"
+`, tracePath, realGit)
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755))
+
+	return append(testutil.GitIsolatedEnv(),
+		"GIT_NO_LAZY_FETCH=0",
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+	), tracePath
 }
 
 func createAndPushCheckpoint(t *testing.T, env *TestEnv, fileName, prompt string) string {
@@ -349,7 +388,7 @@ func createAndPushCheckpoint(t *testing.T, env *TestEnv, fileName, prompt string
 	env.WriteFile(fileName, "package treeless")
 	env.GitAdd(fileName)
 	require.NoError(t, env.SimulateStop(session.ID, transcriptPath))
-	env.GitCommitWithShadowHooks("Add "+fileName, fileName)
+	env.GitCommitWithHooks("Add "+fileName, fileName)
 	cpID := env.GetLatestCheckpointID()
 	require.NotEmpty(t, cpID, "expected a checkpoint after condensation")
 	env.RunPrePush("origin")
@@ -359,7 +398,7 @@ func createAndPushCheckpoint(t *testing.T, env *TestEnv, fileName, prompt string
 // setupTreelessClone creates a fresh git repo in a fresh TempDir, fetches
 // the given refspec from bareURL with --filter=blob:none --depth=1 (so
 // trees but no blobs land locally), and writes a minimal entire settings
-// file pointing at bareURL as the checkpoint_remote. Returns the new dir.
+// file enabling filtered fetches. Returns the new dir.
 //
 // Note: the bare and the fetch must go through the smart protocol for
 // --filter to be honored; the default local-path transport optimization
@@ -376,7 +415,8 @@ func setupTreelessClone(t *testing.T, barePath, refspec string) string {
 
 	for _, args := range [][]string{
 		{"init", "-q"},
-		{"-c", "protocol.file.allow=always", "fetch", "--filter=blob:none", "--depth=1", "--no-tags", fileURL, refspec},
+		{"remote", "add", "origin", fileURL},
+		{"-c", "protocol.file.allow=always", "fetch", "--filter=blob:none", "--depth=1", "--no-tags", "origin", refspec},
 	} {
 		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = cloneDir
@@ -386,7 +426,7 @@ func setupTreelessClone(t *testing.T, barePath, refspec string) string {
 		}
 	}
 
-	require.NoError(t, writeMinimalEntireSettings(cloneDir, barePath))
+	require.NoError(t, writeMinimalEntireSettings(cloneDir))
 	return cloneDir
 }
 
@@ -407,24 +447,17 @@ func enableFilterOnBare(t *testing.T, barePath string, gitEnv []string) {
 }
 
 // writeMinimalEntireSettings writes the smallest valid settings.json that
-// configures the manual-commit strategy with filtered_fetches enabled and
-// a custom checkpoint_remote URL — the partial-clone setup that triggered
-// the original bug.
-func writeMinimalEntireSettings(dir, bareURL string) error {
+// configures the manual-commit strategy with filtered_fetches enabled.
+func writeMinimalEntireSettings(dir string) error {
 	entireDir := filepath.Join(dir, ".entire")
 	if err := os.MkdirAll(entireDir, 0o755); err != nil {
 		return err
 	}
 	settings := map[string]any{
-		"enabled":   true,
-		"local_dev": true,
-		"strategy":  "manual-commit",
+		"enabled":  true,
+		"strategy": "manual-commit",
 		"strategy_options": map[string]any{
 			"filtered_fetches": true,
-			"checkpoint_remote": map[string]any{
-				"provider": "url",
-				"url":      bareURL,
-			},
 		},
 	}
 	data, err := jsonutil.MarshalIndentWithNewline(settings, "", "  ")
@@ -434,20 +467,11 @@ func writeMinimalEntireSettings(dir, bareURL string) error {
 	return os.WriteFile(filepath.Join(entireDir, paths.SettingsFileName), data, 0o644)
 }
 
-// runExplainInDir runs `entire explain --checkpoint <id>` in dir and
-// returns combined output. Fails the test if the command errors. Uses
-// execx.NonInteractive (project rule for spawning the entire binary in
-// tests) so the child has no controlling terminal.
+// runExplainInDir runs `entire checkpoint explain --checkpoint <id>` in dir and
+// returns combined output. Fails the test if the command errors.
 func runExplainInDir(t *testing.T, dir, checkpointID string) string {
 	t.Helper()
-	cmd := execx.NonInteractive(t.Context(), getTestBinary(), "checkpoint", "explain", "--checkpoint", checkpointID)
-	cmd.Dir = dir
-	cmd.Env = testutil.GitIsolatedEnv()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("explain failed: %v\n%s", err, out)
-	}
-	return string(out)
+	return runEntireInDir(t, dir, "checkpoint", "explain", "--checkpoint", checkpointID)
 }
 
 // requireBlobMissing asserts that at least one metadata blob for the

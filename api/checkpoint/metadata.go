@@ -19,6 +19,103 @@ type TranscriptAsset struct {
 	Data      []byte
 }
 
+// TaskPayload materializes one subagent task record's transcript and metadata
+// into a session checkpoint's tasks/<tool-use-id>/ subtree. Produced by
+// condensation from session.TaskRecords (see
+// docs/superpowers/plans/2026-08-19-subagent-durable-records.md) and consumed
+// by the write path via WriteOptions.Tasks — the replacement for the old
+// unreachable IsTask/ToolUseID per-write route (#2058): no producer ever set
+// that route's fields, so every subagent transcript died at condensation
+// until this payload existed.
+type TaskPayload struct {
+	// ToolUseID is the Task tool invocation's tool_use_id — also the
+	// directory name under tasks/.
+	ToolUseID string
+
+	// AgentID is the subagent identifier, used to name agent-<id>.jsonl.
+	AgentID string
+
+	// SubagentType and TaskDescription label the task in task.json.
+	// TaskDescription is free text from the agent and is redacted by the
+	// writer; callers pass it as recorded.
+	SubagentType    string
+	TaskDescription string
+
+	// Transcript is the subagent's transcript content, already run through
+	// the sanitize -> externalize -> redact pipeline (the same one the
+	// session transcript gets — see redact.RedactedBytes for why callers
+	// must not hand this field raw bytes). Empty (Len() == 0) means the
+	// transcript was unavailable — see TranscriptUnavailableReason, which is
+	// non-empty exactly when this is empty — and no agent-<id>.jsonl is
+	// written. This mirrors how WriteOptions.Transcript itself expresses
+	// "no content": a value type, not a pointer, with emptiness read via Len().
+	Transcript redact.RedactedBytes
+
+	// Files is the set of files touched by this subagent.
+	Files []string
+
+	// TokenUsage is this subagent's token usage, when known. nil when
+	// unavailable.
+	TokenUsage *types.TokenUsage
+
+	// StartedAt is when the subagent launch was observed.
+	StartedAt time.Time
+
+	// CompletedAt is when the task record was completed. Zero means the task
+	// was still in flight when this checkpoint was materialized — its
+	// transcript (if any) is a transcript-so-far snapshot, not the final one.
+	CompletedAt time.Time
+
+	// TranscriptUnavailableReason explains why Transcript is empty. A stable
+	// category string (e.g. "transcript unreadable", "transcript path
+	// unresolvable", "transcript empty") — never the underlying error detail,
+	// which may embed an absolute local path and must not enter a pushed
+	// task.json; log that detail via logging.Warn instead. Empty exactly when
+	// Transcript is non-empty.
+	TranscriptUnavailableReason string
+}
+
+// TaskRecord is the persisted task.json of one materialized subagent task
+// record: tasks/<tool_use_id>/task.json at the checkpoint root. The writer
+// builds it from a TaskPayload (see its fields for semantics); readers get it
+// back through TaskReader.ListTasks.
+type TaskRecord struct {
+	ToolUseID       string            `json:"tool_use_id"`
+	AgentID         string            `json:"agent_id,omitempty"`
+	SubagentType    string            `json:"subagent_type,omitempty"`
+	TaskDescription string            `json:"task_description,omitempty"`
+	Files           []string          `json:"files,omitempty"`
+	TokenUsage      *types.TokenUsage `json:"token_usage,omitempty"`
+	// StartedAt/CompletedAt use omitzero (not omitempty, which classic
+	// encoding/json never treats a struct as "empty" for): CompletedAt's
+	// absence from the JSON is exactly what marks the task in flight when
+	// this checkpoint was materialized, so a zero time.Time must actually be
+	// omitted, not serialized as "0001-01-01T00:00:00Z".
+	StartedAt                   time.Time `json:"started_at,omitzero"`
+	CompletedAt                 time.Time `json:"completed_at,omitzero"`
+	TranscriptUnavailableReason string    `json:"transcript_unavailable_reason,omitempty"`
+}
+
+// TaskEntry is one tasks/<tool_use_id>/ directory of a committed checkpoint,
+// as TaskReader.ListTasks reports it.
+type TaskEntry struct {
+	// ToolUseID is the directory name. It is set even when Err is, so a
+	// caller can name the record it could not read.
+	ToolUseID string
+
+	// Record is the parsed task.json. Zero when Err is non-nil.
+	Record TaskRecord
+
+	// TranscriptStored reports whether the record's agent-<agent_id>.jsonl
+	// transcript is present in the checkpoint. It is derived from the stored
+	// tree, not from task.json.
+	TranscriptStored bool
+
+	// Err is set when this record could not be read or failed validation.
+	// The rest of the list is still returned.
+	Err error
+}
+
 // WriteOptions contains options for writing a persistent checkpoint.
 type WriteOptions struct {
 	// CheckpointID is the stable 12-hex-char identifier
@@ -39,13 +136,28 @@ type WriteOptions struct {
 
 	// CommitSHA links this checkpoint to an existing commit without a trailer.
 	// It is an anchor — "imported at this point in time" — not attribution.
-	// Currently set only by `entire import`: imported history has no
+	// Set only on the import path — the `entire import` command and `entire
+	// enable`'s optional history import: imported history has no
 	// Entire-Checkpoint trailer (we never rewrite existing commits), so import
-	// stamps the resolved anchor commit here (the default branch head when
-	// resolvable; see resolveImportLinkCommitSHA for the fallback order).
-	// Empty for all other writers. This comment is the canonical description;
-	// Metadata.CommitSHA and CheckpointSummary.CommitSHA point back here.
+	// stamps the resolved anchor commit here. Per turn that is the commit the
+	// transcript recorded when one resolves and is reachable (see
+	// turnAnchorResolver), otherwise the resolved head fallback (see
+	// resolveImportLinkCommitSHA for the order). An import that can resolve no
+	// anchor at all is refused before it writes, so an import written by a
+	// current CLI always carries one; imports predating that enforcement may
+	// not, so readers must still handle empty.
+	// Empty for all other writers, which is why the field is omitempty. This
+	// comment is the canonical description; Metadata.CommitSHA and
+	// CheckpointSummary.CommitSHA point back here.
 	CommitSHA string
+
+	// LinkedCommits links this checkpoint to existing commits without a
+	// trailer, as `entire session attach --commit` writes when the commit
+	// cannot be amended. Unlike the import anchor (CommitSHA) it is an
+	// attributing link: readers treat each entry exactly like a commit
+	// carrying this checkpoint's Entire-Checkpoint trailer. A rewrite of the
+	// same checkpoint keeps the existing entries and adds new ones.
+	LinkedCommits []LinkedCommit
 
 	// Transcript is the session transcript content (full.jsonl).
 	// Must be pre-redacted (via redact.JSONLBytes or redact.AlreadyRedacted for trusted sources).
@@ -69,14 +181,11 @@ type WriteOptions struct {
 	// historical name/JSON tag, it is no longer a count of checkpoints.
 	CheckpointsCount int
 
-	// SaveStepCount is the number of SaveStep-recorded steps (shadow-branch
-	// commits) for this session. Distinct from CheckpointsCount (the displayed
-	// prompt count): this is the honest "did real checkpoint work happen" signal
-	// used to gate combined attribution. 0 means a commit-only / fallback session.
+	// SaveStepCount is the number of SaveStep-recorded turn-end steps for this
+	// session. Distinct from CheckpointsCount (the displayed prompt count): this
+	// is the honest "did real checkpoint work happen" signal. 0 means a
+	// commit-only / fallback session.
 	SaveStepCount int
-
-	// EphemeralBranch is the shadow branch name (for manual-commit strategy)
-	EphemeralBranch string
 
 	// AuthorName is the name to use for commits
 	AuthorName string
@@ -89,23 +198,19 @@ type WriteOptions struct {
 	// This is useful for copying task metadata files, subagent transcripts, etc.
 	MetadataDir string
 
-	// Task checkpoint fields (for task/subagent checkpoints)
-	IsTask    bool   // Whether this is a task checkpoint
-	ToolUseID string // Tool use ID for task checkpoints
+	// TranscriptPath is a path to the session transcript file, used as a
+	// fallback source when Transcript is empty (e.g. a caller that wants the
+	// store to read and redact the file itself rather than doing so in memory).
+	TranscriptPath string
 
-	// Additional task checkpoint fields for subagent checkpoints
-	AgentID                string // Subagent identifier
-	CheckpointUUID         string // UUID for transcript truncation when rewinding
-	TranscriptPath         string // Path to session transcript file (alternative to in-memory Transcript)
-	SubagentTranscriptPath string // Path to subagent's transcript file
+	// Tasks materializes subagent task records dispatched by this session into
+	// this checkpoint's tasks/<tool-use-id>/ subtree — see TaskPayload. Empty
+	// for sessions with no subagent work (the vast majority) and for backends
+	// or write paths that predate subagent-work durability (#2058); the writer
+	// treats an empty slice as a no-op.
+	Tasks []TaskPayload
 
-	// Incremental checkpoint fields
-	IsIncremental       bool   // Whether this is an incremental checkpoint
-	IncrementalSequence int    // Checkpoint sequence number
-	IncrementalType     string // Tool type that triggered this checkpoint
-	IncrementalData     []byte // Tool input payload for this checkpoint
-
-	// Commit message fields (used for task checkpoints)
+	// Commit message fields
 	CommitSubject string // Subject line for the metadata commit (overrides default)
 
 	// Agent identifies the agent that created this checkpoint (e.g., "Claude Code", "Cursor")
@@ -132,21 +237,6 @@ type WriteOptions struct {
 
 	// SessionMetrics contains hook-provided session metrics (duration, turns, context usage)
 	SessionMetrics *SessionMetrics
-
-	// Attribution is line-level attribution calculated at commit time
-	// comparing checkpoint tree (agent work) to committed tree (may include human edits)
-	Attribution *Attribution
-
-	// PromptAttributionsJSON is the raw PromptAttributions data, JSON-encoded.
-	// Persisted for diagnostic purposes — shows exactly which prompt recorded
-	// which "user" lines, enabling root cause analysis of attribution bugs.
-	// Uses json.RawMessage to avoid importing session package.
-	PromptAttributionsJSON json.RawMessage
-
-	// CombinedAttribution is holistic attribution across all sessions.
-	// Used during migration to preserve v1 root summary attribution.
-	// During normal condensation this is nil (computed post-commit via a CheckpointAttribution write).
-	CombinedAttribution *Attribution
 
 	// Summary is an optional AI-generated summary for this checkpoint.
 	// This field may be nil when:
@@ -272,6 +362,10 @@ func (p *PrecomputedTranscriptBlobs) IsUsable() bool {
 type CheckpointInfo struct {
 	// CheckpointID is the stable 12-hex-char identifier
 	CheckpointID id.CheckpointID
+
+	// LinkedCommits are the checkpoint's trailer-less commit links; see
+	// WriteOptions.LinkedCommits.
+	LinkedCommits []LinkedCommit
 
 	// SessionID is the session identifier (most recent session for multi-session checkpoints)
 	SessionID string
@@ -405,12 +499,15 @@ type Metadata struct {
 	// AI-generated summary of the checkpoint
 	Summary *Summary `json:"summary,omitempty"`
 
-	// Attribution is line-level attribution calculated at commit time
-	Attribution *Attribution `json:"initial_attribution,omitempty"`
-
-	// PromptAttributions is the raw per-prompt attribution data used to compute Attribution.
-	// Diagnostic field — shows which prompt recorded which "user" lines.
-	PromptAttributions json.RawMessage `json:"prompt_attributions,omitempty"`
+	// LegacyInitialAttribution and LegacyPromptAttributions carry the line
+	// attribution older CLIs wrote (initial_attribution, prompt_attributions)
+	// through a rewrite of an existing checkpoint, byte for byte. The CLI no
+	// longer computes, reads or sets them: they are opaque, and absent on
+	// checkpoints this version creates. Without them, decoding and re-encoding
+	// an old checkpoint (a summary backfill, a transcript finalize, an attached
+	// session) would strip data entire.io still reads.
+	LegacyInitialAttribution json.RawMessage `json:"initial_attribution,omitempty"`
+	LegacyPromptAttributions json.RawMessage `json:"prompt_attributions,omitempty"`
 
 	// Kind identifies the session purpose (e.g., "agent_review"). Empty for normal sessions.
 	Kind string `json:"kind,omitempty"`
@@ -461,7 +558,7 @@ func (m Metadata) GetCompactTranscriptStart() (offset int, ok bool) {
 type SessionFilePaths struct {
 	Metadata string `json:"metadata"`
 	// Transcript points at the raw full.jsonl, which CLI read paths
-	// (rewind/resume/explain) resolve by filename.
+	// (resume/explain) resolve by filename.
 	Transcript string `json:"transcript,omitempty"`
 	// CompactTranscript points at the compact transcript.jsonl when one was
 	// generated alongside full.jsonl. Omitted otherwise (non-compactable,
@@ -478,8 +575,8 @@ type SessionFilePaths struct {
 
 // CheckpointSummary is the root-level metadata.json for a checkpoint.
 // It contains aggregated statistics from all sessions and a map of session IDs
-// to their file paths. Session-specific data (including initial_attribution)
-// is stored in the session's subdirectory metadata.json.
+// to their file paths. Session-specific data is stored in the session's
+// subdirectory metadata.json.
 //
 // Structure on entire/checkpoints/v1 branch:
 //
@@ -501,12 +598,18 @@ type CheckpointSummary struct {
 	Strategy     string          `json:"strategy"`
 	Branch       string          `json:"branch,omitempty"`
 	// CommitSHA: import-only anchor; see WriteOptions.CommitSHA.
-	CommitSHA           string             `json:"commit_sha,omitempty"`
-	CheckpointsCount    int                `json:"checkpoints_count"`
-	FilesTouched        []string           `json:"files_touched"`
-	Sessions            []SessionFilePaths `json:"sessions"`
-	TokenUsage          *types.TokenUsage  `json:"token_usage,omitempty"`
-	CombinedAttribution *Attribution       `json:"combined_attribution,omitempty"`
+	CommitSHA        string             `json:"commit_sha,omitempty"`
+	CheckpointsCount int                `json:"checkpoints_count"`
+	FilesTouched     []string           `json:"files_touched"`
+	Sessions         []SessionFilePaths `json:"sessions"`
+	TokenUsage       *types.TokenUsage  `json:"token_usage,omitempty"`
+	// LinkedCommits: attributing trailer-less links; see WriteOptions.LinkedCommits.
+	LinkedCommits []LinkedCommit `json:"linked_commits,omitempty"`
+
+	// LegacyCombinedAttribution carries the combined_attribution older CLIs
+	// wrote into the root summary through rewrites, byte for byte; see
+	// Metadata.LegacyInitialAttribution. Never computed, read or set here.
+	LegacyCombinedAttribution json.RawMessage `json:"combined_attribution,omitempty"`
 
 	// HasReview is the umbrella "any review happened" flag: true when at least
 	// one session in this checkpoint has a review-kind Kind (currently
@@ -563,24 +666,15 @@ type CodeLearning struct {
 	Finding string `json:"finding"`            // What was learned
 }
 
-// Attribution captures line-level attribution metrics at commit time.
-// This is a point-in-time snapshot comparing the checkpoint tree (agent work)
-// against the committed tree (may include human edits).
-//
-// Attribution Metrics:
-//   - TotalCommitted keeps the historical "net additions" view for compatibility
-//   - TotalLinesChanged measures total committed line changes (adds + modifies + removes)
-//   - AgentPercentage represents "of the lines changed in this commit, what percentage came from the agent"
-//   - AgentRemoved tracks committed deletions performed by the agent
-type Attribution struct {
-	CalculatedAt      time.Time `json:"calculated_at"`
-	AgentLines        int       `json:"agent_lines"`              // Lines added by agent that remain in the commit
-	AgentRemoved      int       `json:"agent_removed"`            // Lines removed by agent that remain removed in the commit
-	HumanAdded        int       `json:"human_added"`              // Lines added by human (excluding modifications)
-	HumanModified     int       `json:"human_modified"`           // Lines modified by human (estimate: min(added, removed))
-	HumanRemoved      int       `json:"human_removed"`            // Lines removed by human (excluding modifications)
-	TotalCommitted    int       `json:"total_committed"`          // Net additions in commit (legacy additions-focused metric)
-	TotalLinesChanged int       `json:"total_lines_changed"`      // Total committed line changes (adds + modifies + removes)
-	AgentPercentage   float64   `json:"agent_percentage"`         // (agent_lines + agent_removed) / total_lines_changed * 100
-	MetricVersion     int       `json:"metric_version,omitempty"` // 0/absent = legacy (additions-only %), 2 = changed-lines %
+// LinkedCommit is one trailer-less link from a checkpoint to a commit; see
+// WriteOptions.LinkedCommits. The server links it only after verifying the
+// commit, so Repo is a hint for finding which code repository holds SHA when
+// one checkpoint store serves several.
+type LinkedCommit struct {
+	// SHA is the full lowercase commit hash.
+	SHA string `json:"sha"`
+	// Repo is the code repository as <forge>/<owner>/<repo> (e.g.
+	// gh/entireio/cli), resolved from the git remote that holds the commit.
+	// Empty when it could not be resolved.
+	Repo string `json:"repo,omitempty"`
 }

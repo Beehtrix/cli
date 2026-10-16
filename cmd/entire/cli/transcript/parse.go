@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/entireio/cli/cmd/entire/cli/textutil"
+	transcriptlib "github.com/entireio/cli/transcript"
 )
 
 // ParseFromBytes parses transcript content from a byte slice.
@@ -55,9 +55,25 @@ func ParseFromBytes(content []byte) ([]Line, error) {
 // The startLine parameter is 0-indexed (startLine=0 reads from the beginning).
 // This is useful for incremental parsing when you've already processed some lines.
 func ParseFromFileAtLine(path string, startLine int) ([]Line, error) {
+	lines, _, err := ParseFromFileAtLineWithTotal(path, startLine)
+	return lines, err
+}
+
+// ParseFromFileAtLineWithTotal is ParseFromFileAtLine plus the file's total line
+// count, gathered in the same pass.
+//
+// Callers implementing agent.TranscriptAnalyzer.ExtractModifiedFilesFromOffset need
+// both halves at once: the slice from startLine, and the new position to record for
+// the next call. Reading the file twice (parse, then count) is the thing to avoid —
+// these run on hook paths where transcripts reach tens of megabytes.
+//
+// The total counts every non-empty line in the file, including lines before
+// startLine and lines too malformed to unmarshal, so it stays a faithful position
+// marker for a subsequent startLine.
+func ParseFromFileAtLineWithTotal(path string, startLine int) ([]Line, int, error) {
 	file, err := os.Open(path) //nolint:gosec // path is a controlled transcript file path
 	if err != nil {
-		return nil, fmt.Errorf("failed to open transcript: %w", err)
+		return nil, 0, fmt.Errorf("failed to open transcript: %w", err)
 	}
 	defer func() { _ = file.Close() }()
 
@@ -68,7 +84,7 @@ func ParseFromFileAtLine(path string, startLine int) ([]Line, error) {
 	for {
 		lineBytes, err := reader.ReadBytes('\n')
 		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read transcript: %w", err)
+			return nil, 0, fmt.Errorf("failed to read transcript: %w", err)
 		}
 
 		// Handle empty line or EOF without content
@@ -94,7 +110,7 @@ func ParseFromFileAtLine(path string, startLine int) ([]Line, error) {
 		}
 	}
 
-	return lines, nil
+	return lines, totalLines, nil
 }
 
 // normalizeLineType ensures line.Type is populated for all transcript formats.
@@ -105,41 +121,6 @@ func normalizeLineType(line *Line) {
 	if line.Type == "" && line.Role != "" {
 		line.Type = line.Role
 	}
-}
-
-// SliceFromLine returns the content starting from line number `startLine` (0-indexed).
-// This is used to extract only the checkpoint-specific portion of a cumulative transcript.
-// For example, if startLine is 2, lines 0 and 1 are skipped and the result starts at line 2.
-// Returns empty slice if startLine exceeds the number of lines.
-func SliceFromLine(content []byte, startLine int) []byte {
-	if len(content) == 0 || startLine <= 0 {
-		return content
-	}
-
-	// Find the byte offset where startLine begins
-	lineCount := 0
-	offset := 0
-	for i, b := range content {
-		if b == '\n' {
-			lineCount++
-			if lineCount == startLine {
-				offset = i + 1
-				break
-			}
-		}
-	}
-
-	// If we didn't find enough lines, return empty
-	if lineCount < startLine {
-		return nil
-	}
-
-	// If offset is beyond content, return empty
-	if offset >= len(content) {
-		return nil
-	}
-
-	return content[offset:]
 }
 
 // ExtractUserContent extracts user content from a raw message.
@@ -154,7 +135,7 @@ func ExtractUserContent(message json.RawMessage) string {
 
 	// Handle string content
 	if str, ok := msg.Content.(string); ok {
-		return textutil.StripIDEContextTags(str)
+		return transcriptlib.StripIDEContextTags(str)
 	}
 
 	// Handle array content (only if it contains text blocks)
@@ -162,7 +143,7 @@ func ExtractUserContent(message json.RawMessage) string {
 		var texts []string
 		for _, item := range arr {
 			if m, ok := item.(map[string]interface{}); ok {
-				if m["type"] == ContentTypeText {
+				if m["type"] == transcriptlib.ContentTypeText {
 					if text, ok := m["text"].(string); ok {
 						texts = append(texts, text)
 					}
@@ -170,7 +151,7 @@ func ExtractUserContent(message json.RawMessage) string {
 			}
 		}
 		if len(texts) > 0 {
-			return textutil.StripIDEContextTags(strings.Join(texts, "\n\n"))
+			return transcriptlib.StripIDEContextTags(strings.Join(texts, "\n\n"))
 		}
 	}
 

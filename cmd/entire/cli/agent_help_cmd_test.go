@@ -5,14 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/spf13/cobra"
+
+	"github.com/entireio/cli/cmd/entire/cli/api"
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
 
 const agentHelpTestRepo = "gh/acme/app"
@@ -75,11 +77,19 @@ func TestAgentHelpCommands_IncludesAnnotatedHiddenOnly(t *testing.T) {
 	}
 }
 
-// Per the trails rollout: agent-help must not surface trail-gated commands when
-// trails aren't enabled for the repo, but non-trail commands always show.
-func TestAgentHelpCommands_GatesTrailOnTrailsEnabled(t *testing.T) {
-	t.Parallel()
+func projectTrailsHelpTestRoot() *cobra.Command {
 	root := NewRootCmd()
+	if old, _, err := root.Find([]string{"trail"}); err == nil {
+		root.RemoveCommand(old)
+	}
+	root.AddCommand(newTrailCmdForMode(true))
+	return root
+}
+
+// Project intent remains discoverable without a repository Trails toggle.
+func TestAgentHelpCommands_ProjectTrailsIndependentOfRepoToggle(t *testing.T) {
+	t.Parallel()
+	root := projectTrailsHelpTestRoot()
 
 	enabled := commandNames(agentHelpCommands(root, true))
 	if !contains(enabled, "trail") {
@@ -90,8 +100,8 @@ func TestAgentHelpCommands_GatesTrailOnTrailsEnabled(t *testing.T) {
 	}
 
 	disabled := commandNames(agentHelpCommands(root, false))
-	if contains(disabled, "trail") {
-		t.Errorf("trail must NOT be advertised when trails are disabled, got %v", disabled)
+	if !contains(disabled, "trail") {
+		t.Errorf("project trails must be advertised without repo trails, got %v", disabled)
 	}
 	if !contains(disabled, "checkpoint") {
 		t.Errorf("non-trail commands should always be advertised, got %v", disabled)
@@ -108,12 +118,7 @@ func TestAgentHelpRepoContext_RefreshesUnknownTrailsEnablement(t *testing.T) {
 	testutil.IsolateGitConfigEnv(t)
 	t.Setenv("ENTIRE_CONFIG_DIR", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	cmd := exec.CommandContext(t.Context(), "git", "remote", "add", "origin", "git@github.com:acme/app.git")
-	cmd.Dir = repoDir
-	cmd.Env = testutil.GitIsolatedEnv()
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("git remote add: %v", err)
-	}
+	testutil.RunGit(t, repoDir, "remote", "add", "origin", "git@github.com:acme/app.git")
 	t.Chdir(repoDir)
 
 	refreshCalls := 0
@@ -143,12 +148,7 @@ func TestAgentHelpRepoContext_CachesRefreshFailureBriefly(t *testing.T) {
 	t.Setenv("ENTIRE_TOKEN", makeTestJWT(t, `{"iss":"https://auth.entire.io","sub":"user-1","handle":"alice","aud":"https://entire.io"}`))
 	repoDir := t.TempDir()
 	testutil.InitRepo(t, repoDir)
-	cmd := exec.CommandContext(t.Context(), "git", "remote", "add", "origin", "git@github.com:acme/app.git")
-	cmd.Dir = repoDir
-	cmd.Env = testutil.GitIsolatedEnv()
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("git remote add: %v", err)
-	}
+	testutil.RunGit(t, repoDir, "remote", "add", "origin", "git@github.com:acme/app.git")
 	t.Chdir(repoDir)
 
 	refreshCalls := 0
@@ -197,16 +197,11 @@ func TestAgentHelpRepoContext_CachesRefreshFailureBriefly(t *testing.T) {
 // auth eventually reports that the user is not logged in.
 // Not parallel: changes the process working directory and auth environment.
 func TestAgentHelpRepoContext_SkipsRefreshWithoutLocalIdentity(t *testing.T) {
-	t.Setenv("ENTIRE_TOKEN", "")
+	unsetEnv(t, "ENTIRE_TOKEN")
 	t.Setenv("ENTIRE_CONFIG_DIR", t.TempDir())
 	repoDir := t.TempDir()
 	testutil.InitRepo(t, repoDir)
-	cmd := exec.CommandContext(t.Context(), "git", "remote", "add", "origin", "git@github.com:acme/app.git")
-	cmd.Dir = repoDir
-	cmd.Env = testutil.GitIsolatedEnv()
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("git remote add: %v", err)
-	}
+	testutil.RunGit(t, repoDir, "remote", "add", "origin", "git@github.com:acme/app.git")
 	t.Chdir(repoDir)
 
 	refreshCalls := 0
@@ -226,27 +221,93 @@ func TestAgentHelpRepoContext_SkipsRefreshWithoutLocalIdentity(t *testing.T) {
 	}
 }
 
-// Drilling into a trail-gated command is blocked when trails are disabled.
-func TestRunAgentHelp_TrailDrillGatedOnTrailsEnabled(t *testing.T) {
+// refreshAgentHelpTrailsEnabledCacheIfStaleForScope must route the repo-scoped
+// trails-enablement probe through the entire-api cell that hosts THIS repo
+// (trailRefreshAPIClient), never through the generic data-API/BFF client — the
+// BFF does not proxy /api/v1/trails/... for bearer callers (COR-666).
+// Not parallel: changes the process working directory.
+func TestRefreshAgentHelpTrailsEnabledCacheIfStaleForScope_RoutesThroughRepoCell(t *testing.T) {
+	// A non-repo cwd makes the shared cache lookup return "unknown", so the
+	// refresh path below always runs.
+	t.Chdir(t.TempDir())
+
+	previous := trailRefreshAPIClient
+	var gotForge, gotOwner, gotRepo string
+	wantErr := errors.New("cell client unavailable")
+	trailRefreshAPIClient = func(_ context.Context, _ bool, forge, owner, repo string) (*api.Client, error) {
+		gotForge, gotOwner, gotRepo = forge, owner, repo
+		return nil, wantErr
+	}
+	t.Cleanup(func() { trailRefreshAPIClient = previous })
+
+	scope := trailEnablementScope{
+		Forge:     "gh",
+		Owner:     "acme",
+		Repo:      "widget",
+		APIBase:   api.BaseURL(),
+		AuthKey:   "test-auth-key",
+		Supported: true,
+	}
+	scope.RepoKey = trailEnablementRepoKey(scope.Forge, scope.Owner, scope.Repo)
+
+	err := refreshAgentHelpTrailsEnabledCacheIfStaleForScope(t.Context(), scope)
+
+	if gotForge != scope.Forge || gotOwner != scope.Owner || gotRepo != scope.Repo {
+		t.Fatalf("trailRefreshAPIClient repo = (%q,%q,%q), want (gh,acme,widget)", gotForge, gotOwner, gotRepo)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+}
+
+// refreshAgentHelpTrailsEnabledCacheIfStaleForScope must persist a definitive
+// negative when trailRefreshAPIClient fails because the repo has no
+// processing placement (errRepoNotOnboarded), matching
+// runTrailEnablementRefresh's handling of the same sentinel. Without this,
+// agent-help falls into the short refresh-failure backoff instead, re-paying
+// the full control-plane round trip every 5 minutes forever instead of caching
+// the hour-long definitive negative like every other trails-enablement
+// consumer.
+// Not parallel: changes the process working directory.
+func TestRefreshAgentHelpTrailsEnabledCacheIfStaleForScope_NotOnboardedSavesDisabledCache(t *testing.T) {
+	setupStopTestRepo(t)
+	runGitInDir(t, ".", "remote", "add", "origin", "https://github.com/acme/widget.git")
+
+	previous := trailRefreshAPIClient
+	trailRefreshAPIClient = func(context.Context, bool, string, string, string) (*api.Client, error) {
+		return nil, fmt.Errorf("resolve the Entire cell for acme/widget: %w", errRepoNotOnboarded)
+	}
+	t.Cleanup(func() { trailRefreshAPIClient = previous })
+
+	scope, err := currentTrailEnablementScope(t.Context())
+	if err != nil {
+		t.Fatalf("resolve trail scope: %v", err)
+	}
+
+	if err := refreshAgentHelpTrailsEnabledCacheIfStaleForScope(t.Context(), scope); err != nil {
+		t.Fatalf("err = %v, want nil (not-onboarded is a definitive negative, not a refresh failure)", err)
+	}
+
+	if got := cachedTrailsEnablementForScope(t.Context(), scope, time.Now()); got != trailEnablementCacheDisabled {
+		t.Fatalf("cached enablement = %v, want trailEnablementCacheDisabled (saved, not left unknown)", got)
+	}
+}
+
+// Project-level operations do not require enabled repository code work.
+func TestRunAgentHelp_ProjectTrailDrillIndependentOfRepoToggle(t *testing.T) {
 	t.Parallel()
-	root := NewRootCmd()
+	root := projectTrailsHelpTestRoot()
 
 	if _, err := runAgentHelp(root, []string{"trail"}, agentHelpTestRepo, false, true); err != nil {
 		t.Errorf("trail drill should resolve when trails enabled: %v", err)
 	}
-	_, err := runAgentHelp(root, []string{"trail"}, agentHelpTestRepo, false, false)
-	if err == nil {
-		t.Fatalf("trail drill should be unavailable when trails disabled")
-	}
-	if !strings.Contains(err.Error(), "trails are not enabled") {
-		t.Errorf("expected the requires-trails unavailable error, got: %v", err)
+	if _, err := runAgentHelp(root, []string{"trail"}, agentHelpTestRepo, false, false); err != nil {
+		t.Fatalf("project trail drill should work without repo trails: %v", err)
 	}
 }
 
-// The --json output path gates trail-gated subcommands exactly like the text
-// path: the top-level JSON subcommand list omits trail when trails are disabled
-// and includes it when enabled.
-func TestRunAgentHelp_JSONGatesTrailOnTrailsEnabled(t *testing.T) {
+// JSON discovery also exposes project intent without repository code work.
+func TestRunAgentHelp_JSONProjectTrailsIndependentOfRepoToggle(t *testing.T) {
 	t.Parallel()
 
 	hasSub := func(jsonOut, name string) bool {
@@ -266,12 +327,12 @@ func TestRunAgentHelp_JSONGatesTrailOnTrailsEnabled(t *testing.T) {
 		return false
 	}
 
-	disabled, err := runAgentHelp(NewRootCmd(), nil, agentHelpTestRepo, true /*json*/, false /*trailsDisabled*/)
+	disabled, err := runAgentHelp(projectTrailsHelpTestRoot(), nil, agentHelpTestRepo, true /*json*/, false /*trailsDisabled*/)
 	if err != nil {
 		t.Fatalf("json top (trails disabled): %v", err)
 	}
-	if hasSub(disabled, "trail") {
-		t.Errorf("trail must NOT appear in --json subcommands when trails disabled:\n%s", disabled)
+	if !hasSub(disabled, "trail") {
+		t.Errorf("project trails must appear without repository trails:\n%s", disabled)
 	}
 	if !hasSub(disabled, "checkpoint") {
 		t.Errorf("checkpoint should always appear in --json subcommands:\n%s", disabled)
@@ -539,5 +600,388 @@ func TestAgentHelpCmd_Execute(t *testing.T) {
 	}
 	if parsed.Command != "entire status" {
 		t.Errorf("json command = %q, want %q", parsed.Command, "entire status")
+	}
+}
+
+// Every advertised top-level command must be classified, and so must every
+// child of a LISTED group — a listed group renders "read-only except: X" from
+// its children's classifications, so an unclassified child is silently dropped
+// from that note and the line quietly understates what the group can do.
+// agentHelpFactsFor defaults the unclassified case to user-owned/unlisted, which
+// is the safe direction but the wrong answer for a new read-only command; this
+// guard makes forgetting a CI failure instead. Both trails states are checked
+// because the gate changes which commands are advertised.
+func TestAgentHelpClassification_CoversEveryAdvertisedCommand(t *testing.T) {
+	t.Parallel()
+
+	for _, trailsEnabled := range []bool{true, false} {
+		for _, sub := range agentHelpCommands(NewRootCmd(), trailsEnabled) {
+			path := agentHelpPath(sub)
+			facts, ok := agentHelpClassified(path)
+			if !ok {
+				t.Errorf("command %q (trailsEnabled=%v) is advertised but unclassified; "+
+					"add it to agentHelpClassification", path, trailsEnabled)
+				continue
+			}
+			if !facts.listed {
+				continue
+			}
+			for _, child := range agentHelpCommands(sub, trailsEnabled) {
+				childPath := agentHelpPath(child)
+				if _, ok := agentHelpClassified(childPath); !ok {
+					t.Errorf("subcommand %q of listed group %q is unclassified; "+
+						"add it to agentHelpClassification", childPath, path)
+				}
+			}
+		}
+	}
+}
+
+// A group's audience is a claim about all of its subcommands, so a read-only
+// group may not contain a subcommand that writes. checkpoint and session read
+// as read-only from their Short help but are not (`checkpoint explain --generate`
+// writes a summary; session carries adopt/attach/resume/stop) — both were misclassified
+// read-only in an earlier revision of this table.
+func TestAgentHelpClassification_ReadOnlyGroupsHaveNoWritingChildren(t *testing.T) {
+	t.Parallel()
+
+	for _, sub := range agentHelpCommands(NewRootCmd(), true) {
+		facts, ok := agentHelpClassified(agentHelpPath(sub))
+		if !ok || facts.audience != agentHelpAudienceReadOnly {
+			continue
+		}
+		for _, child := range agentHelpCommands(sub, true) {
+			cf, ok := agentHelpClassified(agentHelpPath(child))
+			if ok && cf.audience != agentHelpAudienceReadOnly {
+				t.Errorf("%q is classified read-only but child %q is %s",
+					agentHelpPath(sub), agentHelpPath(child), agentHelpAudienceSlug(cf.audience))
+			}
+		}
+	}
+	for name, why := range map[string]string{
+		"checkpoint": "`checkpoint explain --generate` writes a summary",
+		"session":    "adopt/attach/resume/stop mutate session state",
+	} {
+		if agentHelpFactsFor(name).audience == agentHelpAudienceReadOnly {
+			t.Errorf("%q must not be classified read-only: %s", name, why)
+		}
+	}
+}
+
+// agentHelpAudienceNote falls back to a group's OWN audience whenever its
+// classified children agree with each other. That fallback is correct — the
+// group's audience also covers children this listing never counts, the hidden
+// ones and the unclassified ones — but it means a group can silently begin
+// advertising an audience every one of its children contradicts, without anyone
+// editing the group's entry.
+//
+// That is not hypothetical: it is what deleting `checkpoint policy` did. policy
+// was the checkpoint group's only task-driven child, so removing it left four
+// read-only children under a group still classified task-driven, and the bare
+// listing rendered "checkpoint … task-driven" over a drill-down that said
+// read-only four times.
+//
+// Which side should move is a product judgment — lower the group, or classify a
+// child to match it — so this fails the build and makes a human choose instead
+// of picking for them.
+func TestAgentHelpClassification_GroupAudienceMatchesUnanimousChildren(t *testing.T) {
+	t.Parallel()
+
+	for _, sub := range agentHelpCommands(NewRootCmd(), true) {
+		facts, ok := agentHelpClassified(agentHelpPath(sub))
+		if !ok {
+			continue
+		}
+		var children []string
+		unanimous, agreed := true, agentHelpAudience(0)
+		for _, child := range agentHelpCommands(sub, true) {
+			cf, ok := agentHelpClassified(agentHelpPath(child))
+			if !ok {
+				continue
+			}
+			if len(children) == 0 {
+				agreed = cf.audience
+			} else if cf.audience != agreed {
+				unanimous = false
+			}
+			children = append(children, child.Name())
+		}
+		if len(children) == 0 || !unanimous || agreed == facts.audience {
+			continue
+		}
+		t.Errorf("group %q is classified %s, but every classified child (%s) is %s; "+
+			"the bare listing renders the group's own audience here, so one side has to move",
+			agentHelpPath(sub), agentHelpAudienceSlug(facts.audience),
+			strings.Join(children, ", "), agentHelpAudienceSlug(agreed))
+	}
+}
+
+// The bare listing shows a curated subset. An exhaustive listing answers "what
+// exists?", not the question an agent mid-task has, and it grew past the length
+// at which it gets read — so this pins that the listing stays short, that
+// user-owned commands are named without spending an entry apiece, and that a
+// mixed group states its exceptions on ONE line rather than per subcommand.
+func TestRenderAgentHelpTop_ListsCuratedSubsetWithInlineAudience(t *testing.T) {
+	t.Parallel()
+
+	out := renderAgentHelpTop(NewRootCmd(), agentHelpTestRepo, true)
+
+	// Listed commands appear with their audience.
+	for _, want := range []string{
+		"status", "trail", "checkpoint", "session", "why", "search",
+		"read-only except: delete, explain",             // checkpoint, one line
+		"read-only except: adopt, attach, resume, stop", // session, one line
+		"read-only: approvals, list, show, watch",       // project trail: minority side named
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("listing missing %q:\n%s", want, out)
+		}
+	}
+
+	// Unlisted commands are named in the footer index, not given entries.
+	for _, name := range []string{"enable", "review", "org", "api"} {
+		if !strings.Contains(out, name) {
+			t.Errorf("unlisted command %q should still be named in the footer:\n%s", name, out)
+		}
+		if strings.Contains(out, "  "+name+"  ") {
+			t.Errorf("unlisted command %q should not get a full listing entry:\n%s", name, out)
+		}
+	}
+	// The footer is split by audience on purpose: one bucket would have to
+	// caption itself with the most restrictive rule, telling an agent not to run
+	// `activity` or `blame` uninvited when the table says they are safe.
+	if !strings.Contains(out, "the user's — suggest, don't run:") {
+		t.Errorf("footer must carry the do-not-run rule for user-owned commands:\n%s", out)
+	}
+	readOnlyIdx := strings.Index(out, "read-only, safe to run:")
+	userOwnedIdx := strings.Index(out, "the user's — suggest, don't run:")
+	if readOnlyIdx < 0 || userOwnedIdx < 0 {
+		t.Fatalf("footer is missing an audience bucket:\n%s", out)
+	}
+	for _, safe := range []string{"activity", "blame", "experts"} {
+		idx := strings.Index(out, safe)
+		if idx < readOnlyIdx || idx > userOwnedIdx {
+			t.Errorf("read-only command %q must not sit under the do-not-run caption:\n%s", safe, out)
+		}
+	}
+
+	// Length is the whole point of the curation: guard it directly.
+	if got := strings.Count(out, "\n"); got > 34 {
+		t.Errorf("listing grew to %d lines; it is curated to stay readable:\n%s", got, out)
+	}
+}
+
+// The text drill-down must carry the same "may I run this?" answer as --json:
+// a bare subcommand list hides which subcommands write.
+func TestRenderAgentHelpCommand_SubcommandsCarryAudienceNote(t *testing.T) {
+	t.Parallel()
+
+	child := agentHelpFindChild(NewRootCmd(), "checkpoint")
+	if child == nil {
+		t.Fatal("checkpoint command not found")
+	}
+	out := renderAgentHelpCommand(child, agentHelpTestRepo, true)
+	if !strings.Contains(out, "read-only except: delete, explain") {
+		t.Errorf("text drill-down must state which subcommands write:\n%s", out)
+	}
+}
+
+// A --json consumer must get the same answer as a text reader (the repo's
+// agent-safe-fallback rule): top-level commands and the children of listed
+// groups carry an audience; anything the table makes no claim about omits the
+// field rather than asserting the user-owned default.
+func TestRenderAgentHelpJSON_CarriesAudienceWhereClassified(t *testing.T) {
+	t.Parallel()
+
+	root := NewRootCmd()
+	raw, err := renderAgentHelpJSON(root, root, agentHelpTestRepo, true)
+	if err != nil {
+		t.Fatalf("render top json: %v", err)
+	}
+	var top agentHelpJSON
+	if err := json.Unmarshal([]byte(raw), &top); err != nil {
+		t.Fatalf("unmarshal top json: %v", err)
+	}
+	seen := map[string]string{}
+	for _, sub := range top.Subcommands {
+		if sub.Audience == "" {
+			t.Errorf("top-level command %q has no audience in --json", sub.Name)
+		}
+		seen[sub.Name] = sub.Audience
+	}
+	if got := seen["enable"]; got != agentHelpUserOwnedSlug {
+		t.Errorf("enable audience = %q, want user-owned", got)
+	}
+	if got := seen["status"]; got != "read-only" {
+		t.Errorf("status audience = %q, want read-only", got)
+	}
+	if got := seen["review"]; got != agentHelpUserOwnedSlug {
+		t.Errorf("review audience = %q, want user-owned (paid multi-agent run)", got)
+	}
+
+	drill := drillJSON(t, root, "checkpoint")
+	want := map[string]string{
+		"list": "read-only", "explain": "task-driven", "search": "read-only",
+		"tokens": "read-only", "delete": agentHelpUserOwnedSlug,
+	}
+	for _, sub := range drill.Subcommands {
+		if w, ok := want[sub.Name]; ok && sub.Audience != w {
+			t.Errorf("checkpoint %s audience = %q, want %q", sub.Name, sub.Audience, w)
+		}
+	}
+
+	drill = drillJSON(t, root, "org")
+	for _, sub := range drill.Subcommands {
+		if sub.Audience != "" {
+			t.Errorf("unclassified subcommand org %s should omit audience, got %q", sub.Name, sub.Audience)
+		}
+	}
+}
+
+// drillJSON renders one command's --json drill-down for assertions.
+func drillJSON(t *testing.T, root *cobra.Command, name string) agentHelpJSON {
+	t.Helper()
+	child := agentHelpFindChild(root, name)
+	if child == nil {
+		t.Fatalf("%s command not found", name)
+	}
+	raw, err := renderAgentHelpJSON(root, child, agentHelpTestRepo, true)
+	if err != nil {
+		t.Fatalf("render %s drill json: %v", name, err)
+	}
+	var doc agentHelpJSON
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("unmarshal %s drill json: %v", name, err)
+	}
+	return doc
+}
+
+// wrapIndented keeps the footer index compact as the command set grows.
+func TestWrapIndented_WrapsAndIndents(t *testing.T) {
+	t.Parallel()
+
+	out := wrapIndented("alpha · beta · gamma · delta", "  ", 20)
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if !strings.HasPrefix(line, "  ") {
+			t.Errorf("line %q is not indented", line)
+		}
+		if len(line) > 20 {
+			t.Errorf("line %q exceeds width 20", line)
+		}
+	}
+	for _, name := range []string{"alpha", "beta", "gamma", "delta"} {
+		if !strings.Contains(out, name) {
+			t.Errorf("wrapping dropped %q:\n%s", name, out)
+		}
+	}
+}
+
+// `entire api` is an escape hatch, not a front-line command: it is the right
+// tool when developing against Entire's own APIs or when no first-class command
+// covers the need, and the wrong tool during ordinary work in a repo that has
+// Entire enabled. It stays discoverable (footer index, `entire help`) so an
+// agent that genuinely needs raw access finds it instead of hand-rolling curl
+// with a token, which is the failure the command exists to prevent.
+func TestAgentHelpAPI_IsUnlistedAndFramedAsLastResort(t *testing.T) {
+	t.Parallel()
+
+	if agentHelpFactsFor("api").listed {
+		t.Error("api must not be in the curated listing; it is an escape hatch")
+	}
+
+	root := NewRootCmd()
+	child := agentHelpFindChild(root, "api")
+	if child == nil {
+		t.Fatal("api command not found")
+	}
+	if !isAgentHelpAdvertised(child, true) {
+		t.Error("api must stay advertised so agents can drill into it")
+	}
+
+	out := renderAgentHelpCommand(child, agentHelpTestRepo, true)
+	for _, want := range []string{
+		"LAST RESORT",
+		"no first-class command covers",
+		"rather than hand-rolling curl",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("agent-facing api help missing %q:\n%s", want, out)
+		}
+	}
+
+	// The same fact has opposite value for a human, who typed `entire api --help`
+	// on purpose and does not need talking out of it. Guidance ships on the agent
+	// channel only; cobra's Long must stay a reference.
+	if strings.Contains(child.Long, "LAST RESORT") {
+		t.Errorf("agent guidance leaked into human help (cobra Long):\n%s", child.Long)
+	}
+	if strings.Contains(child.Short, "Escape hatch") {
+		t.Errorf("agent framing leaked into Short, which `entire help` shows: %q", child.Short)
+	}
+	// What IS true for both audiences stays in Long, where both see it.
+	if !strings.Contains(child.Long, "can change shape without notice") {
+		t.Errorf("human help should still carry the stability caveat:\n%s", child.Long)
+	}
+}
+
+// Guidance is agent-only by construction: nothing in agentHelpGuidance may be
+// duplicated into the command's cobra help, or humans get the lecture too.
+func TestAgentHelpGuidance_NeverLeaksIntoCobraHelp(t *testing.T) {
+	t.Parallel()
+
+	root := NewRootCmd()
+	for path, guidance := range agentHelpGuidance {
+		cmd := root
+		for _, name := range strings.Fields(path) {
+			cmd = agentHelpFindChild(cmd, name)
+			if cmd == nil {
+				t.Fatalf("agentHelpGuidance names unknown command %q", path)
+			}
+		}
+		// Compare on the first line, which is the distinctive part; whole-string
+		// equality would miss a partial paste.
+		firstLine := strings.SplitN(guidance, "\n", 2)[0]
+		if strings.Contains(cmd.Long, firstLine) || strings.Contains(cmd.Short, firstLine) {
+			t.Errorf("guidance for %q is duplicated into its cobra help; keep it agent-only", path)
+		}
+	}
+}
+
+// Group guidance reaches the leaves agents actually look up: `agent-help trail
+// finding list` must carry trail's network/keyring explanation, in text and JSON.
+func TestAgentHelpGuidance_InheritedByLeafCommands(t *testing.T) {
+	t.Parallel()
+
+	root := NewRootCmd()
+	leaf := root
+	for _, name := range []string{"trail", "finding", "list"} {
+		leaf = agentHelpFindChild(leaf, name)
+		if leaf == nil {
+			t.Fatalf("command %q not found", name)
+		}
+	}
+	trailFirstLine := strings.SplitN(agentHelpGuidance["trail"], "\n", 2)[0]
+
+	if got := agentHelpGuidanceFor(leaf); !strings.Contains(got, trailFirstLine) {
+		t.Errorf("guidance for %q = %q, want it to inherit trail's", agentHelpPath(leaf), got)
+	}
+	if text := renderAgentHelpCommand(leaf, "", true); !strings.Contains(text, trailFirstLine) {
+		t.Errorf("text agent-help for %q is missing trail's guidance:\n%s", agentHelpPath(leaf), text)
+	}
+	js, err := renderAgentHelpJSON(root, leaf, "", true)
+	if err != nil {
+		t.Fatalf("renderAgentHelpJSON: %v", err)
+	}
+	if !strings.Contains(js, strings.TrimSpace(trailFirstLine)) {
+		t.Errorf("JSON agent-help for %q is missing trail's guidance:\n%s", agentHelpPath(leaf), js)
+	}
+
+	// A leaf with its own guidance keeps it, after its ancestors'.
+	del := agentHelpFindChild(agentHelpFindChild(root, "checkpoint"), "delete")
+	if del == nil {
+		t.Fatal("checkpoint delete not found")
+	}
+	if got := agentHelpGuidanceFor(del); got != agentHelpGuidance["checkpoint delete"] {
+		t.Errorf("checkpoint delete guidance = %q, want only its own", got)
 	}
 }

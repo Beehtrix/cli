@@ -2,10 +2,51 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/entireio/cli/cmd/entire/cli/api"
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
+
+// TestTrailNativeForgeCoversBothEntryPoints ensures a native repo reaches the
+// repo-ID-addressed trail path whether it is named in --repo or inferred from
+// origin. The inferred path is the common one.
+//
+// Not parallel: chdirs into a temp repo.
+func TestTrailNativeForgeCoversBothEntryPoints(t *testing.T) {
+	t.Run("named in --repo", func(t *testing.T) {
+		forge, owner, repo, err := parseTrailRepoArg("et/paul/dogbark")
+		require.NoError(t, err)
+		require.Equal(t, []string{"et", "paul", "dogbark"}, []string{forge, owner, repo})
+	})
+
+	t.Run("inferred from a native origin remote", func(t *testing.T) {
+		dir := t.TempDir()
+		testutil.InitRepo(t, dir)
+		testutil.RunGit(t, dir, "remote", "add", "origin", "entire://aws-us-east-2.entire.io/et/paul/dogbark")
+		t.Chdir(dir)
+		forge, owner, repo, err := resolveTrailRemote(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, []string{"et", "paul", "dogbark"}, []string{forge, owner, repo})
+	})
+
+	t.Run("a mirror origin remote still resolves", func(t *testing.T) {
+		dir := t.TempDir()
+		testutil.InitRepo(t, dir)
+		testutil.RunGit(t, dir, "remote", "add", "origin", "https://github.com/entireio/cli.git")
+		t.Chdir(dir)
+		forge, owner, repo, err := resolveTrailRemote(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, "gh", forge)
+		require.Equal(t, "entireio", owner)
+		require.Equal(t, "cli", repo)
+	})
+}
 
 func TestParseTrailRepoArg(t *testing.T) {
 	t.Parallel()
@@ -32,6 +73,8 @@ func TestParseTrailRepoArg(t *testing.T) {
 		{name: "bare host instead of forge id", raw: "github.com/acme/app", wantErr: true},
 		{name: "bare unsupported forge host", raw: "gitlab.com/acme/app", wantErr: true},
 		{name: "unknown short forge id", raw: "zz/acme/app", wantErr: true},
+		{name: "native forge", raw: "et/paul/dogbark", wantForge: "et", wantOwner: "paul", wantRepo: "dogbark"},
+		{name: "native forge in a URL", raw: "entire://host/et/paul/dogbark", wantForge: "et", wantOwner: "paul", wantRepo: "dogbark"},
 	}
 
 	for _, tt := range tests {
@@ -69,6 +112,32 @@ func TestResolveTrailRepoOrRemote_OverrideSkipsGit(t *testing.T) {
 	}
 }
 
+func TestRunAuthenticatedTrailAPIRoutesByForgeQualifiedRepo(t *testing.T) {
+	// newTrailAPIClient is a package seam, so this test must not run in parallel.
+	previous := newTrailAPIClient
+	var gotForge, gotOwner, gotRepo string
+	newTrailAPIClient = func(_ context.Context, _ bool, forge, owner, repo string) (*api.Client, string, error) {
+		gotForge, gotOwner, gotRepo = forge, owner, repo
+		return api.NewClientWithBaseURL("token", "https://cell.example"), trailTestRepoID, nil
+	}
+	t.Cleanup(func() { newTrailAPIClient = previous })
+
+	called := false
+	err := runAuthenticatedTrailAPI(t.Context(), io.Discard, false, "entire://cell.example/et/acme/app", func(_ context.Context, _ *api.Client, repoID string) error {
+		called = true
+		if repoID != trailTestRepoID {
+			t.Fatalf("repoID=%q, want %s", repoID, trailTestRepoID)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called || strings.Join([]string{gotForge, gotOwner, gotRepo}, "/") != "et/acme/app" {
+		t.Fatalf("called=%v repo=(%q,%q,%q), want true and (et,acme,app)", called, gotForge, gotOwner, gotRepo)
+	}
+}
+
 func TestResolveTrailBranch_OverrideWins(t *testing.T) {
 	t.Parallel()
 	got, err := resolveTrailBranch(t.Context(), "my/feature")
@@ -85,7 +154,7 @@ func TestResolveTrailBranch_OverrideWins(t *testing.T) {
 // validation that fires before any auth/network/git access.
 func execTrailCmdExpectErr(t *testing.T, args ...string) error {
 	t.Helper()
-	cmd := newTrailCmd()
+	cmd := newTrailCmdForMode(true)
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
 	cmd.SetArgs(args)
@@ -98,7 +167,6 @@ func TestTrailRepoOverride_RejectedByLocalCommands(t *testing.T) {
 		name string
 		args []string
 	}{
-		{name: "create", args: []string{"create", "--repo", "gh/acme/app"}},
 		{name: "checkout", args: []string{"checkout", "--repo", "gh/acme/app"}},
 		{name: "finding apply", args: []string{"finding", "apply", "--repo", "gh/acme/app", "deadbeef"}},
 	}
@@ -113,17 +181,17 @@ func TestTrailRepoOverride_RejectedByLocalCommands(t *testing.T) {
 	}
 }
 
-func TestTrailSelectorAndBranchAreMutuallyExclusive(t *testing.T) {
+func TestTrailWorkingSelectorMustNameProjectIntent(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name    string
 		args    []string
 		wantSub string
 	}{
-		{name: "show", args: []string{"show", "123", "--branch", "foo"}, wantSub: "not both"},
-		{name: "watch", args: []string{"watch", "5", "--branch", "foo"}, wantSub: "not both"},
-		{name: "finding list positional", args: []string{"finding", "list", "123", "--branch", "foo"}, wantSub: "not both"},
-		{name: "finding list --trail", args: []string{"finding", "list", "--trail", "123", "--branch", "foo"}, wantSub: "not both"},
+		{name: "show", args: []string{"show", "feature/work", "--branch", "foo"}, wantSub: "project trail ID or number"},
+		{name: "watch", args: []string{"watch", "feature/work", "--branch", "foo"}, wantSub: "project trail ID or number"},
+		{name: "finding list positional", args: []string{"finding", "list", "feature/work", "--branch", "foo"}, wantSub: "project trail ID or number"},
+		{name: "finding list --trail", args: []string{"finding", "list", "--trail", "feature/work", "--branch", "foo"}, wantSub: "project trail ID or number"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -145,8 +213,8 @@ func TestTrailRepoRequiresExplicitTarget(t *testing.T) {
 	}{
 		{name: "show", args: []string{"show", "--repo", "gh/acme/app"}},
 		{name: "watch", args: []string{"watch", "--repo", "gh/acme/app"}},
-		{name: "update", args: []string{"update", "--repo", "gh/acme/app"}},
-		{name: "delete", args: []string{"delete", "--repo", "gh/acme/app"}},
+		{name: "update", args: []string{"update", "--title", "Intent", "--repo", "gh/acme/app"}},
+		{name: "unlink", args: []string{"unlink", "--repo", "gh/acme/app"}},
 		{name: "finding list", args: []string{"finding", "list", "--repo", "gh/acme/app"}},
 		{name: "approve", args: []string{"approve", "--repo", "gh/acme/app"}},
 		{name: "request-changes", args: []string{"request-changes", "--repo", "gh/acme/app", "-m", "why"}},

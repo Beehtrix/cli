@@ -4,18 +4,6 @@ package transcript
 
 import "encoding/json"
 
-// Message type constants for transcript lines.
-const (
-	TypeUser      = "user"
-	TypeAssistant = "assistant"
-)
-
-// Content type constants for content blocks within messages.
-const (
-	ContentTypeText    = "text"
-	ContentTypeToolUse = "tool_use"
-)
-
 // Line represents a single line in a Claude Code or Cursor JSONL transcript.
 // Claude Code uses "type" to distinguish user/assistant messages.
 // Cursor uses "role" for the same purpose.
@@ -55,6 +43,8 @@ type ToolInput struct {
 	Pattern      string `json:"pattern,omitempty"`
 	// Skill tool fields
 	Skill string `json:"skill,omitempty"`
+	// Task/Agent tool fields: the dispatched subagent's name.
+	SubagentType string `json:"subagent_type,omitempty"`
 	// WebFetch tool fields
 	URL    string `json:"url,omitempty"`
 	Prompt string `json:"prompt,omitempty"`
