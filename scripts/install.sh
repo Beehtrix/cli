@@ -83,7 +83,7 @@ detect_os() {
         mingw*|msys*|cygwin*)
             error "install.sh does not support Windows. Run this from PowerShell 5.1 or later:
 
-    irm https://entire.io/install.ps1 -UseBasicParsing | iex
+    irm https://entire.com/install.ps1 -UseBasicParsing | iex
 
   Or install the Entire CLI using Scoop:
 
@@ -342,7 +342,7 @@ main() {
             error "Could not determine the latest ${channel} version from any release origin.
   Tried: $(for o in $(release_origins); do printf '%s ' "$(origin_label "$o")"; done)
   Check your internet connection, or install a known version directly:
-    curl -fsSL https://entire.io/install.sh | bash -s -- --version X.Y.Z"
+    curl -fsSL https://entire.com/install.sh | bash -s -- --version X.Y.Z"
         fi
     fi
     # Strip leading 'v' if present

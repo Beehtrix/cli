@@ -62,8 +62,8 @@ Use the fully-qualified cask name (`entireio/tap/entire`, not `entire`). Homebre
 Or with the install script:
 
 ```bash
-curl -fsSL https://entire.io/install.sh | bash                          # stable
-# curl -fsSL https://entire.io/install.sh | bash -s -- --channel nightly  # or nightly
+curl -fsSL https://entire.com/install.sh | bash                          # stable
+# curl -fsSL https://entire.com/install.sh | bash -s -- --channel nightly  # or nightly
 ```
 
 ### Windows
@@ -71,9 +71,9 @@ curl -fsSL https://entire.io/install.sh | bash                          # stable
 Install with Windows PowerShell 5.1 or later:
 
 ```powershell
-irm https://entire.io/install.ps1 | iex  # stable
+irm https://entire.com/install.ps1 | iex  # stable
 # or nightly:
-# iex "& {$(irm https://entire.io/install.ps1)} -Channel nightly"
+# iex "& {$(irm https://entire.com/install.ps1)} -Channel nightly"
 ```
 
 For stable releases, the PowerShell installer uses Scoop when it is available,
@@ -138,10 +138,10 @@ How to use each channel:
 
 - Homebrew stable: `brew install --cask entireio/tap/entire`
 - Homebrew nightly: `brew install --cask entireio/tap/entire@nightly`
-- `install.sh` stable: `curl -fsSL https://entire.io/install.sh | bash`
-- `install.sh` nightly: `curl -fsSL https://entire.io/install.sh | bash -s -- --channel nightly`
-- `install.ps1` stable (uses Scoop when available): `irm https://entire.io/install.ps1 | iex`
-- `install.ps1` nightly: `iex "& {$(irm https://entire.io/install.ps1)} -Channel nightly"`
+- `install.sh` stable: `curl -fsSL https://entire.com/install.sh | bash`
+- `install.sh` nightly: `curl -fsSL https://entire.com/install.sh | bash -s -- --channel nightly`
+- `install.ps1` stable (uses Scoop when available): `irm https://entire.com/install.ps1 | iex`
+- `install.ps1` nightly: `iex "& {$(irm https://entire.com/install.ps1)} -Channel nightly"`
 - Scoop: currently supports `stable` only via `scoop install entire/entire`
 
 ### If GitHub is down
@@ -152,7 +152,7 @@ working through a GitHub outage. If you need to bypass version discovery
 entirely, pin a version or fetch the archive directly:
 
 ```bash
-curl -fsSL https://entire.io/install.sh | bash -s -- --version 0.10.0
+curl -fsSL https://entire.com/install.sh | bash -s -- --version 0.10.0
 curl -fsSL https://install.entire.com/v0.10.0/entire_darwin_arm64.tar.gz | tar -xz
 ```
 

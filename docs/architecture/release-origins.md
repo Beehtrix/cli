@@ -148,15 +148,31 @@ tag-triggered release presents `refs/tags/vX.Y.Z` and would be refused.
    suppression (controls `S3.2`, `S3.8`) in
    `infra/aws/entire-security/securityhub-org-config/` to the new bucket ARN, and
    note the bucket in the prod `account-baseline` unit as the nonprod one does.
-7. **Serve `install.sh` from Cloudflare.** Independent of the bucket, and the
-   single cheapest fix available: `infra/cloudflare/entire.io/redirect_rules.tf`
+7. **Serve the installers from Cloudflare, on the `entire.com` zone.**
+   Independent of the bucket, and the single cheapest fix available:
+   `infra/cloudflare/entire.io/redirect_rules.tf`
    currently 307s `entire.io/install.sh` to
    `raw.githubusercontent.com/entireio/cli/refs/heads/main/scripts/install.sh`.
    The install command on the marketing site, in the README, and in the CLI's own
    update prompt therefore fails at hop zero when GitHub is down. It is also a
    version-skew bug: users always run `main`'s installer, never the released one.
-   Serve the script from the zone instead — a Worker route or an object under
-   `install.entire.com` — and apply the same change to the `partial.to` twin.
+
+   Serve `/install.sh` and `/install.ps1` from the `entire.com` zone instead, and
+   apply the same change to the `partial.to` twin.
+
+   **The `entire.io` rules are not deleted.** They become permanent 307s to the
+   `entire.com` equivalents. The published one-liner self-heals — an old binary
+   prints the `.io` URL, that URL serves the installer, and the binary it installs
+   prints `.com` from then on — so the installed population converges after one
+   upgrade each. What never heals is everything with no upgrade path: third-party
+   Dockerfiles and CI configs that baked in the `.io` one-liner, the CHANGELOG
+   entry that published it, and docs we do not control. Those keep arriving
+   indefinitely, which is why the redirect is permanent rather than a deprecation
+   window.
+
+   Prefer a redirect over serving identical bytes at both hosts: the redirect is
+   what makes the residual `.io` traffic countable, which is the only way to tell
+   whether that tail is actually shrinking.
 
 ## Installing while GitHub is down
 
@@ -168,7 +184,7 @@ paths, for when it does not:
 curl -fsSL https://install.entire.com/v0.10.0/entire_darwin_arm64.tar.gz | tar -xz
 
 # Pin a version through the installer
-curl -fsSL https://entire.io/install.sh | bash -s -- --version 0.10.0
+curl -fsSL https://entire.com/install.sh | bash -s -- --version 0.10.0
 
 # From the Go module proxy, which caches independently of GitHub
 go install github.com/entireio/cli/cmd/entire@v0.10.0
