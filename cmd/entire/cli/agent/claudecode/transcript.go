@@ -85,9 +85,15 @@ func ExtractModifiedFiles(lines []TranscriptLine) []string {
 // Due to streaming, multiple transcript rows may share the same message.id.
 // We deduplicate by taking the row with the highest output_tokens for each message.id.
 func CalculateTokenUsage(transcript []TranscriptLine) *agent.TokenUsage {
-	// Map from message.id to the usage with highest output_tokens
 	usageByMessageID := make(map[string]messageUsage)
+	addUsageByMessageID(usageByMessageID, transcript)
+	return sumUsage(usageByMessageID)
+}
 
+// addUsageByMessageID adds each assistant message's usage in transcript to
+// usageByMessageID, keeping per message.id the row with the highest
+// output_tokens (the final streaming state).
+func addUsageByMessageID(usageByMessageID map[string]messageUsage, transcript []TranscriptLine) {
 	for _, line := range transcript {
 		if line.Type != envelopeTypeAssistant {
 			continue
@@ -102,14 +108,15 @@ func CalculateTokenUsage(transcript []TranscriptLine) *agent.TokenUsage {
 			continue
 		}
 
-		// Keep the entry with highest output_tokens (final streaming state)
 		existing, exists := usageByMessageID[msg.ID]
 		if !exists || msg.Usage.OutputTokens > existing.OutputTokens {
 			usageByMessageID[msg.ID] = msg.Usage
 		}
 	}
+}
 
-	// Sum up all unique messages
+// sumUsage totals usageByMessageID, one API call per message.id.
+func sumUsage(usageByMessageID map[string]messageUsage) *agent.TokenUsage {
 	usage := &agent.TokenUsage{
 		APICallCount: len(usageByMessageID),
 	}
@@ -119,23 +126,7 @@ func CalculateTokenUsage(transcript []TranscriptLine) *agent.TokenUsage {
 		usage.CacheReadTokens += u.CacheReadInputTokens
 		usage.OutputTokens += u.OutputTokens
 	}
-
 	return usage
-}
-
-// CalculateTokenUsageFromFile calculates token usage from a Claude Code transcript file.
-// If startLine > 0, only considers lines from startLine onwards.
-func CalculateTokenUsageFromFile(path string, startLine int) (*agent.TokenUsage, error) {
-	if path == "" {
-		return &agent.TokenUsage{}, nil
-	}
-
-	lines, err := transcript.ParseFromFileAtLine(path, startLine)
-	if err != nil {
-		return nil, err //nolint:wrapcheck // caller adds context
-	}
-
-	return CalculateTokenUsage(lines), nil
 }
 
 // ExtractSpawnedAgentIDs extracts agent IDs from Task tool results in a transcript.
@@ -487,23 +478,36 @@ func (c *ClaudeCodeAgent) CalculateTotalTokenUsage(transcriptData []byte, startL
 	// line 0 on every call, so mainUsage.SubagentTokens is a cumulative-since-
 	// session-start snapshot — see the CalculateTotalTokenUsage interface contract
 	// in cmd/entire/cli/agent for how callers must accumulate it.
-	if len(agentPaths) > 0 {
-		subagentUsage := &agent.TokenUsage{}
-		for _, agentPath := range agentPaths {
-			agentUsage, err := CalculateTokenUsageFromFile(agentPath, 0)
-			if err != nil {
-				// Agent transcript may not exist yet or may have been cleaned up
-				continue
-			}
-			subagentUsage.InputTokens += agentUsage.InputTokens
-			subagentUsage.CacheCreationTokens += agentUsage.CacheCreationTokens
-			subagentUsage.CacheReadTokens += agentUsage.CacheReadTokens
-			subagentUsage.OutputTokens += agentUsage.OutputTokens
-			subagentUsage.APICallCount += agentUsage.APICallCount
+	// A fork agent's transcript opens with a copy of the parent message that
+	// launched it (same message.id and usage), and every fork that message
+	// launched copies it; a fork of a subagent copies that subagent's history.
+	// Count each API call once: merge the subagents' usage by message.id, and
+	// drop the messages the parent's transcript holds, which are the parent's
+	// calls, not a subagent's.
+	subagentByMessageID := make(map[string]messageUsage)
+	for _, agentPath := range agentPaths {
+		lines, err := transcript.ParseFromFileAtLine(agentPath, 0)
+		if err != nil {
+			// Agent transcript may not exist yet or may have been cleaned up
+			continue
 		}
-		if subagentUsage.APICallCount > 0 {
-			mainUsage.SubagentTokens = subagentUsage
+		addUsageByMessageID(subagentByMessageID, lines)
+	}
+	// A fork cancelled before its first reply holds only the copied launch.
+	// Its zero is still a reading, not a missing one: callers keep the last
+	// snapshot when SubagentTokens is nil.
+	foundSubagentUsage := len(subagentByMessageID) > 0
+	for _, line := range fullParsed {
+		if len(subagentByMessageID) == 0 {
+			break
 		}
+		var msg messageWithUsage
+		if line.Type == envelopeTypeAssistant && json.Unmarshal(line.Message, &msg) == nil {
+			delete(subagentByMessageID, msg.ID)
+		}
+	}
+	if foundSubagentUsage {
+		mainUsage.SubagentTokens = sumUsage(subagentByMessageID)
 	}
 
 	return mainUsage, nil
