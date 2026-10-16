@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -714,6 +715,53 @@ func TestFetchLatestForChannel_FallsBackWhenManifestIsUnusable(t *testing.T) {
 	}
 	if version != testStableVersion {
 		t.Errorf("fetchLatestForChannel() = %q, want %q from the fallback origin", version, testStableVersion)
+	}
+}
+
+func TestFetchLatestForChannel_HangingPrimaryStillReachesFallback(t *testing.T) {
+	// The failure the second origin exists for: a primary that accepts the
+	// connection and never answers. If it could consume the whole chain budget
+	// the fallback would never be tried, and the update check would be worse
+	// off than before the primary existed.
+	blocked := make(chan struct{})
+	t.Cleanup(func() { close(blocked) })
+	hung := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-blocked:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(hung.Close)
+	useChannelOrigin(t, hung.URL)
+
+	githubServer := newVersionServer(t, testStableVersion)
+	origURL := githubAPIURL
+	githubAPIURL = githubServer.URL
+	t.Cleanup(func() { githubAPIURL = origURL })
+
+	started := time.Now()
+	version, err := fetchLatestForChannel(context.Background(), false)
+	elapsed := time.Since(started)
+
+	if err != nil {
+		t.Fatalf("fetchLatestForChannel() error = %v (after %s)", err, elapsed)
+	}
+	if version != testStableVersion {
+		t.Errorf("fetchLatestForChannel() = %q, want %q from the fallback", version, testStableVersion)
+	}
+	if elapsed > httpTimeout {
+		t.Errorf("took %s, which exceeds the whole-chain budget of %s", elapsed, httpTimeout)
+	}
+}
+
+func TestFetchLatestForChannel_CancelledContextReportsCancellation(t *testing.T) {
+	useGitHubOriginOnly(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := fetchLatestForChannel(ctx, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want it to report the cancellation rather than an empty chain", err)
 	}
 }
 

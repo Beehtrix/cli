@@ -57,11 +57,12 @@ const (
 	// origin costs no extra worst-case latency on this path, which runs
 	// synchronously after every command (see root.go's PersistentPostRun).
 	//
-	// The trade-off that buys: an origin which hangs for the full budget
-	// starves the next candidate. That is the right way round. The realistic
-	// failure for our own origin — DNS miss, refused connection, 404, TLS
-	// error — fails fast and leaves nearly the whole budget for GitHub, while
-	// a hang degrades to exactly today's behaviour: silent, retry tomorrow.
+	// fetchLatestForChannel divides this budget between the candidates rather
+	// than handing the whole of it to the first one, so a primary that hangs
+	// cannot starve the fallback. An earlier version of this comment claimed a
+	// hang "degrades to exactly today's behaviour"; it does not. Before this
+	// origin existed the check reached GitHub and worked, so a blackholed
+	// primary consuming the budget would have been a regression, not a no-op.
 	httpTimeout = 2 * time.Second
 
 	// cacheFileName is the name of the cache file stored in the global config directory.

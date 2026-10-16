@@ -194,15 +194,36 @@ func fetchLatestForChannel(ctx context.Context, nightly bool) (string, error) {
 	client := httpclient.New(httpclient.Options{Transport: httpclient.NewTransport(false)})
 	defer client.CloseIdleConnections()
 
+	// Each candidate gets an equal share of whatever is left, so a primary that
+	// hangs cannot consume the whole budget and starve the fallback. That is
+	// not a per-origin timeout multiplied into a ceiling that never binds: the
+	// shares divide one absolute deadline, so the chain still cannot exceed
+	// httpTimeout. Without it a silently dropped primary — a firewall that
+	// blackholes rather than refuses — takes the update check down for good,
+	// which is strictly worse than before this origin existed.
+	deadline, hasDeadline := ctx.Deadline()
+
 	var firstErr error
-	for i, origin := range versionOrigins() {
+	origins := versionOrigins()
+	for i, origin := range origins {
 		if ctx.Err() != nil {
 			// The budget is spent. Stop rather than issuing a request that
 			// can only fail, so the error we report is the one that matters.
 			break
 		}
 
-		version, err := origin.fetch(ctx, client, nightly)
+		attemptCtx := ctx
+		cancelAttempt := context.CancelFunc(func() {})
+		if hasDeadline {
+			share := time.Until(deadline) / time.Duration(len(origins)-i)
+			if share <= 0 {
+				break
+			}
+			attemptCtx, cancelAttempt = context.WithTimeout(ctx, share)
+		}
+
+		version, err := origin.fetch(attemptCtx, client, nightly)
+		cancelAttempt()
 		if err == nil {
 			if i > 0 {
 				// Which candidate actually answered. Without this a silently
@@ -221,6 +242,12 @@ func fetchLatestForChannel(ctx context.Context, nightly bool) (string, error) {
 	}
 
 	if firstErr == nil {
+		// Nothing was tried. Distinguish "the caller's context was already
+		// done" from "the chain is empty" — reporting the latter for the
+		// former sends anyone reading a debug log after the wrong thing.
+		if err := ctx.Err(); err != nil {
+			return "", fmt.Errorf("version check budget: %w", err)
+		}
 		return "", errors.New("no version origins configured")
 	}
 	return "", firstErr

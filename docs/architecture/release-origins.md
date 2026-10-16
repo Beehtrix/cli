@@ -69,8 +69,12 @@ on every release and get `max-age=60`.
   whether it worked.
 - **`cmd/entire/cli/versioncheck`** — `versionOrigins` is the ordered chain,
   `fetchLatestForChannel` walks it. `httpTimeout` (2s) bounds the *whole* chain,
-  not each origin, so adding an origin costs no extra worst-case latency on a
-  path that runs synchronously after every command.
+  so adding an origin costs no extra worst-case latency on a path that runs
+  synchronously after every command. Each candidate gets an equal share of
+  what is left, so a primary that hangs cannot swallow the budget and starve
+  the fallback — a firewall that blackholes rather than refuses would otherwise
+  take update checks down for good, which is worse than not having the second
+  origin at all.
 - **Homebrew cask and the Scoop manifest** — still point at GitHub. See
   "Remaining work".
 
