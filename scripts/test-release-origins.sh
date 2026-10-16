@@ -256,7 +256,18 @@ echo "$*" >> "$AWS_STUB_ROOT/calls.log"
 src="$3"; dst="$4"
 s3path() { printf '%s/%s' "$AWS_STUB_ROOT" "${1#s3://}"; }
 if [ "${src#s3://}" != "$src" ]; then
-    f="$(s3path "$src")"; [ -f "$f" ] || exit 1; cat "$f"; exit 0
+    # AWS_STUB_READ_ERROR simulates a non-404 read failure (permission denied,
+    # throttling) so the publisher's fail-closed branch is reachable in tests.
+    if [ -n "${AWS_STUB_READ_ERROR:-}" ]; then
+        echo "fatal error: An error occurred (AccessDenied) when calling the HeadObject operation: Forbidden" >&2
+        exit 1
+    fi
+    f="$(s3path "$src")"
+    if [ ! -f "$f" ]; then
+        echo "fatal error: An error occurred (404) when calling the HeadObject operation: Not Found" >&2
+        exit 1
+    fi
+    cat "$f"; exit 0
 fi
 f="$(s3path "$dst")"; mkdir -p "$(dirname "$f")"; cp "$src" "$f"
 AWS
@@ -324,6 +335,25 @@ publish --tag not-a-version --bucket b >/dev/null 2>&1; rc=$?
 expect "rejects a tag that is not semver" eq "$rc" 1
 publish --bucket b >/dev/null 2>&1; rc=$?
 expect "requires --tag" eq "$rc" 1
+
+# The monotonic guard must fail closed: a pointer it could not read cannot be
+# proven to be behind the version being published.
+fresh readerr
+seed stable 9.9.9
+out="$(AWS_STUB_READ_ERROR=1 publish --tag v1.0.0 --bucket b; printf 'rc=%s' "$?")"
+expect "a non-404 read error refuses to publish" contains "$out" "rc=2"
+expect "the refusal says the move cannot be proven forward" contains "$out" "cannot be proven to move it forward"
+expect "the pointer is untouched after a read error" eq "$(pointer stable)" "9.9.9"
+refute "a read error does not fall through to a backwards publish" contains "$out" "Refusing to move"
+
+# A manifest that exists but names no version is not an empty channel.
+fresh unparseable
+mkdir -p "$AWS_STUB_ROOT/b/channels"
+printf '{"channel":"stable"}\n' > "$AWS_STUB_ROOT/b/channels/stable.json"
+out="$(publish --tag v1.0.0 --bucket b; printf 'rc=%s' "$?")"
+expect "an unparseable pointer refuses to publish" contains "$out" "rc=2"
+expect "the refusal names the object to inspect" contains "$out" "names no version"
+
 
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

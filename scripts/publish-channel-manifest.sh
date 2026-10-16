@@ -123,13 +123,45 @@ PY
 # Monotonic guard. release.yml can be dispatched with any version string, so
 # without this a re-run of an old tag would quietly point every fresh install
 # and every update prompt at a version we already moved past.
+#
+# This guard fails CLOSED, which is deliberately the opposite of the read
+# chains in versioncheck and install.sh. There an unreachable origin advances
+# to the next candidate, because the caller still needs an answer and a wrong
+# "you are up to date" is the worse outcome. Here the only question is "can I
+# prove this move is forward", and a pointer we could not read cannot prove
+# it. So only a definite not-found counts as "nothing to move past";
+# permission denied, throttling and network errors abort, because treating
+# them as absence is what lets a re-dispatch during a transient S3 error
+# regress the channel for every install and update check.
 CURRENT=""
-if CURRENT_JSON="$(aws s3 cp "$S3_URI" - --region "$REGION" 2>/dev/null)"; then
+READ_ERR="$(mktemp)"
+if CURRENT_JSON="$(aws s3 cp "$S3_URI" - --region "$REGION" 2>"$READ_ERR")"; then
+    # `|| true` so a manifest without a "version" key reaches the explicit
+    # check below with an empty CURRENT, instead of grep's exit status
+    # tripping `set -e` and aborting with a bare status and no explanation.
     CURRENT="$(printf '%s' "$CURRENT_JSON" \
         | grep '"version"' \
         | sed -E 's/.*"version": *"v?([^"]+)".*/\1/' \
-        | head -n 1)"
+        | head -n 1 || true)"
+    if [[ -z "$CURRENT" ]]; then
+        # A pointer that exists but names no version is not an empty channel:
+        # something published a manifest we cannot parse, and overwriting it
+        # unchecked would move the channel by an unknown amount.
+        rm -f "$READ_ERR"
+        printf 'channels/%s.json exists but names no version. Refusing to publish over a pointer that cannot be read; inspect %s by hand.\n' \
+            "$CHANNEL" "$S3_URI" >&2
+        exit 2
+    fi
+elif grep -qiE '404|not found|nosuchkey|does not exist' "$READ_ERR"; then
+    : # No pointer yet: this is the first publish on this channel.
+else
+    printf 'Could not read the current %s pointer, so this publish cannot be proven to move it forward. Refusing.\n' \
+        "$CHANNEL" >&2
+    sed 's/^/  /' "$READ_ERR" >&2
+    rm -f "$READ_ERR"
+    exit 2
 fi
+rm -f "$READ_ERR"
 
 if [[ -n "$CURRENT" ]]; then
     if [[ "$CURRENT" == "$VERSION" ]]; then
