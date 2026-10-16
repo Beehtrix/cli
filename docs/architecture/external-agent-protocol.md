@@ -344,7 +344,7 @@ Required when `capabilities.compact_transcript` is `true`.
 Converts a native transcript into Entire Transcript Format (the `transcript.jsonl` stored next to `full.jsonl` in each checkpoint).
 
 **Arguments:**
-- `--session-ref` — Path to a transcript file in the agent's native format
+- `--session-ref` — Path to a transcript file in the agent's native format. It may be a CLI temp file outside the agent's session store, so accept any regular file here.
 
 **Output (stdout):** JSON
 
