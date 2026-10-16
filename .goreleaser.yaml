@@ -21,6 +21,13 @@ builds:
     goarch:
       - amd64
       - arm64
+    # Pin the binary mtime to the commit so rebuilding a tag produces identical
+    # bytes. Without it the archives carry build-time mtimes, so a retried
+    # release re-uploads different bytes — and different checksums — to
+    # v<version>/ URLs that are cached immutable for a year. An edge holding the
+    # old archive beside the new checksums.txt makes install.sh abort, because a
+    # checksum mismatch deliberately does not fall back.
+    mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
       - -s -w
       - -X github.com/entireio/cli/cmd/entire/cli/versioninfo.Version={{.Version}}
@@ -49,6 +56,13 @@ builds:
     goarch:
       - amd64
       - arm64
+    # Pin the binary mtime to the commit so rebuilding a tag produces identical
+    # bytes. Without it the archives carry build-time mtimes, so a retried
+    # release re-uploads different bytes — and different checksums — to
+    # v<version>/ URLs that are cached immutable for a year. An edge holding the
+    # old archive beside the new checksums.txt makes install.sh abort, because a
+    # checksum mismatch deliberately does not fall back.
+    mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
       - -s -w
       - -X github.com/entireio/cli/cmd/entire/cli/versioninfo.Version={{.Version}}
