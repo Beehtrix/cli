@@ -45,9 +45,11 @@ The archive includes:
 Redaction:
   By default the bundle redacts known secrets (API keys, credentialed URIs,
   database connection strings, bounded KEY=value credentials) from log files,
-  settings JSON, and git command output before zipping. Pass --raw to skip
-  redaction; use it only when support has explicitly requested an unredacted
-  bundle.
+  settings JSON, and git command output before zipping, plus your own rules:
+  redaction.custom_redactions, packs in .entire/redactors/, and PII detection
+  when enabled. If any of those rules cannot be loaded, the bundle is not
+  written. Pass --raw to skip all redaction; use it only when support has
+  explicitly requested an unredacted bundle.
 
 By default the archive is written to a path inside the OS temp directory and
 that path is printed to stdout. Use --out to choose a specific path.`,
@@ -77,7 +79,7 @@ that path is printed to stdout. Use --out to choose a specific path.`,
 				// packs fail to load; a bundle must not, or it ships content
 				// the user's own rules were written to catch.
 				if err := strategy.RedactionRulesUnloaded(); err != nil {
-					return fmt.Errorf("custom redaction rules could not be loaded, refusing to write a bundle without them: %w (fix the error, or pass --raw only if support asked for an unredacted bundle)", err)
+					return fmt.Errorf("refusing to write a bundle without your custom redaction rules: %w; fix it and rerun (--raw skips ALL redaction, built-in included)", err)
 				}
 			}
 

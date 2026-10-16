@@ -409,7 +409,7 @@ func TestDoctorBundle_RefusesWhenCustomRulesFailToLoad(t *testing.T) {
 
 	outZip := filepath.Join(t.TempDir(), "bundle.zip")
 	err := run("bundle", "--out", outZip)
-	if err == nil || !strings.Contains(err.Error(), "custom redaction rules could not be loaded") {
+	if err == nil || !strings.Contains(err.Error(), "refusing to write a bundle without your custom redaction rules") {
 		t.Fatalf("redacted bundle must refuse when settings fail to load, got: %v", err)
 	}
 	if _, statErr := os.Stat(outZip); !os.IsNotExist(statErr) {
@@ -417,5 +417,74 @@ func TestDoctorBundle_RefusesWhenCustomRulesFailToLoad(t *testing.T) {
 	}
 	if err := run("bundle", "--raw", "--out", outZip); err != nil {
 		t.Errorf("doctor bundle --raw must still work: %v", err)
+	}
+}
+
+// runDoctorInRepo runs a doctor subcommand through the doctor parent in a
+// fresh repo whose .entire holds files, resetting the process-wide redaction
+// Once around it.
+func runDoctorInRepo(t *testing.T, files map[string]string, args ...string) error {
+	t.Helper()
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	testutil.WriteFile(t, dir, "f.txt", "init")
+	testutil.GitAdd(t, dir, "f.txt")
+	testutil.GitCommit(t, dir, "init")
+	for name, content := range files {
+		testutil.WriteFile(t, dir, name, content)
+	}
+	t.Chdir(dir)
+	paths.ClearWorktreeRootCache()
+	strategy.ResetRedactionConfiguredForTest()
+	t.Cleanup(strategy.ResetRedactionConfiguredForTest)
+
+	cmd := newDoctorCmd()
+	var out strings.Builder
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs(args)
+	cmd.SetContext(context.Background())
+	return cmd.Execute()
+}
+
+// A rule the user wrote that silently does not apply is the original leak, so
+// a skipped pack file or an inline regex that fails to compile must stop a
+// redacted bundle too. Settings that fail to load without declaring redaction
+// (e.g. an unknown key from a newer CLI) hold no such rules: the bundle falls
+// back to the built-ins rather than pushing the user to --raw.
+func TestDoctorBundle_RefusesOnlyWhenUserRulesMayBeMissing(t *testing.T) {
+	// Cannot use t.Parallel(): t.Chdir and the process-wide redaction Once.
+	for _, tc := range []struct {
+		name    string
+		files   map[string]string
+		refuses bool
+	}{
+		{
+			name:    "invalid pack file",
+			files:   map[string]string{".entire/redactors/acme.yaml": "name: acme\nrules:\n - id: x\n  regex: 'ACME_[A-Z]{6}'\n"},
+			refuses: true,
+		},
+		{
+			name:    "inline rule that fails to compile",
+			files:   map[string]string{".entire/settings.json": `{"enabled": true, "redaction": {"custom_redactions": {"broken": "INLINE_[A-Z0-9"}}}`},
+			refuses: true,
+		},
+		{
+			name:    "unknown settings key without redaction",
+			files:   map[string]string{".entire/settings.json": `{"enabled": true, "future_feature": true}`},
+			refuses: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outZip := filepath.Join(t.TempDir(), "bundle.zip")
+			err := runDoctorInRepo(t, tc.files, "bundle", "--out", outZip)
+			refused := err != nil && strings.Contains(err.Error(), "refusing to write a bundle without your custom redaction rules")
+			if refused != tc.refuses {
+				t.Fatalf("refused = %v, want %v (err: %v)", refused, tc.refuses, err)
+			}
+			if !tc.refuses && err != nil {
+				t.Fatalf("bundle should fall back to built-in redaction: %v", err)
+			}
+		})
 	}
 }
