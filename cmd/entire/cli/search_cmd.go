@@ -1002,13 +1002,12 @@ func isASCII(s string) bool {
 	return true
 }
 
-// paginateSearchResults slices results for the requested client-side page,
-// normalizing limit and page, and returns the page slice (never nil) plus the
-// normalized pagination values.
 // semanticFetchLimit is how many results one semantic search asks the server
 // for. Interactive output fetches DefaultLimit (the web UI's page) and pages
 // locally. Non-interactive output needs only the requested window, page x
-// limit, capped at DefaultLimit so a deep page never asks for more than the
+// limit, plus one row: without it a full window is indistinguishable from the
+// last page, and total_pages tells agents there is nothing more to fetch.
+// Capped at DefaultLimit so a deep page never asks for more than the
 // interactive path does; the zero-value defaults mirror paginateSearchResults.
 func semanticFetchLimit(limit, page int, nonInteractive bool) int {
 	if !nonInteractive {
@@ -1023,9 +1022,13 @@ func semanticFetchLimit(limit, page int, nonInteractive bool) int {
 	if page > search.DefaultLimit/limit {
 		return search.DefaultLimit
 	}
-	return page * limit
+	return min(page*limit+1, search.DefaultLimit)
 }
 
+// paginateSearchResults slices results for the requested client-side page,
+// normalizing limit and page, and returns the page slice (never nil) plus the
+// normalized pagination values. total counts the fetched rows, so it is a
+// lower bound whenever the fetch was capped.
 func paginateSearchResults(results []search.Result, limit, page int) (pageResults []search.Result, total, totalPages, normLimit, normPage int) {
 	if limit <= 0 {
 		limit = resultsPerPage

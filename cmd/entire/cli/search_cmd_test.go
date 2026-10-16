@@ -1145,6 +1145,22 @@ func TestMergeSearchResults_AllCellsFail(t *testing.T) {
 // locally; JSON and piped output fetch only the requested window, capped at
 // that same page, so an agent's default search costs the query pod a third of
 // what it used to (entire-search trail 208).
+func TestSemanticFetchWindowStillSignalsANextPage(t *testing.T) {
+	t.Parallel()
+
+	matches := make([]search.Result, 100)
+	fetched := matches[:semanticFetchLimit(10, 1, true)]
+	_, total, totalPages, _, _ := paginateSearchResults(fetched, 10, 1)
+	if totalPages < 2 {
+		t.Fatalf("page 1 of a 100-match search reported total_pages=%d (total=%d); agents would stop paging", totalPages, total)
+	}
+
+	last := matches[:7]
+	if _, _, totalPages, _, _ := paginateSearchResults(last, 10, 1); totalPages != 1 {
+		t.Fatalf("a 7-match search reported total_pages=%d, want 1", totalPages)
+	}
+}
+
 func TestSemanticFetchLimit(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -1154,12 +1170,13 @@ func TestSemanticFetchLimit(t *testing.T) {
 	}{
 		{"tui always fetches the full page", 10, 1, false, search.DefaultLimit},
 		{"tui ignores a deep page", 10, 7, false, search.DefaultLimit},
-		{"json default window", 0, 0, true, resultsPerPage},
-		{"json explicit limit", 25, 1, true, 25},
-		{"json page 2 of 10", 10, 2, true, 20},
+		{"json default window", 0, 0, true, resultsPerPage + 1},
+		{"json explicit limit", 25, 1, true, 26},
+		{"json page 2 of 10", 10, 2, true, 21},
 		{"json window at the cap", 50, 2, true, search.DefaultLimit},
 		{"json window past the cap", 50, 3, true, search.DefaultLimit},
 		{"json limit above the cap", 500, 1, true, search.DefaultLimit},
+		{"json uneven window keeps its extra row", 34, 2, true, 69},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
