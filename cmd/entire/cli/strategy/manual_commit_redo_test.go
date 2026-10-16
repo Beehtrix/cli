@@ -747,3 +747,23 @@ func TestRedo_AbortedCommitMarkerIsNotReused(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, state.FilesTouched, "f1.txt", "f1.txt was never committed; it is still the session's pending work")
 }
+
+// The cleanup after a redo settles held files only. Other touched files are
+// left exactly as they were, even ones the carry-forward check would prune on
+// its own (a path that exists nowhere): that is the next condensation's call.
+func TestRedo_PureRedoLeavesOtherTouchedFilesAlone(t *testing.T) {
+	dir := redoFixture(t)
+	testutil.RunGit(t, dir, "reset", "-q", "HEAD~2")
+	s := NewManualCommitStrategy()
+	seedTurnEndSession(t, s, dir, "sess-redid", session.PhaseEnded, "f1.txt")
+	state, err := s.loadSessionState(context.Background(), "sess-redid")
+	require.NoError(t, err)
+	state.FilesTouched = append(state.FilesTouched, "never-created.txt")
+	require.NoError(t, s.saveSessionState(context.Background(), state))
+	testutil.GitAdd(t, dir, "f1.txt")
+
+	require.Equal(t, []string{redoCheckpointOne}, commitThroughHooks(t, dir, s, "feat: part one (logical)\n"))
+	state, err = s.loadSessionState(context.Background(), "sess-redid")
+	require.NoError(t, err)
+	require.Equal(t, []string{"never-created.txt"}, state.FilesTouched)
+}

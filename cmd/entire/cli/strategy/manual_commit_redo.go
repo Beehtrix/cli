@@ -218,16 +218,27 @@ func (s *ManualCommitStrategy) reconcileRedoneFiles(ctx context.Context, repo *g
 			continue
 		}
 		mutErr := MutateSessionState(ctx, sess.SessionID, func(state *SessionState) error {
+			// Only held files go through the carry-forward check; every other
+			// touched file keeps its place untouched (the check would also
+			// prune unrelated paths, which is a condensation's call).
+			var held []string
 			committed := make(map[string]struct{})
 			for _, f := range state.FilesTouched {
 				if redone[f] {
+					held = append(held, f)
 					committed[f] = struct{}{}
 				}
 			}
-			if len(committed) == 0 {
+			if len(held) == 0 {
 				return ErrMutationSkip
 			}
-			remaining := filesWithRemainingAgentChanges(ctx, repo, state.TouchedFileHashes, commit, state.FilesTouched, committed)
+			stillPending := make(map[string]bool)
+			for _, f := range filesWithRemainingAgentChanges(ctx, repo, state.TouchedFileHashes, commit, held, committed) {
+				stillPending[f] = true
+			}
+			remaining := slices.DeleteFunc(slices.Clone(state.FilesTouched), func(f string) bool {
+				return redone[f] && !stillPending[f]
+			})
 			if len(remaining) == len(state.FilesTouched) {
 				return ErrMutationSkip
 			}
