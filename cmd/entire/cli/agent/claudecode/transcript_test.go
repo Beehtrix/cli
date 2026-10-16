@@ -1074,6 +1074,27 @@ func TestCalculateTotalTokenUsage_SameWorkflowAgentInTwoRunsCountsOnce(t *testin
 	assert.Equal(t, 1, usage.SubagentTokens.APICallCount)
 }
 
+// A fork cancelled before its first reply holds only the copied launch: its
+// subagent usage is a zero reading, not a missing one (nil keeps the last).
+func TestCalculateTotalTokenUsage_LaunchOnlyForkIsZeroNotNil(t *testing.T) {
+	t.Parallel()
+
+	const launch = `{"type":"assistant","message":{"id":"m-launch","usage":{"input_tokens":5,"cache_read_input_tokens":1000,"output_tokens":50}}}`
+	subagentsDir := filepath.Join(t.TempDir(), "sess", "subagents")
+	require.NoError(t, os.MkdirAll(subagentsDir, 0o755))
+	writeJSONLFile(t, filepath.Join(subagentsDir, "agent-aforka0000000001.jsonl"), launch)
+	data := buildJSONL(
+		launch,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":[{"type":"text","text":"Async agent launched successfully.\nagentId: aforka0000000001 (internal ID)"}]}]}}`,
+	)
+
+	usage, err := (&ClaudeCodeAgent{}).CalculateTotalTokenUsage(data, 0, subagentsDir)
+	require.NoError(t, err)
+	assert.Equal(t, 1, usage.APICallCount)
+	require.NotNil(t, usage.SubagentTokens)
+	assert.Equal(t, agent.TokenUsage{}, *usage.SubagentTokens)
+}
+
 // A fork agent's transcript opens with a copy of the parent message that
 // launched it (same message id and usage), and every fork launched by that
 // message copies it; a fork of a subagent copies that subagent's history too.

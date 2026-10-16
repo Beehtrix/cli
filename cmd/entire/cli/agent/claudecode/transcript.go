@@ -493,6 +493,10 @@ func (c *ClaudeCodeAgent) CalculateTotalTokenUsage(transcriptData []byte, startL
 		}
 		addUsageByMessageID(subagentByMessageID, lines)
 	}
+	// A fork cancelled before its first reply holds only the copied launch.
+	// Its zero is still a reading, not a missing one: callers keep the last
+	// snapshot when SubagentTokens is nil.
+	foundSubagentUsage := len(subagentByMessageID) > 0
 	for _, line := range fullParsed {
 		if len(subagentByMessageID) == 0 {
 			break
@@ -502,7 +506,7 @@ func (c *ClaudeCodeAgent) CalculateTotalTokenUsage(transcriptData []byte, startL
 			delete(subagentByMessageID, msg.ID)
 		}
 	}
-	if len(subagentByMessageID) > 0 {
+	if foundSubagentUsage {
 		mainUsage.SubagentTokens = sumUsage(subagentByMessageID)
 	}
 
