@@ -13,6 +13,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
 	"github.com/entireio/cli/cmd/entire/cli/validation"
+	transcriptlib "github.com/entireio/cli/transcript"
 )
 
 // TranscriptLine is an alias to the shared transcript.Line type.
@@ -213,7 +214,7 @@ func toolResultAgentIDs(transcriptData []byte) (agentIDs map[string]string, name
 		}
 		// ValidateAgentID allows "" (an optional field elsewhere); here an
 		// empty ID names no agent.
-		if json.Unmarshal(line, &entry) != nil || entry.Type != transcript.TypeUser ||
+		if json.Unmarshal(line, &entry) != nil || entry.Type != transcriptlib.TypeUser ||
 			entry.ToolUseResult.AgentID == "" || validation.ValidateAgentID(entry.ToolUseResult.AgentID) != nil {
 			continue
 		}
@@ -278,7 +279,7 @@ func workflowRunIDsFromToolUseResults(transcriptData []byte) []string {
 				RunID    string `json:"runId"`
 			} `json:"toolUseResult"`
 		}
-		if json.Unmarshal(line, &entry) != nil || entry.Type != transcript.TypeUser || entry.ToolUseResult.TaskType != "local_workflow" {
+		if json.Unmarshal(line, &entry) != nil || entry.Type != transcriptlib.TypeUser || entry.ToolUseResult.TaskType != "local_workflow" {
 			continue
 		}
 		runIDs = appendWorkflowRunID(runIDs, entry.ToolUseResult.RunID)
@@ -390,7 +391,7 @@ func (c *ClaudeCodeAgent) ExtractSkillEvents(transcriptData []byte, startLine in
 		return nil, nil
 	}
 
-	sliced := transcript.SliceFromLine(transcriptData, startLine)
+	sliced := transcriptlib.SliceFromLine(transcriptData, startLine)
 	parsed, err := transcript.ParseFromBytes(sliced)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse transcript: %w", err)
@@ -408,7 +409,7 @@ func (c *ClaudeCodeAgent) ExtractSkillEvents(transcriptData []byte, startLine in
 		}
 
 		for _, block := range msg.Content {
-			if block.Type != transcript.ContentTypeToolUse || block.Name != "Skill" {
+			if block.Type != transcriptlib.ContentTypeToolUse || block.Name != "Skill" {
 				continue
 			}
 			var input toolInput
@@ -477,7 +478,7 @@ func (c *ClaudeCodeAgent) CalculateTotalTokenUsage(transcriptData []byte, startL
 	}
 
 	// Slice to the relevant portion and parse
-	sliced := transcript.SliceFromLine(transcriptData, startLine)
+	sliced := transcriptlib.SliceFromLine(transcriptData, startLine)
 	parsed, err := transcript.ParseFromBytes(sliced)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse transcript: %w", err)
@@ -583,7 +584,7 @@ func (c *ClaudeCodeAgent) ExtractAllModifiedFiles(transcriptData []byte, startLi
 	}
 
 	// Slice to the relevant portion and parse
-	sliced := transcript.SliceFromLine(transcriptData, startLine)
+	sliced := transcriptlib.SliceFromLine(transcriptData, startLine)
 	parsed, err := transcript.ParseFromBytes(sliced)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse transcript: %w", err)
