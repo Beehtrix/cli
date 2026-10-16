@@ -310,7 +310,7 @@ func TestJSONLContent_SkippedFieldValueCollision(t *testing.T) {
 
 func TestJSONLContent_CredentialIdentifierKeysStayScanned(t *testing.T) {
 	t.Parallel()
-	input := `{"aws_access_key_id":"AKIAIOSFODNN7EXAMPLE","api_token_id":"correct-horse-battery","AccessKeyId":"AKIAIOSFODNN7EXAMPLE","apiTokenId":"correct-horse-battery","session_id":"ses_37273a1fdffegpYbwUTqEkPsQ0","tenantId":"tenant-123","auth_id":"auth-123","cred_id":"cred-123","cert_id":"cert-123","credential_id":"credential-123"}`
+	input := `{"aws_access_key_id":"` + awsDocsKeyFixture + `","api_token_id":"correct-horse-battery","AccessKeyId":"` + awsDocsKeyFixture + `","apiTokenId":"correct-horse-battery","session_id":"ses_37273a1fdffegpYbwUTqEkPsQ0","tenantId":"tenant-123","auth_id":"auth-123","cred_id":"cred-123","cert_id":"cert-123","credential_id":"credential-123"}`
 
 	result, err := JSONLContent(input)
 	if err != nil {
@@ -408,6 +408,14 @@ func TestString_PatternDetection(t *testing.T) {
 // AWS rule stays genuinely exercised — the "key=REDACTED" cases below fail if
 // it ever stops matching. Do not re-inline it.
 const awsKeyFixture = "AKIAYRWQG5" + "EJLPZLBYNP"
+
+// awsDocsKeyFixture is AWS's canonical documentation example key, and
+// awsRealisticKeyFixture a mixed-alphabet one; both are assembled for the
+// same reason as awsKeyFixture.
+const (
+	awsDocsKeyFixture      = "AKIAIOSFODNN7" + "EXAMPLE"
+	awsRealisticKeyFixture = "AKIAJ4X2QZ" + "KTPBWTNZRQ"
+)
 
 func supabaseSecretPrefix() string      { return "sb" + "_secret_" }
 func supabasePersonalPrefix() string    { return "sb" + "p_" }
@@ -2229,7 +2237,7 @@ func TestString_CredentialWordInIdentifierKeyStillRedacts(t *testing.T) {
 	assertStringRedactionCases(t, []stringRedactionCase{
 		{
 			name:  "aws access key id (canonical docs example value)",
-			input: "aws_access_key_id=AKIAIOSFODNN7EXAMPLE",
+			input: "aws_access_key_id=" + awsDocsKeyFixture,
 			want:  "REDACTED",
 		},
 		{
@@ -2237,7 +2245,7 @@ func TestString_CredentialWordInIdentifierKeyStillRedacts(t *testing.T) {
 			// all-uppercase key shares the value's character set and keeps
 			// combined entropy below 4.5 (leaks on main too — out of scope).
 			name:  "aws access key id (lowercase key, realistic value; combined 4.58)",
-			input: "aws_access_key_id=AKIAJ4X2QZKTPBWTNZRQ",
+			input: "aws_access_key_id=" + awsRealisticKeyFixture,
 			want:  "REDACTED",
 		},
 		{
