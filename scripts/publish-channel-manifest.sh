@@ -82,11 +82,15 @@ VERSION="${TAG#v}"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.+-]+)?$ ]] \
     || die "tag '${TAG}' is not a semver release tag"
 
-# A tag carrying a prerelease segment belongs to nightly, anything else to
-# stable. This is the same test release.yml uses to pick release notes, kept
-# here so the pointer can never land on the channel the tag doesn't belong to.
-if [[ "$VERSION" == *-* ]]; then
+# A nightly prerelease belongs to nightly, no prerelease to stable. Any other
+# prerelease is refused rather than routed: readers identify the nightly channel
+# by the "nightly" prerelease segment, so an rc tag sent to nightly would publish
+# a pointer they reject, leaving nightly silently stuck on the previous version.
+# Refusing here makes that a loud failure at publish time instead.
+if [[ "$VERSION" == *-*nightly* ]]; then
     CHANNEL="nightly"
+elif [[ "$VERSION" == *-* ]]; then
+    die "tag '${TAG}' carries a prerelease segment that is not a nightly; no channel claims it"
 else
     CHANNEL="stable"
 fi

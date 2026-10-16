@@ -122,6 +122,13 @@ release can enqueue a second run and cancel a queued hotfix by itself. Dropping
 a release outright is worse than the race, and the conditional write already
 closes that race for workflow runs and manual ones alike.
 
+The channel a tag belongs to is decided the same way in all three places: a
+`nightly` prerelease goes to nightly, no prerelease to stable, and any other
+prerelease is **refused at publish time**. Readers identify nightly by that
+prerelease segment, so an rc tag routed to nightly would publish a pointer both
+readers reject, leaving the channel silently stuck. Both readers also prefer
+`tag` over `version` and check the manifest's declared `channel`.
+
 **Publishing inverts rule 1 on purpose.** `publish-channel-manifest.sh` fails
 *closed*: if it cannot read the current pointer it refuses to publish. The two
 directions are not inconsistent, because the questions differ. A reader needs an

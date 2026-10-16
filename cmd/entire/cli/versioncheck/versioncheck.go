@@ -300,8 +300,16 @@ func fetchChannelManifestVersion(ctx context.Context, client *http.Client, night
 	if manifest.Channel != "" && manifest.Channel != channel {
 		return "", fmt.Errorf("manifest declares channel %q, wanted %q", manifest.Channel, channel)
 	}
-	if isNightly(version) != nightly {
-		return "", fmt.Errorf("version %q does not belong to channel %q", version, channel)
+	// Stable means no prerelease at all, not merely "not a nightly". An rc tag
+	// would otherwise be accepted here and pushed to every stable user, and it
+	// is also the form install.sh rejects — the two readers have to agree about
+	// what a channel contains.
+	if nightly {
+		if !isNightly(version) {
+			return "", fmt.Errorf("version %q does not belong to channel %q", version, channel)
+		}
+	} else if pre := semver.Prerelease(semverTag(version)); pre != "" {
+		return "", fmt.Errorf("version %q is a prerelease (%s) and does not belong to channel %q", version, pre, channel)
 	}
 
 	return version, nil

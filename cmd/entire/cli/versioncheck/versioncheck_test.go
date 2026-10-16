@@ -832,6 +832,14 @@ func TestFetchChannelManifestVersion_RejectsCrossChannel(t *testing.T) {
 			nightly:  false,
 			manifest: ChannelManifest{Channel: "stable", Version: "1.2"},
 		},
+		{
+			// publish-channel-manifest.sh refuses to route this at all, and
+			// install.sh rejects it on stable. Accepting it here would push an
+			// rc to every stable user from the one reader that allowed it.
+			name:     "non-nightly prerelease on the stable channel",
+			nightly:  false,
+			manifest: ChannelManifest{Channel: "stable", Tag: "v1.2.3-rc.1"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

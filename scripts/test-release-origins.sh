@@ -273,6 +273,23 @@ out="$(run_install "$WORK/home-crossmeta" "$WORK/install-crossmeta.sh")"
 expect "a nightly on the stable channel falls back to GitHub" contains "$out" "Installing version: 8.8.8"
 refute "the nightly version is never installed" contains "$out" "4.4.4-nightly"
 
+# The CLI reads tag before version and checks the declared channel; install.sh
+# has to agree or the two disagree about what is installable.
+build_origin "$WORK/tagpref" 3.3.3
+printf '{"channel":"stable","tag":"v3.3.3","version":"9.9.9"}\n' \
+    > "$WORK/tagpref/channels/stable.json"
+TAGPREF_PORT="$(serve "$WORK/tagpref")"
+repoint "$WORK/install-tagpref.sh" "http://127.0.0.1:$TAGPREF_PORT" "$GH" "$GH/api"
+out="$(run_install "$WORK/home-tagpref" "$WORK/install-tagpref.sh")"
+expect "tag wins over version, as in the CLI" contains "$out" "Installing version: 3.3.3"
+
+build_origin "$WORK/wrongchan" 2.2.2
+printf '{"channel":"nightly","tag":"v2.2.2"}\n' > "$WORK/wrongchan/channels/stable.json"
+WRONGCHAN_PORT="$(serve "$WORK/wrongchan")"
+repoint "$WORK/install-wrongchan.sh" "http://127.0.0.1:$WRONGCHAN_PORT" "$GH" "$GH/api"
+out="$(run_install "$WORK/home-wrongchan" "$WORK/install-wrongchan.sh")"
+expect "a manifest declaring another channel falls back" contains "$out" "Installing version: 8.8.8"
+
 section "the release mirror stays inert when the variable is empty"
 
 # release.yml always exports ENTIRE_RELEASE_BUCKET, and an unset Actions
@@ -438,6 +455,11 @@ fresh badinput
 publish --tag not-a-version --bucket b >/dev/null 2>&1; rc=$?
 expect "rejects a tag that is not semver" eq "$rc" 1
 publish --bucket b >/dev/null 2>&1; rc=$?
+fresh rctag
+out="$(publish --tag v1.2.3-rc.1 --bucket b; printf 'rc=%s' "$?")"
+expect "refuses a prerelease no channel claims" contains "$out" "rc=1"
+expect "the refusal says no channel claims it" contains "$out" "no channel claims it"
+
 expect "requires --tag" eq "$rc" 1
 
 # The monotonic guard must fail closed: a pointer it could not read cannot be

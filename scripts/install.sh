@@ -198,14 +198,35 @@ version_valid_for_channel() {
     return 0
 }
 
+# manifest_field prints one string field from a channel manifest, or nothing.
+manifest_field() {
+    printf '%s' "$1" \
+        | grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+        | sed -E 's/.*: *"([^"]*)".*/\1/' \
+        | head -n 1 || true
+}
+
 resolve_version_from_entire() {
     local channel="$1"
-    local base version
+    local base body declared version
     base="$(origin_artifact_base entire)"
-    version="$(curl -fsSL "${CURL_METADATA_OPTS[@]}" "${base}/channels/${channel}.json" 2>/dev/null \
-        | grep '"version"' \
-        | sed -E 's/.*"version": *"v?([^"]+)".*/\1/' \
-        | head -n 1 || true)"
+    body="$(curl -fsSL "${CURL_METADATA_OPTS[@]}" "${base}/channels/${channel}.json" 2>/dev/null || true)"
+    [[ -n "$body" ]] || return 1
+
+    # A manifest published to the wrong key, or left stale across a rename,
+    # would otherwise cross the streams. The CLI's update check makes the same
+    # check; both readers have to agree or the two disagree about what is
+    # installable.
+    declared="$(manifest_field "$body" channel)"
+    if [[ -n "$declared" && "$declared" != "$channel" ]]; then
+        return 1
+    fi
+
+    # tag first, then version, matching the CLI. They normally agree; when they
+    # do not, the tag is the thing the artifacts were published under.
+    version="$(manifest_field "$body" tag)"
+    [[ -n "$version" ]] || version="$(manifest_field "$body" version)"
+    version="${version#v}"
 
     if [[ -n "$version" ]] && version_valid_for_channel "$version" "$channel"; then
         printf '%s' "$version"
