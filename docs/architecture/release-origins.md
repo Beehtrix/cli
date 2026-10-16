@@ -103,12 +103,20 @@ origin's checksums vouching for another origin's bytes would be a weaker
 guarantee than either origin offers alone.
 
 The pointer write is **conditional on the object the guard inspected**
-(`--if-match`, or `--if-none-match` for a first publish), and `release.yml`
-carries a `concurrency` group. Reading, comparing and writing are three
-operations, so without both a second publisher landing in between would pass its
-own guard and leave the pointer at whichever write finished last — possibly the
-older one. A conflict aborts rather than retrying: the guard exists to refuse
-unproven moves, and re-running is clearer in a release log than a silent retry.
+(`--if-match`, or `--if-none-match` for a first publish). Reading, comparing and
+writing are three operations, so without it a second publisher landing in
+between would pass its own guard and leave the pointer at whichever write
+finished last — possibly the older one. A conflict aborts rather than retrying:
+the guard exists to refuse unproven moves, and re-running is clearer in a
+release log than a silent retry.
+
+The workflow deliberately carries **no `concurrency` group**. GitHub keeps at
+most one pending run per group and cancels the previously pending one — which
+`cancel-in-progress: false` does not prevent, since it only protects the run
+already in progress. Because `mirror-nightly` pushes a nightly tag, one stable
+release can enqueue a second run and cancel a queued hotfix by itself. Dropping
+a release outright is worse than the race, and the conditional write already
+closes that race for workflow runs and manual ones alike.
 
 **Publishing inverts rule 1 on purpose.** `publish-channel-manifest.sh` fails
 *closed*: if it cannot read the current pointer it refuses to publish. The two

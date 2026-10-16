@@ -14,14 +14,14 @@ on:
 permissions:
   contents: write
 
-# Serialize releases. The channel pointer is a read-modify-write, so two
-# overlapping runs can both read the same current version, both pass the
-# monotonic guard, and leave the pointer at whichever wrote last — which may be
-# the older one. Queue rather than cancel: a cancelled release leaves artifacts
-# uploaded with no pointer flipped.
-concurrency:
-  group: release
-  cancel-in-progress: false
+# Deliberately NOT serialized with a concurrency group. GitHub keeps at most one
+# pending run per group and cancels the previously pending one, which
+# cancel-in-progress: false does not prevent — it only protects the run already
+# in progress. mirror-nightly pushes a nightly tag, so a single stable release
+# can enqueue a second run and cancel a queued hotfix by itself. Dropping a
+# release is worse than the race a group would close, and the pointer's
+# conditional write (--if-match in publish-channel-manifest.sh) already closes
+# that race, including for runs started by hand.
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
@@ -172,17 +172,6 @@ jobs:
           done
           exit $fail
 
-      # Before the pointer, and stable-only. These two keys are overwritten on
-      # every release rather than versioned, so a nightly publishing here would
-      # replace the installer stable users fetch; nightly users are served by
-      # the same stable installer, which takes --channel nightly.
-      - name: Publish install scripts
-        if: vars.ENTIRE_RELEASE_BUCKET != '' && steps.release-type.outputs.prerelease == 'false'
-        run: |
-          scripts/publish-installers.sh \
-            --bucket "${{ vars.ENTIRE_RELEASE_BUCKET }}" \
-            --region "${{ vars.ENTIRE_RELEASE_REGION || 'us-east-2' }}"
-
       # Last, and deliberately so. The pointer is what makes a version visible
       # to install.sh and to the CLI's update check, so it must not move until
       # the artifacts are uploaded AND the macOS signing check above has passed.
@@ -193,6 +182,23 @@ jobs:
         run: |
           scripts/publish-channel-manifest.sh \
             --tag "$RELEASE_TAG" \
+            --bucket "${{ vars.ENTIRE_RELEASE_BUCKET }}" \
+            --region "${{ vars.ENTIRE_RELEASE_REGION || 'us-east-2' }}"
+
+      # After the pointer, and stable-only. These two keys are overwritten on
+      # every release rather than versioned, so a nightly publishing here would
+      # replace the installer stable users fetch; nightly users are served by
+      # the same stable installer, which takes --channel nightly.
+      #
+      # After the pointer rather than before it: these keys are shared across
+      # versions, so uploading first means a release the pointer then refuses
+      # (an older tag re-dispatched) leaves the installers rolled back with
+      # nothing advanced. The installer is version-independent, so a pointer
+      # that moved before it is harmless.
+      - name: Publish install scripts
+        if: vars.ENTIRE_RELEASE_BUCKET != '' && steps.release-type.outputs.prerelease == 'false'
+        run: |
+          scripts/publish-installers.sh \
             --bucket "${{ vars.ENTIRE_RELEASE_BUCKET }}" \
             --region "${{ vars.ENTIRE_RELEASE_REGION || 'us-east-2' }}"
 
