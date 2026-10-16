@@ -42,6 +42,7 @@ import (
 
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
@@ -442,17 +443,16 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 		return s.prepareAmendCommitMsg(ctx, commitMsgFile, strippedDeleted)
 	}
 
-	_, openRepoSpan := perf.Start(ctx, "open_repository")
-	repo, err := OpenRepository(ctx)
+	repo, err := openRepositoryTimed(ctx)
 	if err != nil {
-		openRepoSpan.RecordError(err)
-		openRepoSpan.End()
 		return nil
 	}
-	// Commits redone after a reset are links too: their trailers ride along.
-	inherited = s.withRedoneTrailers(ctx, repo, commitMsgFile, source, inherited)
 	defer repo.Close()
-	openRepoSpan.End()
+	// Commits redone after a reset are links too: their trailers ride along.
+	inherited, redone := s.withRedoneTrailers(ctx, repo, commitMsgFile, source, inherited)
+	if redone.onlyRedone() {
+		return nil // everything staged is work the inherited checkpoints hold
+	}
 
 	_, findSessionsSpan := perf.Start(ctx, "find_sessions_for_worktree")
 	worktreePath, err := paths.WorktreeRoot(ctx)
@@ -487,7 +487,7 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 
 	// Check if any session has new content to condense
 	_, filterSessionsSpan := perf.Start(ctx, "filter_sessions_with_content")
-	sessionsWithContent := s.filterSessionsWithNewContent(ctx, repo, sessions)
+	sessionsWithContent := s.filterSessionsWithNewContent(ctx, repo, sessions, redone)
 	filterSessionsSpan.End()
 
 	if len(sessionsWithContent) == 0 {
@@ -618,6 +618,18 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 	writeCommitMessageSpan.End()
 
 	return nil
+}
+
+// openRepositoryTimed opens the repository under an "open_repository" perf span.
+func openRepositoryTimed(ctx context.Context) (*git.Repository, error) {
+	_, span := perf.Start(ctx, "open_repository")
+	defer span.End()
+	repo, err := OpenRepository(ctx)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	return repo, nil
 }
 
 // inheritSquashedCheckpointTrailers handles a commit made while `git merge
@@ -890,7 +902,7 @@ func (s *ManualCommitStrategy) stampFreshCheckpointForAmend(ctx context.Context,
 	if err != nil || len(sessions) == 0 {
 		return
 	}
-	withContent := s.filterSessionsWithNewContent(ctx, repo, sessions)
+	withContent := s.filterSessionsWithNewContent(ctx, repo, sessions, redo{})
 	if len(withContent) == 0 {
 		return
 	}
@@ -1289,13 +1301,16 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 	}
 
 	// Condense into the trailer prepare stamped, never into an inherited one.
-	stamped := stampedTrailersOf(ctx, commit)
+	stamped, redone := stampedTrailersOf(ctx, commit)
 	checkpointID, targetPreexisting, found := s.condensationTarget(ctx, repo, stamped)
 	openRepoSpan.End()
 
 	if !found {
 		// No trailer — user removed it or it was never added (mid-turn commit).
 		// Still update BaseCommit for active sessions so future commits can match.
+		// A redo that stamped nothing (pure, or partial with no session's
+		// other work) settles the held files the inherited checkpoints have.
+		s.reconcileRedoneFiles(ctx, repo, commit, redone)
 		s.postCommitUpdateBaseCommitOnly(ctx, head)
 		return nil
 	}
@@ -1983,20 +1998,32 @@ func truncateHash(h string) string {
 // no-trailer early exit before reaching any session.
 // Computes the staged files list once and reuses it across all sessions to avoid
 // redundant `git diff --cached` calls (previously called up to 3 times per session).
-func (s *ManualCommitStrategy) filterSessionsWithNewContent(ctx context.Context, repo *git.Repository, sessions []*SessionState) []*SessionState {
+// Staged paths a redo's inherited checkpoints already hold count as no
+// session's new work: the overlap check then sees only the redo's other staged
+// paths, from the same rename-free view of the commit index the redo compared
+// (a rename-detecting list would report a deletion paired with a held file
+// as that file alone). The caller returns before this for a commit that
+// stages nothing else.
+func (s *ManualCommitStrategy) filterSessionsWithNewContent(ctx context.Context, repo *git.Repository, sessions []*SessionState, redone redo) []*SessionState {
 	logCtx := logging.WithComponent(ctx, "manual-commit")
 	var result []*SessionState
 
 	// Compute staged files once for all sessions.
 	// On error, pass nil — sessionHasNewContent treats nil stagedFiles as
 	// "unavailable" and skips overlap checks, falling through to other heuristics.
-	stagedFiles, err := getStagedFiles(ctx)
-	if err != nil {
-		logging.Debug(logCtx,
-			"filterSessionsWithNewContent: getStagedFiles failed, skipping overlap checks",
-			slog.String("error", err.Error()),
-		)
-		stagedFiles = nil
+	var stagedFiles []string
+	if len(redone.paths) > 0 {
+		stagedFiles = redone.others
+	} else {
+		var err error
+		stagedFiles, err = getStagedFiles(ctx)
+		if err != nil {
+			logging.Debug(logCtx,
+				"filterSessionsWithNewContent: getStagedFiles failed, skipping overlap checks",
+				slog.String("error", err.Error()),
+			)
+			stagedFiles = nil
+		}
 	}
 
 	for _, state := range sessions {
@@ -3114,6 +3141,8 @@ func parseStagedRaw(output []byte) []stagedChange {
 			change.deleted = true
 		} else {
 			change.blob = plumbing.NewHash(meta[3])
+			// An unparsable mode stays zero, which matches no tree entry.
+			change.mode, _ = filemode.New(dstMode) //nolint:errcheck // zero mode is the safe fallback
 		}
 		staged = append(staged, change)
 	}
