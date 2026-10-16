@@ -1074,6 +1074,74 @@ func TestCalculateTotalTokenUsage_SameWorkflowAgentInTwoRunsCountsOnce(t *testin
 	assert.Equal(t, 1, usage.SubagentTokens.APICallCount)
 }
 
+// A fork cancelled before its first reply holds only the copied launch: its
+// subagent usage is a zero reading, not a missing one (nil keeps the last).
+func TestCalculateTotalTokenUsage_LaunchOnlyForkIsZeroNotNil(t *testing.T) {
+	t.Parallel()
+
+	const launch = `{"type":"assistant","message":{"id":"m-launch","usage":{"input_tokens":5,"cache_read_input_tokens":1000,"output_tokens":50}}}`
+	subagentsDir := filepath.Join(t.TempDir(), "sess", "subagents")
+	require.NoError(t, os.MkdirAll(subagentsDir, 0o755))
+	writeJSONLFile(t, filepath.Join(subagentsDir, "agent-aforka0000000001.jsonl"), launch)
+	data := buildJSONL(
+		launch,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":[{"type":"text","text":"Async agent launched successfully.\nagentId: aforka0000000001 (internal ID)"}]}]}}`,
+	)
+
+	usage, err := (&ClaudeCodeAgent{}).CalculateTotalTokenUsage(data, 0, subagentsDir)
+	require.NoError(t, err)
+	assert.Equal(t, 1, usage.APICallCount)
+	require.NotNil(t, usage.SubagentTokens)
+	assert.Equal(t, agent.TokenUsage{}, *usage.SubagentTokens)
+}
+
+// A fork agent's transcript opens with a copy of the parent message that
+// launched it (same message id and usage), and every fork launched by that
+// message copies it; a fork of a subagent copies that subagent's history too.
+// Every call counts once: the launch in the main usage, also once the
+// checkpoint starts after it, and a copied subagent call in the subagents'.
+func TestCalculateTotalTokenUsage_ForkCopiesOfTheLaunchCountOnce(t *testing.T) {
+	t.Parallel()
+
+	const launch = `{"type":"assistant","message":{"id":"m-launch","usage":{"input_tokens":5,"cache_read_input_tokens":1000,"output_tokens":50}}}`
+	subagentsDir := filepath.Join(t.TempDir(), "sess", "subagents")
+	require.NoError(t, os.MkdirAll(subagentsDir, 0o755))
+	writeJSONLFile(t, filepath.Join(subagentsDir, "agent-aforka0000000001.jsonl"), launch,
+		`{"type":"assistant","message":{"id":"m-a","usage":{"input_tokens":10,"output_tokens":20}}}`)
+	// A fork of agent a copies a's history, which is not in the parent's.
+	writeJSONLFile(t, filepath.Join(subagentsDir, "agent-aforkb0000000001.jsonl"), launch,
+		`{"type":"assistant","message":{"id":"m-a","usage":{"input_tokens":10,"output_tokens":20}}}`,
+		`{"type":"assistant","message":{"id":"m-b","usage":{"input_tokens":30,"output_tokens":40}}}`)
+	data := buildJSONL(
+		launch,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":[{"type":"text","text":"Async agent launched successfully.\nagentId: aforka0000000001 (internal ID)"}]}]}}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_b","content":[{"type":"text","text":"Async agent launched successfully.\nagentId: aforkb0000000001 (internal ID)"}]}]}}`,
+		`{"type":"assistant","message":{"id":"m-main2","usage":{"input_tokens":7,"output_tokens":8}}}`,
+	)
+
+	for name, tc := range map[string]struct {
+		startLine         int
+		mainIn, mainCalls int
+	}{
+		"whole transcript":        {startLine: 0, mainIn: 12, mainCalls: 2},
+		"checkpoint after launch": {startLine: 3, mainIn: 7, mainCalls: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			usage, err := (&ClaudeCodeAgent{}).CalculateTotalTokenUsage(data, tc.startLine, subagentsDir)
+			require.NoError(t, err)
+			assert.Equal(t, tc.mainIn, usage.InputTokens)
+			assert.Equal(t, tc.mainCalls, usage.APICallCount)
+			require.NotNil(t, usage.SubagentTokens)
+			assert.Equal(t, 40, usage.SubagentTokens.InputTokens)
+			assert.Equal(t, 0, usage.SubagentTokens.CacheReadTokens, "the launch's cache reads belong to the parent")
+			assert.Equal(t, 60, usage.SubagentTokens.OutputTokens)
+			assert.Equal(t, 2, usage.SubagentTokens.APICallCount)
+		})
+	}
+}
+
 // forkedSkillResultLine is the parent transcript's tool_result line for a
 // Skill call that ran forked (Claude Code 2.1.291): the text does not name the
 // agent; the structured toolUseResult does.

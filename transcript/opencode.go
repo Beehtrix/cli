@@ -189,7 +189,7 @@ func emitOpenCodeAssistant(result *[]byte, base transcriptLine, msg openCodeMess
 // openCodeToolResult builds the compact {"output":"...","status":"success"|"error"}
 // object from an OpenCode tool state map.
 func openCodeToolResult(state map[string]json.RawMessage) json.RawMessage {
-	r := toolResultJSON{
+	r := ToolResult{
 		Output: unquote(state["output"]),
 		Status: ToolStatusSuccess,
 	}
