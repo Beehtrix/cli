@@ -152,6 +152,18 @@ func TestProjectTrailMissingParentDoesNotFallBack(t *testing.T) {
 	require.Empty(t, out)
 }
 
+func TestProjectTrailShowPrintsServerURL(t *testing.T) {
+	setupProjectTrailTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		item := projectTrailTestResource()
+		item.URL = "https://entire.io/gh/acme/-/trails/42"
+		assert.NoError(t, json.NewEncoder(w).Encode(item))
+	})
+	out, _, err := executeProjectTrailTest(t, "show", "42", "--project", "gh/acme")
+	require.NoError(t, err)
+	require.Contains(t, out, "Trail #42: Project intent\n")
+	require.Contains(t, out, "URL: https://entire.io/gh/acme/-/trails/42\n")
+}
+
 func TestProjectTrailUpdateAtomicConditionalPatch(t *testing.T) {
 	var methods []string
 	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
