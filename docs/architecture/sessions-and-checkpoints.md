@@ -248,11 +248,13 @@ squash, the staged files a redo inherited for are no evidence of new session
 work: the reset put them back in the worktree and the next turn end records
 them as touched again, though the session did nothing new to them. A staged
 path counts as held only when the newest dropped commit that changed it
-carries a live checkpoint and the staged mode matches too. Session matching
+carries a checkpoint this clone has (a trailer whose capture failed still
+links, but holds nothing) and the staged mode matches too. Session matching
 ignores held paths, so a commit that only redoes linked work gets no fresh
 trailer, and one that also stages other session work gets one for that work.
-Prepare records the held paths beside the inherited IDs. After a pure redo,
-which stamps nothing and so condenses nothing, post-commit drops them from
+Session matching reads the same rename-free staged paths the redo compared.
+Prepare records the held paths beside the inherited IDs. After a redo that
+stamps nothing and so condenses nothing, post-commit drops them from
 the touched files of this worktree's sessions when the commit holds the
 recorded content, as carry-forward would; other touched files, steps and
 transcript growth stay pending. When a fresh trailer is stamped, post-commit

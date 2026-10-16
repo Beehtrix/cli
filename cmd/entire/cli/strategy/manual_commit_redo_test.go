@@ -15,14 +15,16 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
+	"github.com/entireio/cli/redact"
 )
 
 const (
-	redoCheckpointOne = "01M2VBJBJQZ2BP1W2PBWDF3J31"
-	redoCheckpointTwo = "01M2VBJBJQZ2BP1W2PBWDF3J32"
+	redoCheckpointOne = "a1b2c3d4e501"
+	redoCheckpointTwo = "a1b2c3d4e502"
 )
 
 // redoFixture: two linked commits on top of a base, ready to be redone.
@@ -41,7 +43,32 @@ func redoFixture(t *testing.T) string {
 	testutil.GitAdd(t, dir, "f2.txt")
 	testutil.GitCommit(t, dir, "agent: part two\n\nEntire-Checkpoint: "+redoCheckpointTwo)
 	t.Chdir(dir)
+	// The dropped commits' checkpoints exist, as when their post-commit
+	// condensed: only a checkpoint this clone has may hold a redone file.
+	writeRedoCheckpoints(t, redoCheckpointOne, redoCheckpointTwo)
 	return dir
+}
+
+// writeRedoCheckpoints writes checkpoints through the store the hooks read.
+func writeRedoCheckpoints(t *testing.T, ids ...string) {
+	t.Helper()
+	repo, err := OpenRepository(t.Context())
+	require.NoError(t, err)
+	defer repo.Close()
+	store, err := NewManualCommitStrategy().getPersistentStore(t.Context(), repo)
+	require.NoError(t, err)
+	for _, cpID := range ids {
+		require.NoError(t, store.Write(t.Context(), checkpoint.Session{
+			CheckpointID: id.MustCheckpointID(cpID),
+			SessionID:    "sess-original",
+			CreatedAt:    time.Now(),
+			Strategy:     "manual-commit",
+			Transcript:   redact.AlreadyRedacted([]byte(testTranscriptPromptResponse)),
+			Agent:        agent.AgentTypeClaudeCode,
+			AuthorName:   "Test",
+			AuthorEmail:  "test@example.com",
+		}))
+	}
 }
 
 func prepareMessage(t *testing.T, text string) string {
@@ -615,4 +642,108 @@ func TestRedo_PureRedoSettlesOnlyRedoneFiles(t *testing.T) {
 	state, err = s.loadSessionState(context.Background(), "sess-redid")
 	require.NoError(t, err)
 	require.Equal(t, []string{"wip.txt"}, state.FilesTouched)
+}
+
+// A trailer whose checkpoint this clone does not have (its post-commit
+// condensation failed) is still inherited as a link, but it cannot stand in
+// for capture: the session's pending work gets a fresh checkpoint.
+func TestRedo_MissingInheritedCheckpointKeepsFreshCapture(t *testing.T) {
+	dir := redoFixture(t)
+	const unwritten = "a1b2c3d4e509"
+	testutil.WriteFile(t, dir, "f3.txt", "three\n")
+	testutil.GitAdd(t, dir, "f3.txt")
+	testutil.GitCommit(t, dir, "agent: part three\n\nEntire-Checkpoint: "+unwritten)
+	testutil.RunGit(t, dir, "reset", "-q", "HEAD~1")
+	s := NewManualCommitStrategy()
+	seedTurnEndSession(t, s, dir, "sess-pending", session.PhaseEnded, "f3.txt")
+	testutil.GitAdd(t, dir, "f3.txt")
+
+	ids := commitThroughHooks(t, dir, s, "redo after a failed condensation\n")
+	require.Len(t, ids, 2, "%v", ids)
+	require.Equal(t, unwritten, ids[0], "the link is still inherited")
+	requireFreshTrailersResolve(t, ids[1:])
+	state, err := s.loadSessionState(context.Background(), "sess-pending")
+	require.NoError(t, err)
+	require.Equal(t, ids[1], state.LastCheckpointID.String())
+}
+
+// A checkpoint deleted from this clone is neither inherited nor allowed to
+// hold the redone file.
+func TestRedo_DeletedInheritedCheckpointKeepsFreshCapture(t *testing.T) {
+	dir := redoFixture(t)
+	recordDeleted(t, id.MustCheckpointID(redoCheckpointOne))
+	testutil.RunGit(t, dir, "reset", "-q", "HEAD~2")
+	s := NewManualCommitStrategy()
+	seedTurnEndSession(t, s, dir, "sess-pending", session.PhaseEnded, "f1.txt")
+	testutil.GitAdd(t, dir, "f1.txt")
+
+	ids := commitThroughHooks(t, dir, s, "redo of a deleted checkpoint\n")
+	require.Len(t, ids, 1, "%v", ids)
+	require.NotEqual(t, redoCheckpointOne, ids[0])
+	requireFreshTrailersResolve(t, ids)
+}
+
+// Git pairs a staged deletion with an identical added file as a rename. The
+// held file must not hide the deletion: the redo and the session check read
+// the same rename-free staged paths, and the human's deletion is no session's
+// work.
+func TestRedo_RenamePairedDeletionStampsNoFreshTrailer(t *testing.T) {
+	dir := redoFixture(t)
+	testutil.WriteFile(t, dir, "a.txt", "same\n")
+	testutil.GitAdd(t, dir, "a.txt")
+	testutil.GitCommit(t, dir, "source")
+	testutil.WriteFile(t, dir, "b.txt", "same\n")
+	testutil.GitAdd(t, dir, "b.txt")
+	testutil.GitCommit(t, dir, "destination\n\nEntire-Checkpoint: "+redoCheckpointOne)
+	testutil.RunGit(t, dir, "reset", "-q", "HEAD~1")
+	s := NewManualCommitStrategy()
+	seedTurnEndSession(t, s, dir, "sess-redid", session.PhaseIdle, "b.txt")
+	testutil.RunGit(t, dir, "rm", "-q", "a.txt")
+	testutil.GitAdd(t, dir, "b.txt")
+	got := prepareMessage(t, "redo with a human deletion\n")
+	require.Equal(t, []string{redoCheckpointOne}, checkpointIDs(got))
+}
+
+// `git commit -a` and path-limited commits prepare the commit in a temporary
+// index. The redo reads content and mode from it, not from .git/index.
+func TestRedo_ReadsTheTemporaryCommitIndex(t *testing.T) {
+	dir := redoFixture(t)
+	testutil.RunGit(t, dir, "reset", "-q", "HEAD~2")
+	s := NewManualCommitStrategy()
+	seedTurnEndSession(t, s, dir, "sess-redid", session.PhaseEnded, "f1.txt")
+	// The ordinary index stages f1.txt executable; the commit index stages it
+	// exactly as the dropped commit left it.
+	testutil.GitAdd(t, dir, "f1.txt")
+	testutil.RunGit(t, dir, "update-index", "--chmod=+x", "f1.txt")
+	commitIndex := filepath.Join(dir, ".git", "entire-test-commit-index")
+	for _, args := range [][]string{{"read-tree", "HEAD"}, {"add", "f1.txt"}} {
+		cmd := exec.CommandContext(t.Context(), "git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+commitIndex)
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "%s", out)
+	}
+	t.Setenv("GIT_INDEX_FILE", commitIndex)
+	got := prepareMessage(t, "feat: part one (logical)\n")
+	require.Equal(t, []string{redoCheckpointOne}, checkpointIDs(got), "%q", got)
+}
+
+// A commit aborted after prepare leaves its marker behind. The next commit's
+// prepare clears it, so a later trailer-less commit cannot settle the aborted
+// redo's paths out of a session that never committed them.
+func TestRedo_AbortedCommitMarkerIsNotReused(t *testing.T) {
+	dir := redoFixture(t)
+	testutil.RunGit(t, dir, "reset", "-q", "HEAD~2")
+	s := NewManualCommitStrategy()
+	seedTurnEndSession(t, s, dir, "sess-redid", session.PhaseEnded, "f1.txt")
+	testutil.GitAdd(t, dir, "f1.txt")
+	require.Equal(t, []string{redoCheckpointOne}, checkpointIDs(prepareMessage(t, "aborted redo\n")))
+
+	testutil.RunGit(t, dir, "reset", "-q", "--", "f1.txt")
+	testutil.WriteFile(t, dir, "notes.txt", "human notes\n")
+	testutil.GitAdd(t, dir, "notes.txt")
+	require.Empty(t, commitThroughHooks(t, dir, s, "docs: notes\n"))
+	state, err := s.loadSessionState(context.Background(), "sess-redid")
+	require.NoError(t, err)
+	require.Contains(t, state.FilesTouched, "f1.txt", "f1.txt was never committed; it is still the session's pending work")
 }

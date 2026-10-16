@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
@@ -451,7 +450,7 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 	defer repo.Close()
 	// Commits redone after a reset are links too: their trailers ride along.
 	inherited, redone := s.withRedoneTrailers(ctx, repo, commitMsgFile, source, inherited)
-	if redone.allStaged {
+	if redone.onlyRedone() {
 		return nil // everything staged is work the inherited checkpoints hold
 	}
 
@@ -488,7 +487,7 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 
 	// Check if any session has new content to condense
 	_, filterSessionsSpan := perf.Start(ctx, "filter_sessions_with_content")
-	sessionsWithContent := s.filterSessionsWithNewContent(ctx, repo, sessions, redone.paths)
+	sessionsWithContent := s.filterSessionsWithNewContent(ctx, repo, sessions, redone)
 	filterSessionsSpan.End()
 
 	if len(sessionsWithContent) == 0 {
@@ -903,7 +902,7 @@ func (s *ManualCommitStrategy) stampFreshCheckpointForAmend(ctx context.Context,
 	if err != nil || len(sessions) == 0 {
 		return
 	}
-	withContent := s.filterSessionsWithNewContent(ctx, repo, sessions, nil)
+	withContent := s.filterSessionsWithNewContent(ctx, repo, sessions, redo{})
 	if len(withContent) == 0 {
 		return
 	}
@@ -1309,8 +1308,8 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 	if !found {
 		// No trailer — user removed it or it was never added (mid-turn commit).
 		// Still update BaseCommit for active sessions so future commits can match.
-		// A pure redo stamps nothing either; its sessions' redone files are
-		// committed work the inherited checkpoints hold.
+		// A redo that stamped nothing (pure, or partial with no session's
+		// other work) settles the held files the inherited checkpoints have.
 		s.reconcileRedoneFiles(ctx, repo, commit, redone)
 		s.postCommitUpdateBaseCommitOnly(ctx, head)
 		return nil
@@ -1999,26 +1998,32 @@ func truncateHash(h string) string {
 // no-trailer early exit before reaching any session.
 // Computes the staged files list once and reuses it across all sessions to avoid
 // redundant `git diff --cached` calls (previously called up to 3 times per session).
-// Staged paths in redone recommit work inherited checkpoints already hold, so
-// they count as no session's new work; the caller handles a commit that
+// Staged paths a redo's inherited checkpoints already hold count as no
+// session's new work: the overlap check then sees only the redo's other staged
+// paths, from the same rename-free view of the commit index the redo compared
+// (a rename-detecting list would report a deletion paired with a held file
+// as that file alone). The caller returns before this for a commit that
 // stages nothing else.
-func (s *ManualCommitStrategy) filterSessionsWithNewContent(ctx context.Context, repo *git.Repository, sessions []*SessionState, redone map[string]bool) []*SessionState {
+func (s *ManualCommitStrategy) filterSessionsWithNewContent(ctx context.Context, repo *git.Repository, sessions []*SessionState, redone redo) []*SessionState {
 	logCtx := logging.WithComponent(ctx, "manual-commit")
 	var result []*SessionState
 
 	// Compute staged files once for all sessions.
 	// On error, pass nil — sessionHasNewContent treats nil stagedFiles as
 	// "unavailable" and skips overlap checks, falling through to other heuristics.
-	stagedFiles, err := getStagedFiles(ctx)
-	if err != nil {
-		logging.Debug(logCtx,
-			"filterSessionsWithNewContent: getStagedFiles failed, skipping overlap checks",
-			slog.String("error", err.Error()),
-		)
-		stagedFiles = nil
-	}
-	if len(redone) > 0 {
-		stagedFiles = slices.DeleteFunc(stagedFiles, func(f string) bool { return redone[f] })
+	var stagedFiles []string
+	if len(redone.paths) > 0 {
+		stagedFiles = redone.others
+	} else {
+		var err error
+		stagedFiles, err = getStagedFiles(ctx)
+		if err != nil {
+			logging.Debug(logCtx,
+				"filterSessionsWithNewContent: getStagedFiles failed, skipping overlap checks",
+				slog.String("error", err.Error()),
+			)
+			stagedFiles = nil
+		}
 	}
 
 	for _, state := range sessions {

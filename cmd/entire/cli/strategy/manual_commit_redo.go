@@ -55,24 +55,52 @@ func (s *ManualCommitStrategy) inheritReplacedCommitsTrailers(ctx context.Contex
 	if err != nil {
 		return redo{}
 	}
+	// Each dropped commit's diff is computed once; matching and ownership both
+	// read it.
+	changes := make([]object.Changes, len(replaced))
+	for i, c := range replaced {
+		changes[i], _ = firstParentChanges(c) //nolint:errcheck // a commit without a diff matches nothing
+	}
+	matched := make([][]string, len(replaced))
+	trailerIDs := make([][]id.CheckpointID, len(replaced))
+	var candidates []id.CheckpointID
+	for i := range replaced {
+		if matched[i] = recommitsFilesOf(changes[i], tipTree, staged); len(matched[i]) > 0 {
+			trailerIDs[i] = trailers.ParseAllCheckpoints(replaced[i].Message)
+			candidates = append(candidates, trailerIDs[i]...)
+		}
+	}
+	live := make(map[id.CheckpointID]bool)
+	for _, cpID := range withoutDeletedCheckpoints(ctx, candidates) { // one deleted-list load
+		live[cpID] = true
+	}
+	captured := s.capturedCheckpoints(ctx, repo)
+	lastChangedBy := newestChangeOf(changes)
 	var inherited []id.CheckpointID
 	seen := make(map[id.CheckpointID]bool)
 	redonePaths := make(map[string]bool)
-	lastChangedBy := newestChangeOf(replaced)
 	for i := len(replaced) - 1; i >= 0; i-- { // oldest first, like a squash message
-		matched := recommitsFilesOf(replaced[i], tipTree, staged)
-		if len(matched) == 0 {
+		if len(matched[i]) == 0 {
 			continue
 		}
-		ids := withoutDeletedCheckpoints(ctx, trailers.ParseAllCheckpoints(replaced[i].Message))
+		var ids []id.CheckpointID
+		heldByCheckpoint := false
+		for _, cpID := range trailerIDs[i] {
+			if live[cpID] {
+				ids = append(ids, cpID)
+				heldByCheckpoint = heldByCheckpoint || captured(cpID)
+			}
+		}
 		if len(ids) == 0 {
 			continue
 		}
 		// A path's staged state is held by a checkpoint only when the commit
-		// that last changed it carries one and the staged mode is that
-		// commit's too; anything else is work no inherited checkpoint holds.
-		for _, p := range matched {
-			if lastChangedBy[p] == i && sameModeAsTip(tipTree, p, staged[p]) {
+		// that last changed it carries one this clone actually has, and the
+		// staged mode is that commit's too. Inheriting stays permissive: a
+		// trailer links even when its checkpoint is missing here, but only a
+		// checkpoint that exists may stand in for a fresh capture.
+		for _, p := range matched[i] {
+			if heldByCheckpoint && lastChangedBy[p] == i && sameModeAsTip(tipTree, p, staged[p]) {
 				redonePaths[p] = true
 			}
 		}
@@ -88,7 +116,13 @@ func (s *ManualCommitStrategy) inheritReplacedCommitsTrailers(ctx context.Contex
 			slog.Int("replaced_commits", len(replaced)), slog.Int("staged", len(staged)))
 		return redo{}
 	}
-	result := redo{ids: inherited, paths: redonePaths, allStaged: len(redonePaths) == len(staged)}
+	result := redo{ids: inherited, paths: redonePaths}
+	for p := range staged {
+		if !redonePaths[p] {
+			result.others = append(result.others, p)
+		}
+	}
+	slices.Sort(result.others)
 	content, err := os.ReadFile(commitMsgFile) //nolint:gosec // commitMsgFile is provided by git hook
 	if err != nil {
 		return redo{}
@@ -121,24 +155,51 @@ func (s *ManualCommitStrategy) inheritReplacedCommitsTrailers(ctx context.Contex
 
 // redo is what a commit inherited from the commits it redoes: their checkpoint
 // IDs, the staged paths those checkpoints already hold (content and mode, as
-// last changed by a checkpoint-bearing commit), and whether that is every
-// staged path. Those paths are no evidence of new session work: a reset
-// puts them back in the worktree, and the turn end that follows records them
-// as touched again although the session did nothing new to them.
+// last changed by a commit whose checkpoint this clone has), and every other
+// staged path. Both sets come from one rename-free view of the commit index.
+// Held paths are no evidence of new session work: a reset puts them back in
+// the worktree, and the turn end that follows records them as touched again
+// although the session did nothing new to them.
 type redo struct {
-	ids       []id.CheckpointID
-	paths     map[string]bool
-	allStaged bool
+	ids    []id.CheckpointID
+	paths  map[string]bool
+	others []string
 }
 
-// reconcileRedoneFiles settles a pure redo with the sessions in this worktree.
-// The commit stamped no fresh trailer, so no condensation consumes the redone
-// files the reset put back in those sessions' touched sets; without this they
-// stay pending as if the session still owed a checkpoint for them. Each redone
-// file the commit holds with the session's recorded content leaves
+// onlyRedone reports whether everything staged is work a checkpoint holds.
+func (r redo) onlyRedone() bool {
+	return len(r.paths) > 0 && len(r.others) == 0
+}
+
+// capturedCheckpoints returns a memoized check that a checkpoint exists in
+// this clone's store. Without a store nothing counts as captured, so a redo
+// never suppresses a fresh capture it cannot vouch for.
+func (s *ManualCommitStrategy) capturedCheckpoints(ctx context.Context, repo *git.Repository) func(id.CheckpointID) bool {
+	store, err := s.getPersistentStore(ctx, repo)
+	if err != nil {
+		return func(id.CheckpointID) bool { return false }
+	}
+	known := make(map[id.CheckpointID]bool)
+	return func(cpID id.CheckpointID) bool {
+		exists, ok := known[cpID]
+		if !ok {
+			exists = checkpointExists(ctx, store, cpID)
+			known[cpID] = exists
+		}
+		return exists
+	}
+}
+
+// reconcileRedoneFiles settles a redone commit that stamped no fresh trailer
+// with the sessions in this worktree: a pure redo, or a partial redo whose
+// other staged files were no session's work. No condensation consumes the held
+// files the reset put back in those sessions' touched sets, so without this
+// they stay pending as if the session still owed a checkpoint for them. Each
+// held file the commit contains with the session's recorded content leaves
 // FilesTouched, exactly as carry-forward drops committed files after a
-// condensation. Other touched files, turn-end steps and transcript growth are
-// left alone: that is work no checkpoint holds yet.
+// condensation; a held path the commit does not contain stays. Other touched
+// files, turn-end steps and transcript growth are left alone: that is work no
+// checkpoint holds yet.
 func (s *ManualCommitStrategy) reconcileRedoneFiles(ctx context.Context, repo *git.Repository, commit *object.Commit, redone map[string]bool) {
 	if len(redone) == 0 {
 		return
@@ -194,7 +255,7 @@ func (s *ManualCommitStrategy) withRedoneTrailers(ctx context.Context, repo *git
 	}
 	inherited = append(inherited, redone.ids...)
 	recordInheritedMarker(ctx, inherited, redone.paths)
-	if redone.allStaged {
+	if redone.onlyRedone() {
 		logging.Debug(logging.WithComponent(ctx, "checkpoint"),
 			"prepare-commit-msg: commit only redoes linked work, no new trailer",
 			slog.String("source", source))
@@ -500,15 +561,11 @@ func stagedBlobs(ctx context.Context) (map[string]stagedEntry, error) {
 	return staged, nil
 }
 
-// recommitsFilesOf returns the staged paths that recommit c's work, or nil
-// when c is not being redone: at least one file c changed is staged, and every
-// staged file c changed has the content it had at the reset's old HEAD
-// (tipTree).
-func recommitsFilesOf(c *object.Commit, tipTree *object.Tree, staged map[string]stagedEntry) []string {
-	changes, err := firstParentChanges(c)
-	if err != nil {
-		return nil
-	}
+// recommitsFilesOf returns the staged paths that recommit a dropped commit's
+// work (its first-parent changes), or nil when it is not being redone: at
+// least one file it changed is staged, and every staged file it changed has
+// the content it had at the reset's old HEAD (tipTree).
+func recommitsFilesOf(changes object.Changes, tipTree *object.Tree, staged map[string]stagedEntry) []string {
 	var matched []string
 	for _, change := range changes {
 		// A rename can be partially staged as either the destination addition
@@ -537,12 +594,16 @@ func recommitsFilesOf(c *object.Commit, tipTree *object.Tree, staged map[string]
 }
 
 // newestChangeOf maps each path the replaced commits changed to the index of
-// the newest one that changed it (replaced is newest first).
-func newestChangeOf(replaced []*object.Commit) map[string]int {
+// the newest one that changed it (replaced, and so changes, is newest first).
+func newestChangeOf(changes []object.Changes) map[string]int {
 	out := make(map[string]int)
-	for i := len(replaced) - 1; i >= 0; i-- {
-		for p := range changedPaths(replaced[i : i+1]) {
-			out[p] = i
+	for i := len(changes) - 1; i >= 0; i-- {
+		for _, change := range changes[i] {
+			for _, p := range []string{change.To.Name, change.From.Name} {
+				if p != "" {
+					out[p] = i
+				}
+			}
 		}
 	}
 	return out
