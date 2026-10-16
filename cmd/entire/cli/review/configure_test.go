@@ -868,6 +868,29 @@ func TestSaveReviewAgentConfigs(t *testing.T) {
 	if _, err := saveReviewAgentConfigs(ctx, "shared", map[string]*settings.ReviewAgentConfig{"codex": cfg}); err == nil {
 		t.Error("config for a reviewer the profile doesn't have was saved")
 	}
+
+	// The picker drops a reviewer whose config was all it had when it is
+	// switched to the checkout's config; its stored config is still cleared.
+	if _, err := saveReviewAgentConfigs(ctx, "shared", map[string]*settings.ReviewAgentConfig{"codex": cfg, tAgentClaude: cfg}); err == nil {
+		t.Fatal("config for a reviewer the profile doesn't have was saved")
+	}
+	if err := settings.ModifyClonePreferences(ctx, func(p *settings.ClonePreferences) error {
+		p.ReviewAgentConfigs = map[string]map[string]*settings.ReviewAgentConfig{"shared": {"codex": cfg}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"shared", "mine"} {
+		if _, err := saveReviewAgentConfigs(ctx, name, map[string]*settings.ReviewAgentConfig{"codex": nil}); err != nil {
+			t.Fatalf("%s: removing a dropped reviewer's config: %v", name, err)
+		}
+	}
+	if prefs, err := settings.LoadClonePreferences(ctx); err != nil || len(prefs.ReviewAgentConfigs) != 0 {
+		t.Errorf("dropped reviewer's config left behind: %+v (err %v)", prefs.ReviewAgentConfigs, err)
+	}
+	if _, raw, err := loadReviewSettingsRaw(ctx, reviewScopeLocal); err != nil || strings.Contains(string(raw["review_profiles"]), "codex") {
+		t.Errorf("removal added the dropped reviewer to the local profile: %s (err %v)", raw["review_profiles"], err)
+	}
 }
 
 // Saving one reviewer's config into the local file edits that file as stored.

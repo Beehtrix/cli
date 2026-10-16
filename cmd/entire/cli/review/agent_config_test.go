@@ -30,6 +30,8 @@ func TestValidateAgentConfig(t *testing.T) {
 		{"MCP url", "claude-code", reviewtypes.AgentConfig{MCPServers: mcp(`{"url":"https://mcp.example"}`)}, ""},
 		{"MCP without command or url", "claude-code", reviewtypes.AgentConfig{MCPServers: mcp(`{"args":["x"]}`)}, "needs a command or a url"},
 		{"codex MCP env", "codex", reviewtypes.AgentConfig{MCPServers: mcp(`{"command":"/opt/mcp","env":{"TOKEN":"x"}}`)}, "env values aren't supported for Codex"},
+		{"codex MCP header dropped", "codex", reviewtypes.AgentConfig{MCPServers: mcp(`{"url":"https://mcp.example","headers":{"Authorization":"x"}}`)}, `"headers" isn't supported for Codex`},
+		{"codex MCP type", "codex", reviewtypes.AgentConfig{MCPServers: mcp(`{"type":"stdio","command":"/opt/mcp","default_tools_approval_mode":"approve"}`)}, ""},
 		{"claude MCP env", "claude-code", reviewtypes.AgentConfig{MCPServers: mcp(`{"command":"/opt/mcp","env":{"TOKEN":"x"}}`)}, ""},
 		{"MCP bad name", "codex", reviewtypes.AgentConfig{MCPServers: map[string]json.RawMessage{"a.b": json.RawMessage(`{"url":"x"}`)}}, "letters, digits"},
 		{"settings not an object", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`[]`)}, "settings"},

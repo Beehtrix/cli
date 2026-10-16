@@ -104,8 +104,10 @@ func saveReviewAgentConfigs(ctx context.Context, profileName string, configs map
 	if !ok {
 		return "", fmt.Errorf("review profile %q not found", profileName)
 	}
-	for worker := range configs {
-		if _, ok := profile.Agents[worker]; !ok {
+	// A removal may name a reviewer the profile just dropped (its config was
+	// all it had); clearing that config is still wanted.
+	for worker, cfg := range configs {
+		if _, ok := profile.Agents[worker]; !ok && cfg != nil {
 			return "", fmt.Errorf("review profile %q has no reviewer %q", profileName, worker)
 		}
 	}
@@ -127,7 +129,10 @@ func saveReviewAgentConfigs(ctx context.Context, profileName string, configs map
 			agents[worker] = cfg
 		}
 		for worker, cfg := range configs {
-			existing := agents[worker]
+			existing, ok := agents[worker]
+			if !ok && cfg == nil {
+				continue
+			}
 			existing.Config = cfg
 			agents[worker] = existing
 		}

@@ -23,6 +23,10 @@ var agentConfigFields = map[string][]string{
 
 var mcpServerNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
+// codexMCPFields are the MCP server fields a Codex reviewer passes through.
+// "type" is accepted and dropped: Codex infers it from command or url.
+var codexMCPFields = []string{"command", "args", "url", "env", "default_tools_approval_mode", "type"}
+
 // toAgentConfig converts a profile's config for a run; nil stays nil.
 func toAgentConfig(cfg *settings.ReviewAgentConfig) *reviewtypes.AgentConfig {
 	if cfg == nil {
@@ -77,8 +81,13 @@ func ValidateAgentConfig(agentName string, cfg *reviewtypes.AgentConfig) error {
 		if server.Command == "" && server.URL == "" {
 			return fmt.Errorf("MCP server %q needs a command or a url", name)
 		}
-		if agentName == "codex" && len(server.Env) > 0 {
-			return fmt.Errorf("MCP server %q: env values aren't supported for Codex in a review profile yet", name)
+		if agentName == "codex" {
+			if err := checkCodexMCPFields(name, cfg.MCPServers[name]); err != nil {
+				return err
+			}
+			if len(server.Env) > 0 {
+				return fmt.Errorf("MCP server %q: env values aren't supported for Codex in a review profile yet", name)
+			}
 		}
 	}
 	// A relative extension would load from the reviewed checkout, the one
@@ -86,6 +95,21 @@ func ValidateAgentConfig(agentName string, cfg *reviewtypes.AgentConfig) error {
 	for _, ext := range cfg.Extensions {
 		if !filepath.IsAbs(ext) {
 			return fmt.Errorf("extension %q: use an absolute path", ext)
+		}
+	}
+	return nil
+}
+
+// checkCodexMCPFields refuses fields a Codex reviewer would not pass on, so a
+// server doesn't run without, say, its auth header.
+func checkCodexMCPFields(name string, raw json.RawMessage) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return fmt.Errorf("MCP server %q: %w", name, err)
+	}
+	for _, field := range sortedStringKeys(fields) {
+		if !slices.Contains(codexMCPFields, field) {
+			return fmt.Errorf("MCP server %q: %q isn't supported for Codex in a review profile yet", name, field)
 		}
 	}
 	return nil
