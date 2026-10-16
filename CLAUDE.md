@@ -84,8 +84,9 @@ implementations/tests. Check `.golangci.yaml`; handle errors and avoid duplicati
   terminal cannot make them prompt or hang.
 - Caller-resolution tests clear every variable from `agent.CallerSessionEnvVars()`;
   never hand-maintain a partial list or inherit the developer's agent identity.
-- Source-scanning guards use `testutil.GitGrepGuard`, restrict pathspecs to Go
-  files, and fail on zero matches. Do not weaken guard ledgers to silence failures.
+- Source-scanning guards discover files through testutil's guard helpers
+  (`GitGrepGuard`, `GuardGoFiles`), restrict pathspecs to Go files, and fail on
+  zero matches. Do not weaken guard ledgers to silence failures.
 
 ## Filesystem and settings safety
 
