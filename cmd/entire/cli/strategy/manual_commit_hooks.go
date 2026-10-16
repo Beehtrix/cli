@@ -537,25 +537,7 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 		return fmt.Errorf("failed to generate checkpoint ID: %w", err)
 	}
 
-	// Determine agent type and last prompt from session
-	var agentType types.AgentType
-	var lastPrompt string
-	if len(sessionsWithContent) > 0 {
-		firstSession := sessionsWithContent[0]
-		if firstSession.AgentType != "" {
-			agentType = firstSession.AgentType
-		}
-		lastPrompt = s.getLastPrompt(ctx, firstSession)
-	}
-
-	// Prepare prompt for display: collapse newlines/whitespace, then truncate (rune-safe)
-	displayPrompt := stringutil.TruncateRunes(stringutil.CollapseWhitespace(lastPrompt), 80, "...")
-
-	// Load commit_linking setting to decide whether to prompt
-	commitLinking := settings.CommitLinkingPrompt // safe default
-	if stngs, loadErr := settings.Load(ctx); loadErr == nil {
-		commitLinking = stngs.GetCommitLinking()
-	}
+	agentType, displayPrompt, commitLinking := s.trailerPromptContext(ctx, sessionsWithContent)
 	resolveMetadataSpan.End()
 
 	// Add trailer differently based on commit source
@@ -622,6 +604,31 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 	writeCommitMessageSpan.End()
 
 	return nil
+}
+
+// trailerPromptContext returns what the trailer prompt shows and whether to
+// ask: the first session's agent type and display-ready last prompt, and the
+// commit_linking setting.
+func (s *ManualCommitStrategy) trailerPromptContext(ctx context.Context, sessions []*SessionState) (types.AgentType, string, string) {
+	var agentType types.AgentType
+	var lastPrompt string
+	if len(sessions) > 0 {
+		firstSession := sessions[0]
+		if firstSession.AgentType != "" {
+			agentType = firstSession.AgentType
+		}
+		lastPrompt = s.getLastPrompt(ctx, firstSession)
+	}
+
+	// Prepare prompt for display: collapse newlines/whitespace, then truncate (rune-safe)
+	displayPrompt := stringutil.TruncateRunes(stringutil.CollapseWhitespace(lastPrompt), 80, "...")
+
+	// Load commit_linking setting to decide whether to prompt
+	commitLinking := settings.CommitLinkingPrompt // safe default
+	if stngs, loadErr := settings.Load(ctx); loadErr == nil {
+		commitLinking = stngs.GetCommitLinking()
+	}
+	return agentType, displayPrompt, commitLinking
 }
 
 // openRepositoryTimed opens the repository under an "open_repository" perf span.
