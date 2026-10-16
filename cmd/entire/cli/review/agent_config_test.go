@@ -28,6 +28,7 @@ func TestValidateAgentConfig(t *testing.T) {
 		{"claude hook with a launcher", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"yarn lint"}]}]}}`)}, ""},
 		{"MCP command", "codex", reviewtypes.AgentConfig{MCPServers: mcp(`{"command":"npx","args":["server"]}`)}, ""},
 		{"MCP url", "claude-code", reviewtypes.AgentConfig{MCPServers: mcp(`{"url":"https://mcp.example"}`)}, ""},
+		{"MCP command and url", "codex", reviewtypes.AgentConfig{MCPServers: mcp(`{"command":"/opt/mcp","url":"https://mcp.example"}`)}, "not both"},
 		{"MCP without command or url", "claude-code", reviewtypes.AgentConfig{MCPServers: mcp(`{"args":["x"]}`)}, "needs a command or a url"},
 		{"codex MCP env", "codex", reviewtypes.AgentConfig{MCPServers: mcp(`{"command":"/opt/mcp","env":{"TOKEN":"x"}}`)}, "env values aren't supported for Codex"},
 		{"codex MCP header dropped", "codex", reviewtypes.AgentConfig{MCPServers: mcp(`{"url":"https://mcp.example","headers":{"Authorization":"x"}}`)}, `"headers" isn't supported for Codex`},

@@ -81,6 +81,9 @@ func ValidateAgentConfig(agentName string, cfg *reviewtypes.AgentConfig) error {
 		if server.Command == "" && server.URL == "" {
 			return fmt.Errorf("MCP server %q needs a command or a url", name)
 		}
+		if server.Command != "" && server.URL != "" {
+			return fmt.Errorf("MCP server %q: set a command or a url, not both", name)
+		}
 		if agentName == "codex" {
 			if err := checkCodexMCPFields(name, cfg.MCPServers[name]); err != nil {
 				return err
