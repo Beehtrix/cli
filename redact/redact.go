@@ -48,6 +48,11 @@ const dbPasswordKeyShape = `(?:db|database|pg|postgres|postgresql|mysql|mariadb|
 //     `{"secret":"…"}` JSON fields are intentionally NOT matched here —
 //     entropy + Betterleaks cover real high-entropy values, and bare
 //     `token`/`secret` keys appear in many non-credential contexts.
+//
+// codeIdentRef is a digit-free identifier or dotted member reference, the
+// only shape credentialCodeCallPattern accepts in callee and argument position.
+const codeIdentRef = `[A-Za-z_]+(?:\.[A-Za-z_]+)*`
+
 const secretValueKeyShape = `(?:(?:[a-z0-9]+[_-]+)*(?:api[_-]*key|auth[_-]*token|access[_-]*token|refresh[_-]*token|client[_-]*secret|consumer[_-]*secret|secret[_-]*key|private[_-]*key|ssh[_-]*key)|(?:[a-z0-9]+[_-]+)+(?:secret|token))` //nolint:gosec // regex literal, not a credential
 
 var (
@@ -64,10 +69,15 @@ var (
 	// prose, rejecting an initial `=` avoids equality expressions, and newline-
 	// free quote branches keep a match inside one command.
 	credentialAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*=[ \t]*(?P<value>"[^"\r\n]*"|'[^'\r\n]*'|\([a-z][a-z _-]*\)|[^\s,;&=` + "`" + `][^\s,;&]*)`)
-	credentialCodeCallPattern   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\([^()\r\n]*\)$`)
-	credentialCodeRefPattern    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$`)
-	goTemplateReferencePattern  = regexp.MustCompile(`^\{\{[ \t]*\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+[ \t]*\}\}$`)
-	printfFormatVerbPattern     = regexp.MustCompile(`^%[-+#0 ]*(?:[0-9]+|\*)?(?:\.(?:[0-9]+|\*))?[A-Za-z]$`)
+	// credentialCodeCallPattern accepts a call whose callee and arguments are
+	// digit-free identifiers or member references (fetch_secret(),
+	// self.refresh_token(), get(name, cfg.key)). Digits and literals are
+	// excluded on purpose: `decode(c2stbGl2ZS1hYmM)`, `f(hunter2)` and
+	// `Pa55w0rd(x)` put the secret itself in call position.
+	credentialCodeCallPattern  = regexp.MustCompile(`^` + codeIdentRef + `\((?:` + codeIdentRef + `(?:,[ \t]*` + codeIdentRef + `)*)?\)$`)
+	credentialCodeRefPattern   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$`)
+	goTemplateReferencePattern = regexp.MustCompile(`^\{\{[ \t]*\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+[ \t]*\}\}$`)
+	printfFormatVerbPattern    = regexp.MustCompile(`^%[-+#0 ]*(?:[0-9]+|\*)?(?:\.(?:[0-9]+|\*))?[A-Za-z]$`)
 	// shellStdinSecretPattern matches a printf literal piped into a
 	// secret-management command (`printf 'v' | mycli secrets put KEY`). Named
 	// captures keep the literal and key contracts stable; bounded, newline-free

@@ -2520,3 +2520,27 @@ func TestJSONLContent_GenericCredentialWordIdentifiersPreserved(t *testing.T) {
 		}
 	}
 }
+
+// Trail-finding regression: the call-expression exemption must not preserve a
+// secret literal placed in callee or argument position.
+func TestString_CredentialCodeCallWithLiteralRedacts(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{
+		`PASSWORD = Pa55w0rd(x)`,
+		`api_key = decode(c2stbGl2ZS1hYmM)`,
+		`client_secret = f(hunter2)`,
+	} {
+		if out := String(in); !strings.Contains(out, RedactedPlaceholder) {
+			t.Errorf("String(%q) = %q, want a redaction", in, out)
+		}
+	}
+	for _, in := range []string{
+		`client_secret = fetch_secret()`,
+		`access_token = self.refresh_token()`,
+		`api_key = load_key(cfg.path)`,
+	} {
+		if out := String(in); out != in {
+			t.Errorf("String(%q) = %q, want unchanged", in, out)
+		}
+	}
+}
