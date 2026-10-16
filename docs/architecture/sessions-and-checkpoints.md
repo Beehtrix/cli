@@ -243,7 +243,25 @@ made since the reset keep the redo open only while each of them redid some of
 the dropped work; any other ref operation (checkout, merge, rebase, pull) ends
 it. Folding with `git reset --soft HEAD~1 && git commit --amend` inherits the
 folded commit's trailers too. Inherited trailers are links, exactly as for a
-squash, and are recorded so post-commit never condenses into one.
+squash, and are recorded so post-commit never condenses into one. Unlike a
+squash, the staged files a redo inherited for are no evidence of new session
+work: the reset put them back in the worktree and the next turn end records
+them as touched again, though the session did nothing new to them. A staged
+path counts as held only when the newest dropped commit that changed it
+carries a live checkpoint and the staged mode matches too. Session matching
+ignores held paths, so a commit that only redoes linked work gets no fresh
+trailer, and one that also stages other session work gets one for that work.
+Prepare records the held paths beside the inherited IDs. After a pure redo,
+which stamps nothing and so condenses nothing, post-commit drops them from
+the touched files of this worktree's sessions when the commit holds the
+recorded content, as carry-forward would; other touched files, steps and
+transcript growth stay pending. When a fresh trailer is stamped, post-commit
+judges overlap without the redo, so a session that only redid work may fold
+into it: that keeps every stamped trailer resolvable (a stale ACTIVE or a
+read-only session can depend on it). The mid-turn agent fast path likewise
+still stamps on a partial redo: transcripts miss edits made through shell
+commands, so it cannot rule new work out. In both, a redundant checkpoint is
+preferred to a lost or dangling link.
 
 **Worktree matching** (always computed; the sole mechanism for commits with
 no recorded agent in their ancestry — human commits, detached runners): exact
