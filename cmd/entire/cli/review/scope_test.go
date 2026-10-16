@@ -499,6 +499,7 @@ func TestFallbackScopeRef_IgnoresLookalikeRefs(t *testing.T) {
 
 	dir := filepath.Join(t.TempDir(), "clone")
 	testutil.RunGit(t, upstream, "clone", "-q", upstream, dir)
+	testutil.RunGit(t, dir, "config", "commit.gpgsign", "false") // a clone doesn't copy InitRepo's config
 	testutil.RunGit(t, dir, "checkout", "-q", "-b", "feature")
 	commitFile(t, dir, "b.go", "package main", "theirs")
 	testutil.RunGit(t, dir, "tag", "origin/HEAD", "HEAD")

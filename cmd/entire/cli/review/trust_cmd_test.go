@@ -160,7 +160,7 @@ func TestRunReview_RefNamedLikeDefaultBranchDoesNotSkipGate(t *testing.T) {
 			cmd.SetOut(&bytes.Buffer{})
 			cmd.SetErr(&bytes.Buffer{})
 			cmd.SetArgs([]string{"general"})
-			if err := cmd.Execute(); err == nil || reviewer.called {
+			if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "review needs approval") || reviewer.called {
 				t.Fatalf("%s named %s skipped the gate (err=%v, called=%v)", spoof[0], spoof[1], err, reviewer.called)
 			}
 		})
