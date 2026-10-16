@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/entireio/cli/cmd/entire/cli/interactive"
+	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/internal/coreapi"
 )
 
@@ -637,7 +638,8 @@ func validateClusterHost(host string) error {
 }
 
 // newRepoMirrorCmd is the `entire repo mirror` subtree: manage EntireDB
-// GitHub-mirror placements on a cluster (add / list / remove). The
+// GitHub-mirror placements on a cluster (add / list / remove), and detach a
+// GitHub mirror into a native repo. The
 // local-clone rewrite lives at `repo remote add` (repo_remote.go) and the
 // collaborator view at `repo grant list` (repo_grant.go).
 func newRepoMirrorCmd() *cobra.Command {
@@ -648,6 +650,7 @@ func newRepoMirrorCmd() *cobra.Command {
 	cmd.AddCommand(newRepoMirrorAddCmd())
 	cmd.AddCommand(newRepoMirrorListCmd())
 	cmd.AddCommand(newRepoMirrorRemoveCmd())
+	cmd.AddCommand(newRepoMirrorDetachCmd())
 	return requireSubcommand(cmd)
 }
 
@@ -1319,8 +1322,8 @@ func newRepoMirrorListCmd() *cobra.Command {
 // its access and availability instead of a placements table — though today's
 // control plane only matches onboarded repos in the filter, so that path
 // waits on the server (the not-found error points at `list --available`).
-// --json emits the same repoDirRow shape `list --json` uses, placements
-// nested.
+// --json adds top-level repoId/apiUrl to the directory row; placements stay
+// nested. Coordinates are omitted together when resolution is unavailable.
 //
 // clusterHost is empty for a repository reference, which carries no cluster and
 // so resolves on the active context's core. A clone URL names its cluster, and
@@ -1328,27 +1331,55 @@ func newRepoMirrorListCmd() *cobra.Command {
 // than the active login resolves instead of reading as "no repo matching".
 func runRepoMirrorViewByName(cmd *cobra.Command, ref, clusterHost string) error {
 	return coreRunnerFor(clusterHost)(cmd, func(ctx context.Context, c *coreapi.Client) error {
-		out, err := c.ListRepos(ctx, coreapi.ListReposParams{Filter: coreapi.NewOptString(ref)})
-		if err != nil {
-			return err
-		}
-		if len(out.Repos) == 0 {
+		entry, err := lookupRepoIndexEntry(ctx, c, ref)
+		if errors.Is(err, errRepoNotOnboarded) {
 			// The filter only matches onboarded repos on today's control
 			// plane, so a not-yet-mirrored GitHub repo lands here too —
 			// point at the list mode that shows those.
 			return fmt.Errorf("no repo matching %q visible from your login (GitHub repos you could onboard: `entire repo mirror list --available`)", ref)
 		}
+		if err != nil {
+			return err
+		}
 		clusters, err := c.ListClusters(ctx)
 		if err != nil {
 			return err
 		}
-		row := mirrorRepoDetailRow(out.Repos[0], clusterHostBySlug(clusters.Clusters))
+		row := mirrorRepoDetailRow(entry, clusterHostBySlug(clusters.Clusters))
 		if jsonRequested(cmd) {
-			return printJSON(cmd.OutOrStdout(), row)
+			view := mirrorRepoViewJSON{repoDirRow: row}
+			view.RepoID, view.APIURL, err = repoViewCoords(entry, clusters.Clusters)
+			if err != nil {
+				logging.Debug(ctx, "repo view: API coordinates unavailable", "error", err)
+			}
+			return printJSON(cmd.OutOrStdout(), view)
 		}
 		renderRepoDetail(cmd.OutOrStdout(), row)
 		return nil
 	})
+}
+
+// mirrorRepoViewJSON adds the responsible cell's coordinates to the detail
+// view. Both fields are omitted when the processing placement cannot resolve.
+type mirrorRepoViewJSON struct {
+	repoDirRow
+
+	RepoID string `json:"repoId,omitempty"`
+	APIURL string `json:"apiUrl,omitempty"`
+}
+
+// repoViewCoords reuses the routing resolver's selection and catalog join.
+// Missing coordinates must not prevent viewing an unready repo's status.
+func repoViewCoords(entry coreapi.RepoIndexEntry, clusters []coreapi.Cluster) (repoID, apiURL string, err error) {
+	placement, err := processingPlacementOfEntry(entry)
+	if err != nil {
+		return "", "", err
+	}
+	target, err := cellTargetForPlacementInCatalog(clusters, placement)
+	if err != nil {
+		return "", "", err
+	}
+	return strings.TrimSpace(placement.ID), target.BaseURL, nil
 }
 
 // mirrorRepoDetailRow shapes one directory entry for the record view, reusing the

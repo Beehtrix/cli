@@ -11,6 +11,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/entireio/cli/cmd/entire/cli/gitremote"
+	"github.com/entireio/cli/cmd/entire/cli/interactive"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/internal/coreapi"
 )
 
@@ -186,29 +188,55 @@ func suggestRepoName(rest string) (string, bool) {
 
 func newRepoCreateCmd() *cobra.Command {
 	var (
-		projectID    string
+		projectRef   string
 		objectFormat string
+		visibility   string
 		noWait       bool
 		waitTimeout  time.Duration
 	)
 	cmd := &cobra.Command{
-		Use:   cmdCreateName,
+		Use:   "create [<name>]",
 		Short: "Create a repository in a project",
 		Long: `Create a repository and wait for provisioning to become active by
 default. Active means provisioning completed; later pushes or mirror
 creation can still fail for other reasons.
 
+With both a name and --project the repository is created directly.
+
+In an interactive terminal, 'entire repo create' or 'entire repo create
+<name>' opens a wizard instead. It asks for the project, name,
+visibility and advanced options, starting from the given name (or the
+current folder's), and shows a summary before creating anything. With
+--json the prompts stay off stdout, which carries only the repository
+object.
+
+--project, --visibility and --object-format are the flag form: give any
+of them and both a name and --project are required.
+
+--visibility is set once the repository is ready, or straight after
+creation with --no-wait: public grants read-only (pull) access to any
+authenticated Entire user, private restricts it to explicit grantees.
+New repositories are private, so omitting it (or the wizard's default)
+leaves the repository private. If setting it fails, the command exits
+nonzero, keeps the repository and prints the 'entire repo edit' that
+finishes the job.
+
 --wait-timeout must be positive. It bounds project resolution, creation,
 and readiness polling after client setup, including creation with
---no-wait. Use --no-wait to return without confirming readiness.
+--no-wait. The wizard's loading and create share that one budget; time
+spent answering the wizard does not count. Use --no-wait
+to return without confirming readiness.
 
 If creation succeeds but readiness cannot be confirmed, the command exits
 nonzero and preserves the repository result. Do not create again to
 recover. With --json, stdout contains one repository object; progress
 and recovery instructions go to stderr.`,
 		Example: "  entire repo create web --project acme\n" +
+			"  entire repo create web --project acme --visibility public\n" +
 			"  entire repo create web --project acme --no-wait\n" +
-			"  entire repo create web --project acme --wait-timeout=5m",
+			"  entire repo create web --project acme --wait-timeout=5m\n\n" +
+			"  # Pick the project and settings interactively\n" +
+			"  entire repo create web",
 		PreRunE: func(_ *cobra.Command, _ []string) error {
 			// Invalid flag values are usage errors, including zero/negative
 			// durations; match mirror add and Cobra's malformed-value path.
@@ -217,80 +245,81 @@ and recovery instructions go to stderr.`,
 			}
 			return nil
 		},
-		Args: cobra.ExactArgs(1),
+		Args: cobra.RangeArgs(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Refuse a name that ends in `.git`, whatever its case. The suffix
-			// is never part of a repo name (see gitDirSuffix): every ref
-			// parser drops it, so the name would round-trip to a different
-			// string than the one typed. The server refuses it too; saying so
-			// here costs no round trip and names the spelling to use instead.
-			//
-			// The case-insensitive cut is what makes that promise hold. A
-			// case-sensitive check let ".GIT" through to the server, which
-			// rejects it for carrying uppercase — a true statement about a
-			// different problem, leaving the user to discover the suffix rule
-			// on a second attempt.
-			//
-			// The trimmed name is what gets checked AND what gets sent
-			// (see body below): a guard reading one value while another
-			// travels is a disagreement waiting for the server to stop
-			// covering for it.
-			name := strings.TrimSpace(args[0])
-			if rest, had := gitremote.CutGitDirSuffix(name); had {
+			req := repoCreateRequest{}
+			if len(args) == 1 {
+				// Trimmed once for both paths, as the wizard trims what is
+				// typed, so ' web ' names the same repo either way and a blank
+				// name counts as missing. The trimmed name is what gets checked
+				// AND what gets sent.
+				req.name = strings.TrimSpace(args[0])
+			}
+			if err := refuseGitSuffixRepoName(req.name); err != nil {
 				cmd.SilenceUsage = true
-				err := fmt.Errorf("repo name %q must not end in %s, in any case: the suffix is never part of a repo name, so Entire could not address the repo by the name you typed", name, gitDirSuffix)
-				if use, ok := suggestRepoName(rest); ok {
-					err = fmt.Errorf("%w (use %q)", err, use)
-				}
 				return err
 			}
-			var format coreapi.CreateRepoInputBodyObjectFormat
 			if objectFormat != "" {
 				parsed, err := parseObjectFormat(objectFormat)
 				if err != nil {
 					cmd.SilenceUsage = true
 					return err
 				}
-				format = parsed
+				req.objectFormat = parsed
+			}
+			if visibility != "" {
+				parsed, err := parseVisibility(visibility)
+				if err != nil {
+					cmd.SilenceUsage = true
+					return err
+				}
+				req.visibility = parsed
+			}
+			opts := repoCreateOptions{noWait: noWait, waitTimeout: waitTimeout}
+			if req.name == "" || projectRef == "" {
+				// Settled from the command line alone, before any request: a
+				// run that cannot be prompted must not cost a lookup. Flags
+				// mean the flag form, so a create flag with an input missing
+				// is refused even in a terminal: the wizard takes only the
+				// positional name. --json still prompts, as `grant add` does:
+				// the form renders on stderr or the controlling terminal and
+				// stdout carries only the result.
+				// No terminal is checked first: the flag-form refusal suggests
+				// running without flags to be prompted, which nothing can do
+				// without one.
+				cmd.SilenceUsage = true
+				if !interactive.CanPromptInteractively() {
+					return repoCreateMissingInput(req.name, projectRef, errRepoCreateNeedsInput)
+				}
+				if repoCreateFlagsGiven(cmd) {
+					return repoCreateMissingInput(req.name, projectRef, errRepoCreateFlagsNeedInput)
+				}
+				return runRepoCreateWizard(cmd, req.name, opts)
 			}
 			return runCore(cmd, func(ctx context.Context, c *coreapi.Client) error {
 				ctx, cancel := context.WithTimeout(ctx, waitTimeout)
 				defer cancel()
-				projID, err := resolveProjectRef(ctx, c, projectID)
+				project, err := resolveProjectRefResolved(ctx, c, projectRef)
 				if err != nil {
 					return err
 				}
-				body := &coreapi.CreateRepoInputBody{Name: name, ProjectId: projID}
-				if format != "" {
-					body.ObjectFormat = coreapi.NewOptCreateRepoInputBodyObjectFormat(format)
-				}
-				response, err := c.CreateRepo(ctx, body)
+				req.projectID, req.projectName = project.ID, project.Name
+				created, err := createRepo(ctx, c, req)
 				if err != nil {
 					return err
 				}
-				created, err := createdRepoAsRepo(&response.Response)
-				if err != nil {
-					return err
-				}
-				var waitErr error
-				if !noWait {
-					var finish func(bool)
-					waitErr = awaitRepoActive(ctx, c, created, func() {
-						finish = startSpinner(cmd.ErrOrStderr(), "Waiting for repository "+created.Name+" to become active")
-					})
-					if finish != nil {
-						finish(waitErr == nil)
-					}
-				}
-				return reportRepoCreation(cmd, created, noWait, waitErr)
+				return finishRepoCreate(ctx, cmd, c, req, created, opts)
 			})
 		},
 	}
 	cmd.Flags().BoolVar(&noWait, "no-wait", false, "Return after creation without confirming provisioning readiness")
 	cmd.Flags().DurationVar(&waitTimeout, "wait-timeout", 10*time.Minute, "Time limit for project resolution, creation, and provisioning readiness")
-	cmd.Flags().StringVar(&projectID, projectFlagName, "", "Owning project (name or ULID) (required)")
-	cmd.Flags().StringVar(&objectFormat, "object-format", "", "Git object format for the repository: sha1 or sha256 (defaults to the server default)")
-	markRequired(cmd, projectFlagName)
+	// "(required)" stays in the text although the flag is not cobra-required
+	// (the wizard asks for it): agents read this list and never have a
+	// terminal, so it is the only place they learn it.
+	cmd.Flags().StringVar(&projectRef, projectFlagName, "", "Owning project (by name) (required; run in a terminal without --project, --visibility or --object-format to be asked instead)")
+	cmd.Flags().StringVar(&objectFormat, repoCreateFlagObjectFormat, "", "Git object format for the repository: sha1 or sha256 (defaults to the server default)")
+	cmd.Flags().StringVar(&visibility, repoCreateFlagVisibility, "", "Visibility to set after creation: public or private (new repositories are private)")
 	addJSONFlag(cmd)
 	return cmd
 }
@@ -421,11 +450,13 @@ func newRepoListCmd() *cobra.Command {
 func newRepoViewCmd() *cobra.Command {
 	var authoritative bool
 	cmd := &cobra.Command{
-		Use:   "view <repo>",
+		Use:   "view [repo]",
 		Short: "Show a repository and every cluster holding a copy of it",
 		Long: "Show a repository: its identity, visibility, and one row per cluster " +
 			"it is placed on, with that cluster's clone URL and status.\n\n" +
-			"<repo> names its forge, and nothing else addresses a repository here:\n\n" +
+			"With no repository argument, resolve the current clone's origin remote.\n" +
+			"--json includes repoId and apiUrl for the responsible API cell when resolvable.\n\n" +
+			"An explicit <repo> names its forge:\n\n" +
 			"  - /et/<project>/<repo> — an Entire-native repo, shown with its\n" +
 			"    primary cluster and each mirror of it, plus how far a seed in\n" +
 			"    progress has got\n" +
@@ -441,14 +472,24 @@ func newRepoViewCmd() *cobra.Command {
 			"A native repo's state is read authoritatively, so the primary's STATUS " +
 			"says whether it is usable. Pass --authoritative to fail rather than " +
 			"dash that cell when the server cannot answer.",
-		Example: "  entire repo view /et/acme/web\n" +
+		Example: "  entire repo view --json\n" +
+			"  entire repo view /et/acme/web\n" +
 			"  entire repo view /gh/octocat/hello-world\n" +
 			"  entire repo view /et/acme/web --json\n" +
 			"  entire repo view entire://aws-us-east-2.entire.io/et/acme/web",
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cmd.SilenceUsage = true
-			ref := strings.TrimSpace(args[0])
+			var ref string
+			if len(args) == 0 {
+				var err error
+				ref, err = currentRepoViewRef(cmd.Context())
+				if err != nil {
+					return err
+				}
+			} else {
+				ref = strings.TrimSpace(args[0])
+			}
 			// A clone URL names its own cluster, so it is looked up on the core
 			// fronting that cluster. Recognised by its scheme so a malformed one
 			// keeps the clone-URL parser's reason instead of being reported as a
@@ -488,26 +529,30 @@ func newRepoViewCmd() *cobra.Command {
 	return cmd
 }
 
-func newRepoDeleteCmd() *cobra.Command {
-	var project string
-	cmd := &cobra.Command{
-		Use:   "delete <repo>",
-		Short: "Delete a repository by /et/<project>/<repo> path, name, or ULID",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runControlPlaneDelete(cmd, "repo", args[0],
-				func(ctx context.Context, c *coreapi.Client) (resolvedRef, error) {
-					return resolveRepoRefResolved(ctx, c, args[0], project)
-				},
-				func(ctx context.Context, c *coreapi.Client, id string) error {
-					_, err := c.DeleteRepo(ctx, coreapi.DeleteRepoParams{RepoId: id})
-					return err
-				})
-		},
+// Keep Entire clone URLs intact so the normal view path selects the login
+// server fronting that cluster, including origins in another federation.
+func currentRepoViewRef(ctx context.Context) (string, error) {
+	if _, err := paths.WorktreeRoot(ctx); err != nil {
+		if errors.Is(err, paths.ErrNotARepository) {
+			return "", fmt.Errorf("not in a git repository; pass /gh/<owner>/<repo> or /et/<project>/<repo> explicitly: %w", err)
+		}
+		return "", fmt.Errorf("resolve current git repository: %w", err)
 	}
-	bindRepoProjectFlag(cmd, &project)
-	addForceFlag(cmd)
-	return cmd
+	remoteURL, err := gitremote.GetRemoteURL(ctx, "origin")
+	if err != nil {
+		return "", fmt.Errorf("%w; pass /gh/<owner>/<repo> or /et/<project>/<repo> explicitly", err)
+	}
+	if strings.HasPrefix(strings.ToLower(remoteURL), entireCloneURLScheme) {
+		return remoteURL, nil
+	}
+	forge, owner, repo, err := gitremote.ResolveRemoteRepo(ctx, "origin")
+	if err != nil {
+		return "", fmt.Errorf("resolve origin remote: %w", err)
+	}
+	if forge != mirrorCloneForge {
+		return "", errors.New("origin must name a GitHub or Entire repository; pass a /gh/ or /et/ repository reference explicitly")
+	}
+	return "/gh/" + owner + "/" + repo, nil
 }
 
 // repoVisibility is the field/JSON view shared by `visibility get` and

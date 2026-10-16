@@ -10,7 +10,7 @@ The CLI discovers external agents by scanning `$PATH` for executables matching t
 
 Two rules bound that scan, both because discovery *executes* what it finds (it calls each binary's `info` subcommand):
 
-- It is off unless `external_agents` is set in an untracked `.entire/settings.local.json`. The committed `.entire/settings.json` cannot grant it — see [Why `external_agents` is local-only](../security-and-privacy.md#why-external_agents-is-local-only). Interactive setup flows scan regardless, so you can still pick a plugin before the setting exists.
+- It is off unless `external_agents` is set in an untracked `.entire/settings.local.json`. The committed `.entire/settings.json` cannot grant it — see [Why `external_agents` is local-only](../security-and-privacy.md#why-external_agents-is-local-only). Interactive setup flows scan regardless, so you can still pick a plugin before the setting exists. Commands that name one agent (`entire enable --agent <name>`, `entire agent add <name>`, `entire agent remove <name>`) resolve only that binary, also regardless of the setting; `entire agent list` names none, so it scans only when the setting is on.
 - Only absolute `$PATH` entries are scanned. A relative entry resolves against the working directory, which for a git hook is whatever repository invoked it.
 
 - Binaries whose `<name>` conflicts with an already-registered built-in agent are skipped.
@@ -19,7 +19,7 @@ Two rules bound that scan, both because discovery *executes* what it finds (it c
 
 ## Environment
 
-Every subcommand invocation sets:
+Every subcommand invocation except `generate-text` sets:
 
 | Variable | Description |
 |---|---|
@@ -27,6 +27,13 @@ Every subcommand invocation sets:
 | `ENTIRE_PROTOCOL_VERSION` | Protocol version (`1`) |
 
 The working directory is set to the repository root.
+
+`generate-text` is the exception. Its stdin is a summary prompt carrying
+untrusted transcript content, so it runs from a fresh empty temporary
+directory, without `ENTIRE_REPO_ROOT` and without `GIT_*` variables, the same
+isolation Entire gives its built-in summary generators. A plugin should not
+need the repository to generate text; if its model has tools, it should run
+them with none enabled, as the built-in generators do where their CLI allows.
 
 ## Communication Model
 
@@ -68,6 +75,8 @@ Returns agent metadata and declared capabilities.
 ```
 
 The `capabilities` object determines which optional subcommands the CLI will call. If a capability is `false` or missing, the CLI will never invoke the corresponding subcommands.
+
+Optional: `"caller_env_vars": ["MYAGENT_SESSION_ID"]` lists environment variables the agent sets for the commands it runs (uppercase names only). `entire review` uses them to recognise the agent as the caller, so it refuses to approve reviews of someone else's code on the user's behalf and names the agent when one passes `--trust-target`. Agents that set the cross-tool `AI_AGENT` variable are recognised without declaring it.
 
 #### `detect`
 
@@ -311,19 +320,6 @@ Extracts user prompts from a transcript.
 
 ```json
 {"prompts": ["first prompt text", "second prompt text"]}
-```
-
-#### `extract-summary --session-ref <path>`
-
-Extracts an AI-generated summary from a transcript.
-
-**Arguments:**
-- `--session-ref` — Path to the transcript file
-
-**Output (stdout):** JSON
-
-```json
-{"summary": "Summary text here", "has_summary": true}
 ```
 
 ### Capability: `transcript_preparer`

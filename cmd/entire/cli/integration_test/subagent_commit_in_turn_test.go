@@ -12,22 +12,21 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/session"
 )
 
-// TestSubagentCheckpoints_CommittedMidTurn_LeavesNoShadowBranch reproduces the
-// orphaned shadow branch behind the e2e failure of
+// TestSubagentCheckpoints_CommittedMidTurn_LeavesNothingPending reproduces the
+// orphaned pending work behind the e2e failure of
 // TestSingleSessionSubagentCommitInTurn.
 //
 // The subagent writes a file and commits it itself, mid-turn. That commit condenses
-// the session and deletes the shadow branch. post-task then fires with nothing left
-// to snapshot — the file is already in HEAD — so it must skip the task checkpoint.
-// Creating one instead mints a *new* shadow branch after condensation has already
-// run, and nothing ever condenses it away: turn-end sees no file modifications and
-// skips, so the branch outlives the session.
+// the session. post-task then fires with nothing left pending — the file is
+// already in HEAD — so it must not put the file back into FilesTouched. Doing so
+// leaves work pending after condensation has already run, and no commit ever
+// claims it, so it outlives the session.
 //
 // The trap is that the subagent's transcript still records the Write. Deciding from
 // the transcript alone conflates "the subagent wrote this at some point" with "there
 // is an uncommitted change here" — see filterToUncommittedFiles, which the turn-end
 // path already applies for exactly this reason.
-func TestSubagentCheckpoints_CommittedMidTurn_LeavesNoShadowBranch(t *testing.T) {
+func TestSubagentCheckpoints_CommittedMidTurn_LeavesNothingPending(t *testing.T) {
 	t.Parallel()
 	env := NewFeatureBranchEnv(t)
 	session := env.NewSession()
@@ -50,11 +49,11 @@ func TestSubagentCheckpoints_CommittedMidTurn_LeavesNoShadowBranch(t *testing.T)
 
 	// The subagent writes the file and commits it itself, still inside the turn.
 	env.WriteFile(editedFile, "Red is a warm colour.\n")
-	env.GitCommitWithShadowHooksAsAgent("Add red.md", editedFile)
+	env.GitCommitWithHooksAsAgent("Add red.md", editedFile)
 
-	// Condensation ran on that commit and cleaned up the shadow branch.
-	if got := shadowBranches(env); len(got) != 0 {
-		t.Fatalf("precondition: shadow branch should be gone after the mid-turn commit, got %v", got)
+	// Condensation ran on that commit and consumed the pending files.
+	if state, err := env.GetSessionState(session.ID); err != nil || state == nil || containsFile(state.FilesTouched, editedFile) {
+		t.Fatalf("precondition: %s should not be pending after the mid-turn commit (state=%+v, err=%v)", editedFile, state, err)
 	}
 
 	if err := env.SimulatePostTask(PostTaskInput{
@@ -66,10 +65,15 @@ func TestSubagentCheckpoints_CommittedMidTurn_LeavesNoShadowBranch(t *testing.T)
 		t.Fatalf("SimulatePostTask failed: %v", err)
 	}
 
-	if got := shadowBranches(env); len(got) != 0 {
-		t.Errorf("post-task created a shadow branch for already-committed work: %v\n"+
-			"nothing will condense it away — turn-end skips when no files changed", got)
+	state, err := env.GetSessionState(session.ID)
+	if err != nil || state == nil {
+		t.Fatalf("GetSessionState failed: state=%+v err=%v", state, err)
 	}
+	if containsFile(state.FilesTouched, editedFile) {
+		t.Errorf("post-task left already-committed %s pending: %v\n"+
+			"no commit will claim it — turn-end skips when no files changed", editedFile, state.FilesTouched)
+	}
+	env.AssertNoShadowBranches()
 }
 
 // TestSubagentCheckpoints_UncommittedWork_StillCheckpoints is the companion guard:
@@ -115,19 +119,6 @@ func TestSubagentCheckpoints_UncommittedWork_StillCheckpoints(t *testing.T) {
 	if rec == nil || rec.CompletedAt.IsZero() || !containsFile(rec.Files, editedFile) {
 		t.Errorf("expected a completed task record carrying uncommitted subagent work, got %+v", rec)
 	}
-}
-
-// shadowBranches returns the per-base-commit shadow branches, excluding the
-// permanent committed-checkpoint branch which is not session-scoped.
-func shadowBranches(env *TestEnv) []string {
-	var out []string
-	for _, b := range env.ListBranchesWithPrefix("entire/") {
-		if b == paths.MetadataBranchName {
-			continue
-		}
-		out = append(out, b)
-	}
-	return out
 }
 
 // TestSubagentCheckpoints_CommitWhileIdleWithTaskRecord_LinksAndCondensesContent
@@ -205,7 +196,7 @@ func TestSubagentCheckpoints_CommitWhileIdleWithTaskRecord_LinksAndCondensesCont
 	// The commit lands while the session is IDLE, through the real
 	// prepare-commit-msg + post-commit hook chain, with no TTY (agent-mode
 	// commit) — the exact shape of the incident.
-	env.GitCommitWithShadowHooksAsAgent("Add idle-marker doc", editedFile)
+	env.GitCommitWithHooksAsAgent("Add idle-marker doc", editedFile)
 
 	headHash := env.GetHeadHash()
 	checkpointID := env.GetCheckpointIDFromCommitMessage(headHash)
@@ -308,9 +299,9 @@ func TestSubagentCheckpoints_CommitAfterBackgroundTaskCompletes_LinksViaFiles(t 
 			}
 
 			if tt.tty {
-				env.GitCommitWithShadowHooks("Add completed doc", editedFile)
+				env.GitCommitWithHooks("Add completed doc", editedFile)
 			} else {
-				env.GitCommitWithShadowHooksAsAgent("Add completed doc", editedFile)
+				env.GitCommitWithHooksAsAgent("Add completed doc", editedFile)
 			}
 
 			checkpointID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
@@ -326,6 +317,108 @@ func TestSubagentCheckpoints_CommitAfterBackgroundTaskCompletes_LinksViaFiles(t 
 				t.Errorf("materialized subagent transcript does not reference %q", editedFile)
 			}
 		})
+	}
+}
+
+// TestSubagentCheckpoints_BackgroundTaskCompletesMidTurn_ParentCommitLinks pins
+// the ordering from issue #2653: a background subagent appends to a tracked
+// file and its completion arrives while the parent is still mid-turn, and the
+// parent commits in that same turn, before any Stop. The commit must link to the
+// session through the subagent's file and carry the subagent's transcript.
+func TestSubagentCheckpoints_BackgroundTaskCompletesMidTurn_ParentCommitLinks(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+
+	const (
+		taskToolUseID = "toolu_01CompletesMidTurn"
+		subagentID    = "f5555666677778888"
+		editedFile    = "notes.txt"
+		baseContent   = "base\n"
+		editedContent = "base\nadded by the background subagent\n"
+	)
+	env.WriteFile(editedFile, baseContent)
+	env.GitAdd(editedFile)
+	env.GitCommit("Add notes")
+
+	sess := env.NewSession()
+	sess.CreateTranscript("delegate a background task, then commit", nil)
+
+	if err := env.SimulateUserPromptSubmitWithTranscriptPath(sess.ID, sess.TranscriptPath); err != nil {
+		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	}
+	if err := env.SimulatePreTask(sess.ID, sess.TranscriptPath, taskToolUseID); err != nil {
+		t.Fatalf("SimulatePreTask failed: %v", err)
+	}
+	if err := env.SimulatePostTask(PostTaskInput{
+		SessionID:      sess.ID,
+		TranscriptPath: sess.TranscriptPath,
+		ToolUseID:      taskToolUseID,
+		AgentID:        subagentID,
+		Background:     true,
+	}); err != nil {
+		t.Fatalf("SimulatePostTask (background stub) failed: %v", err)
+	}
+
+	subagentTranscript := sess.CreateSubagentTranscript(subagentID, []FileChange{
+		{Path: editedFile, Content: editedContent},
+	})
+	env.WriteFile(editedFile, editedContent)
+	if err := env.SimulateSubagentStop(SubagentStopInput{
+		SessionID:           sess.ID,
+		TranscriptPath:      sess.TranscriptPath,
+		AgentID:             subagentID,
+		AgentTranscriptPath: subagentTranscript,
+	}); err != nil {
+		t.Fatalf("SimulateSubagentStop failed: %v", err)
+	}
+
+	state, err := env.GetSessionState(sess.ID)
+	if err != nil || state == nil {
+		t.Fatalf("GetSessionState failed: %v (state=%v)", err, state)
+	}
+	if !state.Phase.IsActive() || len(state.LiveTaskRecords()) != 0 {
+		t.Fatalf("precondition: want an ACTIVE parent with only a completed record, got phase=%s records=%+v",
+			state.Phase, state.TaskRecords)
+	}
+
+	env.GitCommitWithHooksAsAgent("Update notes", editedFile)
+
+	checkpointID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
+	if checkpointID == "" {
+		t.Fatalf("parent's mid-turn commit of the subagent's file should carry an Entire-Checkpoint trailer")
+	}
+	metadataContent, ok := env.ReadFileFromBranch(paths.MetadataBranchName, SessionMetadataPath(checkpointID))
+	if !ok {
+		t.Fatalf("session metadata missing for checkpoint %s", checkpointID)
+	}
+	var metadata checkpoint.Metadata
+	if err := json.Unmarshal([]byte(metadataContent), &metadata); err != nil {
+		t.Fatalf("parse session metadata: %v", err)
+	}
+	if metadata.SessionID != sess.ID {
+		t.Errorf("checkpoint session = %q, want %q", metadata.SessionID, sess.ID)
+	}
+	if !containsFile(metadata.FilesTouched, editedFile) {
+		t.Errorf("checkpoint files_touched = %v, want it to contain %s", metadata.FilesTouched, editedFile)
+	}
+	storedTranscript, ok := env.ReadFileFromBranch(paths.MetadataBranchName,
+		CheckpointTaskFilePath(checkpointID, taskToolUseID, "agent-"+subagentID+".jsonl"))
+	if !ok {
+		t.Fatalf("subagent transcript not materialized under the checkpoint's tasks/ subtree")
+	}
+	if !strings.Contains(storedTranscript, editedFile) {
+		t.Errorf("materialized subagent transcript does not reference %q", editedFile)
+	}
+
+	if err := env.SimulateStop(sess.ID, sess.TranscriptPath); err != nil {
+		t.Fatalf("SimulateStop failed: %v", err)
+	}
+	state, err = env.GetSessionState(sess.ID)
+	if err != nil || state == nil {
+		t.Fatalf("GetSessionState failed: %v (state=%v)", err, state)
+	}
+	if containsFile(state.FilesTouched, editedFile) {
+		t.Errorf("%s still pending after it was committed: %v", editedFile, state.FilesTouched)
 	}
 }
 
@@ -389,7 +482,7 @@ func TestSubagentCheckpoints_JointCommitWithRunningSubagent_KeepsBothSessions(t 
 	env.WriteFile(codingFile, codingBody)
 	coding.CreateTranscript("Add the feature and commit everything", []FileChange{{Path: codingFile, Content: codingBody}})
 
-	env.GitCommitWithShadowHooksAsAgent("Add feature and joint doc", codingFile, subagentFile)
+	env.GitCommitWithHooksAsAgent("Add feature and joint doc", codingFile, subagentFile)
 
 	checkpointID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
 	if checkpointID == "" {
