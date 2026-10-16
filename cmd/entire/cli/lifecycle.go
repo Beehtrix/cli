@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -658,11 +659,12 @@ func handleLifecycleTurnStart(ctx context.Context, ag agent.Agent, event *agent.
 	captureSpan.End()
 
 	// Append prompt to prompt.txt on filesystem so it's available for
-	// mid-turn commits and condensation.
+	// mid-turn commits and condensation. It goes to the session's home
+	// worktree, where its other prompts are (see OpenSessionEntireDir).
 	// Prompts are separated by "\n\n---\n\n" to support multiple turns.
 	if event.Prompt != "" {
 		sessionName := sessionMetadataName(sessionID)
-		if root, rootErr := entiredir.Open(ctx); rootErr == nil {
+		if root, rootErr := strategy.OpenSessionEntireDir(ctx, sessionID); rootErr == nil {
 			if mkErr := osroot.MkdirAllNoSymlink(root, sessionName, 0o750); mkErr == nil {
 				promptName := sessionName + "/" + paths.PromptFileName
 				existing, readErr := entiredir.ReadFile(root, promptName)
@@ -813,6 +815,19 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 	}
 	prepareSpan.End()
 
+	// An agent launched in one worktree fires its hooks there even when it
+	// edits another by absolute path. Those edits are recorded against the
+	// worktree they are in (strategy.SplitEditsByWorktree), so a commit there
+	// links them; the hook's own worktree is handled below as always.
+	hookRoot, err := paths.WorktreeRoot(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get worktree root: %w", err)
+	}
+	var elsewhere map[string][]string
+	if sessionID != unknownSessionID {
+		elsewhere = uncommittedEditsElsewhere(ctx, strategy.SplitEditsByWorktree(ctx, hookRoot, turnEditedPaths(logCtx, ag, transcriptRef, sessionID)))
+	}
+
 	// Create session metadata directory
 	_, copySpan := perf.Start(ctx, "copy_transcript")
 	// sessionDir is the repo-relative path that ends up in commit trailers and
@@ -820,7 +835,9 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 	// the .entire root, which is what every read and write below uses.
 	sessionDir := paths.SessionMetadataDirFromSessionID(sessionID)
 	sessionName := sessionMetadataName(sessionID)
-	entireRoot, err := entiredir.Open(ctx)
+	// The session's home worktree holds its stored copy, even when this turn
+	// ended in another worktree (see strategy.OpenSessionEntireDir).
+	entireRoot, err := strategy.OpenSessionEntireDir(ctx, sessionID)
 	if err != nil {
 		copySpan.RecordError(err)
 		copySpan.End()
@@ -958,12 +975,7 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 
 	// Get worktree root for path normalization
 	_, detectSpan := perf.Start(ctx, "detect_file_changes")
-	repoRoot, err := paths.WorktreeRoot(ctx)
-	if err != nil {
-		detectSpan.RecordError(err)
-		detectSpan.End()
-		return fmt.Errorf("failed to get worktree root: %w", err)
-	}
+	repoRoot := hookRoot
 
 	var preUntrackedFiles []string
 	if preState != nil {
@@ -1066,7 +1078,17 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 
 	// Check if there are any changes
 	totalChanges := len(relModifiedFiles) + len(relNewFiles) + len(relDeletedFiles)
-	if totalChanges == 0 {
+	if totalChanges == 0 && len(elsewhere) > 0 {
+		// Nothing git can see changed here, but the turn worked in another
+		// worktree and goes on to save that step. An untracked file it
+		// created here earlier and has now removed is still recorded, as in
+		// the branch below.
+		if recErr := GetStrategy(ctx).RecordVanishedUntrackedFiles(ctx, sessionID); recErr != nil {
+			logging.Warn(logCtx, "failed to record removed untracked files",
+				slog.String("error", recErr.Error()))
+		}
+	}
+	if totalChanges == 0 && len(elsewhere) == 0 {
 		logging.Info(logCtx, "no files modified during session, skipping checkpoint")
 		// A turn that only removed an untracked file the agent created
 		// earlier changes nothing git can see; record that deletion anyway.
@@ -1133,9 +1155,28 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 		SubagentLedgerVersion:    codexLedgerVersion,
 	}
 
-	if err := strat.SaveStep(ctx, stepCtx); err != nil {
-		return fmt.Errorf("failed to save step: %w", err)
+	// The hook's worktree, then each other worktree the turn edited: one
+	// step, counted once and carrying the turn's tokens once.
+	counted := false
+	if totalChanges > 0 {
+		if err := strat.SaveStep(ctx, stepCtx); err != nil {
+			return fmt.Errorf("failed to save step: %w", err)
+		}
+		counted = true
 	}
+	for _, root := range slices.Sorted(maps.Keys(elsewhere)) {
+		step := stepCtx
+		step.WorktreeRoot = root
+		step.ModifiedFiles, step.NewFiles, step.DeletedFiles = elsewhere[root], nil, nil
+		if counted {
+			step.SameTurn, step.TokenUsage = true, nil
+		}
+		if err := strat.SaveStep(ctx, step); err != nil {
+			return fmt.Errorf("failed to save step for %s: %w", root, err)
+		}
+		counted = true
+	}
+	strategy.PruneRemovedWorktrees(ctx, sessionID, hookRoot)
 
 	// The LastPrompt backfill must come after SaveStep because SaveStep may
 	// reinitialize session state, which would overwrite an earlier LastPrompt
@@ -1283,11 +1324,13 @@ func handleLifecycleSessionEnd(ctx context.Context, ag agent.Agent, event *agent
 		_, _ = refreshCodexInventory(ctx, ag, event.SessionID, nil, 0)
 		finalizeCodexObservedAtSessionEnd(ctx, event.SessionID)
 		completeLiveTaskRecords(ctx, ag, event.SessionID, event.SessionRef)
+		pruneRemovedWorktreesAtEnd(ctx, event.SessionID)
 		condenseEndedSession(ctx, event.SessionID, deadline)
 		return nil
 	}
 
 	completeLiveTaskRecords(ctx, ag, event.SessionID, event.SessionRef)
+	pruneRemovedWorktreesAtEnd(ctx, event.SessionID)
 
 	if _, err := endSessionNow(ctx, event, event.SessionID, nil, sessionEndCondenseDeadline(ag), endedNow); err != nil {
 		logging.Warn(logCtx, "failed to mark session ended",
@@ -1295,6 +1338,17 @@ func handleLifecycleSessionEnd(ctx context.Context, ag agent.Agent, event *agent
 	}
 
 	return nil
+}
+
+// pruneRemovedWorktreesAtEnd drops the ending session's records of worktrees
+// removed since its last turn end, which pruned them last: no turn end follows
+// to do it, and those records would keep the ended session pending for ever.
+func pruneRemovedWorktreesAtEnd(ctx context.Context, sessionID string) {
+	hookRoot, err := paths.WorktreeRoot(ctx)
+	if err != nil {
+		return
+	}
+	strategy.PruneRemovedWorktrees(ctx, sessionID, hookRoot)
 }
 
 // finalizeCodexObservedAtSessionEnd closes every observed turn of a VERIFIED
@@ -3097,4 +3151,41 @@ func adoptInvestigateEnv(ctx context.Context, state *session.State, expectedAgen
 				slog.String("run_id", state.InvestigateRunID))
 		},
 	})
+}
+
+// turnEditedPaths returns the files this turn's main transcript says the
+// agent edited, as recorded (usually absolute). Subagent transcripts are left
+// out: a subagent's edits in its own throwaway worktree belong to its task
+// record (see strategy.SplitEditsByWorktree). Failures yield none.
+func turnEditedPaths(ctx context.Context, ag agent.Agent, transcriptRef, sessionID string) []string {
+	analyzer, ok := agent.AsTranscriptAnalyzer(ag)
+	if !ok {
+		return nil
+	}
+	preState, err := LoadPrePromptState(ctx, sessionID)
+	if err != nil {
+		preState = nil
+	}
+	files, _, err := analyzer.ExtractModifiedFilesFromOffset(ctx, transcriptRef, resolveTranscriptOffset(ctx, preState, sessionID))
+	if err != nil {
+		return nil
+	}
+	return files
+}
+
+// uncommittedEditsElsewhere keeps, of a turn's edits grouped by worktree, the
+// files that still differ from that worktree's HEAD: the agent may already
+// have committed them there mid-turn.
+func uncommittedEditsElsewhere(ctx context.Context, byWorktree map[string][]string) map[string][]string {
+	for root, rels := range byWorktree {
+		if kept := filterToUncommittedFiles(ctx, rels, root); len(kept) > 0 {
+			byWorktree[root] = kept
+		} else {
+			delete(byWorktree, root)
+		}
+	}
+	if len(byWorktree) == 0 {
+		return nil
+	}
+	return byWorktree
 }

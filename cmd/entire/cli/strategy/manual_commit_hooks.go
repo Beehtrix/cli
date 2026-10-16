@@ -1407,11 +1407,27 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 		iterCtx, iterSpan := processSessionsLoop.Iteration(loopCtx)
 		var newSkillEvents []agent.SkillEvent
 		var condensedSignal *commitCondensedSignal
+		entryOnly := sess.LinkedByWorktreeEntry
 		mutErr := MutateSessionStateOnSaved(iterCtx, sessionID, func(state *SessionState) error {
+			// Judged again under the lock: a home moved here is stored at its
+			// new path, and a worktree re-added at the home's path commits
+			// as a guest (one linked by identity; it can't match by path).
+			switch followMovedHome(iterCtx, state, worktreePath) {
+			case homeNotHere, homeReplaced:
+				state.HomeNotHere = true
+			case homeUnknown, homeHere, homeMovedHere:
+			}
+			// The same view of this worktree the linking set judged it by.
+			leave, inView := enterWorktreeView(iterCtx, state, worktreePath)
+			state.LinkedByWorktreeEntry = entryOnly
 			var condensed bool
 			newSkillEvents, condensedSignal, condensed = s.postCommitProcessSessionLocked(iterCtx, repo, state, &transitionCtx, checkpointID,
 				head, commit, newHead, worktreePath, headTree, parentTree,
 				committedFileSet, sessionsWithCommittedFiles, condensedTelemetry)
+			state.LinkedByWorktreeEntry, state.HomeNotHere = false, false
+			if inView {
+				leave()
+			}
 			trailerOwned = trailerOwned || condensed
 			if IsCondensableEndedSession(state) {
 				staleEnded++
@@ -1584,7 +1600,7 @@ func (s *ManualCommitStrategy) hasMidTurnClaimant(ctx context.Context, sessions 
 			continue
 		}
 		prepareTranscriptForState(ctx, state)
-		for _, f := range s.extractModifiedFilesFromLiveTranscript(ctx, state, state.CheckpointTranscriptStart) {
+		for _, f := range s.extractModifiedFilesFromLiveTranscript(ctx, state, uncheckpointedTranscriptStart(state)) {
 			if _, ok := committedFileSet[f]; ok {
 				return true
 			}
@@ -1623,6 +1639,11 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 	condensedTelemetry *commitCondensedEmitter,
 ) (newSkillEvents []agent.SkillEvent, condensedSignal *commitCondensedSignal, condensed bool) {
 	logCtx := logging.WithComponent(ctx, "checkpoint")
+	if state.LinkedByWorktreeEntry && !overlapsFiles(state.FilesTouched, committedFileSet) {
+		// Linked only by its record of this worktree, and the commit holds
+		// none of those files: not this session's commit.
+		return newSkillEvents, condensedSignal, false
+	}
 	reservedCheckpointID := state.PendingCondensationID()
 	if reservedCheckpointID != id.EmptyCheckpointID && reservedCheckpointID != checkpointID {
 		logging.Warn(logCtx, "post-commit: preserving interrupted condensation with a different checkpoint ID",
@@ -1734,7 +1755,7 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 	// would rewrite the home worktree's pending files with foreign data (see
 	// condenseAndUpdateState).
 	_, carryForwardSpan := perf.Start(ctx, "carry_forward_files")
-	if handler.condensed && isSessionHomeWorktree(repoDir, state) {
+	if handler.condensed && committedAtHome(repoDir, state) {
 		remainingFiles := filesWithRemainingAgentChanges(ctx, repo, touchedFileHashesBefore, commit, filesTouchedBefore, committedFileSet, overlapOpts{
 			headTree: headTree,
 		})
@@ -1749,7 +1770,9 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 			slog.Any("remaining", remainingFiles),
 			slog.Any("committed_files", committedFileSet),
 		)
-		if len(remainingFiles) > 0 {
+		// Files still waiting here or in another worktree keep the session
+		// pending and the next checkpoint self-contained.
+		if state.HasPendingFiles() {
 			carryForwardRemainingFiles(logCtx, state)
 		}
 
@@ -1757,7 +1780,7 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 		// committed. If carry-forward files remain they must persist, so the
 		// next condensation (triggered by the next commit) can still read them.
 		// Released through the root the condensation read them from.
-		if len(state.FilesTouched) == 0 {
+		if !state.HasPendingFiles() {
 			clearStagedFilesIn(ctx, handler.storedRoot, state.SessionID, state.WorktreePath)
 		}
 	}
@@ -1767,7 +1790,7 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 	// Either we just condensed (no carry-forward remains) or there was never any
 	// new content. PostCommit will skip these on future commits; they persist only
 	// for LastCheckpointID (amend trailer restoration).
-	if state.Phase == session.PhaseEnded && len(state.FilesTouched) == 0 && (handler.condensed || !hasNew) {
+	if state.Phase == session.PhaseEnded && !state.HasPendingFiles() && (handler.condensed || !hasNew) {
 		state.FullyCondensed = true
 	}
 
@@ -1851,7 +1874,7 @@ func (s *ManualCommitStrategy) condenseAndUpdateState(
 	// (or letting the caller recompute them via carry-forward, which compares
 	// files in the current — wrong — worktree) would replace the home
 	// worktree's in-flight state with the committing worktree's files.
-	isHome := isSessionHomeWorktree(opts.repoDir, state)
+	isHome := committedAtHome(opts.repoDir, state)
 	if !isHome {
 		state.LastCheckpointID = result.CheckpointID
 		pendingStepCount := state.StepCount
@@ -1916,7 +1939,7 @@ func (s *ManualCommitStrategy) updateBaseCommitIfChanged(ctx context.Context, st
 	// Guest-linked sessions (identity-matched from a sibling worktree) keep
 	// their BaseCommit on their home worktree's HEAD — see
 	// condenseAndUpdateState for the rationale.
-	if !isSessionHomeWorktree(worktreePath, state) {
+	if !committedAtHome(worktreePath, state) {
 		return
 	}
 	if state.BaseCommit != newHead {
@@ -1961,6 +1984,12 @@ func (s *ManualCommitStrategy) postCommitUpdateBaseCommitOnly(ctx context.Contex
 		mutErr := MutateSessionState(ctx, sessionID, func(state *SessionState) error {
 			if !state.Phase.IsActive() || state.BaseCommit == newHead {
 				return ErrMutationSkip
+			}
+			// Judged again under the lock, as the post-commit loop does.
+			switch followMovedHome(ctx, state, worktreePath) {
+			case homeNotHere, homeReplaced:
+				return ErrMutationSkip
+			case homeUnknown, homeHere, homeMovedHere:
 			}
 			logging.Debug(logCtx, "post-commit (no trailer): updating BaseCommit",
 				slog.String("session_id", state.SessionID),
@@ -2050,6 +2079,12 @@ func (s *ManualCommitStrategy) filterSessionsWithNewContent(ctx context.Context,
 			)
 			continue
 		}
+		if state.LinkedByWorktreeEntry && !overlapsFiles(state.FilesTouched, fileSet(stagedFiles)) {
+			logging.Debug(logCtx, "filterSessionsWithNewContent: linked by its record of this worktree, but none of those files is staged",
+				slog.String("session_id", state.SessionID),
+			)
+			continue
+		}
 		if s.staleRecordIsOnlyContent(ctx, repo, state, stagedFiles) {
 			logging.Debug(logCtx, "filterSessionsWithNewContent: session's only content is a stale task record, not stamping a trailer",
 				slog.String("session_id", state.SessionID),
@@ -2121,7 +2156,7 @@ func (s *ManualCommitStrategy) sessionHasNewContent(ctx context.Context, repo *g
 	// every Stop) for a fast growth check, rather than reading the content
 	// (potentially tens of MB) just to count lines. That size is in the same
 	// coordinate as CheckpointTranscriptSize; see storedTranscriptSize.
-	transcriptBlobSize, hasTranscriptFile := storedTranscriptSize(ctx, state.SessionID)
+	transcriptBlobSize, hasTranscriptFile := storedTranscriptSize(ctx, state)
 
 	// No stored transcript (e.g. released after a condensation that left
 	// carry-forward files): check if the session has FilesTouched.
@@ -2281,7 +2316,7 @@ func (s *ManualCommitStrategy) sessionHasNewContentFromLiveTranscript(ctx contex
 	// resolveFilesTouched (which would prepare again) and extract directly.
 	modifiedFiles := state.FilesTouched
 	if len(modifiedFiles) == 0 {
-		modifiedFiles = s.extractModifiedFilesFromLiveTranscript(ctx, state, state.CheckpointTranscriptStart)
+		modifiedFiles = s.extractModifiedFilesFromLiveTranscript(ctx, state, uncheckpointedTranscriptStart(state))
 	}
 	if len(modifiedFiles) == 0 {
 		return false, nil
@@ -2306,6 +2341,16 @@ func (s *ManualCommitStrategy) sessionHasNewContentFromLiveTranscript(ctx contex
 	}
 
 	return true, nil
+}
+
+// uncheckpointedTranscriptStart is where the transcript's edits not yet in
+// any checkpoint begin, for deciding whether a commit holds the session's new
+// work. Carry-forward moves CheckpointTranscriptStart back to 0 so the next
+// checkpoint shows the whole conversation (as when commits in two worktrees
+// split a session's work), but edits before TokenStart are already in a
+// checkpoint and must not claim a later commit of the same paths.
+func uncheckpointedTranscriptStart(state *SessionState) int {
+	return max(state.CheckpointTranscriptStart, state.TokenStart())
 }
 
 // resolveFilesTouched returns the file list for a session.
@@ -2503,8 +2548,10 @@ func normalizeTranscriptFilePaths(ctx context.Context, state *SessionState, modi
 		for _, f := range modifiedFiles {
 			if rel := paths.ToRelativePath(f, basePath); rel != "" {
 				normalized = append(normalized, filepath.ToSlash(rel))
-			} else if len(f) > 0 && !filepath.IsAbs(f) && f[0] != '/' {
-				// Already relative — keep as-is
+			} else if len(f) > 0 && !filepath.IsAbs(f) && f[0] != '/' && !state.InWorktreeView {
+				// Already relative — keep as-is. Not in another worktree's
+				// view: a relative path is relative to where the agent runs,
+				// not to the worktree being committed.
 				normalized = append(normalized, filepath.ToSlash(f))
 			}
 			// else: absolute path outside repo — skip. These can't match
@@ -2546,12 +2593,23 @@ func (s *ManualCommitStrategy) tryAgentCommitFastPath(ctx context.Context, commi
 	eligibleSessions := 0
 	emptyEligibleSessions := 0
 	now := time.Now()
+	var staged map[string]struct{}
 	for _, state := range sessions {
 		// ACTIVE, or IDLE with a fresh in-flight task record whose content the
 		// commit's own condensation materializes (see idleWithLiveTaskRecord).
 		eligible := state.Phase.IsActive() || idleWithLiveTaskRecord(state, now)
 		if !eligible {
 			continue
+		}
+		if state.LinkedByWorktreeEntry {
+			// Linked only by its record of this worktree: a commit from
+			// another process (a script, a GUI client) must hold those files.
+			if staged == nil {
+				staged = stagedFileSet(ctx)
+			}
+			if !overlapsFiles(state.FilesTouched, staged) {
+				continue
+			}
 		}
 		eligibleSessions++
 		if sessionLacksCondensableContent(state) {
@@ -2967,12 +3025,17 @@ func (s *ManualCommitStrategy) InitializeSession(ctx context.Context, sessionID 
 		}
 		remember = updateSessionAgentHome(ctx, state)
 		homeAgentType = state.AgentType
-		captureSessionBranch(repo, state)
 		captureSessionOwner(state)
 		reconcileWorktreePathForResumedTurn(ctx, state)
 
-		if err := syncBaseCommitToHead(ctx, repo, state); err != nil {
-			return err
+		// A turn resumed in another worktree leaves the session's branch and
+		// base where its home has them (see hookInSessionHome).
+		// An unresolvable worktree counts as home, as before this check.
+		if worktreeRoot, wtErr := paths.WorktreeRoot(ctx); wtErr != nil || hookInSessionHome(worktreeRoot, state) {
+			captureSessionBranch(repo, state)
+			if err := syncBaseCommitToHead(ctx, repo, state); err != nil {
+				return err
+			}
 		}
 
 		state.LastCheckpointID = ""
@@ -3150,10 +3213,11 @@ func parseStagedRaw(output []byte) []stagedChange {
 }
 
 // getLastPrompt retrieves the most recent user prompt of a session from its
-// staged .entire/metadata/<session>/prompt.txt, falling back to the truncated
+// staged .entire/metadata/<session>/prompt.txt in the session's home worktree
+// (storedSessionRoot), falling back to the truncated
 // LastPrompt in session state. Returns empty string if neither is available.
 func (s *ManualCommitStrategy) getLastPrompt(ctx context.Context, state *SessionState) string {
-	if root, err := entiredir.OpenForRead(ctx); err == nil {
+	if root := storedSessionRootOrNil(ctx, state); root != nil {
 		if data, readErr := entiredir.ReadFile(root, sessionMetadataFileName(state.SessionID, paths.PromptFileName)); readErr == nil {
 			if prompt := extractLastPrompt(string(data)); prompt != "" {
 				return prompt
@@ -3224,7 +3288,7 @@ func (s *ManualCommitStrategy) HandleTurnEnd(ctx context.Context, state *Session
 	// Skip this when carry-forward is active. carryForwardRemainingFiles
 	// intentionally resets CheckpointTranscriptStart to 0 so the next checkpoint
 	// remains self-contained with the full transcript.
-	if hadMidTurnCommits && state.TranscriptPath != "" && len(state.FilesTouched) == 0 {
+	if hadMidTurnCommits && state.TranscriptPath != "" && !state.HasPendingFiles() {
 		advanceCheckpointTranscriptStartToTurnEnd(ctx, state)
 	}
 
@@ -3252,19 +3316,15 @@ func advanceCheckpointTranscriptStartToTurnEnd(ctx context.Context, state *Sessi
 	_, isLate := agent.AsLateTranscriptWriter(ag)
 
 	advanced := false
-	if transcriptPath, resolveErr := resolveTranscriptPath(state); resolveErr == nil {
-		if analyzer, ok := agent.AsTranscriptAnalyzer(ag); ok {
-			if pos, posErr := analyzer.GetTranscriptPosition(transcriptPath); posErr == nil && pos > state.CheckpointTranscriptStart {
-				logging.Debug(logCtx,
-					"advancing CheckpointTranscriptStart to turn end after mid-turn commit",
-					slog.String("session_id", state.SessionID),
-					slog.Int("old_offset", state.CheckpointTranscriptStart),
-					slog.Int("new_offset", pos),
-				)
-				state.AdvanceDisplayWindow(pos)
-				advanced = true
-			}
-		}
+	if pos, ok := currentTranscriptPosition(state); ok && pos > state.CheckpointTranscriptStart {
+		logging.Debug(logCtx,
+			"advancing CheckpointTranscriptStart to turn end after mid-turn commit",
+			slog.String("session_id", state.SessionID),
+			slog.Int("old_offset", state.CheckpointTranscriptStart),
+			slog.Int("new_offset", pos),
+		)
+		state.AdvanceDisplayWindow(pos)
+		advanced = true
 	}
 
 	if !isLate {
@@ -3456,7 +3516,7 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 	}
 	defer repo.Close()
 
-	prompts := readPromptsFromFilesystem(ctx, state.SessionID)
+	prompts := readPromptsFromFilesystem(ctx, state)
 
 	// Persist newly extracted events into state (the caller's MutateSessionState
 	// saves them); telemetry for them is emitted by the lifecycle turn-end
@@ -3792,4 +3852,22 @@ func getAllChangedFilesBetweenTreesSlow(ctx context.Context, tree1, tree2 *objec
 	}
 
 	return changed, nil
+}
+
+// stagedFileSet is the set of staged paths, empty when they can't be listed.
+func stagedFileSet(ctx context.Context) map[string]struct{} {
+	staged, err := getStagedFiles(ctx)
+	if err != nil {
+		return map[string]struct{}{}
+	}
+	return fileSet(staged)
+}
+
+// fileSet makes a set of repo-relative paths.
+func fileSet(files []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		set[filepath.ToSlash(f)] = struct{}{}
+	}
+	return set
 }
