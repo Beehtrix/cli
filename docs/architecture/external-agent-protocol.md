@@ -352,7 +352,7 @@ Converts a native transcript into Entire Transcript Format (the `transcript.json
 {"transcript": "<base64-encoded transcript.jsonl>", "assets": [{"name": "img-001.png", "media_type": "image/png", "data": "<base64>"}]}
 ```
 
-`assets` is optional. The CLI calls this when writing a checkpoint, with a temporary file holding the session's already-redacted transcript, and redacts the result again before storing it. To scope a checkpoint it also compacts the lines before the checkpoint's start, so output should be line-oriented: compacting a prefix of the input should yield a prefix of the output. If the command fails, returns an empty transcript, or returns assets (which checkpoints do not store), the CLI falls back to its built-in compactor, which only understands built-in agents' formats. `entire explain` also uses it to prepare transcripts for summaries.
+`assets` is optional. The CLI calls this on each checkpoint write with a temp file of the already-redacted transcript, and redacts the result again. It also compacts the lines before the checkpoint's start to scope the checkpoint, so compacting a prefix of the input should yield a prefix of the output. On failure, empty output, or assets, the CLI uses its built-in compactor instead. `entire explain` also uses it for summaries.
 
 ### Capability: `token_calculator`
 

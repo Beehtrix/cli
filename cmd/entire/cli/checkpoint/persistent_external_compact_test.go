@@ -16,12 +16,9 @@ import (
 	"github.com/entireio/cli/redact"
 )
 
-// installCompactingExternalAgent puts a mock external agent on $PATH that
-// declares compact_transcript and registers it. Its compact-transcript emits
-// one unified line per input line ("agent-compacted N"), so a test can tell its
-// output from the built-in compactor's and check prefix-based scoping. mode
-// "fail" makes compact-transcript exit non-zero; "assets" adds an asset;
-// "secret" embeds a credential in the output.
+// installCompactingExternalAgent registers a mock external agent whose
+// compact-transcript emits one line per input line ("agent-compacted N").
+// mode "fail" exits non-zero, "assets" adds an asset, "secret" embeds a credential.
 func installCompactingExternalAgent(t *testing.T, name, agentType, mode string) {
 	t.Helper()
 	if _, err := exec.LookPath("sh"); err != nil {
@@ -87,10 +84,8 @@ func writeExternalAgentCheckpoint(t *testing.T, agentType types.AgentType, cpHex
 	return store, cpID.Path() + "/0/"
 }
 
-// TestWriteCommitted_ExternalAgentCompactsTranscript pins that an external agent
-// declaring compact_transcript writes transcript.jsonl with its own compactor:
-// the built-in one only knows built-in agents' native formats and produces empty
-// lines for anything else.
+// An external agent declaring compact_transcript writes transcript.jsonl with
+// its own compactor.
 func TestWriteCommitted_ExternalAgentCompactsTranscript(t *testing.T) {
 	// Cannot use t.Parallel: mutates $PATH and the agent registry.
 	installCompactingExternalAgent(t, "compactok", "Compact OK", "")
@@ -104,8 +99,7 @@ func TestWriteCommitted_ExternalAgentCompactsTranscript(t *testing.T) {
 		t.Fatalf("transcript.jsonl was not produced by the agent's compactor:\n%s", compact)
 	}
 
-	// Scoping: the checkpoint starts at raw line 2, and the agent compacts the
-	// first two raw lines into two lines, so this checkpoint's slice starts at 2.
+	// The checkpoint starts at raw line 2; the agent compacts those two lines to two.
 	meta := readSessionMetadata(t, store.repo, id.MustCheckpointID("d4e5f6a1b2c3"))
 	marker, ok := meta.GetCompactTranscriptStart()
 	if !ok || marker != 2 {
@@ -113,8 +107,7 @@ func TestWriteCommitted_ExternalAgentCompactsTranscript(t *testing.T) {
 	}
 }
 
-// TestWriteCommitted_ExternalCompactorFailureFallsBack pins that a failing
-// agent compactor never costs the checkpoint its compact transcript.
+// A failing agent compactor falls back to the built-in compactor.
 func TestWriteCommitted_ExternalCompactorFailureFallsBack(t *testing.T) {
 	// Cannot use t.Parallel: mutates $PATH and the agent registry.
 	installCompactingExternalAgent(t, "compactfail", "Compact Fail", "fail")
@@ -126,9 +119,7 @@ func TestWriteCommitted_ExternalCompactorFailureFallsBack(t *testing.T) {
 	}
 }
 
-// TestWriteCommitted_ExternalCompactorAssetsFallBack pins that a compaction with
-// binary assets falls back: checkpoints have nowhere to store agent-extracted
-// assets yet, and transcript lines would point at missing files.
+// Agent output with assets falls back: checkpoints don't store assets.
 func TestWriteCommitted_ExternalCompactorAssetsFallBack(t *testing.T) {
 	// Cannot use t.Parallel: mutates $PATH and the agent registry.
 	installCompactingExternalAgent(t, "compactassets", "Compact Assets", "assets")
@@ -140,9 +131,7 @@ func TestWriteCommitted_ExternalCompactorAssetsFallBack(t *testing.T) {
 	}
 }
 
-// TestWriteCommitted_ExternalCompactorOutputIsRedacted pins that the agent's
-// output is redacted before it is stored: the plugin is outside the redaction
-// pipeline, so its output is treated as untrusted.
+// The agent's output is redacted before it is stored.
 func TestWriteCommitted_ExternalCompactorOutputIsRedacted(t *testing.T) {
 	// Cannot use t.Parallel: mutates $PATH and the agent registry.
 	installCompactingExternalAgent(t, "compactsecret", "Compact Secret", "secret")

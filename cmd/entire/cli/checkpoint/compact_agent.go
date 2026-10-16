@@ -14,19 +14,10 @@ import (
 	"github.com/entireio/cli/redact"
 )
 
-// compactWithAgent builds transcript.jsonl with the session agent's own
-// compactor when it has one (external agents declaring compact_transcript).
-// The built-in compactor only knows built-in agents' native formats, so for
-// any other agent it produces lines with no content.
-//
-// It returns ok=false whenever the agent path is unavailable or fails, and the
-// caller falls back to the built-in compactor: the compact transcript is
-// derived data and must never cost a checkpoint.
-//
-// The boundary keeps the built-in scoping contract (fullCompactLines[boundary:]
-// is this checkpoint's slice). A plugin compacts a whole file, so the boundary
-// is the line count of compacting the raw lines before startLine. A prefix the
-// plugin cannot compact holds nothing to show, so its boundary is 0.
+// compactWithAgent builds transcript.jsonl with the agent's own compactor, since
+// the built-in one only knows built-in agents' formats. ok=false means the
+// caller should fall back to the built-in compactor. The boundary is the line
+// count of compacting the raw lines before startLine (0 if that fails).
 func compactWithAgent(ctx context.Context, agentType types.AgentType, startLine int, transcriptBytes []byte) ([]byte, int, bool) {
 	ag, err := agent.GetByAgentType(agentType)
 	if err != nil {
@@ -60,10 +51,8 @@ func compactWithAgent(ctx context.Context, agentType types.AgentType, startLine 
 	return full, boundary, true
 }
 
-// runAgentCompactor hands transcriptBytes (already redacted by the caller) to
-// the agent through a private temp file, since the protocol passes a path, and
-// re-redacts what comes back: the plugin sits outside the redaction pipeline,
-// so its output is untrusted.
+// runAgentCompactor passes the already-redacted bytes to the agent via a temp
+// file (the protocol takes a path) and re-redacts the untrusted output.
 func runAgentCompactor(ctx context.Context, compactor agent.TranscriptCompactor, transcriptBytes []byte) ([]byte, error) {
 	tmp, err := os.CreateTemp("", "entire-compact-transcript-*.jsonl")
 	if err != nil {
@@ -93,8 +82,7 @@ func runAgentCompactor(ctx context.Context, compactor agent.TranscriptCompactor,
 	if compacted == nil || len(bytes.TrimSpace(compacted.Transcript)) == 0 {
 		return nil, errors.New("agent returned an empty compact transcript")
 	}
-	// Checkpoints have nowhere to store agent-extracted assets yet, and lines
-	// referencing them would point at missing files.
+	// Checkpoints don't store agent-extracted assets.
 	if len(compacted.Assets) > 0 {
 		return nil, errors.New("agent compact transcript has assets, which checkpoints do not store")
 	}
@@ -105,8 +93,7 @@ func runAgentCompactor(ctx context.Context, compactor agent.TranscriptCompactor,
 	return redacted.Bytes(), nil
 }
 
-// leadingLines returns the first n newline-terminated lines of b (all of b
-// when it has fewer).
+// leadingLines returns the first n lines of b, or all of b when it has fewer.
 func leadingLines(b []byte, n int) []byte {
 	if n <= 0 {
 		return nil
