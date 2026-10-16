@@ -18,7 +18,8 @@ import (
 
 // installCompactingExternalAgent registers a mock external agent whose
 // compact-transcript emits one line per input line ("agent-compacted N").
-// mode "fail" exits non-zero, "assets" adds an asset, "secret" embeds a credential.
+// mode "fail" exits non-zero, "assets" adds an asset, "secret" embeds a credential,
+// "empty" returns an empty transcript, "prefixfail" fails on inputs under 4 lines.
 func installCompactingExternalAgent(t *testing.T, name, agentType, mode string) {
 	t.Helper()
 	if _, err := exec.LookPath("sh"); err != nil {
@@ -41,7 +42,9 @@ case "$1" in
     ;;
   compact-transcript)
     [ "` + mode + `" = "fail" ] && { echo "compactor exploded" >&2; exit 1; }
+    [ "` + mode + `" = "empty" ] && { echo '{"transcript":""}'; exit 0; }
     n=$(grep -c '' "$3")
+    [ "` + mode + `" = "prefixfail" ] && [ "$n" -lt 4 ] && { echo "prefix exploded" >&2; exit 1; }
     i=1
     out=""
     while [ "$i" -le "$n" ]; do
@@ -146,5 +149,73 @@ func TestWriteCommitted_ExternalCompactorOutputIsRedacted(t *testing.T) {
 	}
 	if !strings.Contains(compact, "agent-compacted") {
 		t.Fatalf("expected the agent's (redacted) output, got:\n%s", compact)
+	}
+}
+
+// An empty agent transcript falls back to the built-in compactor.
+func TestWriteCommitted_ExternalCompactorEmptyFallsBack(t *testing.T) {
+	// Cannot use t.Parallel: mutates $PATH and the agent registry.
+	installCompactingExternalAgent(t, "compactempty", "Compact Empty", "empty")
+	store, sessionPath := writeExternalAgentCheckpoint(t, "Compact Empty", "b2c3d4e5f6a8", 0)
+
+	compact, ok := readBranchFile(t, store, sessionPath+paths.CompactTranscriptFileName)
+	if !ok || !strings.Contains(compact, "reply two") {
+		t.Fatalf("expected the built-in compact transcript after an empty agent transcript, got (present=%v):\n%s", ok, compact)
+	}
+}
+
+// When only the prefix can't be compacted, the agent's transcript is kept and
+// the checkpoint scope starts at line 0.
+func TestWriteCommitted_ExternalCompactorPrefixFailureScopesFromZero(t *testing.T) {
+	// Cannot use t.Parallel: mutates $PATH and the agent registry.
+	installCompactingExternalAgent(t, "compactprefix", "Compact Prefix", "prefixfail")
+	store, sessionPath := writeExternalAgentCheckpoint(t, "Compact Prefix", "c3d4e5f6a1b9", 2)
+
+	compact, ok := readBranchFile(t, store, sessionPath+paths.CompactTranscriptFileName)
+	if !ok || !strings.Contains(compact, "agent-compacted 4") {
+		t.Fatalf("expected the agent's transcript, got (present=%v):\n%s", ok, compact)
+	}
+	meta := readSessionMetadata(t, store.repo, id.MustCheckpointID("c3d4e5f6a1b9"))
+	if marker, _ := meta.GetCompactTranscriptStart(); marker != 0 {
+		t.Fatalf("compact_transcript_start = %d, want 0 when the prefix can't be compacted", marker)
+	}
+}
+
+func TestLeadingLines(t *testing.T) {
+	t.Parallel()
+	in := []byte("a\nb\nc")
+	tests := []struct {
+		n    int
+		want string
+	}{
+		{0, ""},
+		{-1, ""},
+		{1, "a\n"},
+		{2, "a\nb\n"},
+		{3, "a\nb\nc"},
+		{5, "a\nb\nc"},
+	}
+	for _, tt := range tests {
+		if got := string(leadingLines(in, tt.n)); got != tt.want {
+			t.Errorf("leadingLines(%q, %d) = %q, want %q", in, tt.n, got, tt.want)
+		}
+	}
+}
+
+func TestCountLines(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		in   string
+		want int
+	}{
+		{"", 0},
+		{"a", 1},
+		{"a\n", 1},
+		{"a\n\n  \nb\n", 2},
+	}
+	for _, tt := range tests {
+		if got := countLines([]byte(tt.in)); got != tt.want {
+			t.Errorf("countLines(%q) = %d, want %d", tt.in, got, tt.want)
+		}
 	}
 }
