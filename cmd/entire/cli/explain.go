@@ -1039,6 +1039,12 @@ func generateCheckpointSummary(ctx context.Context, w, errW io.Writer, store che
 		}, fmt.Errorf("checkpoint %s already has a summary", checkpointID))
 	}
 
+	// The summary is written back into the checkpoint, and compaction below
+	// redacts what the provider sees, so both need the repo's rules.
+	if err := strategy.EnsureRedactionConfigured(ctx); err != nil {
+		return fmt.Errorf("configure redaction: %w", err)
+	}
+
 	// Check if transcript exists
 	if len(content.Transcript) == 0 {
 		return renderExplainFailure(errW, "Checkpoint has no transcript", []explainRow{

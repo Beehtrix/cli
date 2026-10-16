@@ -110,4 +110,71 @@ lines, err := transcript.Decode(full)
 checkpointLines := lines[boundary:]
 ```
 
-There is no writer for the format; only the converters produce it.
+There is no general-purpose writer for the format; the converters and the fold
+produce it.
+
+## Records and fold
+
+A `Record` is one append-only change to a transcript. Records are never revised
+once emitted, so they can be streamed and stored as plain appends. `Fold`
+applies records in order and returns the transcript lines.
+
+In this repository the fold is used by `Convert`: for Claude Code, Cursor and
+Droid, it runs an adapter that turns the native transcript into records and then
+folds them. The other converters still write lines directly. The fold is meant
+to be shared with a backend that folds the same records to show a live session,
+so that a live view and a checkpoint's `transcript.jsonl` match byte for byte;
+that integration does not exist yet.
+
+### Record wire format v1
+
+One JSON object per record. An omitted field and a zero-length one mean the same: in Go, a nil or empty `json.RawMessage` is absent. This is about the field, not its JSON value: `content` of `[]` or `null` is present, and the visibility rules below treat it differently from absent content.
+
+| Field | Type | Ops | Notes |
+| --- | --- | --- | --- |
+| `op` | string | all | `message`, `append`, `result`, `usage` or `drop`. |
+| `id` | string | all | The fold key: unique and stable within a session. Required. |
+| `sourceId` | string | `message` | The agent's own message ID, printed as the line's `id`. Differs from `id` when the agent reuses an ID for a later, separate message. |
+| `role` | string | `message` | `user` or `assistant`; becomes the line's `type`. Required on `message`. |
+| `ts` | any JSON | `message`, `append` | Copied to the line's `ts` verbatim. An `append` without `ts` clears the timestamp. |
+| `content` | any JSON | `message`, `append` | Normally an array of blocks. `message` replaces the content; `append` adds the blocks of an array and ignores anything else. Appending to content that is not an array discards that content, since it has no blocks. |
+| `toolUseId` | string | `result` | The `tool_use` block to target, searching from the end. Empty targets the last `tool_use` block. |
+| `result` | object | `result` | The tool result object described under Blocks. Required on `result`. |
+| `inputTokens`, `outputTokens` | int | `message`, `append`, `usage` | A non-zero value replaces the previous one; agents report cumulative usage. |
+
+What each op does to the message `id` names:
+
+- `message` creates it, or restates it: role, source ID, timestamp and content are replaced, token counts are updated, and a dropped message is restored. A message keeps the position where it was first created.
+- `append` concatenates content blocks and replaces the timestamp. Appending to non-array content (a string, `null`, or none) replaces it with the appended blocks, possibly none: the result is always an array.
+- `result` sets the result of one `tool_use` block. Nothing changes when the content is not an array, when one of its blocks is not an object, or when no block matches.
+- `usage` updates token counts.
+- `drop` hides the message.
+
+Every op except `message` must target a message created earlier, in this batch or a previous one.
+
+Compatibility: new optional fields may be added, and readers ignore fields they do not know. A new op is a breaking change: `Apply` rejects a batch containing an op it does not know.
+
+### Incremental folding
+
+A `Folder` folds incrementally. `Apply` validates a whole batch before changing anything and returns the IDs of the messages it touched. `Line(id)` returns one message's current line, or not visible when the message is dropped or is an assistant message whose content is `[]` or `null`. An assistant message with no content at all is visible and prints `"content":null`, as `Convert` always has. A live view re-renders the touched messages and removes those that are no longer visible:
+
+```go
+f := transcript.NewFolder(transcript.Options{Agent: "claude-code", CLIVersion: "0.5.1"})
+touched, err := f.Apply(records)
+if err != nil {
+	return err
+}
+for _, id := range touched {
+	if line, ok := f.Line(id); ok {
+		render(id, line)
+	} else {
+		remove(id)
+	}
+}
+```
+
+Decode each streamed record into a zero `Record`. `encoding/json` leaves fields the input omits unchanged, so a reused variable would carry an earlier `ts` into an `append` that has none.
+
+### Resource use
+
+A `Folder` keeps every message in memory and has no limits of its own. Applying a record costs time in the record's size, with one exception: the first `append` or `result` after a `message` record splits that record's content into blocks, once. Until an `append` or a matching `result` takes the split blocks over as the content, they are kept beside the original bytes, so such a message briefly costs twice its size. Producing a line costs time in that message's size, and `Lines` in the size of all messages. A caller folding records from an untrusted source must bound the number and size of records and messages itself.
