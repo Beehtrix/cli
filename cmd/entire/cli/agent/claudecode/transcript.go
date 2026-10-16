@@ -128,21 +128,6 @@ func sumUsage(usageByMessageID map[string]messageUsage) *agent.TokenUsage {
 	return usage
 }
 
-// CalculateTokenUsageFromFile calculates token usage from a Claude Code transcript file.
-// If startLine > 0, only considers lines from startLine onwards.
-func CalculateTokenUsageFromFile(path string, startLine int) (*agent.TokenUsage, error) {
-	if path == "" {
-		return &agent.TokenUsage{}, nil
-	}
-
-	lines, err := transcript.ParseFromFileAtLine(path, startLine)
-	if err != nil {
-		return nil, err //nolint:wrapcheck // caller adds context
-	}
-
-	return CalculateTokenUsage(lines), nil
-}
-
 // ExtractSpawnedAgentIDs extracts agent IDs from Task tool results in a transcript.
 // When a Task tool completes, the tool_result contains "agentId: <id>" in its content.
 // Returns a map of agentID -> toolUseID for all spawned agents.
@@ -507,11 +492,13 @@ func (c *ClaudeCodeAgent) CalculateTotalTokenUsage(transcriptData []byte, startL
 		}
 		addUsageByMessageID(subagentByMessageID, lines)
 	}
-	if len(subagentByMessageID) > 0 {
-		parentByMessageID := make(map[string]messageUsage)
-		addUsageByMessageID(parentByMessageID, fullParsed)
-		for messageID := range parentByMessageID {
-			delete(subagentByMessageID, messageID)
+	for _, line := range fullParsed {
+		if len(subagentByMessageID) == 0 {
+			break
+		}
+		var msg messageWithUsage
+		if line.Type == envelopeTypeAssistant && json.Unmarshal(line.Message, &msg) == nil {
+			delete(subagentByMessageID, msg.ID)
 		}
 	}
 	if len(subagentByMessageID) > 0 {

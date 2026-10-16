@@ -1101,8 +1101,8 @@ func TestCalculateTotalTokenUsage_ForkCopiesOfTheLaunchCountOnce(t *testing.T) {
 		startLine         int
 		mainIn, mainCalls int
 	}{
-		"whole transcript":      {startLine: 0, mainIn: 12, mainCalls: 2},
-		"checkpoint after fork": {startLine: 3, mainIn: 7, mainCalls: 1},
+		"whole transcript":        {startLine: 0, mainIn: 12, mainCalls: 2},
+		"checkpoint after launch": {startLine: 3, mainIn: 7, mainCalls: 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
