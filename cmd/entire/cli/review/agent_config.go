@@ -61,9 +61,14 @@ func ValidateAgentConfig(agentName string, cfg *reviewtypes.AgentConfig) error {
 		return err
 	}
 	if len(cfg.Settings) > 0 {
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(cfg.Settings, &obj); err != nil {
+		obj, err := jsonObject(cfg.Settings)
+		if err != nil {
 			return fmt.Errorf("settings: %w", err)
+		}
+		if hooks, ok := obj["hooks"]; ok {
+			if _, err := jsonObject(hooks); err != nil {
+				return fmt.Errorf("settings hooks: %w", err)
+			}
 		}
 	}
 	for _, name := range sortedStringKeys(cfg.MCPServers) {
@@ -101,6 +106,19 @@ func ValidateAgentConfig(agentName string, cfg *reviewtypes.AgentConfig) error {
 		}
 	}
 	return nil
+}
+
+// jsonObject decodes raw as a JSON object; null is refused, since the agent
+// would treat it as missing.
+func jsonObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, err //nolint:wrapcheck // callers name the field
+	}
+	if obj == nil {
+		return nil, errors.New("must be an object, not null")
+	}
+	return obj, nil
 }
 
 // checkCodexMCPFields refuses fields a Codex reviewer would not pass on, so a

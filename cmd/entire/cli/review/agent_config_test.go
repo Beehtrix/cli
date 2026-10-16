@@ -35,6 +35,8 @@ func TestValidateAgentConfig(t *testing.T) {
 		{"codex MCP type", "codex", reviewtypes.AgentConfig{MCPServers: mcp(`{"type":"stdio","command":"/opt/mcp","default_tools_approval_mode":"approve"}`)}, ""},
 		{"claude MCP env", "claude-code", reviewtypes.AgentConfig{MCPServers: mcp(`{"command":"/opt/mcp","env":{"TOKEN":"x"}}`)}, ""},
 		{"MCP bad name", "codex", reviewtypes.AgentConfig{MCPServers: map[string]json.RawMessage{"a.b": json.RawMessage(`{"url":"x"}`)}}, "letters, digits"},
+		{"settings null", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`null`)}, "not null"},
+		{"settings hooks null", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`{"hooks":null}`)}, "settings hooks"},
 		{"settings not an object", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`[]`)}, "settings"},
 		{"codex settings unsupported", "codex", reviewtypes.AgentConfig{Settings: json.RawMessage(`{}`)}, `does not support "settings"`},
 		{"pi MCP unsupported", "pi", reviewtypes.AgentConfig{MCPServers: mcp(`{"url":"x"}`)}, `does not support "mcp_servers"`},

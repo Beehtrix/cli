@@ -119,3 +119,18 @@ func TestPrepareReviewAgentConfigRefusesSymlinkedSkill(t *testing.T) {
 		t.Fatalf("err = %v, want a symlink refusal", err)
 	}
 }
+
+// A null settings or hooks value still gets Entire's hooks rather than
+// crashing the review.
+func TestReviewProfileSettingsNull(t *testing.T) {
+	t.Parallel()
+	for _, profile := range []string{`null`, `{"hooks":null}`} {
+		out, err := reviewProfileSettings(json.RawMessage(profile))
+		if err != nil {
+			t.Fatalf("%s: %v", profile, err)
+		}
+		if !strings.Contains(string(out), "entire hooks claude-code") {
+			t.Errorf("%s: Entire's hooks missing: %s", profile, out)
+		}
+	}
+}

@@ -88,10 +88,16 @@ func reviewProfileSettings(profile json.RawMessage) ([]byte, error) {
 			return nil, fmt.Errorf("review profile settings: %w", err)
 		}
 	}
+	if obj == nil { // "null"
+		obj = map[string]json.RawMessage{}
+	}
 	rawHooks := map[string]json.RawMessage{}
 	if existing, ok := obj["hooks"]; ok {
 		if err := json.Unmarshal(existing, &rawHooks); err != nil {
 			return nil, fmt.Errorf("review profile settings hooks: %w", err)
+		}
+		if rawHooks == nil {
+			rawHooks = map[string]json.RawMessage{}
 		}
 	}
 	installHookEntries(rawHooks, false)
