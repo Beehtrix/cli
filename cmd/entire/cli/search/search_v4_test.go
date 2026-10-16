@@ -336,3 +336,23 @@ func TestShedBackoff(t *testing.T) {
 		}
 	}
 }
+
+func TestJitterSpreadsRetriesAroundTheHint(t *testing.T) {
+	t.Parallel()
+
+	const d = time.Second
+	seen := map[time.Duration]bool{}
+	for range 200 {
+		got := jitter(d)
+		if got < d/2 || got >= d*3/2 {
+			t.Fatalf("jitter(%v) = %v, want within [%v, %v)", d, got, d/2, d*3/2)
+		}
+		seen[got] = true
+	}
+	if len(seen) < 2 {
+		t.Fatal("jitter returned the same wait every time; shed retries would come back in one burst")
+	}
+	if got := jitter(0); got != 0 {
+		t.Fatalf("jitter(0) = %v, want 0", got)
+	}
+}

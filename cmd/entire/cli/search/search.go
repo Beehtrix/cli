@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -826,8 +827,7 @@ func getWithBackoff(ctx context.Context, client *api.Client, path string) (statu
 		if resp.StatusCode != http.StatusTooManyRequests || attempt >= shedMaxRetries {
 			return resp.StatusCode, body, nil
 		}
-		wait := shedBackoff(resp.Header.Get("Retry-After"))
-		timer := time.NewTimer(wait)
+		timer := time.NewTimer(jitter(shedBackoff(resp.Header.Get("Retry-After"))))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -849,6 +849,16 @@ func shedBackoff(retryAfter string) time.Duration {
 		secs = shedRetryAfterLimit
 	}
 	return time.Duration(secs) * shedBackoffUnit
+}
+
+// jitter spreads d uniformly over [d/2, 3d/2): an agent's parallel fan-out is
+// shed in one burst, and identical waits would bring every retry back in one
+// burst too.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d/2 + rand.N(d) //nolint:gosec // jitter, not security-sensitive
 }
 
 // addCommonSearchParams sets the query params other than the repo scoping
