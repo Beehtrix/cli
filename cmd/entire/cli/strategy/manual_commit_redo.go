@@ -44,7 +44,7 @@ func (s *ManualCommitStrategy) inheritReplacedCommitsTrailers(ctx context.Contex
 		logging.Debug(logCtx, "prepare-commit-msg: no commits being redone", slog.String("reason", why))
 		return nil
 	}
-	staged, err := stagedBlobs(ctx, repo)
+	staged, err := stagedBlobs(ctx)
 	if err != nil || len(staged) == 0 {
 		logging.Debug(logCtx, "prepare-commit-msg: redo check has no staged blobs to compare",
 			slog.Int("replaced_commits", len(replaced)), slog.Any("error", err))
@@ -395,29 +395,17 @@ type stagedEntry struct {
 	deleted bool
 }
 
-// stagedBlobs maps each file staged against HEAD to its index state.
-func stagedBlobs(ctx context.Context, repo *git.Repository) (map[string]stagedEntry, error) {
-	files, err := getStagedFiles(ctx)
+// stagedBlobs maps each file staged against HEAD to what the commit index
+// stages. A detected rename would report only its destination, hiding the
+// staged deletion of its source, so rename detection is off.
+func stagedBlobs(ctx context.Context) (map[string]stagedEntry, error) {
+	changes, err := getStagedChanges(ctx, "--no-renames")
 	if err != nil {
 		return nil, err
 	}
-	idx, err := repo.Storer.Index()
-	if err != nil {
-		return nil, err //nolint:wrapcheck // caller only tests for nil
-	}
-	inIndex := make(map[string]plumbing.Hash, len(idx.Entries))
-	for _, e := range idx.Entries {
-		inIndex[e.Name] = e.Hash
-	}
-	staged := make(map[string]stagedEntry, len(files))
-	for _, f := range files {
-		if h, ok := inIndex[f]; ok {
-			staged[f] = stagedEntry{blob: h}
-		} else {
-			// getStagedFiles established that this path differs from HEAD. Its
-			// absence from the index therefore represents a staged deletion.
-			staged[f] = stagedEntry{deleted: true}
-		}
+	staged := make(map[string]stagedEntry, len(changes))
+	for _, c := range changes {
+		staged[c.path] = c.stagedEntry
 	}
 	return staged, nil
 }

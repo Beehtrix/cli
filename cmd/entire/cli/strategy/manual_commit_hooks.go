@@ -3038,12 +3038,36 @@ func captureSessionOwner(state *SessionState) {
 // Returns (non-nil empty slice, nil) when no files are staged — callers can
 // distinguish "no staged files" from "error resolving staged files" (nil, err).
 func getStagedFiles(ctx context.Context) ([]string, error) {
+	changes, err := getStagedChanges(ctx)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]string, 0, len(changes))
+	for _, c := range changes {
+		files = append(files, c.path)
+	}
+	return files, nil
+}
+
+// stagedChange is a path staged against HEAD and what the index stages for it.
+type stagedChange struct {
+	stagedEntry
+
+	path string
+}
+
+// getStagedChanges reads staged paths and their blobs in one query, with
+// diffArgs added to it. It keeps the hook's GIT_INDEX_FILE: `git commit -a` and
+// path-limited commits prepare the commit in a temporary index, which the
+// ordinary index does not match.
+func getStagedChanges(ctx context.Context, diffArgs ...string) ([]stagedChange, error) {
 	repoRoot, err := paths.WorktreeRoot(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("resolve worktree root: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--raw", "-z")
+	args := append([]string{"diff", "--cached", "--raw", "-z", "--no-abbrev"}, diffArgs...)
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = repoRoot
 	output, err := cmd.Output()
 	if err != nil {
@@ -3055,12 +3079,12 @@ func getStagedFiles(ctx context.Context) ([]string, error) {
 // gitlinkMode is the tree-entry mode git uses for a submodule commit pointer.
 const gitlinkMode = "160000"
 
-// parseStagedRaw parses `git diff --raw -z` output into the staged paths,
+// parseStagedRaw parses `git diff --raw -z` output into the staged changes,
 // skipping submodule gitlinks. Each record is
 // ":<src mode> <dst mode> <src sha> <dst sha> <status>\0<path>\0", with a
 // second path for renames and copies (status R or C).
-func parseStagedRaw(output []byte) []string {
-	staged := []string{}
+func parseStagedRaw(output []byte) []stagedChange {
+	staged := []stagedChange{}
 	fields := bytes.Split(output, []byte{0})
 	for i := 0; i < len(fields); i++ {
 		header := string(fields[i])
@@ -3082,9 +3106,16 @@ func parseStagedRaw(output []byte) []string {
 		if dstMode == gitlinkMode || (status == "D" && srcMode == gitlinkMode) {
 			continue
 		}
-		if path != "" {
-			staged = append(staged, filepath.ToSlash(path))
+		if path == "" {
+			continue
 		}
+		change := stagedChange{path: filepath.ToSlash(path)}
+		if status == "D" {
+			change.deleted = true
+		} else {
+			change.blob = plumbing.NewHash(meta[3])
+		}
+		staged = append(staged, change)
 	}
 	return staged
 }

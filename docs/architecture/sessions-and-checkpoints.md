@@ -233,7 +233,9 @@ tip reaches it: commits HEAD, a remote or another branch still reach (merged-in
 main, a teammate's commit an undone rebase brought in) are never inherited,
 while a backup branch pointing at the tip itself does not count. A dropped
 commit's trailers are carried into the new message when every staged file it
-changed has exactly the content it had at that tip, so an agent's ten commits
+changed has exactly the content it had at that tip (read from the index git is
+preparing the commit in, so `git commit -a` and path-limited commits compare
+what they commit), so an agent's ten commits
 redone as three logical ones keep every checkpoint, each on the commit that now
 holds its files, while one coincidentally identical file (a lockfile, an empty
 `__init__.py`, the same deletion) among rewritten ones inherits nothing. Commits
