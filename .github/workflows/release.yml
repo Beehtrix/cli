@@ -163,6 +163,17 @@ jobs:
           done
           exit $fail
 
+      # Before the pointer, and stable-only. These two keys are overwritten on
+      # every release rather than versioned, so a nightly publishing here would
+      # replace the installer stable users fetch; nightly users are served by
+      # the same stable installer, which takes --channel nightly.
+      - name: Publish install scripts
+        if: vars.ENTIRE_RELEASE_BUCKET != '' && steps.release-type.outputs.prerelease == 'false'
+        run: |
+          scripts/publish-installers.sh \
+            --bucket "${{ vars.ENTIRE_RELEASE_BUCKET }}" \
+            --region "${{ vars.ENTIRE_RELEASE_REGION || 'us-east-2' }}"
+
       # Last, and deliberately so. The pointer is what makes a version visible
       # to install.sh and to the CLI's update check, so it must not move until
       # the artifacts are uploaded AND the macOS signing check above has passed.

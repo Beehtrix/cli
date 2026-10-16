@@ -354,6 +354,38 @@ out="$(publish --tag v1.0.0 --bucket b; printf 'rc=%s' "$?")"
 expect "an unparseable pointer refuses to publish" contains "$out" "rc=2"
 expect "the refusal names the object to inspect" contains "$out" "names no version"
 
+printf '\n\033[1m%s\033[0m\n' "publish-installers.sh"
+
+installers() { PATH="$STUB_BIN:$SAFE_PATH" bash "$REPO_ROOT/scripts/publish-installers.sh" "$@" 2>&1; }
+
+fresh installers
+out="$(installers --bucket b; printf 'rc=%s' "$?")"
+expect "publishes both installers" contains "$out" "rc=0"
+expect "install.sh lands under installers/" \
+    [ -f "$AWS_STUB_ROOT/b/installers/install.sh" ]
+expect "install.ps1 lands under installers/" \
+    [ -f "$AWS_STUB_ROOT/b/installers/install.ps1" ]
+expect "the uploaded install.sh is the one in the repo" \
+    cmp -s "$REPO_ROOT/scripts/install.sh" "$AWS_STUB_ROOT/b/installers/install.sh"
+
+# Overwritten in place on every release, so a long TTL would pin a stale
+# installer in every edge cache for the life of that TTL.
+expect "installers get a short TTL, not the artifacts' immutable one" \
+    grep -qF "max-age=300" "$AWS_STUB_ROOT/calls.log"
+refute "installers are not marked immutable" \
+    grep -qF "immutable" "$AWS_STUB_ROOT/calls.log"
+
+# Served through the Worker as-is: without an explicit type the script is
+# offered as an octet-stream download instead of text anyone can read before
+# piping it to a shell.
+expect "install.sh is published as a shell script" \
+    grep -qF "text/x-shellscript" "$AWS_STUB_ROOT/calls.log"
+expect "install.ps1 is published as readable text" \
+    grep -qF "text/plain; charset=utf-8" "$AWS_STUB_ROOT/calls.log"
+
+out="$(installers; printf 'rc=%s' "$?")"
+expect "requires --bucket" contains "$out" "rc=1"
+expect "the usage error names the missing flag" contains "$out" "--bucket is required"
 
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -28,6 +28,7 @@ both:
 | Archives | `https://install.entire.com/v0.10.0/entire_darwin_arm64.tar.gz` | `https://github.com/entireio/cli/releases/download/v0.10.0/entire_darwin_arm64.tar.gz` |
 | Checksums | `https://install.entire.com/v0.10.0/checksums.txt` | `…/v0.10.0/checksums.txt` |
 | Current version | `https://install.entire.com/channels/stable.json` | `https://api.github.com/repos/entireio/cli/releases/latest` |
+| Install scripts | `https://install.entire.com/installers/install.sh` | `raw.githubusercontent.com/entireio/cli/refs/heads/main/scripts/install.sh` |
 
 ### The channel pointer
 
@@ -85,94 +86,85 @@ and `checkpoint/remote/checkpoint_ref.go`, the closest precedents in this repo:
 origin's checksums vouching for another origin's bytes would be a weaker
 guarantee than either origin offers alone.
 
+**Publishing inverts rule 1 on purpose.** `publish-channel-manifest.sh` fails
+*closed*: if it cannot read the current pointer it refuses to publish. The two
+directions are not inconsistent, because the questions differ. A reader needs an
+answer and the worst outcome is a confident wrong one, so it tries every origin.
+The monotonic guard only has to answer "can I prove this move is forward", and a
+pointer it could not read cannot prove it — so only a definite not-found counts
+as an empty channel. Treating a permission error or a throttle as absence is
+exactly what would let a re-dispatched old tag regress the channel for every
+install and update check.
+
 ## Turning it on
 
-The publishing side is **inert until two repository variables are set**, so this
-config ships before the bucket exists and a release behaves exactly as it did
-before:
+The publishing side is **inert until `ENTIRE_RELEASE_BUCKET` is set**. That is
+also the way back out: delete the variable and rerun the job, and the release
+publishes exactly as it did before the mirror existed.
 
 | Variable | Example | Effect |
 | --- | --- | --- |
-| `ENTIRE_RELEASE_BUCKET` | `install.entire.com` | Enables the GoReleaser `blobs` pipe and the channel-pointer step |
+| `ENTIRE_RELEASE_BUCKET` | `entire-release-origin-4zovktgk` | Enables the GoReleaser `blobs` pipe, the installer upload and the channel-pointer step |
 | `ENTIRE_RELEASE_UPLOAD_ROLE` | `arn:aws:iam::934711778961:role/github-actions-release-upload` | Role assumed via OIDC |
 | `ENTIRE_RELEASE_REGION` | `us-east-2` | Optional, defaults to `us-east-2` |
 
-Order of operations inside `release.yml` is load-bearing. The channel pointer is
-flipped **last**, after the artifacts are uploaded *and* after the macOS
-Developer ID check has passed. The pointer is what makes a version visible, so
-advertising a release whose binaries Gatekeeper kills would be worse than not
-advertising it at all.
+The bucket name is not the hostname. The bucket is private and reached only
+through the Worker, so it follows the infra repo's random-suffix convention
+rather than being named after `install.entire.com`.
 
-## Infrastructure required (not in this repo)
+Do **not** add an `environment:` to the release job. That changes the OIDC `sub`
+claim, and the upload role's trust policy matches `repo:entireio/cli:ref:refs/tags/v*`
+and `repo:entireio/cli:ref:refs/heads/main` exactly — it would start refusing the
+token.
 
-To be built in `entirehq/infra`, modelled on the existing
-`infra/aws/entire-nonprod/public-release-bucket/` unit. That unit is the pattern
-to copy, **not** the bucket to reuse: it lives in the nonprod account with
-versioning off, no lifecycle rules and `enforce_tls = false`, and its upload role
-trusts only `repo:entireio/cli:ref:refs/heads/main` as an exact match — a
-tag-triggered release presents `refs/tags/vX.Y.Z` and would be refused.
+Order of operations inside `release.yml` is load-bearing:
 
-1. **Bucket** — new unit `infra/aws/entire-prod/public-release-bucket/`, module
-   `catalog/modules/aws-s3`, region `us-east-2`, `allow_public_policy = true`.
-   Differences from the nonprod twin, both deliberate for a customer-facing
-   binary store: `enable_versioning = true` so an accidental overwrite is
-   recoverable, and `enforce_tls = true`.
-2. **Bucket policy** — anonymous `s3:GetObject` on `/v*` and `/channels/*` only,
-   keeping the nonprod unit's deny-by-default posture rather than opening `/*`.
-   Plus the same `DenyInsecureTransport` statement.
-3. **Upload role** — `github-actions-release-upload`, federated to
-   `token.actions.githubusercontent.com`, `sts:AssumeRoleWithWebIdentity`,
-   `aud = sts.amazonaws.com`. The subject condition must cover **both**
-   `repo:entireio/cli:ref:refs/tags/v*` (`StringLike` — tag-triggered releases)
-   and `repo:entireio/cli:ref:refs/heads/main` (`workflow_dispatch` runs present
-   the branch ref, not the tag). Inline policy: `s3:PutObject` on this bucket
-   only, plus `s3:GetObject` so the channel-pointer step can read the current
-   pointer for its monotonic check.
-4. **CDN + TLS** — the wrinkle worth knowing before starting. Cloudflare cannot
-   proxy straight to an S3 REST endpoint over HTTPS with a custom `Host`: the
-   origin certificate covers `*.s3.<region>.amazonaws.com`, so validation fails
-   unless the zone drops to Flexible SSL, which contradicts point 1. Put
-   **CloudFront** in front of the bucket with an ACM certificate for
-   `install.entire.com` (issued in `us-east-1`), and point Cloudflare DNS at the
-   distribution. This is a new pattern for the infra repo — there is no
-   CloudFront distribution in it today. The alternative that avoids CloudFront
-   entirely is an R2 bucket with a native custom domain, at the cost of static
-   R2 access keys in Actions secrets instead of keyless OIDC.
-5. **DNS** — `install.entire.com` in the `entire.com` zone
-   (`infra/cloudflare/entire.com/dns_records.tf`), *not* the `entire.io` zone the
-   rest of this spec touches. Both zones are on the same Cloudflare account
-   (nameservers `chelsea`/`norm.ns.cloudflare.com`), so this is a new record in an
-   existing zone — but confirm that zone has a Terraform unit, since `entire.io`
-   is the one with units today.
-6. **Security Hub** — extend the `public-release-bucket-anonymous-read`
-   suppression (controls `S3.2`, `S3.8`) in
-   `infra/aws/entire-security/securityhub-org-config/` to the new bucket ARN, and
-   note the bucket in the prod `account-baseline` unit as the nonprod one does.
-7. **Serve the installers from Cloudflare, on the `entire.com` zone.**
-   Independent of the bucket, and the single cheapest fix available:
-   `infra/cloudflare/entire.io/redirect_rules.tf`
-   currently 307s `entire.io/install.sh` to
-   `raw.githubusercontent.com/entireio/cli/refs/heads/main/scripts/install.sh`.
-   The install command on the marketing site, in the README, and in the CLI's own
-   update prompt therefore fails at hop zero when GitHub is down. It is also a
-   version-skew bug: users always run `main`'s installer, never the released one.
+1. GoReleaser uploads the artifacts (`blobs`).
+2. The macOS Developer ID check passes.
+3. The install scripts go to `installers/` — stable releases only.
+4. The channel pointer is flipped **last**.
 
-   Serve `/install.sh` and `/install.ps1` from the `entire.com` zone instead, and
-   apply the same change to the `partial.to` twin.
+The pointer is what makes a version visible, so advertising a release whose
+binaries Gatekeeper kills would be worse than not advertising it at all. The
+installers go before it for the same reason in reverse: an installer newer than
+the pointer is harmless, the opposite is not.
 
-   **The `entire.io` rules are not deleted.** They become permanent 307s to the
-   `entire.com` equivalents. The published one-liner self-heals — an old binary
-   prints the `.io` URL, that URL serves the installer, and the binary it installs
-   prints `.com` from then on — so the installed population converges after one
-   upgrade each. What never heals is everything with no upgrade path: third-party
-   Dockerfiles and CI configs that baked in the `.io` one-liner, the CHANGELOG
-   entry that published it, and docs we do not control. Those keep arriving
-   indefinitely, which is why the redirect is permanent rather than a deprecation
-   window.
+Step 3 is stable-only because `installers/install.sh` and `installers/install.ps1`
+are overwritten on every release rather than versioned — a nightly publishing
+there would replace the installer stable users fetch. Nightly users run the same
+stable installer with `--channel nightly`. For the same reason those two keys get
+`max-age=300` rather than the artifacts' immutable TTL: a long max-age on an
+overwritten key pins a stale installer in every edge cache for its lifetime.
 
-   Prefer a redirect over serving identical bytes at both hosts: the redirect is
-   what makes the residual `.io` traffic countable, which is the only way to tell
-   whether that tail is actually shrinking.
+## The origin, as built
+
+Built in `entirehq/infra` and verified end to end: an object uploaded to the
+bucket was served through `install.entire.com` with the right bytes.
+
+- **Bucket** `entire-release-origin-4zovktgk`, `us-east-2`, account
+  `934711778961`. It is **private** — no anonymous read, no ACLs.
+- **`install.entire.com` is a Cloudflare Worker.** It maps `/<path>` to the
+  bucket key `<path>` verbatim and reads through its own OIDC role.
+- **Upload role** `arn:aws:iam::934711778961:role/github-actions-release-upload`,
+  trusting `repo:entireio/cli:ref:refs/tags/v*` and
+  `repo:entireio/cli:ref:refs/heads/main` exactly. It can `PutObject` and
+  `GetObject` under `v*`, `channels/*` and `installers/*`, plus `ListBucket`.
+  No delete.
+
+Two consequences worth keeping in mind when changing anything here.
+
+**The Worker knows nothing about the layout.** It does not parse versions, split
+channels or rewrite paths. That is what keeps this cheap to change: a new prefix
+needs an IAM change and nothing else, and a layout change never touches the
+Worker. The only place it may learn the layout is metrics dimensions, which have
+to parse `v<version>/<file>` — keep that a best-effort regex that degrades to
+`unknown` and never affects the response, so a layout change can blur a metric
+but can never break a download.
+
+**The bucket is private, so anonymous read is not the fallback it looks like.**
+If the Worker is down, the bucket is unreachable; there is no bypass URL. The
+fallback for that case is the same one as for a GitHub outage — the other origin
+— which is why the chain reads two origins rather than two paths to one.
 
 ## Installing while GitHub is down
 
@@ -199,6 +191,19 @@ keeps its default, so experimental commands are visible.
 
 ## Remaining work
 
+- **Set the repository variables and watch a release.** Nothing has assumed the
+  upload role from GitHub yet. If `configure-aws-credentials` fails the release
+  job fails *before* GoReleaser runs, so do this on a release someone is
+  watching. Back out by deleting `ENTIRE_RELEASE_BUCKET` and rerunning.
+  Afterwards confirm: `channels/stable.json` names the new version,
+  `v<version>/checksums.txt` returns 200 with
+  `cache-control: public, max-age=31536000, immutable`, and
+  `installers/install.sh` returns 200.
+- **Tell the infra side once the first release with the installer step ships.**
+  `entire.com/install.{sh,ps1}` still redirect to raw GitHub; infra repoints them
+  at `install.entire.com/installers/…` only after a release has actually uploaded
+  those keys. Repointing first would turn every install into a 404 with no
+  fallback.
 - **Repoint the cask and Scoop download URLs** at `install.entire.com`
   (`homebrew_casks[].url.template` with `verified:`, and `scoops[].url_template`).
   Deliberately not done here: a published manifest must never name a host that
