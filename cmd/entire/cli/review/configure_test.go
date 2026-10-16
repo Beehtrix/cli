@@ -891,6 +891,25 @@ func TestSaveReviewAgentConfigs(t *testing.T) {
 	if _, raw, err := loadReviewSettingsRaw(ctx, reviewScopeLocal); err != nil || strings.Contains(string(raw["review_profiles"]), "codex") {
 		t.Errorf("removal added the dropped reviewer to the local profile: %s (err %v)", raw["review_profiles"], err)
 	}
+
+	// Removing a config from a local-owned profile also drops a stale
+	// preferences entry, which would otherwise apply again.
+	if err := settings.ModifyClonePreferences(ctx, func(p *settings.ClonePreferences) error {
+		p.ReviewAgentConfigs = map[string]map[string]*settings.ReviewAgentConfig{"mine": {tAgentClaude: cfg}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := saveReviewAgentConfigs(ctx, "mine", map[string]*settings.ReviewAgentConfig{tAgentClaude: nil}); err != nil {
+		t.Fatal(err)
+	}
+	s, err = settings.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ReviewProfiles["mine"].Agents[tAgentClaude].Config; got != nil {
+		t.Errorf("removed config still applies: %+v", got)
+	}
 }
 
 // Saving one reviewer's config into the local file edits that file as stored.

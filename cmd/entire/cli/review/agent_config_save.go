@@ -140,15 +140,29 @@ func saveReviewAgentConfigs(ctx context.Context, profileName string, configs map
 		if err := saveReviewProfile(ctx, profileName, localProfile, false, reviewScopeLocal); err != nil {
 			return "", err
 		}
+		// A preferences entry for these reviewers would apply again once the
+		// local file stops setting one, so drop it.
+		if err := saveClonePreferenceAgentConfigs(ctx, profileName, configs, true); err != nil {
+			return "", err
+		}
 		return reviewScopeLocal.file(), nil
 	}
-	err = settings.ModifyClonePreferences(ctx, func(p *settings.ClonePreferences) error {
+	if err := saveClonePreferenceAgentConfigs(ctx, profileName, configs, false); err != nil {
+		return "", err
+	}
+	return "clone-local review preferences", nil
+}
+
+// saveClonePreferenceAgentConfigs stores configs on profileName in clone-local
+// preferences; a nil config, or every config when removeAll is set, is removed.
+func saveClonePreferenceAgentConfigs(ctx context.Context, profileName string, configs map[string]*settings.ReviewAgentConfig, removeAll bool) error {
+	err := settings.ModifyClonePreferences(ctx, func(p *settings.ClonePreferences) error {
 		workers := p.ReviewAgentConfigs[profileName]
 		if workers == nil {
 			workers = map[string]*settings.ReviewAgentConfig{}
 		}
 		for worker, cfg := range configs {
-			if cfg == nil {
+			if cfg == nil || removeAll {
 				delete(workers, worker)
 			} else {
 				workers[worker] = cfg
@@ -165,9 +179,9 @@ func saveReviewAgentConfigs(ctx context.Context, profileName string, configs map
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("save clone-local review preferences: %w", err)
+		return fmt.Errorf("save clone-local review preferences: %w", err)
 	}
-	return "clone-local review preferences", nil
+	return nil
 }
 
 // parseSetConfig parses --set-config worker=<file|isolated|none>.
