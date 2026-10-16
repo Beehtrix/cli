@@ -2505,3 +2505,18 @@ func TestString_CredentialKeyValueCodeLiteralsPreserved(t *testing.T) {
 		t.Errorf("parenthesized non-placeholder value must still redact, got %q", got)
 	}
 }
+
+// Identifier keys that only mention a generic credential word name a resource
+// (an AWS Secrets Manager secret, a KMS key, a record), not key material.
+func TestJSONLContent_GenericCredentialWordIdentifiersPreserved(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{
+		`{"SecretId":"prod/db/creds"}`,
+		`{"keyId":"alias/my-key"}`,
+		`{"token_id":"t_123"}`,
+	} {
+		if out := mustJSONLContent(t, in); out != in {
+			t.Errorf("JSONLContent(%s) = %s, want unchanged", in, out)
+		}
+	}
+}

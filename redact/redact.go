@@ -90,8 +90,8 @@ var (
 	// normalized key. Generic credential nouns (auth, cred, credential, cert)
 	// stay ordinary identifiers unless paired with one of these secret shapes.
 	// Used by isNonSecretIdentifierAssignment: an id/account-suffixed key that
-	// also names a secret
-	// (aws_access_key_id, api_token_id) must never suppress redaction.
+	// also names a secret (aws_access_key_id, api_token_id, secret_id) must
+	// never suppress entropy-layer redaction.
 	credentialWordInKeyRE = regexp.MustCompile(`(?:^|_)(?:key|token|secret|pass|passwd|password|pwd)(?:_|$)`)
 )
 
@@ -841,7 +841,10 @@ func isNonSecretIdentifierAssignment(candidate string) bool {
 	// can clear the 4.5 threshold while the value alone does not (e.g.
 	// aws_access_key_id=AKIA… scores 4.50 combined vs 3.68 for the value),
 	// and betterleaks' vendor rules filter the moderate-entropy forms too.
-	if isCredentialIdentifierKey(normalized) {
+	// Deliberately broader than isCredentialIdentifierKey: this only decides
+	// whether the entropy layer may stay silent, so failing closed costs
+	// readability, not a leak.
+	if credentialWordInKeyRE.MatchString(normalized) {
 		return false
 	}
 	if isHighEntropySecretCandidate(value) {
@@ -857,9 +860,26 @@ func isIdentifierAssignmentKey(normalized string) bool {
 		strings.HasSuffix(normalized, "_account")
 }
 
+// isCredentialIdentifierKey reports whether an id/account-suffixed JSON key
+// names a credential (aws_access_key_id, api_token_id) rather than an
+// identifier that merely mentions one. The stem must itself be a credential
+// key shape: a lone generic word (SecretId, KeyId, token_id) names an AWS
+// secret, a KMS key, or a record id, not key material.
 func isCredentialIdentifierKey(normalized string) bool {
-	return isIdentifierAssignmentKey(normalized) && credentialWordInKeyRE.MatchString(normalized)
+	stem, ok := strings.CutSuffix(normalized, "_id")
+	if !ok {
+		stem, ok = strings.CutSuffix(normalized, "_account")
+	}
+	if !ok || stem == "" {
+		return false
+	}
+	return isSensitiveNormalizedJSONValueKey(stem) || accessKeyStemRE.MatchString(stem)
 }
+
+// accessKeyStemRE matches the AWS access-key id stem (access_key,
+// aws_access_key, secret_access_key), which secretValueKeyShape leaves out
+// because a bare access_key value is an identifier, not the secret.
+var accessKeyStemRE = regexp.MustCompile(`^(?:[a-z0-9]+_)*access_key$`)
 
 func isHighEntropySecretCandidate(value string) bool {
 	for _, loc := range secretPattern.FindAllStringIndex(value, -1) {
