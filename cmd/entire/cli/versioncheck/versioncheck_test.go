@@ -113,6 +113,9 @@ func TestIsDevBuild(t *testing.T) {
 	}
 }
 
+// testStableVersion is the stable tag reused across these tests.
+const testStableVersion = "v1.2.3"
+
 func TestFetchLatestNightlyVersion(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		releases := []GitHubRelease{
@@ -130,7 +133,7 @@ func TestFetchLatestNightlyVersion(t *testing.T) {
 	githubReleasesURL = server.URL
 	t.Cleanup(func() { githubReleasesURL = original })
 
-	version, err := fetchLatestNightlyVersion(context.Background())
+	version, err := fetchLatestNightlyVersion(context.Background(), http.DefaultClient)
 	if err != nil {
 		t.Fatalf("fetchLatestNightlyVersion() error = %v", err)
 	}
@@ -154,7 +157,7 @@ func TestFetchLatestNightlyVersion_NoNightlies(t *testing.T) {
 	githubReleasesURL = server.URL
 	t.Cleanup(func() { githubReleasesURL = original })
 
-	_, err := fetchLatestNightlyVersion(context.Background())
+	_, err := fetchLatestNightlyVersion(context.Background(), http.DefaultClient)
 	if err == nil {
 		t.Fatal("fetchLatestNightlyVersion() expected error when no nightlies, got nil")
 	}
@@ -254,7 +257,7 @@ func TestFetchLatestVersion(t *testing.T) {
 		}
 
 		release := GitHubRelease{
-			TagName:    "v1.2.3",
+			TagName:    testStableVersion,
 			Prerelease: false,
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -267,12 +270,12 @@ func TestFetchLatestVersion(t *testing.T) {
 	githubAPIURL = server.URL
 	t.Cleanup(func() { githubAPIURL = original })
 
-	version, err := fetchLatestVersion(context.Background())
+	version, err := fetchLatestVersion(context.Background(), http.DefaultClient)
 	if err != nil {
-		t.Fatalf("fetchLatestVersion(context.Background()) error = %v", err)
+		t.Fatalf("fetchLatestVersion() error = %v", err)
 	}
-	if version != "v1.2.3" {
-		t.Errorf("fetchLatestVersion(context.Background()) = %q, want v1.2.3", version)
+	if version != testStableVersion {
+		t.Errorf("fetchLatestVersion() = %q, want v1.2.3", version)
 	}
 }
 
@@ -292,9 +295,9 @@ func TestFetchLatestVersionPrerelease(t *testing.T) {
 	githubAPIURL = server.URL
 	t.Cleanup(func() { githubAPIURL = original })
 
-	_, err := fetchLatestVersion(context.Background())
+	_, err := fetchLatestVersion(context.Background(), http.DefaultClient)
 	if err == nil {
-		t.Fatal("fetchLatestVersion(context.Background()) expected error for prerelease, got nil")
+		t.Fatal("fetchLatestVersion() expected error for prerelease, got nil")
 	}
 }
 
@@ -308,9 +311,9 @@ func TestFetchLatestVersionServerError(t *testing.T) {
 	githubAPIURL = server.URL
 	t.Cleanup(func() { githubAPIURL = original })
 
-	_, err := fetchLatestVersion(context.Background())
+	_, err := fetchLatestVersion(context.Background(), http.DefaultClient)
 	if err == nil {
-		t.Fatal("fetchLatestVersion(context.Background()) expected error for 500 response, got nil")
+		t.Fatal("fetchLatestVersion() expected error for 500 response, got nil")
 	}
 }
 
@@ -321,7 +324,7 @@ func TestParseGitHubRelease(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"valid release", `{"tag_name": "v1.2.3", "prerelease": false}`, "v1.2.3", false},
+		{"valid release", `{"tag_name": "v1.2.3", "prerelease": false}`, testStableVersion, false},
 		{"prerelease", `{"tag_name": "v2.0.0-rc1", "prerelease": true}`, "", true},
 		{"empty tag", `{"tag_name": "", "prerelease": false}`, "", true},
 		{"invalid json", `not json`, "", true},
@@ -402,6 +405,11 @@ func setupCheckAndNotifyTest(t *testing.T, serverURL string) (*cobra.Command, *b
 
 	t.Setenv("ENTIRE_CONFIG_DIR", t.TempDir())
 
+	// These tests exercise the GitHub origin specifically. Without this the
+	// chain would try the real install.entire.com first, putting a live network call
+	// in a unit test.
+	useGitHubOriginOnly(t)
+
 	origURL := githubAPIURL
 	githubAPIURL = serverURL
 	t.Cleanup(func() { githubAPIURL = origURL })
@@ -411,6 +419,27 @@ func setupCheckAndNotifyTest(t *testing.T, serverURL string) (*cobra.Command, *b
 	cmd.SetOut(&buf)
 
 	return cmd, &buf
+}
+
+// useGitHubOriginOnly narrows the origin chain to the GitHub candidate for
+// tests that stub githubAPIURL / githubReleasesURL, so nothing reaches the
+// real release origin.
+func useGitHubOriginOnly(t *testing.T) {
+	t.Helper()
+	orig := versionOrigins
+	versionOrigins = func() []versionOrigin {
+		return []versionOrigin{{name: "api.github.com", fetch: fetchGitHubVersion}}
+	}
+	t.Cleanup(func() { versionOrigins = orig })
+}
+
+// useChannelOrigin points the release-origin candidate at a local server and
+// keeps GitHub in the chain behind it, which is the production ordering.
+func useChannelOrigin(t *testing.T, baseURL string) {
+	t.Helper()
+	orig := channelBaseURL
+	channelBaseURL = baseURL
+	t.Cleanup(func() { channelBaseURL = orig })
 }
 
 // newVersionServer returns an httptest.Server that responds with the given version.
@@ -573,3 +602,191 @@ func globalConfigDirPath() string {
 
 // globalConfigDirName is the name of the global config directory in the user's home.
 const globalConfigDirName = ".config/entire"
+
+// newChannelServer serves a channel manifest at /channels/<channel>.json and
+// records which paths were requested.
+func newChannelServer(t *testing.T, manifest ChannelManifest) (*httptest.Server, *[]string) {
+	t.Helper()
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		//nolint:errcheck // test helper
+		json.NewEncoder(w).Encode(manifest)
+	}))
+	t.Cleanup(server.Close)
+	return server, &paths
+}
+
+func TestFetchLatestForChannel_PrefersReleaseOrigin(t *testing.T) {
+	channelServer, paths := newChannelServer(t, ChannelManifest{
+		Channel: "stable",
+		Tag:     testStableVersion,
+		Version: "1.2.3",
+	})
+	useChannelOrigin(t, channelServer.URL)
+
+	githubHits := 0
+	githubServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		githubHits++
+		w.Header().Set("Content-Type", "application/json")
+		//nolint:errcheck // test helper
+		json.NewEncoder(w).Encode(GitHubRelease{TagName: "v9.9.9"})
+	}))
+	defer githubServer.Close()
+	origURL := githubAPIURL
+	githubAPIURL = githubServer.URL
+	t.Cleanup(func() { githubAPIURL = origURL })
+
+	version, err := fetchLatestForChannel(context.Background(), false)
+	if err != nil {
+		t.Fatalf("fetchLatestForChannel() error = %v", err)
+	}
+	if version != testStableVersion {
+		t.Errorf("fetchLatestForChannel() = %q, want v1.2.3", version)
+	}
+	if githubHits != 0 {
+		t.Errorf("GitHub was queried %d times, want 0 when the release origin answers", githubHits)
+	}
+	if len(*paths) != 1 || (*paths)[0] != "/channels/stable.json" {
+		t.Errorf("requested paths = %v, want [/channels/stable.json]", *paths)
+	}
+}
+
+func TestFetchLatestForChannel_FallsBackToGitHub(t *testing.T) {
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer down.Close()
+	useChannelOrigin(t, down.URL)
+
+	githubServer := newVersionServer(t, testStableVersion)
+	origURL := githubAPIURL
+	githubAPIURL = githubServer.URL
+	t.Cleanup(func() { githubAPIURL = origURL })
+
+	version, err := fetchLatestForChannel(context.Background(), false)
+	if err != nil {
+		t.Fatalf("fetchLatestForChannel() error = %v", err)
+	}
+	if version != testStableVersion {
+		t.Errorf("fetchLatestForChannel() = %q, want v1.2.3 from the fallback origin", version)
+	}
+}
+
+func TestFetchLatestForChannel_NightlyFromReleaseOrigin(t *testing.T) {
+	want := "v0.5.4-nightly.202604061200.abc1234"
+	channelServer, paths := newChannelServer(t, ChannelManifest{
+		Channel: "nightly",
+		Tag:     want,
+	})
+	useChannelOrigin(t, channelServer.URL)
+
+	version, err := fetchLatestForChannel(context.Background(), true)
+	if err != nil {
+		t.Fatalf("fetchLatestForChannel() error = %v", err)
+	}
+	if version != want {
+		t.Errorf("fetchLatestForChannel() = %q, want %q", version, want)
+	}
+	if len(*paths) != 1 || (*paths)[0] != "/channels/nightly.json" {
+		t.Errorf("requested paths = %v, want [/channels/nightly.json]", *paths)
+	}
+}
+
+func TestFetchLatestForChannel_AllOriginsFail(t *testing.T) {
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer down.Close()
+	useChannelOrigin(t, down.URL)
+
+	origURL := githubAPIURL
+	githubAPIURL = down.URL
+	t.Cleanup(func() { githubAPIURL = origURL })
+
+	_, err := fetchLatestForChannel(context.Background(), false)
+	if err == nil {
+		t.Fatal("fetchLatestForChannel() expected an error when every origin fails, got nil")
+	}
+	// The first origin's failure is the one reported, so an operator reading a
+	// debug log learns which origin they should be looking at first.
+	if !strings.Contains(err.Error(), "install.entire.com") {
+		t.Errorf("error = %q, want it to name the first origin", err.Error())
+	}
+}
+
+func TestFetchChannelManifestVersion_RejectsCrossChannel(t *testing.T) {
+	tests := []struct {
+		name     string
+		nightly  bool
+		manifest ChannelManifest
+	}{
+		{
+			name:     "nightly tag on the stable channel",
+			nightly:  false,
+			manifest: ChannelManifest{Channel: "stable", Tag: "v0.5.4-nightly.202604061200.abc1234"},
+		},
+		{
+			name:     "stable tag on the nightly channel",
+			nightly:  true,
+			manifest: ChannelManifest{Channel: "nightly", Tag: testStableVersion},
+		},
+		{
+			name:     "manifest declares a different channel",
+			nightly:  false,
+			manifest: ChannelManifest{Channel: "nightly", Tag: testStableVersion},
+		},
+		{
+			name:     "manifest names no version",
+			nightly:  false,
+			manifest: ChannelManifest{Channel: "stable"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, _ := newChannelServer(t, tt.manifest)
+			useChannelOrigin(t, server.URL)
+
+			if _, err := fetchChannelManifestVersion(context.Background(), http.DefaultClient, tt.nightly); err == nil {
+				t.Fatalf("fetchChannelManifestVersion(nightly=%v) expected an error, got nil", tt.nightly)
+			}
+		})
+	}
+}
+
+func TestFetchChannelManifestVersion_FallsBackToVersionField(t *testing.T) {
+	// A manifest without a tag is still usable: the version field carries the
+	// same value without the "v" prefix.
+	server, _ := newChannelServer(t, ChannelManifest{Channel: "stable", Version: "1.2.3"})
+	useChannelOrigin(t, server.URL)
+
+	version, err := fetchChannelManifestVersion(context.Background(), http.DefaultClient, false)
+	if err != nil {
+		t.Fatalf("fetchChannelManifestVersion() error = %v", err)
+	}
+	if version != "1.2.3" {
+		t.Errorf("fetchChannelManifestVersion() = %q, want 1.2.3", version)
+	}
+}
+
+func TestFetchLatestForChannel_StopsWhenBudgetSpent(t *testing.T) {
+	// A cancelled context must not produce requests that can only fail.
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	useChannelOrigin(t, server.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := fetchLatestForChannel(ctx, false); err == nil {
+		t.Fatal("fetchLatestForChannel() expected an error on a cancelled context, got nil")
+	}
+	if hits != 0 {
+		t.Errorf("server was hit %d times on a cancelled context, want 0", hits)
+	}
+}

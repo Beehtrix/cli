@@ -20,6 +20,12 @@ env:
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Mint the OIDC token that configure-aws-credentials exchanges for
+      # short-lived credentials to the release-mirror bucket. Scoped to this
+      # job so the other jobs keep the workflow-level permissions.
+      id-token: write
     outputs:
       prerelease: ${{ steps.release-type.outputs.prerelease }}
     steps:
@@ -95,6 +101,17 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # The release mirror is opt-in: with ENTIRE_RELEASE_BUCKET unset, this and
+      # the two steps below are skipped and the release publishes exactly as it
+      # did before. Setting the repository variables turns the mirror on with no
+      # code change. See docs/architecture/release-origins.md.
+      - name: Configure AWS credentials for the release mirror
+        if: vars.ENTIRE_RELEASE_BUCKET != ''
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.ENTIRE_RELEASE_UPLOAD_ROLE }}
+          aws-region: ${{ vars.ENTIRE_RELEASE_REGION || 'us-east-2' }}
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
@@ -113,6 +130,8 @@ jobs:
           MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
           POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
           POSTHOG_ENDPOINT: ${{ vars.POSTHOG_ENDPOINT }}
+          ENTIRE_RELEASE_BUCKET: ${{ vars.ENTIRE_RELEASE_BUCKET }}
+          ENTIRE_RELEASE_REGION: ${{ vars.ENTIRE_RELEASE_REGION }}
           DISCORD_WEBHOOK_ID: ${{ secrets.DISCORD_WEBHOOK_ID }}
           DISCORD_WEBHOOK_TOKEN: ${{ secrets.DISCORD_WEBHOOK_TOKEN }}
 
@@ -143,6 +162,19 @@ jobs:
             fi
           done
           exit $fail
+
+      # Last, and deliberately so. The pointer is what makes a version visible
+      # to install.sh and to the CLI's update check, so it must not move until
+      # the artifacts are uploaded AND the macOS signing check above has passed.
+      # Advertising a release whose binaries Gatekeeper kills would be worse
+      # than not advertising it at all.
+      - name: Publish channel pointer
+        if: vars.ENTIRE_RELEASE_BUCKET != ''
+        run: |
+          scripts/publish-channel-manifest.sh \
+            --tag "$RELEASE_TAG" \
+            --bucket "${{ vars.ENTIRE_RELEASE_BUCKET }}" \
+            --region "${{ vars.ENTIRE_RELEASE_REGION || 'us-east-2' }}"
 
   # A stable tag only refreshes the stable cask; the nightly channel would
   # otherwise not catch up until the next scheduled nightly run cuts a tag from

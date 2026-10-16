@@ -144,6 +144,23 @@ How to use each channel:
 - `install.ps1` nightly: `iex "& {$(irm https://entire.io/install.ps1)} -Channel nightly"`
 - Scoop: currently supports `stable` only via `scoop install entire/entire`
 
+### If GitHub is down
+
+Release artifacts are published to `install.entire.com` as well as to GitHub, and
+`install.sh` reads that origin first — so the normal install command keeps
+working through a GitHub outage. If you need to bypass version discovery
+entirely, pin a version or fetch the archive directly:
+
+```bash
+curl -fsSL https://entire.io/install.sh | bash -s -- --version 0.10.0
+curl -fsSL https://install.entire.com/v0.10.0/entire_darwin_arm64.tar.gz | tar -xz
+```
+
+Homebrew and Scoop still resolve their manifests from GitHub, so use one of the
+commands above (or `go install github.com/entireio/cli/cmd/entire@v0.10.0`, which
+is served from the Go module proxy) while GitHub is unavailable. See
+[Release Origins](docs/architecture/release-origins.md).
+
 ## Typical Workflow
 
 ### 1. Enable Entire in Your Repository

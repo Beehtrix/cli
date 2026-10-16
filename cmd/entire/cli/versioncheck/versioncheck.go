@@ -38,8 +38,8 @@ func CheckAndNotify(ctx context.Context, w io.Writer, currentVersion string) {
 	}
 
 	// Load the cache to check when we last fetched
-	cache, err := loadCache()
-	if err != nil {
+	cache, cacheErr := loadCache()
+	if cacheErr != nil {
 		cache = &VersionCache{}
 	}
 
@@ -48,13 +48,12 @@ func CheckAndNotify(ctx context.Context, w io.Writer, currentVersion string) {
 		return
 	}
 
-	// Fetch the latest version from the appropriate channel
-	var latestVersion string
-	if isNightly(currentVersion) {
-		latestVersion, err = fetchLatestNightlyVersion(ctx)
-	} else {
-		latestVersion, err = fetchLatestVersion(ctx)
-	}
+	// Fetch the latest version for this binary's channel. The origin chain
+	// (our release origin, then GitHub) is resolved inside this call, which
+	// matters: the cache is stamped below regardless of the outcome, so an
+	// origin that only gets tried after that point would never get a second
+	// chance within the 24h window.
+	latestVersion, err := fetchLatestForChannel(ctx, isNightly(currentVersion))
 
 	// Always update cache to avoid retrying on every CLI invocation
 	cache.LastCheckTime = time.Now()
@@ -161,33 +160,155 @@ func saveCache(cache *VersionCache) error {
 	return nil
 }
 
-// fetchLatestVersion fetches the latest stable version tag from the GitHub API.
-func fetchLatestVersion(ctx context.Context) (string, error) {
+// versionOrigin is one candidate in the version-lookup chain.
+type versionOrigin struct {
+	name  string
+	fetch func(ctx context.Context, client *http.Client, nightly bool) (string, error)
+}
+
+// versionOrigins is the ordered candidate chain: the release origin we own
+// first, GitHub second. A var so tests can install their own chain.
+//
+// The ordering rules mirror strategy.CheckpointReadRemotesWithElection, the
+// closest precedent in this repo — candidates in a fixed order, first success
+// wins, and the chain fails open: every origin failing is reported as a single
+// error, never as "you are up to date".
+var versionOrigins = func() []versionOrigin {
+	return []versionOrigin{
+		{name: "install.entire.com", fetch: fetchChannelManifestVersion},
+		{name: "api.github.com", fetch: fetchGitHubVersion},
+	}
+}
+
+// fetchLatestForChannel resolves the newest version on channel from the first
+// origin that answers. httpTimeout bounds the whole chain, not each origin —
+// see its doc comment for why that ceiling is absolute.
+func fetchLatestForChannel(ctx context.Context, nightly bool) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, httpTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, githubAPIURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("creating request: %w", err)
+	// New() supplies the shared redirect policy (no HTTPS downgrades, capped
+	// chains), which this path needs because the GitHub candidate redirects.
+	// NewTransport supplies the shared dial budget and
+	// ENTIRE_CONNECT_TIMEOUT_SECONDS, which http.DefaultTransport would not.
+	client := httpclient.New(httpclient.Options{Transport: httpclient.NewTransport(false)})
+	defer client.CloseIdleConnections()
+
+	var firstErr error
+	for i, origin := range versionOrigins() {
+		if ctx.Err() != nil {
+			// The budget is spent. Stop rather than issuing a request that
+			// can only fail, so the error we report is the one that matters.
+			break
+		}
+
+		version, err := origin.fetch(ctx, client, nightly)
+		if err == nil {
+			if i > 0 {
+				// Which candidate actually answered. Without this a silently
+				// dead primary is invisible until the day GitHub is also down.
+				logging.Debug(ctx, "version check: answered by fallback origin",
+					"origin", origin.name, "index", i, "channel", channelName(nightly))
+			}
+			return version, nil
+		}
+
+		logging.Debug(ctx, "version check: origin failed",
+			"origin", origin.name, "channel", channelName(nightly), "error", err.Error())
+		if firstErr == nil {
+			firstErr = fmt.Errorf("%s: %w", origin.name, err)
+		}
 	}
 
-	req.Header.Set("Accept", "application/vnd.github+json")
+	if firstErr == nil {
+		return "", errors.New("no version origins configured")
+	}
+	return "", firstErr
+}
+
+// fetchChannelManifestVersion reads the channel pointer we publish at release
+// time. Unlike the GitHub paths it needs no list-and-filter: the manifest
+// names one version, which is the whole point of publishing it.
+func fetchChannelManifestVersion(ctx context.Context, client *http.Client, nightly bool) (string, error) {
+	channel := channelName(nightly)
+	url := strings.TrimSuffix(channelBaseURL, "/") + "/channels/" + channel + ".json"
+
+	body, err := getVersionJSON(ctx, client, url, "application/json")
+	if err != nil {
+		return "", err
+	}
+
+	var manifest ChannelManifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return "", fmt.Errorf("parsing manifest: %w", err)
+	}
+
+	version := manifest.Tag
+	if version == "" {
+		version = manifest.Version
+	}
+	if version == "" {
+		return "", errors.New("manifest names no version")
+	}
+
+	// A manifest published to the wrong key, or left stale across a channel
+	// rename, would otherwise cross the streams — nudging stable users onto a
+	// nightly, or nightly users backwards onto stable. Both checks are cheap
+	// and turn a silent mis-upgrade into a skipped check.
+	if manifest.Channel != "" && manifest.Channel != channel {
+		return "", fmt.Errorf("manifest declares channel %q, wanted %q", manifest.Channel, channel)
+	}
+	if isNightly(version) != nightly {
+		return "", fmt.Errorf("version %q does not belong to channel %q", version, channel)
+	}
+
+	return version, nil
+}
+
+// fetchGitHubVersion is the fallback origin: the GitHub releases API.
+func fetchGitHubVersion(ctx context.Context, client *http.Client, nightly bool) (string, error) {
+	if nightly {
+		return fetchLatestNightlyVersion(ctx, client)
+	}
+	return fetchLatestVersion(ctx, client)
+}
+
+// getVersionJSON performs one GET within the caller's context and returns the
+// bounded body. The client belongs to the chain in fetchLatestForChannel, so
+// every origin is fetched with the same configured client rather than an
+// ad-hoc one per call site.
+func getVersionJSON(ctx context.Context, client *http.Client, url, accept string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+
+	req.Header.Set("Accept", accept)
 	req.Header.Set("User-Agent", versioninfo.UserAgent())
 
-	client := httpclient.New(httpclient.Options{})
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fetching release info: %w", err)
+		return nil, fmt.Errorf("fetching %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("reading response: %w", err)
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	return body, nil
+}
+
+// fetchLatestVersion fetches the latest stable version tag from the GitHub API.
+// The chain in fetchLatestForChannel owns the timeout and the client.
+func fetchLatestVersion(ctx context.Context, client *http.Client) (string, error) {
+	body, err := getVersionJSON(ctx, client, githubAPIURL, "application/vnd.github+json")
+	if err != nil {
+		return "", err
 	}
 
 	version, err := parseGitHubRelease(body)
@@ -195,6 +316,17 @@ func fetchLatestVersion(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("parsing release: %w", err)
 	}
 	return version, nil
+}
+
+// channelName is a channel's published name: the path segment under channels/
+// on the release origin and the value its manifest declares. It is the only
+// place the nightly predicate becomes a string, because those two wire values
+// are the only things that need one.
+func channelName(nightly bool) string {
+	if nightly {
+		return "nightly"
+	}
+	return "stable"
 }
 
 // isNightly returns true if the version string is a nightly build.
@@ -206,32 +338,11 @@ func isNightly(version string) bool {
 }
 
 // fetchLatestNightlyVersion fetches the latest nightly version tag from the GitHub releases list.
-func fetchLatestNightlyVersion(ctx context.Context) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, httpTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, githubReleasesURL+"?per_page=20", nil)
+// The chain in fetchLatestForChannel owns the timeout and the client.
+func fetchLatestNightlyVersion(ctx context.Context, client *http.Client) (string, error) {
+	body, err := getVersionJSON(ctx, client, githubReleasesURL+"?per_page=20", "application/vnd.github+json")
 	if err != nil {
-		return "", fmt.Errorf("creating request: %w", err)
-	}
-
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", versioninfo.UserAgent())
-
-	client := httpclient.New(httpclient.Options{})
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("fetching releases: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return "", fmt.Errorf("reading response: %w", err)
+		return "", err
 	}
 
 	var releases []GitHubRelease
