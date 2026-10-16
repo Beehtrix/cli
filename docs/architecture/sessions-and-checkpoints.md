@@ -420,7 +420,8 @@ still reaches a permanent checkpoint.
 (`manual_commit_condensation.go`) resolves each record's transcript — declared
 path first, agent-layout fallback, and last an agent re-export through
 `agent.SubagentTranscriptFetcher` for agents whose subagents are fetchable
-sessions (OpenCode: an in-flight task, or a stop hook whose export failed) —
+sessions (OpenCode: a completed task whose stop hook's export failed; live
+records are not re-exported, and all re-exports share one budget) —
 runs the same sanitize → externalize →
 redact pipeline the session transcript gets
 (`prepareTaskTranscriptForStorage`), and writes

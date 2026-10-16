@@ -330,10 +330,10 @@ type TranscriptFetcher interface {
 // SubagentTranscriptFetcher is implemented by agents whose subagents are
 // sessions the agent can still export after the fact, keyed by the task
 // record's AgentID (OpenCode: the child session ID). Condensation calls it for
-// a task record whose transcript was never declared or can no longer be read —
-// an in-flight task at a mid-task commit, or a subagent-stop whose export
-// failed — so a transcript that still exists in the agent's store is not
-// recorded as unavailable. Agents whose AgentID is not a fetchable session
+// a completed task record whose transcript was never declared or can no
+// longer be read (a subagent-stop whose export failed), so a transcript that
+// still exists in the agent's store is not recorded as unavailable. Callers go
+// through FetchSubagentTranscript, which honours WithSubagentFetchBudget. Agents whose AgentID is not a fetchable session
 // (Claude Code's agent IDs) must not implement it.
 type SubagentTranscriptFetcher interface {
 	Agent

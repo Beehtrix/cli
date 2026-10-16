@@ -1,8 +1,6 @@
 package cli
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"strconv"
 	"strings"
 	"time"
@@ -10,7 +8,6 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
-	"github.com/entireio/cli/cmd/entire/cli/validation"
 )
 
 // completionRecordKey picks the task record a completion-without-launch stop
@@ -65,17 +62,13 @@ func completionRecordKey(state *strategy.SessionState, event *agent.Event) strin
 	return reusedCallKey(callID, event.SubagentID, event.SubagentStartedAt, sameChild)
 }
 
-// reusedCallKey mints the record key for a call that reused callID. A child ID
-// the checkpoint path validator rejects (session IDs may contain "." or ":")
-// gives way to 12 hex of the suffix's SHA-256, so the key stays deterministic.
+// reusedCallKey mints the record key for a call that reused callID. Both
+// parts are already path-safe: dispatch validates SubagentID and the adapter
+// maps an unsafe callID before it reaches here.
 func reusedCallKey(callID, childID string, startedAt time.Time, sameChild bool) string {
-	suffix := childID
+	key := callID + "-" + childID
 	if sameChild {
-		suffix += "-" + strconv.FormatInt(startedAt.UnixMilli(), 10)
+		key += "-" + strconv.FormatInt(startedAt.UnixMilli(), 10)
 	}
-	if key := callID + "-" + suffix; validation.ValidateToolUseID(key) == nil {
-		return key
-	}
-	sum := sha256.Sum256([]byte(suffix))
-	return callID + "-" + hex.EncodeToString(sum[:])[:12]
+	return key
 }

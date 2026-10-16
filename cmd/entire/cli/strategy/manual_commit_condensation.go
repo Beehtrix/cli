@@ -360,6 +360,8 @@ func (s *ManualCommitStrategy) materializeTaskRecords(
 		return nil, assets
 	}
 
+	// One fetch budget for every record: each may re-export its subagent.
+	ctx = agent.WithSubagentFetchBudget(ctx, agent.SubagentFetchBudget)
 	inventoryPaths := resolveInventoryTaskTranscripts(ctx, ag, state)
 	payloads := make([]cpkg.TaskPayload, 0, len(state.TaskRecords))
 	for _, record := range state.TaskRecords {
@@ -445,9 +447,10 @@ func (s *ManualCommitStrategy) materializeTaskRecords(
 // nothing at those paths belongs to it.
 //
 // When none yields a transcript, an agent that can re-export its subagents
-// (SubagentTranscriptFetcher) is asked for one. That covers an in-flight
-// record, which has no declared path until its stop hook runs, and a stop hook
-// whose export failed. A fetch error is logged and the earlier outcome stands.
+// (SubagentTranscriptFetcher) is asked for one, for a completed record whose
+// stop hook's export failed. A live record is not fetched: its transcript is
+// partial, and the record is stored again once it completes. A fetch error is
+// logged and the earlier outcome stands.
 //
 // Returns an empty path and nil error when nothing could be resolved, and a
 // non-nil error when a candidate existed but could not be read.
@@ -474,10 +477,10 @@ func readTaskTranscript(ctx, logCtx context.Context, ag agent.Agent, state *Sess
 	}
 
 	fetcher, ok := agent.AsSubagentTranscriptFetcher(ag)
-	if !ok {
+	if !ok || record.CompletedAt.IsZero() {
 		return nil, "", readErr
 	}
-	path, err := fetcher.FetchSubagentTranscript(ctx, record.AgentID, record.ToolUseID, record.StartedAt, record.CompletedAt)
+	path, err := agent.FetchSubagentTranscript(ctx, fetcher, record.AgentID, record.ToolUseID, record.StartedAt, record.CompletedAt)
 	if err != nil {
 		logging.Warn(logCtx, "failed to fetch subagent transcript from the agent",
 			slog.String("session_id", state.SessionID),

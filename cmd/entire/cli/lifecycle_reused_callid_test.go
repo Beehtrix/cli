@@ -7,9 +7,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
-	"github.com/entireio/cli/cmd/entire/cli/validation"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // TestCompletionRecordKey pins how a completion-without-launch stop picks its
@@ -96,18 +94,4 @@ func TestCompletionRecordKey(t *testing.T) {
 			assert.Equal(t, tt.want, completionRecordKey(state, event))
 		})
 	}
-}
-
-// TestCompletionRecordKey_UnsafeChildHashesTheSuffix pins that a child ID the
-// checkpoint path validator rejects still yields a path-safe, deterministic key.
-func TestCompletionRecordKey_UnsafeChildHashesTheSuffix(t *testing.T) {
-	t.Parallel()
-	state := &strategy.SessionState{TaskRecords: []session.TaskRecord{
-		{ToolUseID: "c", AgentID: "ses_a", StartedAt: time.UnixMilli(1_000), CompletedAt: time.UnixMilli(2_000)},
-	}}
-	event := &agent.Event{ToolUseID: "c", SubagentID: "ses.b:1", SubagentStartedAt: time.UnixMilli(3_000), CompletionWithoutLaunch: true}
-	key := completionRecordKey(state, event)
-	require.NoError(t, validation.ValidateToolUseID(key))
-	assert.Regexp(t, `^c-[0-9a-f]{12}$`, key)
-	assert.Equal(t, key, completionRecordKey(state, event), "repeated stops of one call must map alike")
 }

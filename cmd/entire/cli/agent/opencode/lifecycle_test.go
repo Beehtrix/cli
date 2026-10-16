@@ -358,7 +358,7 @@ func TestFetchSubagentTranscript_ExportsTheChild(t *testing.T) {
 	path, err := ag.FetchSubagentTranscript(context.Background(), "ses_child", "call_red", time.Time{}, time.Time{})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"ses_child"}, exported, "exactly the child is exported")
-	assert.True(t, strings.HasSuffix(path, filepath.Join(paths.EntireTmpDir, "ses_child.json")), path)
+	assert.True(t, strings.HasSuffix(path, filepath.Join(paths.EntireTmpDir, "ses_child.call_red.json")), path)
 	data, err := ag.ReadTranscript(path)
 	require.NoError(t, err)
 	usage, err := ag.CalculateTokenUsage(data, 0)

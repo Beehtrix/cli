@@ -41,8 +41,8 @@ export const EntirePlugin: Plugin = async ({ directory }) => {
   // (some providers number calls per conversation), so a child's own task
   // call can share one with its parent's running call.
   // Call keys already announced via subagent-start (the running part update
-  // repeats). Never pruned, so a late running update cannot announce a task
-  // again after its stop.
+  // repeats), so a late running update cannot announce a task again after its
+  // stop. Cleared for a key when a new call starts under it (a reused callID).
   const announcedTasks = new Set<string>()
   // Call key -> Date.now() at tool.execute.before, sent as started_at. A
   // child resumed via `task_id` holds every earlier call's messages too; this
@@ -339,7 +339,14 @@ export const EntirePlugin: Plugin = async ({ directory }) => {
     "tool.execute.before": async (input) => {
       try {
         if (input.tool !== "task") return
-        taskStartedAt.set(callKey(input.sessionID, input.callID), Date.now())
+        const key = callKey(input.sessionID, input.callID)
+        // A new call under this key: some providers number calls per
+        // conversation, so an earlier call's markers must not dedupe or
+        // swallow this one's start and stop.
+        announcedTasks.delete(key)
+        stoppedBeforeStart.delete(key)
+        stoppedOnError.delete(key)
+        taskStartedAt.set(key, Date.now())
       } catch {
         // Silently ignore — plugin failures must not crash OpenCode
       }

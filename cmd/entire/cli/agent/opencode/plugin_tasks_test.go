@@ -457,26 +457,44 @@ func TestPlugin_NestedTaskErrorStopsOnTopLevelSession(t *testing.T) {
 	}
 }
 
-// TestPlugin_ReusedCallIDStillStops pins that a callID reused by a later task
-// (some providers number tool calls per conversation) still fires that task's
-// stop, though its start is deduplicated away.
-func TestPlugin_ReusedCallIDStillStops(t *testing.T) {
+// TestPlugin_ReusedCallID pins that a callID reused by a later task (some
+// providers number tool calls per conversation) is a call of its own: it gets
+// its own start and stop whether either call completes or is aborted.
+func TestPlugin_ReusedCallID(t *testing.T) {
 	t.Parallel()
-	hooks := runPluginTaskScenario(t, []map[string]any{
-		before("ses_parent", "functions.task:0"),
-		taskPart("ses_parent", "p1", "functions.task:0", "ses_child", "running"),
-		after("functions.task:0", "ses_child", false),
-		before("ses_parent", "functions.task:0"),
-		taskPart("ses_parent", "p2", "functions.task:0", "ses_child2", "running"),
-		after("functions.task:0", "ses_child2", false),
-	})
-	var got []string
-	for _, h := range hooks {
-		got = append(got, h.key()+"@"+h.ChildID)
+	const callID = "functions.task:0"
+	completed := func(partID, childID string) []map[string]any {
+		return []map[string]any{
+			before("ses_parent", callID),
+			taskPart("ses_parent", partID, callID, childID, "running"),
+			after(callID, childID, false),
+		}
 	}
-	want := "subagent-start:functions.task:0@ses_child,subagent-stop:functions.task:0@ses_child,subagent-stop:functions.task:0@ses_child2"
-	if strings.Join(got, ",") != want {
-		t.Errorf("hooks = %v, want %s", got, want)
+	aborted := func(partID, childID string) []map[string]any {
+		return []map[string]any{
+			before("ses_parent", callID),
+			taskPart("ses_parent", partID, callID, childID, "running"),
+			taskPart("ses_parent", partID, callID, childID, "error"),
+		}
+	}
+	const want = "subagent-start:functions.task:0@ses_child,subagent-stop:functions.task:0@ses_child," +
+		"subagent-start:functions.task:0@ses_child2,subagent-stop:functions.task:0@ses_child2"
+	for name, steps := range map[string][][]map[string]any{
+		"completed then completed": {completed("p1", "ses_child"), completed("p2", "ses_child2")},
+		"aborted then completed":   {aborted("p1", "ses_child"), completed("p2", "ses_child2")},
+		"completed then aborted":   {completed("p1", "ses_child"), aborted("p2", "ses_child2")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			hooks := runPluginTaskScenario(t, append(steps[0], steps[1]...))
+			var got []string
+			for _, h := range hooks {
+				got = append(got, h.key()+"@"+h.ChildID)
+			}
+			if strings.Join(got, ",") != want {
+				t.Errorf("hooks = %v, want %s", got, want)
+			}
+		})
 	}
 }
 

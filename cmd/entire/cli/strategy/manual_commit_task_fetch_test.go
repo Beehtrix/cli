@@ -47,6 +47,7 @@ func TestReadTaskTranscript_FetchFallback(t *testing.T) {
 	declared := filepath.Join(t.TempDir(), "declared.json")
 	require.NoError(t, os.WriteFile(declared, []byte("declared"), 0o600))
 	missing := filepath.Join(t.TempDir(), "gone.json")
+	done := time.Now()
 
 	tests := []struct {
 		name        string
@@ -57,22 +58,28 @@ func TestReadTaskTranscript_FetchFallback(t *testing.T) {
 		wantErr     bool
 	}{
 		{
-			name:        "in-flight record without a declared path is fetched",
-			record:      session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child"},
+			name:        "completed record without a declared path is fetched",
+			record:      session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child", CompletedAt: done},
 			ag:          func(dir string) agent.Agent { return &fetchingAgent{dir: dir, content: "fetched"} },
 			wantContent: "fetched",
 			wantFetched: true,
 		},
 		{
+			// Its transcript is partial; it is stored again once it completes.
+			name:   "in-flight record is not fetched",
+			record: session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child"},
+			ag:     func(dir string) agent.Agent { return &fetchingAgent{dir: dir, content: "fetched"} },
+		},
+		{
 			name:        "transcript-unavailable record is fetched",
-			record:      session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child", TranscriptUnavailable: true},
+			record:      session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child", TranscriptUnavailable: true, CompletedAt: done},
 			ag:          func(dir string) agent.Agent { return &fetchingAgent{dir: dir, content: "fetched"} },
 			wantContent: "fetched",
 			wantFetched: true,
 		},
 		{
 			name:        "unreadable declared path falls through to the fetch",
-			record:      session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child", DeclaredTranscriptPath: missing},
+			record:      session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child", DeclaredTranscriptPath: missing, CompletedAt: done},
 			ag:          func(dir string) agent.Agent { return &fetchingAgent{dir: dir, content: "fetched"} },
 			wantContent: "fetched",
 			wantFetched: true,
@@ -85,13 +92,13 @@ func TestReadTaskTranscript_FetchFallback(t *testing.T) {
 		},
 		{
 			name:        "failed fetch with no candidates stays unresolvable",
-			record:      session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child"},
+			record:      session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child", CompletedAt: done},
 			ag:          func(dir string) agent.Agent { return &fetchingAgent{dir: dir, err: errors.New("export failed")} },
 			wantFetched: true,
 		},
 		{
 			name:        "failed fetch keeps the declared path's read error",
-			record:      session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child", DeclaredTranscriptPath: missing},
+			record:      session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child", DeclaredTranscriptPath: missing, CompletedAt: done},
 			ag:          func(dir string) agent.Agent { return &fetchingAgent{dir: dir, err: errors.New("export failed")} },
 			wantFetched: true,
 			wantErr:     true,
@@ -146,4 +153,20 @@ func TestMaterializeTaskRecords_FetchedTranscriptIsRedactedAndStored(t *testing.
 	stored := string(payloads[0].Transcript.Bytes())
 	require.NotContains(t, stored, taskTranscriptSecret)
 	require.Contains(t, stored, "REDACTED")
+}
+
+// TestReadTaskTranscript_FetchBudgetIsShared pins that once a pass's fetch
+// budget is spent, later records are not exported at all: each export is a
+// separate agent process with its own timeout, run inside post-commit.
+func TestReadTaskTranscript_FetchBudgetIsShared(t *testing.T) {
+	t.Parallel()
+	ag := &fetchingAgent{dir: t.TempDir(), content: "fetched"}
+	state := &SessionState{SessionID: "ses_parent"}
+	record := session.TaskRecord{ToolUseID: "call_a", AgentID: "ses_child", CompletedAt: time.Now()}
+	spent := agent.WithSubagentFetchBudget(context.Background(), 0)
+	raw, path, err := readTaskTranscript(spent, context.Background(), ag, state, record, "")
+	require.NoError(t, err)
+	require.Empty(t, raw)
+	require.Empty(t, path)
+	require.Empty(t, ag.fetched)
 }

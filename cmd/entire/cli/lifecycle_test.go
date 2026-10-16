@@ -3722,6 +3722,18 @@ func TestHandleLifecycleSubagentStart_DeferredCompletion_RecordsInFlightMarker(t
 	require.NoError(t, err)
 	require.Len(t, state.TaskRecords, 1)
 	assert.False(t, state.TaskRecords[0].CompletedAt.IsZero(), "duplicate start must not overwrite a completed record")
+
+	// A start reaching an ended session would leave a record nothing completes.
+	require.NoError(t, strategy.MutateSessionState(ctx, sessionID, func(s *strategy.SessionState) error {
+		s.Phase = session.PhaseEnded
+		return nil
+	}))
+	late := *start
+	late.ToolUseID = "call_blue"
+	require.NoError(t, handleLifecycleSubagentStart(ctx, newMockAgent(), &late))
+	state, err = strategy.LoadSessionState(ctx, sessionID)
+	require.NoError(t, err)
+	assert.Nil(t, state.FindTaskRecord("call_blue"), "an ended session must not get a live record")
 }
 
 // TestHandleLifecycleSubagentEnd_SubagentStop_CapturesUsingLaunchRecordedLabel

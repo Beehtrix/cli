@@ -151,7 +151,11 @@ func TestFetchSubagentTranscript_ResumedChildDeclaresOnlyThisCall(t *testing.T) 
 	assert.Equal(t, 3, usage.OutputTokens)
 }
 
-func TestFetchSubagentTranscript_UnknownStartDeclaresFullExport(t *testing.T) {
+// TestFetchSubagentTranscript_UnknownStartDeclaresTheLastCall pins that a
+// stop with no start (the plugin missed the call's start) declares the last
+// call's slice in a file of its own, not the shared export cache that later
+// exports overwrite.
+func TestFetchSubagentTranscript_UnknownStartDeclaresTheLastCall(t *testing.T) {
 	// Not parallel: t.Chdir and stubExport.
 	t.Chdir(t.TempDir())
 	paths.ClearWorktreeRootCache()
@@ -162,10 +166,17 @@ func TestFetchSubagentTranscript_UnknownStartDeclaresFullExport(t *testing.T) {
 
 	path, err := (&OpenCodeAgent{}).FetchSubagentTranscript(context.Background(), "ses_child", "call_blue", time.Time{}, time.Time{})
 	require.NoError(t, err)
-	assert.True(t, strings.HasSuffix(path, filepath.Join(paths.EntireTmpDir, "ses_child.json")), path)
+	assert.True(t, strings.HasSuffix(path, filepath.Join(paths.EntireTmpDir, "ses_child.call_blue.json")), path)
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"m1", "m2", "m3", "m4"}, messageIDs(t, data))
+	assert.Equal(t, []string{"m3", "m4"}, messageIDs(t, data))
+
+	// A re-export bounded by the first call's completion keeps that call.
+	path, err = (&OpenCodeAgent{}).FetchSubagentTranscript(context.Background(), "ses_child", "call_red", time.Time{}, time.UnixMilli(100))
+	require.NoError(t, err)
+	data, err = os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"m1", "m2"}, messageIDs(t, data))
 }
 
 func TestFetchSubagentTranscript_ScopesLikeTheStopHook(t *testing.T) {

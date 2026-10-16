@@ -517,7 +517,8 @@ func TestInstallHooks_SubagentHooksFireFromParentTaskSignals(t *testing.T) {
 		// call start: recorded before the child exists, sent on both hooks so a
 		// resumed child's export can be cut to this call
 		`"tool.execute.before": async (input) => {`,
-		`taskStartedAt.set(callKey(input.sessionID, input.callID), Date.now())`,
+		`const key = callKey(input.sessionID, input.callID)`,
+		`taskStartedAt.set(key, Date.now())`,
 		`taskStartedAt.get(key) ?? taskStartedAt.get(partKey) ?? part.state?.time?.start ?? 0`,
 		`started_at: startedAt`,
 		// a background result injected as a synthetic user part is not a prompt

@@ -1687,7 +1687,10 @@ func recordInFlightTaskLaunch(logCtx context.Context, event *agent.Event) error 
 // identity and whose completion is a later Final event
 // (Event.DeferredCompletion). EnsureTaskRecord rather than AddTaskRecord: a
 // start replayed after the Final completed the record must enrich, never
-// overwrite, so a completed record is never reopened.
+// overwrite, so a completed record is never reopened. A start reaching an
+// ended session records nothing: its stop is dropped for the ended parent
+// (handleSubagentStopFinal) and the SessionEnd sweep has run, so the record
+// would stay live forever.
 func recordDeferredTaskLaunch(logCtx context.Context, event *agent.Event) error {
 	logging.Debug(logCtx, "deferred-completion subagent start detected; deferring capture to subagent-stop",
 		slog.String("session_id", event.SessionID),
@@ -1695,6 +1698,12 @@ func recordDeferredTaskLaunch(logCtx context.Context, event *agent.Event) error 
 		slog.String("agent_id", event.SubagentID),
 	)
 	return recordTaskLaunchMarker(logCtx, event, func(state *strategy.SessionState, rec session.TaskRecord) {
+		if state.IsEnded() {
+			logging.Info(logCtx, "skipping subagent start: parent session already ended",
+				slog.String("session_id", event.SessionID),
+				slog.String("tool_use_id", event.ToolUseID))
+			return
+		}
 		_ = state.EnsureTaskRecord(rec)
 	})
 }
@@ -2015,7 +2024,7 @@ func fetchSubagentTranscriptForCapture(logCtx context.Context, ag agent.Agent, e
 	if !ok || event.SubagentID == "" {
 		return ""
 	}
-	path, err := fetcher.FetchSubagentTranscript(logCtx, event.SubagentID, event.ToolUseID, event.SubagentStartedAt, time.Time{})
+	path, err := agent.FetchSubagentTranscript(logCtx, fetcher, event.SubagentID, event.ToolUseID, event.SubagentStartedAt, time.Time{})
 	if err != nil {
 		logging.Warn(logCtx, "could not fetch subagent transcript for capture; completing the task without it",
 			slog.String("session_id", event.SessionID),
@@ -2378,6 +2387,8 @@ func loadLiveTaskRecords(logCtx context.Context, sessionID string) []session.Tas
 // condense materializes the just-completed records.
 // Best-effort: one task's failure does not stop the others.
 func completeLiveTaskRecords(ctx context.Context, ag agent.Agent, sessionID, sessionRef string) {
+	// One fetch budget for the whole sweep: each live record may re-export its child.
+	ctx = agent.WithSubagentFetchBudget(ctx, agent.SubagentFetchBudget)
 	logCtx := logging.WithAgent(logging.WithComponent(ctx, "lifecycle"), ag.Name())
 	for _, task := range loadLiveTaskRecords(logCtx, sessionID) {
 		captureInFlightTaskFinal(logCtx, ag, sessionID, sessionRef, task)

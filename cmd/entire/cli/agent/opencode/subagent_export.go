@@ -28,11 +28,11 @@ import (
 // the SessionEnd sweep). The slice is written to
 // `.entire/tmp/<child>.<toolUseID>.json` — one file per call, so a later call
 // on the same child cannot overwrite an earlier record's transcript before it
-// is condensed. With neither bound known, the full export is returned.
+// is condensed. Without a start, the call is the last one prompted by until
+// (or by now).
 func (a *OpenCodeAgent) exportSubagent(ctx context.Context, childID, toolUseID string, since, until time.Time) (string, error) {
-	full, err := a.fetchAndCacheExport(ctx, childID)
-	if err != nil || (since.IsZero() && until.IsZero()) {
-		return full, err
+	if _, err := a.fetchAndCacheExport(ctx, childID); err != nil {
+		return "", err
 	}
 	if toolUseID == "" {
 		return "", errors.New("opencode subagent export needs a tool use ID to scope a call")
@@ -81,8 +81,9 @@ func (a *OpenCodeAgent) exportSubagent(ctx context.Context, childID, toolUseID s
 // prompt, the first prompt created at or after since, and run up to the next
 // prompt, which belongs to the next call on the same child: an export taken
 // after the child served a later call holds that call too. With since unset
-// the slice begins at the first prompt. When until is set, messages created after it are
-// dropped too. Messages are carried as raw JSON, so fields the typed export
+// the slice begins at the last prompt created by until: a stop captures right
+// after its call ended, and a re-export is bounded by the call's completion.
+// When until is set, messages created after it are dropped too. Messages are carried as raw JSON, so fields the typed export
 // structs do not model survive.
 func scopeExportToCall(data []byte, since, until time.Time) ([]byte, int, error) {
 	var doc map[string]json.RawMessage
@@ -95,17 +96,17 @@ func scopeExportToCall(data []byte, since, until time.Time) ([]byte, int, error)
 			return nil, 0, fmt.Errorf("parse subagent export messages: %w", err)
 		}
 	}
-	sinceMs := since.UnixMilli()
-	if since.IsZero() {
-		sinceMs = math.MinInt64
-	}
 	untilMs := int64(math.MaxInt64)
 	if !until.IsZero() {
 		untilMs = until.UnixMilli()
 	}
-	kept := make([]json.RawMessage, 0, len(messages))
-	inCall := false
-	for _, m := range messages {
+	created := make([]int64, len(messages))
+	prompt := make([]bool, len(messages))
+	sinceMs := since.UnixMilli()
+	if since.IsZero() {
+		sinceMs = math.MaxInt64
+	}
+	for i, m := range messages {
 		var head struct {
 			Info  MessageInfo `json:"info"`
 			Parts []Part      `json:"parts"`
@@ -113,14 +114,22 @@ func scopeExportToCall(data []byte, since, until time.Time) ([]byte, int, error)
 		if err := json.Unmarshal(m, &head); err != nil {
 			return nil, 0, fmt.Errorf("parse subagent export message: %w", err)
 		}
-		created := head.Info.Time.Created
-		if isCallPrompt(head.Info, head.Parts) {
+		created[i] = head.Info.Time.Created
+		prompt[i] = isCallPrompt(head.Info, head.Parts)
+		if since.IsZero() && prompt[i] && created[i] <= untilMs {
+			sinceMs = created[i]
+		}
+	}
+	kept := make([]json.RawMessage, 0, len(messages))
+	inCall := false
+	for i, m := range messages {
+		if prompt[i] {
 			if inCall {
 				break
 			}
-			inCall = created >= sinceMs
+			inCall = created[i] >= sinceMs
 		}
-		if inCall && created <= untilMs {
+		if inCall && created[i] <= untilMs {
 			kept = append(kept, m)
 		}
 	}
