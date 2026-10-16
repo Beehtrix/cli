@@ -381,3 +381,41 @@ func TestDoctorSubcommands_InvalidScannerConfigBlocksOnlyRedactedBundle(t *testi
 		t.Errorf("redacted doctor bundle must fail closed on invalid scanner config, got: %v", err)
 	}
 }
+
+// Settings that fail to load leave hooks on the built-in layers, but a
+// redacted bundle must refuse rather than ship without the user's own rules.
+func TestDoctorBundle_RefusesWhenCustomRulesFailToLoad(t *testing.T) {
+	// Cannot use t.Parallel(): t.Chdir and the process-wide redaction Once.
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	testutil.WriteFile(t, dir, "f.txt", "init")
+	testutil.GitAdd(t, dir, "f.txt")
+	testutil.GitCommit(t, dir, "init")
+	testutil.WriteFile(t, dir, ".entire/settings.json", `{"enabled": true, "redaction": {`)
+	t.Chdir(dir)
+	paths.ClearWorktreeRootCache()
+
+	run := func(args ...string) error {
+		strategy.ResetRedactionConfiguredForTest()
+		t.Cleanup(strategy.ResetRedactionConfiguredForTest)
+		cmd := newDoctorCmd()
+		var out strings.Builder
+		cmd.SetOut(&out)
+		cmd.SetErr(&out)
+		cmd.SetArgs(args)
+		cmd.SetContext(context.Background())
+		return cmd.Execute()
+	}
+
+	outZip := filepath.Join(t.TempDir(), "bundle.zip")
+	err := run("bundle", "--out", outZip)
+	if err == nil || !strings.Contains(err.Error(), "custom redaction rules could not be loaded") {
+		t.Fatalf("redacted bundle must refuse when settings fail to load, got: %v", err)
+	}
+	if _, statErr := os.Stat(outZip); !os.IsNotExist(statErr) {
+		t.Errorf("refused bundle must not leave an archive behind (stat err: %v)", statErr)
+	}
+	if err := run("bundle", "--raw", "--out", outZip); err != nil {
+		t.Errorf("doctor bundle --raw must still work: %v", err)
+	}
+}

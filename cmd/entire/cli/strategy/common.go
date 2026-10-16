@@ -410,6 +410,11 @@ var (
 	// errRedactionScanner is set inside the Once and returned by every
 	// subsequent EnsureRedactionConfigured call (sticky failure).
 	errRedactionScanner error
+	// errRedactionRulesUnloaded is set inside the Once when settings or the
+	// redactor packs directory failed to load, so user-defined rules may be
+	// missing. Hooks keep the warn-and-default behavior; callers whose output
+	// leaves the machine check it through RedactionRulesUnloaded.
+	errRedactionRulesUnloaded error
 )
 
 // resetRedactionConfiguredForTest reinitializes the Once so tests can
@@ -417,6 +422,14 @@ var (
 func resetRedactionConfiguredForTest() {
 	initRedactionOnce = sync.Once{}
 	errRedactionScanner = nil
+	errRedactionRulesUnloaded = nil
+}
+
+// RedactionRulesUnloaded reports why user-defined redaction settings or packs
+// could not be loaded by EnsureRedactionConfigured, or nil when they loaded
+// (or there were none). Only meaningful after EnsureRedactionConfigured.
+func RedactionRulesUnloaded() error {
+	return errRedactionRulesUnloaded
 }
 
 // EnsureRedactionConfigured loads redaction settings and configures the
@@ -454,6 +467,7 @@ func EnsureRedactionConfigured(ctx context.Context) error {
 				errRedactionScanner = err
 				return
 			}
+			errRedactionRulesUnloaded = fmt.Errorf("load settings: %w", err)
 			logCtx := logging.WithComponent(ctx, "redaction")
 			logging.Warn(logCtx, "failed to load settings for redaction", slog.String("error", err.Error()))
 			return
@@ -510,10 +524,12 @@ func EnsureRedactionConfigured(ctx context.Context) error {
 		if root, rerr := entiredir.OpenForRead(ctx); rerr == nil {
 			packs, lerr = redact.LoadPacks(root.FS(), redact.RedactorsDirName, logger)
 		} else if !errors.Is(rerr, fs.ErrNotExist) {
+			errRedactionRulesUnloaded = fmt.Errorf("open .entire for redactor packs: %w", rerr)
 			logCtx := logging.WithComponent(ctx, "redaction")
 			logging.Warn(logCtx, "failed to open .entire for redactor packs", slog.String("error", rerr.Error()))
 		}
 		if lerr != nil {
+			errRedactionRulesUnloaded = fmt.Errorf("load redactor packs: %w", lerr)
 			warnUser(ctx, "redaction",
 				"failed to load redactor packs",
 				fmt.Sprintf("redactor packs failed to load (%v); see .entire/logs/entire.log or run `entire doctor`.", lerr),

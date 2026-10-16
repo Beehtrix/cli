@@ -73,6 +73,12 @@ that path is printed to stdout. Use --out to choose a specific path.`,
 				if err := strategy.EnsureRedactionConfigured(ctx); err != nil {
 					return fmt.Errorf("configure redaction before bundling: %w", err)
 				}
+				// Hooks fall back to the built-in layers when settings or
+				// packs fail to load; a bundle must not, or it ships content
+				// the user's own rules were written to catch.
+				if err := strategy.RedactionRulesUnloaded(); err != nil {
+					return fmt.Errorf("custom redaction rules could not be loaded, refusing to write a bundle without them: %w (fix the error, or pass --raw only if support asked for an unredacted bundle)", err)
+				}
 			}
 
 			if err := writeDoctorBundle(ctx, repoRoot, outPath, rawFlag); err != nil {
