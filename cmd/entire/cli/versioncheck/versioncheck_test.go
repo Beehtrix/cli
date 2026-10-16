@@ -694,6 +694,29 @@ func TestFetchLatestForChannel_NightlyFromReleaseOrigin(t *testing.T) {
 	}
 }
 
+func TestFetchLatestForChannel_FallsBackWhenManifestIsUnusable(t *testing.T) {
+	// The whole point of validating the manifest is that a corrupt pointer on
+	// our own origin must not take update checks down with it.
+	channelServer, _ := newChannelServer(t, ChannelManifest{
+		Channel: "stable",
+		Version: "not-a-version",
+	})
+	useChannelOrigin(t, channelServer.URL)
+
+	githubServer := newVersionServer(t, testStableVersion)
+	origURL := githubAPIURL
+	githubAPIURL = githubServer.URL
+	t.Cleanup(func() { githubAPIURL = origURL })
+
+	version, err := fetchLatestForChannel(context.Background(), false)
+	if err != nil {
+		t.Fatalf("fetchLatestForChannel() error = %v", err)
+	}
+	if version != testStableVersion {
+		t.Errorf("fetchLatestForChannel() = %q, want %q from the fallback origin", version, testStableVersion)
+	}
+}
+
 func TestFetchLatestForChannel_AllOriginsFail(t *testing.T) {
 	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -741,6 +764,25 @@ func TestFetchChannelManifestVersion_RejectsCrossChannel(t *testing.T) {
 			name:     "manifest names no version",
 			nightly:  false,
 			manifest: ChannelManifest{Channel: "stable"},
+		},
+		{
+			// isNightly is false for an unparseable string, so this passes the
+			// channel check. Accepting it ends the chain, and isOutdated then
+			// reports no update because an invalid version sorts below every
+			// valid one — update checks silently switch off.
+			name:     "version is not a version",
+			nightly:  false,
+			manifest: ChannelManifest{Channel: "stable", Version: "not-a-version"},
+		},
+		{
+			name:     "tag is not a version",
+			nightly:  false,
+			manifest: ChannelManifest{Channel: "stable", Tag: "vnope"},
+		},
+		{
+			name:     "version is a bare major.minor",
+			nightly:  false,
+			manifest: ChannelManifest{Channel: "stable", Version: "1.2"},
 		},
 	}
 	for _, tt := range tests {

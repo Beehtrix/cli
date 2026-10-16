@@ -14,6 +14,15 @@ on:
 permissions:
   contents: write
 
+# Serialize releases. The channel pointer is a read-modify-write, so two
+# overlapping runs can both read the same current version, both pass the
+# monotonic guard, and leave the pointer at whichever wrote last — which may be
+# the older one. Queue rather than cancel: a cancelled release leaves artifacts
+# uploaded with no pointer flipped.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
 

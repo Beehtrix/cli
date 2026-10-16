@@ -228,12 +228,16 @@ expect "the error names the pinning escape hatch" contains "$out" "--version X.Y
 
 section "install.sh — a hanging origin still fails over"
 
-# Same code path, shorter budget, so this costs ~2s instead of ~15s.
+# Shortens the real policy rather than substituting a different one. The
+# download path has no --max-time in production — injecting one here would make
+# this pass on a bound that does not exist, which is exactly the failure it is
+# supposed to catch. So the metadata budget shrinks (it already has --max-time)
+# and the download keeps --speed-limit/--speed-time with a 2s window.
 BH_PORT="$(blackhole "$WORK/blackhole")"
 repoint "$WORK/install-hang.sh" "http://127.0.0.1:$BH_PORT" "$GH" "$GH/api"
 sed -i.bak \
     -e 's|^CURL_METADATA_OPTS=.*|CURL_METADATA_OPTS=(--connect-timeout 1 --max-time 2)|' \
-    -e 's|^CURL_DOWNLOAD_OPTS=.*|CURL_DOWNLOAD_OPTS=(--connect-timeout 1 --max-time 2)|' \
+    -e 's|^CURL_DOWNLOAD_OPTS=.*|CURL_DOWNLOAD_OPTS=(--connect-timeout 1 --speed-limit 1 --speed-time 2)|' \
     "$WORK/install-hang.sh"
 started="$(date +%s)"
 out="$(run_install "$WORK/home-hang" "$WORK/install-hang.sh")"
@@ -243,33 +247,133 @@ expect "the install completes despite the hung origin" test -x "$WORK/home-hang/
 expect "gives up on the hung origin within the budget" test "$elapsed" -lt 20
 
 # ============================================================ channel pointer
+section "install.sh — unusable manifest metadata falls back"
+
+# A version that is not a version must not end discovery. Both origins would
+# then be asked for a release that does not exist, failing the install even
+# though GitHub has a valid one.
+build_origin "$WORK/badmeta" 5.5.5
+printf '{"channel":"stable","tag":"vnot-a-version","version":"not-a-version"}\n' \
+    > "$WORK/badmeta/channels/stable.json"
+BADMETA_PORT="$(serve "$WORK/badmeta")"
+repoint "$WORK/install-badmeta.sh" "http://127.0.0.1:$BADMETA_PORT" "$GH" "$GH/api"
+out="$(run_install "$WORK/home-badmeta" "$WORK/install-badmeta.sh")"
+expect "a manifest naming a non-version falls back to GitHub" contains "$out" "Installing version: 8.8.8"
+expect "the install completes from the fallback" test -x "$WORK/home-badmeta/.local/bin/entire"
+refute "the bad version is never requested" contains "$out" "not-a-version"
+
+# A nightly on the stable channel is the cross-stream case: accepting it would
+# move every stable install onto a prerelease.
+build_origin "$WORK/crossmeta" 6.6.6
+printf '{"channel":"stable","version":"4.4.4-nightly.202604061200.abc1234"}\n' \
+    > "$WORK/crossmeta/channels/stable.json"
+CROSS_PORT="$(serve "$WORK/crossmeta")"
+repoint "$WORK/install-crossmeta.sh" "http://127.0.0.1:$CROSS_PORT" "$GH" "$GH/api"
+out="$(run_install "$WORK/home-crossmeta" "$WORK/install-crossmeta.sh")"
+expect "a nightly on the stable channel falls back to GitHub" contains "$out" "Installing version: 8.8.8"
+refute "the nightly version is never installed" contains "$out" "4.4.4-nightly"
+
+section "the release mirror stays inert when the variable is empty"
+
+# release.yml always exports ENTIRE_RELEASE_BUCKET, and an unset Actions
+# variable exports as an empty string, so isEnvSet alone is true on every
+# release. Gating on presence enables the blobs pipe with an empty bucket and
+# no credentials, failing the release instead of staying inert.
+expect "the blobs gate tests non-emptiness, not just presence" \
+    grep -qF 'ne .Env.ENTIRE_RELEASE_BUCKET ""' "$REPO_ROOT/.goreleaser.yaml"
+refute "no bare isEnvSet gate remains on the bucket" \
+    grep -qE "if isEnvSet \"ENTIRE_RELEASE_BUCKET\"" "$REPO_ROOT/.goreleaser.yaml"
+refute "no bare isEnvSet gate remains on the region" \
+    grep -qE "if isEnvSet \"ENTIRE_RELEASE_REGION\"" "$REPO_ROOT/.goreleaser.yaml"
+
 section "publish-channel-manifest.sh"
 
 STUB_BIN="$WORK/stub-bin"
 mkdir -p "$STUB_BIN"
 cat > "$STUB_BIN/aws" <<'AWS'
 #!/bin/bash
-# Stub for `aws s3 cp`, mapping s3://bucket/key to $AWS_STUB_ROOT/bucket/key.
+# Stub for the AWS CLI surface these scripts use, mapping s3://bucket/key and
+# --bucket/--key to $AWS_STUB_ROOT/bucket/key.
+#
+#   s3 cp                 (publish-installers.sh)
+#   s3api get-object      (publish-channel-manifest.sh, needs the ETag)
+#   s3api put-object      (publish-channel-manifest.sh, conditional write)
+#
+# ETags are the content md5, as S3 does for a single-part upload, so --if-match
+# behaves the way the real conditional write does.
 set -uo pipefail
 echo "$*" >> "$AWS_STUB_ROOT/calls.log"
-[ "${1:-}" = "s3" ] && [ "${2:-}" = "cp" ] || exit 64
-src="$3"; dst="$4"
+
 s3path() { printf '%s/%s' "$AWS_STUB_ROOT" "${1#s3://}"; }
-if [ "${src#s3://}" != "$src" ]; then
-    # AWS_STUB_READ_ERROR simulates a non-404 read failure (permission denied,
-    # throttling) so the publisher's fail-closed branch is reachable in tests.
-    if [ -n "${AWS_STUB_READ_ERROR:-}" ]; then
+etag_of() { md5 -q "$1" 2>/dev/null || md5sum "$1" | cut -d' ' -f1; }
+not_found() {
+    echo "fatal error: An error occurred (404) when calling the HeadObject operation: Not Found" >&2
+    exit 1
+}
+
+if [ "${1:-}" = "s3" ] && [ "${2:-}" = "cp" ]; then
+    src="$3"; dst="$4"
+    if [ -n "${AWS_STUB_READ_ERROR:-}" ] && [ "${src#s3://}" != "$src" ]; then
         echo "fatal error: An error occurred (AccessDenied) when calling the HeadObject operation: Forbidden" >&2
         exit 1
     fi
-    f="$(s3path "$src")"
-    if [ ! -f "$f" ]; then
-        echo "fatal error: An error occurred (404) when calling the HeadObject operation: Not Found" >&2
-        exit 1
+    if [ "${src#s3://}" != "$src" ]; then
+        f="$(s3path "$src")"; [ -f "$f" ] || not_found; cat "$f"; exit 0
     fi
-    cat "$f"; exit 0
+    f="$(s3path "$dst")"; mkdir -p "$(dirname "$f")"; cp "$src" "$f"; exit 0
 fi
-f="$(s3path "$dst")"; mkdir -p "$(dirname "$f")"; cp "$src" "$f"
+
+if [ "${1:-}" = "s3api" ]; then
+    op="$2"; shift 2
+    bucket=""; key=""; body=""; outfile=""; if_match=""; if_none_match=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --bucket)         bucket="$2"; shift 2 ;;
+            --key)            key="$2"; shift 2 ;;
+            --body)           body="$2"; shift 2 ;;
+            --if-match)       if_match="$2"; shift 2 ;;
+            --if-none-match)  if_none_match="$2"; shift 2 ;;
+            --region|--content-type|--cache-control) shift 2 ;;
+            --*)              shift ;;
+            *)                outfile="$1"; shift ;;
+        esac
+    done
+    f="$AWS_STUB_ROOT/$bucket/$key"
+
+    case "$op" in
+        get-object)
+            [ -z "${AWS_STUB_READ_ERROR:-}" ] || {
+                echo "fatal error: An error occurred (AccessDenied) when calling the GetObject operation: Forbidden" >&2
+                exit 1
+            }
+            [ -f "$f" ] || not_found
+            [ -n "$outfile" ] && cp "$f" "$outfile"
+            # AWS_STUB_STALE_ETAG reports an ETag that will not match at write
+            # time, which is what a concurrent publisher looks like.
+            if [ -n "${AWS_STUB_STALE_ETAG:-}" ]; then
+                printf '{"ETag": "\"%s\"", "ContentType": "application/json"}\n' "stale00000000000000000000000000"
+                exit 0
+            fi
+            printf '{"ETag": "\"%s\"", "ContentType": "application/json"}\n' "$(etag_of "$f")"
+            exit 0 ;;
+        put-object)
+            if [ -n "$if_none_match" ] && [ -f "$f" ]; then
+                echo "An error occurred (PreconditionFailed) when calling the PutObject operation: At least one of the pre-conditions you specified did not hold" >&2
+                exit 1
+            fi
+            if [ -n "$if_match" ]; then
+                [ -f "$f" ] || not_found
+                if [ "$if_match" != "$(etag_of "$f")" ]; then
+                    echo "An error occurred (PreconditionFailed) when calling the PutObject operation: At least one of the pre-conditions you specified did not hold" >&2
+                    exit 1
+                fi
+            fi
+            mkdir -p "$(dirname "$f")"; cp "$body" "$f"; exit 0 ;;
+        *) exit 64 ;;
+    esac
+fi
+
+exit 64
 AWS
 chmod +x "$STUB_BIN/aws"
 
@@ -353,6 +457,25 @@ printf '{"channel":"stable"}\n' > "$AWS_STUB_ROOT/b/channels/stable.json"
 out="$(publish --tag v1.0.0 --bucket b; printf 'rc=%s' "$?")"
 expect "an unparseable pointer refuses to publish" contains "$out" "rc=2"
 expect "the refusal names the object to inspect" contains "$out" "names no version"
+
+# The guard reads, compares and writes as three operations. A concurrent
+# publisher landing in between would otherwise pass both guards and leave the
+# pointer wherever the slower write finished.
+fresh conflict
+seed stable 1.0.0
+out="$(AWS_STUB_STALE_ETAG=1 publish --tag v2.0.0 --bucket b; printf 'rc=%s' "$?")"
+expect "a pointer that changed mid-publish is refused" contains "$out" "rc=2"
+expect "the refusal says the comparison no longer holds" contains "$out" "no longer holds"
+expect "the pointer is untouched after a conflict" eq "$(pointer stable)" "1.0.0"
+
+fresh conditional
+publish --tag v1.0.0 --bucket b >/dev/null
+expect "a first publish is conditional on the key being absent" \
+    grep -qF -- "--if-none-match" "$AWS_STUB_ROOT/calls.log"
+publish --tag v1.1.0 --bucket b >/dev/null
+expect "an update is conditional on the ETag it read" \
+    grep -qF -- "--if-match" "$AWS_STUB_ROOT/calls.log"
+expect "the conditional update still moved the pointer" eq "$(pointer stable)" "1.1.0"
 
 printf '\n\033[1m%s\033[0m\n' "publish-installers.sh"
 

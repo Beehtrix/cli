@@ -121,9 +121,16 @@ checksum:
 # serving yet. See docs/architecture/release-origins.md.
 blobs:
   - provider: s3
-    disable: '{{ if isEnvSet "ENTIRE_RELEASE_BUCKET" }}false{{ else }}true{{ end }}'
-    bucket: '{{ if isEnvSet "ENTIRE_RELEASE_BUCKET" }}{{ .Env.ENTIRE_RELEASE_BUCKET }}{{ else }}unset{{ end }}'
-    region: '{{ if isEnvSet "ENTIRE_RELEASE_REGION" }}{{ .Env.ENTIRE_RELEASE_REGION }}{{ else }}us-east-2{{ end }}'
+    # Tests non-emptiness, NOT isEnvSet alone. release.yml always exports
+    # ENTIRE_RELEASE_BUCKET, and an Actions variable that is unset exports as
+    # an empty string — so isEnvSet is true on every release. Gating on
+    # presence would enable this pipe with an empty bucket and no credentials
+    # (configure-aws-credentials is correctly skipped), failing every release
+    # instead of staying inert. `.Env.<missing>` renders empty rather than
+    # erroring, so one expression covers absent and empty alike.
+    disable: '{{ if and (isEnvSet "ENTIRE_RELEASE_BUCKET") (ne .Env.ENTIRE_RELEASE_BUCKET "") }}false{{ else }}true{{ end }}'
+    bucket: '{{ if and (isEnvSet "ENTIRE_RELEASE_BUCKET") (ne .Env.ENTIRE_RELEASE_BUCKET "") }}{{ .Env.ENTIRE_RELEASE_BUCKET }}{{ else }}unset{{ end }}'
+    region: '{{ if and (isEnvSet "ENTIRE_RELEASE_REGION") (ne .Env.ENTIRE_RELEASE_REGION "") }}{{ .Env.ENTIRE_RELEASE_REGION }}{{ else }}us-east-2{{ end }}'
     directory: "v{{ .Version }}"
     # A file under a version prefix never changes once published, so it can be
     # cached for as long as anything is willing to hold it. The channel

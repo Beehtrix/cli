@@ -134,8 +134,17 @@ PY
 # them as absence is what lets a re-dispatch during a transient S3 error
 # regress the channel for every install and update check.
 CURRENT=""
+CURRENT_ETAG=""
 READ_ERR="$(mktemp)"
-if CURRENT_JSON="$(aws s3 cp "$S3_URI" - --region "$REGION" 2>"$READ_ERR")"; then
+READ_BODY="$(mktemp)"
+# get-object rather than `s3 cp`, because the write below is conditional on the
+# ETag this read returns and `aws s3 cp` cannot surface it.
+if READ_META="$(aws s3api get-object --bucket "$BUCKET" --key "$KEY" --region "$REGION" "$READ_BODY" 2>"$READ_ERR")"; then
+    CURRENT_JSON="$(cat "$READ_BODY")"
+    CURRENT_ETAG="$(printf '%s' "$READ_META" \
+        | grep -o '"ETag"[^,}]*' \
+        | sed -E 's/.*"ETag": *"?\\?"?([^"\\]+).*/\1/' \
+        | head -n 1 || true)"
     # `|| true` so a manifest without a "version" key reaches the explicit
     # check below with an empty CURRENT, instead of grep's exit status
     # tripping `set -e` and aborting with a bare status and no explanation.
@@ -147,7 +156,7 @@ if CURRENT_JSON="$(aws s3 cp "$S3_URI" - --region "$REGION" 2>"$READ_ERR")"; the
         # A pointer that exists but names no version is not an empty channel:
         # something published a manifest we cannot parse, and overwriting it
         # unchecked would move the channel by an unknown amount.
-        rm -f "$READ_ERR"
+        rm -f "$READ_ERR" "$READ_BODY"
         printf 'channels/%s.json exists but names no version. Refusing to publish over a pointer that cannot be read; inspect %s by hand.\n' \
             "$CHANNEL" "$S3_URI" >&2
         exit 2
@@ -158,10 +167,10 @@ else
     printf 'Could not read the current %s pointer, so this publish cannot be proven to move it forward. Refusing.\n' \
         "$CHANNEL" >&2
     sed 's/^/  /' "$READ_ERR" >&2
-    rm -f "$READ_ERR"
+    rm -f "$READ_ERR" "$READ_BODY"
     exit 2
 fi
-rm -f "$READ_ERR"
+rm -f "$READ_ERR" "$READ_BODY"
 
 if [[ -n "$CURRENT" ]]; then
     if [[ "$CURRENT" == "$VERSION" ]]; then
@@ -191,12 +200,48 @@ cat > "$TMP" <<JSON
 }
 JSON
 
+# Conditional on the exact object the guard above inspected. Reading the
+# pointer, comparing versions and writing are three operations; between the
+# read and the write another publisher can land a newer version, and both would
+# pass their own guard. --if-match makes S3 reject the write if the object
+# changed, and --if-none-match '*' makes a first publish refuse if someone
+# created the pointer in the meantime.
+#
+# A conflict aborts rather than retrying. The guard's whole purpose is to not
+# move the channel on an unproven comparison, and a retry would have to redo the
+# comparison anyway — re-running the step is both simpler and more obvious in a
+# release log.
+#
 # A short TTL, not an immutable one: this object is the thing that changes when
 # a release ships. Readers check at most once every 24h, so a minute of edge
 # caching costs nothing and still absorbs a stampede.
-aws s3 cp "$TMP" "$S3_URI" \
+PUT_ERR="$(mktemp)"
+if [[ -n "$CURRENT_ETAG" ]]; then
+    CONDITION=(--if-match "$CURRENT_ETAG")
+else
+    CONDITION=(--if-none-match "*")
+fi
+
+if ! aws s3api put-object \
+    --bucket "$BUCKET" \
+    --key "$KEY" \
+    --body "$TMP" \
     --region "$REGION" \
     --content-type application/json \
-    --cache-control "public, max-age=60"
+    --cache-control "public, max-age=60" \
+    "${CONDITION[@]}" >/dev/null 2>"$PUT_ERR"; then
+    if grep -qiE 'precondition|conditional request failed|412' "$PUT_ERR"; then
+        printf 'The %s pointer changed while this publish was running, so the monotonic check no longer holds. Nothing was written — re-run to compare against the new value.\n' \
+            "$CHANNEL" >&2
+        sed 's/^/  /' "$PUT_ERR" >&2
+        rm -f "$PUT_ERR"
+        exit 2
+    fi
+    printf 'Publishing channels/%s.json failed.\n' "$CHANNEL" >&2
+    sed 's/^/  /' "$PUT_ERR" >&2
+    rm -f "$PUT_ERR"
+    exit 1
+fi
+rm -f "$PUT_ERR"
 
 printf 'Published %s -> %s (%s)\n' "$KEY" "$VERSION" "$CHANNEL"

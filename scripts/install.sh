@@ -119,7 +119,13 @@ detect_arch() {
 # timeout, because capping total time would kill a working download on a slow
 # link — the failure we are guarding against is a dead origin, not a slow one.
 CURL_METADATA_OPTS=(--connect-timeout 5 --max-time 15)
-CURL_DOWNLOAD_OPTS=(--connect-timeout 10)
+# --connect-timeout only bounds connection setup. An origin that accepts the
+# connection and then sends nothing would otherwise stall the install forever
+# and never reach the fallback. --speed-limit/--speed-time bounds that without
+# capping a slow-but-progressing download the way --max-time would: abort only
+# if throughput stays under 1KB/s for 30s. Verified to fire before any headers
+# arrive, which is the case that matters here.
+CURL_DOWNLOAD_OPTS=(--connect-timeout 10 --speed-limit 1024 --speed-time 30)
 
 fetch_github_json() {
     local url="$1"
@@ -167,14 +173,45 @@ origin_label() {
 # time. One request, one answer — no list-and-filter, and no GitHub API rate
 # limit (60/hour per IP unauthenticated, which a shared office or CI egress IP
 # can exhaust on its own).
+# version_valid_for_channel rejects a manifest value that is not a version, or
+# that belongs to the other channel. Without this a value like "not-a-version"
+# ends discovery here, and both origins are then asked for a release that does
+# not exist — failing the install even when GitHub has a valid one. Invalid
+# metadata has to advance to the fallback, not stop the walk.
+version_valid_for_channel() {
+    local version="$1" channel="$2"
+
+    if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+        return 1
+    fi
+    if [[ "$channel" == "nightly" ]]; then
+        if ! printf '%s' "$version" | grep -qE -- '-nightly\.'; then
+            return 1
+        fi
+        return 0
+    fi
+    # Stable carries no prerelease segment; a nightly here would downgrade or
+    # cross-grade every stable install.
+    if printf '%s' "$version" | grep -qE -- '-'; then
+        return 1
+    fi
+    return 0
+}
+
 resolve_version_from_entire() {
     local channel="$1"
-    local base
+    local base version
     base="$(origin_artifact_base entire)"
-    curl -fsSL "${CURL_METADATA_OPTS[@]}" "${base}/channels/${channel}.json" 2>/dev/null \
+    version="$(curl -fsSL "${CURL_METADATA_OPTS[@]}" "${base}/channels/${channel}.json" 2>/dev/null \
         | grep '"version"' \
         | sed -E 's/.*"version": *"v?([^"]+)".*/\1/' \
-        | head -n 1
+        | head -n 1 || true)"
+
+    if [[ -n "$version" ]] && version_valid_for_channel "$version" "$channel"; then
+        printf '%s' "$version"
+        return 0
+    fi
+    return 1
 }
 
 resolve_version_from_github() {

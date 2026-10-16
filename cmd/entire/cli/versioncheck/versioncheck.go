@@ -250,6 +250,21 @@ func fetchChannelManifestVersion(ctx context.Context, client *http.Client, night
 	if version == "" {
 		return "", errors.New("manifest names no version")
 	}
+	// Reject anything that is not a version before the channel checks, because
+	// those checks pass for garbage: isNightly is false for an unparseable
+	// string, which matches the stable channel. Accepting it would end the
+	// chain here, and isOutdated then reports no update because an invalid
+	// version sorts below every valid one — so a corrupt pointer on our own
+	// origin would silently switch update checks off instead of falling
+	// through to GitHub.
+	// Canonical form, not merely valid: semver.IsValid accepts "v1.2" and "v1"
+	// with an implied patch, but the artifact URLs are built as
+	// v<version>/<file>, so a short form resolves to a prefix that does not
+	// exist. Comparing against Canonical also rejects build metadata, which no
+	// release tag carries.
+	if tag := semverTag(version); !semver.IsValid(tag) || semver.Canonical(tag) != tag {
+		return "", fmt.Errorf("manifest names %q, which is not a release version", version)
+	}
 
 	// A manifest published to the wrong key, or left stale across a channel
 	// rename, would otherwise cross the streams — nudging stable users onto a
@@ -329,12 +344,19 @@ func channelName(nightly bool) string {
 	return "stable"
 }
 
+// semverTag normalizes a version to the "v"-prefixed form the semver package
+// expects. Both the nightly predicate and the manifest validation go through
+// it so they cannot disagree about what they are parsing.
+func semverTag(version string) string {
+	if !strings.HasPrefix(version, "v") {
+		return "v" + version
+	}
+	return version
+}
+
 // isNightly returns true if the version string is a nightly build.
 func isNightly(version string) bool {
-	if !strings.HasPrefix(version, "v") {
-		version = "v" + version
-	}
-	return strings.Contains(semver.Prerelease(version), "nightly")
+	return strings.Contains(semver.Prerelease(semverTag(version)), "nightly")
 }
 
 // fetchLatestNightlyVersion fetches the latest nightly version tag from the GitHub releases list.

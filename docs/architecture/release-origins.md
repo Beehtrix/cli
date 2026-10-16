@@ -59,7 +59,11 @@ on every release and get `max-age=60`.
 ## Who reads what
 
 - **`scripts/install.sh`** — walks the origins for both version discovery and
-  the download. `--version X.Y.Z` pins a version and skips discovery entirely;
+  the download. Metadata requests carry `--max-time`; downloads carry
+  `--speed-limit`/`--speed-time` instead, which aborts a stalled transfer
+  without capping a slow but progressing one. `--connect-timeout` alone would
+  not bound an origin that accepts the connection and then sends nothing, and
+  that stall is the failure the fallback exists for. `--version X.Y.Z` pins a version and skips discovery entirely;
   `ENTIRE_INSTALL_BASE_URL` replaces the origin list with one entry, because
   someone pinning a mirror wants that mirror, not a silent fall back that hides
   whether it worked.
@@ -81,10 +85,30 @@ and `checkpoint/remote/checkpoint_ref.go`, the closest precedents in this repo:
    checksums mean that origin is corrupt or hostile, and quietly retrying
    elsewhere would hide it.
 
+Bad *metadata* is the other way round, and the distinction is the point. A
+manifest naming something that is not a release version, or a version from the
+other channel, **advances** to the next origin. At that moment we do not yet
+know which version exists, so another origin may simply know better — advancing
+is continuing discovery, not hiding corruption. By the time a checksum is being
+checked the version is settled and only the bytes are in question, which is why
+that case stops instead. Accepting unusable metadata would be the worst of both:
+the chain ends, and because an invalid version sorts below every valid one, the
+CLI reports no update at all while `install.sh` fetches a version that does not
+exist. Both sides require the canonical `vX.Y.Z` form — `semver.IsValid` alone
+accepts `v1.2`, which resolves to an artifact prefix that was never published.
+
 `install.sh` also never mixes origins within one install: the archive and the
 `checksums.txt` that vouches for it always come from the same place. A healthy
 origin's checksums vouching for another origin's bytes would be a weaker
 guarantee than either origin offers alone.
+
+The pointer write is **conditional on the object the guard inspected**
+(`--if-match`, or `--if-none-match` for a first publish), and `release.yml`
+carries a `concurrency` group. Reading, comparing and writing are three
+operations, so without both a second publisher landing in between would pass its
+own guard and leave the pointer at whichever write finished last — possibly the
+older one. A conflict aborts rather than retrying: the guard exists to refuse
+unproven moves, and re-running is clearer in a release log than a silent retry.
 
 **Publishing inverts rule 1 on purpose.** `publish-channel-manifest.sh` fails
 *closed*: if it cannot read the current pointer it refuses to publish. The two
@@ -101,6 +125,13 @@ install and update check.
 The publishing side is **inert until `ENTIRE_RELEASE_BUCKET` is set**. That is
 also the way back out: delete the variable and rerun the job, and the release
 publishes exactly as it did before the mirror existed.
+
+The GoReleaser gate tests the variable for **non-emptiness**, not for presence.
+`release.yml` always exports it, and an Actions variable that is unset exports
+as an empty string, so `isEnvSet` is true on every release. Gating on presence
+would enable the `blobs` pipe with an empty bucket and no credentials —
+`configure-aws-credentials` is correctly skipped — and fail every release
+instead of staying inert. `scripts/test-release-origins.sh` pins this.
 
 | Variable | Example | Effect |
 | --- | --- | --- |
