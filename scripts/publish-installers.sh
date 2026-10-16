@@ -7,9 +7,15 @@
 #
 # Without this the binaries survive a GitHub outage but the one-liner does not:
 # entire.com/install.{sh,ps1} redirects to raw.githubusercontent.com, so a new
-# install still fails at hop zero. Mirroring the scripts closes the last GitHub
-# dependency in the install path, and fixes a version-skew bug at the same time
-# — the redirect serves main's installer, never the released one.
+# install still fails at hop zero. Mirroring the scripts removes that hop, and
+# fixes a version-skew bug at the same time — the redirect serves main's
+# installer, never the released one.
+#
+# This does NOT make every install path GitHub-free. install.ps1 is mirrored so
+# it can be fetched, but it still resolves versions through api.github.com,
+# downloads archives from GitHub releases, and adds a Scoop bucket by git URL.
+# Windows therefore remains outage-affected; see "Remaining work" in
+# docs/architecture/release-origins.md.
 #
 # Run this on STABLE releases only. These two keys are overwritten on every
 # release rather than versioned, so a nightly publishing here would replace the

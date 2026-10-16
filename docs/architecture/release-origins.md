@@ -241,6 +241,12 @@ keeps its default, so experimental commands are visible.
 
 ## Remaining work
 
+- **Windows is still GitHub-dependent.** `install.ps1` is mirrored to
+  `installers/` so it can be *fetched* during an outage, but it resolves
+  versions through `api.github.com`, downloads archives from GitHub releases,
+  and adds the Scoop bucket by git URL. None of the two-origin work covers it.
+  Scoop in particular is a git dependency that two-origin HTTP cannot fix, so
+  Windows needs its own answer rather than a copy of this one.
 - **Set the repository variables and watch a release.** Nothing has assumed the
   upload role from GitHub yet. If `configure-aws-credentials` fails the release
   job fails *before* GoReleaser runs, so do this on a release someone is
