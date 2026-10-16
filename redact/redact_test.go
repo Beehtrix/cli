@@ -2501,8 +2501,19 @@ func TestString_CredentialKeyValueCodeLiteralsPreserved(t *testing.T) {
 			t.Errorf("String(%q) = %q, want unchanged", in, got)
 		}
 	}
-	if got := String(`api_key=(hunter2)`); !strings.Contains(got, RedactedPlaceholder) {
-		t.Errorf("parenthesized non-placeholder value must still redact, got %q", got)
+	// Trail-finding regression: only the exact masks count, and never under a
+	// password key, where the "literal" can be the real password.
+	for _, in := range []string{
+		`api_key=(hunter2)`,
+		`api_key=(correcthorse)`,
+		`PASSWORD=hidden`,
+		`PASSWORD=true`,
+		`DB_PASSWORD=none`,
+		`DB_PASSWORD=(value hidden)`,
+	} {
+		if got := String(in); !strings.Contains(got, RedactedPlaceholder) {
+			t.Errorf("String(%q) = %q, want a redaction", in, got)
+		}
 	}
 }
 

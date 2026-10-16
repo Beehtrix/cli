@@ -68,7 +68,7 @@ var (
 	// shared key classifier decide whether it is sensitive. Requiring `=` avoids
 	// prose, rejecting an initial `=` avoids equality expressions, and newline-
 	// free quote branches keep a match inside one command.
-	credentialAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*=[ \t]*(?P<value>"[^"\r\n]*"|'[^'\r\n]*'|\([a-z][a-z _-]*\)|[^\s,;&=` + "`" + `][^\s,;&]*)`)
+	credentialAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*=[ \t]*(?P<value>"[^"\r\n]*"|'[^'\r\n]*'|\(value hidden\)|[^\s,;&=` + "`" + `][^\s,;&]*)`)
 	// credentialCodeCallPattern accepts a call whose callee and arguments are
 	// digit-free identifiers or member references (fetch_secret(),
 	// self.refresh_token(), get(name, cfg.key)). Digits and literals are
@@ -521,6 +521,10 @@ func detectCredentialKeyCaptures(
 		if !isCredentialJSONSecretKey(key, credentialContext) {
 			continue
 		}
+		if valueStart, valueEnd, valueOK := captureRange(match, valueGroup); valueOK &&
+			isNonPasswordCodeLiteral(key, strings.Trim(s[valueStart:valueEnd], `"'`)) {
+			continue
+		}
 		if shouldPreserve != nil {
 			valueStart, valueEnd, valueOK := captureRange(match, valueGroup)
 			if valueOK && keyEnd <= valueStart && shouldPreserve(s[valueStart:valueEnd], s[keyEnd:valueStart]) {
@@ -648,19 +652,35 @@ func isPlaceholderSecretValue(value string) bool {
 	return isRepeatedCharPlaceholder(normalized)
 }
 
-// codeLiteralPlaceholderValues are values a credential key/value capture
-// meets in code and tool output rather than in secrets: language null/boolean
-// literals (`access_token = None`) and masks other tools print in place of a
-// value (`api_key=hidden`). Key/value captures only — never scanner findings.
+// codeLiteralPlaceholderValues are values a non-password credential key meets
+// in code and tool output rather than in secrets: language null/boolean
+// literals (`access_token = None`) and the exact masks Entire's own review
+// trust inventory prints (`api_key=hidden`, `--api-key=(value hidden)`).
+// Never applied to password keys — `PASSWORD=hidden` or `=true` can be the
+// real password — nor to scanner findings.
 var codeLiteralPlaceholderValues = map[string]struct{}{
 	"none": {}, "null": {}, "nil": {}, "undefined": {},
 	"true": {}, "false": {},
-	"hidden": {},
+	"hidden": {}, "(value hidden)": {},
 }
 
-// parenthesizedPlaceholderPattern matches a "(value hidden)"-style mask:
-// lowercase words in parentheses, the round-bracket analogue of `<your-token>`.
-var parenthesizedPlaceholderPattern = regexp.MustCompile(`^\([a-z][a-z _-]*\)$`)
+// isNonPasswordCodeLiteral reports whether value is a code literal or tool
+// mask under a credential key that does not name a password.
+func isNonPasswordCodeLiteral(key, value string) bool {
+	if _, ok := codeLiteralPlaceholderValues[strings.ToLower(strings.TrimSpace(value))]; !ok {
+		return false
+	}
+	for _, form := range credentialJSONKeyForms(key) {
+		if credentialJSONKeyRegex.MatchString(form) || genericPasswordKeyRegex.MatchString(form) ||
+			passwordWordInKeyRE.MatchString(form) {
+			return false
+		}
+	}
+	return true
+}
+
+// passwordWordInKeyRE spots a password segment anywhere in a normalized key.
+var passwordWordInKeyRE = regexp.MustCompile(`(?:^|_)(?:pass|passwd|password|pwd|passphrase)(?:_|$)`)
 
 func isPlaceholderSecretValueQuoted(value string, singleQuoted bool) bool {
 	trimmedSpace := strings.TrimSpace(value)
@@ -707,12 +727,6 @@ func isPlaceholderSecretValueQuoted(value string, singleQuoted bool) bool {
 		}
 	}
 	if _, ok := placeholderSecretValues[normalized]; ok {
-		return true
-	}
-	if _, ok := codeLiteralPlaceholderValues[normalized]; ok {
-		return true
-	}
-	if parenthesizedPlaceholderPattern.MatchString(trimmed) {
 		return true
 	}
 	return isRepeatedCharPlaceholder(normalized)
