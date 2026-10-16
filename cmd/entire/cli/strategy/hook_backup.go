@@ -148,11 +148,22 @@ func prepareHookBackup(root *os.Root, name string, now time.Time) (backupAction,
 
 // replaceWithCopy atomically replaces dst with a link to (or copy of) src.
 func replaceWithCopy(root *os.Root, src, dst string) error {
+	return replaceWith(root, src, dst, linkOrCopy)
+}
+
+// replaceWithOwnCopy is replaceWithCopy without the hard link: dst gets its
+// own bytes (or its own symlink), so a hook manager that later writes into
+// either name in place leaves the other as it was.
+func replaceWithOwnCopy(root *os.Root, src, dst string) error {
+	return replaceWith(root, src, dst, copyOrRelink)
+}
+
+func replaceWith(root *os.Root, src, dst string, create func(root *os.Root, src, dst string) error) error {
 	tmp := tempPrefix + dst
 	if err := root.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("remove leftover %s: %w", tmp, err)
 	}
-	if err := linkOrCopy(root, src, tmp); err != nil {
+	if err := create(root, src, tmp); err != nil {
 		return err
 	}
 	if err := root.Rename(tmp, dst); err != nil {
@@ -168,6 +179,12 @@ func linkOrCopy(root *os.Root, src, dst string) error {
 	if err == nil || errors.Is(err, fs.ErrExist) {
 		return err //nolint:wrapcheck // callers check fs.ErrExist
 	}
+	return copyOrRelink(root, src, dst)
+}
+
+// copyOrRelink creates dst as a byte copy of src, or as a symlink to the same
+// target when src is a symlink, failing if dst exists.
+func copyOrRelink(root *os.Root, src, dst string) error {
 	info, err := root.Lstat(src)
 	if err != nil {
 		return fmt.Errorf("copy %s: %w", src, err)
@@ -372,7 +389,7 @@ func isHookNameByte(b byte) bool {
 func reclaimFromPreCommit(root *os.Root, hook string) (bool, error) {
 	legacy, backup := hook+legacySuffix, hook+backupSuffix
 	if !carriesEntireMarker(root, legacy) {
-		return false, nil
+		return false, refreshKeepCopy(root, legacy)
 	}
 	if info, err := root.Lstat(hook); err == nil && info.Mode()&fs.ModeSymlink != 0 {
 		// Possibly a linked pre-commit wrapper, which runs .legacy: backing it up
@@ -402,18 +419,23 @@ func reclaimFromPreCommit(root *os.Root, hook string) (bool, error) {
 // it finds onto moved again. userHookInBackup says .pre-entire holds the
 // user's hook rather than the wrapper; it is cleared, so the wrapper can be
 // backed up there. With no user hook anywhere, empty decides what moved holds.
-// Reports whether moved now holds the user's hook.
+// moved and the keep copy are separate files, not links to one, because a
+// manager that writes its moved file in place would overwrite both. Reports
+// whether moved now holds the user's hook.
 func moveUserHookInto(root *os.Root, hook, moved string, userHookInBackup bool, empty func() error) (bool, error) {
 	backup, keep := hook+backupSuffix, moved+backupSuffix
+	if err := removeEntireKeepCopy(root, keep); err != nil {
+		return false, err
+	}
 	if userHookInBackup {
-		if err := replaceWithCopy(root, backup, keep); err != nil {
+		if err := replaceWithOwnCopy(root, backup, keep); err != nil {
 			return false, err
 		}
 	}
 	if !hookFileExists(root, keep) {
 		return false, empty()
 	}
-	if err := replaceWithCopy(root, keep, moved); err != nil {
+	if err := replaceWithOwnCopy(root, keep, moved); err != nil {
 		return false, err
 	}
 	if userHookInBackup {
@@ -423,6 +445,33 @@ func moveUserHookInto(root *os.Root, hook, moved string, userHookInBackup bool, 
 		}
 	}
 	return true, nil
+}
+
+// removeEntireKeepCopy removes a keep copy that holds Entire's hook rather than
+// the user's, as one hard-linked to its moved file does once a manager writes
+// Entire's hook into that file in place. Restoring it would run Entire's hook
+// from the manager's wrapper.
+func removeEntireKeepCopy(root *os.Root, keep string) error {
+	if !carriesEntireMarker(root, keep) {
+		return nil
+	}
+	if err := root.Remove(keep); err != nil {
+		return fmt.Errorf("remove %s, which holds Entire's hook: %w", keep, err)
+	}
+	return nil
+}
+
+// refreshKeepCopy updates moved's keep copy to the user's hook now in moved,
+// so an edit the user made there survives the manager's next install moving
+// Entire's hook onto moved. It touches only a keep copy Entire made, and only
+// while moved holds a hook that is not Entire's.
+func refreshKeepCopy(root *os.Root, moved string) error {
+	keep := moved + backupSuffix
+	if !hookFileExists(root, keep) || !hookFileExists(root, moved) ||
+		carriesEntireMarker(root, moved) || sameHookFile(root, moved, keep) {
+		return nil
+	}
+	return replaceWithOwnCopy(root, moved, keep)
 }
 
 // noopMovedHook replaces Entire's hook in a file a hook manager's wrapper runs
@@ -501,6 +550,9 @@ func reclaimFromWrappers(root *os.Root, hook string) (wrapperReclaim, error) {
 	backup := hook + backupSuffix
 	for _, m := range moved {
 		if !carriesEntireMarker(root, m) {
+			if err := refreshKeepCopy(root, m); err != nil {
+				return reclaimed, err
+			}
 			continue
 		}
 		var userHookInBackup bool
@@ -648,6 +700,9 @@ func restoreWrapped(root *os.Root, hook string) error {
 	backup := hook + backupSuffix
 	for _, m := range moved {
 		keep := m + backupSuffix
+		if err := removeEntireKeepCopy(root, keep); err != nil {
+			return err
+		}
 		keepExists := hookFileExists(root, keep)
 		switch {
 		case carriesEntireMarker(root, m) && keepExists:
