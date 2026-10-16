@@ -251,6 +251,11 @@ func LoadBackgroundClaimContext(ctx context.Context, sessionID, toolUseID string
 			if !rec.Background || (state.SessionID == sessionID && rec.ToolUseID == toolUseID) {
 				continue
 			}
+			// SessionEnd completes every live record, so one left on an
+			// ended session was leaked, not running.
+			if rec.CompletedAt.IsZero() && state.IsEnded() {
+				continue
+			}
 			if rec.CompletedAt.IsZero() || rec.CompletedAt.After(task.StartedAt) {
 				claims.Overlapped = true
 			}
