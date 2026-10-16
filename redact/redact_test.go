@@ -2443,3 +2443,65 @@ func TestJSONLBytesWithPrivacyFilter_ScannerDegradedSentinel(t *testing.T) {
 		t.Fatalf("JSONLBytesWithPrivacyFilter error = %v, want ErrScannerDegraded", err)
 	}
 }
+
+// Merge-review regression: scanner findings keep exact placeholder matching.
+// The key/value placeholder rules (ellipses, shell references, code literals)
+// must not drop a betterleaks finding whose capture ends in prose dots.
+func TestString_ScannerFindingsIgnoreKeyValuePlaceholderRules(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{
+		`api_key = "Xk3R9pLm2QwZ8vTn5Yb7..."`,
+		`curl -H "Authorization: Bearer Xk3R9pLm2QwZ8vTn5Yb7Wq..." https://x`,
+		`password = "Tr0ub4dor&3..."`,
+		`DB_PASSWORD=hunter2...`,
+	} {
+		out := String(in)
+		if !strings.Contains(out, RedactedPlaceholder) {
+			t.Errorf("String(%q) = %q, want a redaction", in, out)
+		}
+	}
+	// A bare documentation prefix before the ellipsis is still a placeholder.
+	if got := String(`ANTHROPIC_API_KEY=sk-ant-...`); got != `ANTHROPIC_API_KEY=sk-ant-...` {
+		t.Errorf("documentation ellipsis placeholder redacted: %q", got)
+	}
+}
+
+// Merge-review regression: camel-splitting must not lose keys the flat
+// normalization matched (hostName -> host_name, MySQLPassword -> my_sql_password).
+func TestJSONLContent_VendorCasedCredentialKeysRedacted(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{
+		`{"hostName":"db.internal","userName":"admin","password":"hunter2"}`,
+		`{"Host":"db.internal","UserName":"admin","Password":"hunter2"}`,
+		`{"HostName":"db.internal","UserId":"admin","Password":"hunter2"}`,
+		`{"msg":"x","MySQLPassword":"hunter2"}`,
+		`{"msg":"x","PostgreSQLPassword":"hunter2"}`,
+		`{"msg":"x","SQLServerPassword":"hunter2"}`,
+		`{"msg":"x","MariaDBPassword":"hunter2"}`,
+		`{"msg":"x","mySqlPassword":"hunter2"}`,
+	} {
+		if out := mustJSONLContent(t, in); strings.Contains(out, "hunter2") {
+			t.Errorf("JSONLContent(%s) leaked the password: %s", in, out)
+		}
+	}
+}
+
+// Code literals and other tools' masks in a credential key/value position are
+// not secrets: `access_token = None`, `api_key=hidden`, `--api-key=(value hidden)`.
+func TestString_CredentialKeyValueCodeLiteralsPreserved(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{
+		`access_token = None`,
+		`api_key=null`,
+		`private_key=False`,
+		`https://mcp.example/sse?api_key=hidden&region=us`,
+		`npx mcp-a --api-key=(value hidden) --verbose`,
+	} {
+		if got := String(in); got != in {
+			t.Errorf("String(%q) = %q, want unchanged", in, got)
+		}
+	}
+	if got := String(`api_key=(hunter2)`); !strings.Contains(got, RedactedPlaceholder) {
+		t.Errorf("parenthesized non-placeholder value must still redact, got %q", got)
+	}
+}

@@ -63,7 +63,7 @@ var (
 	// shared key classifier decide whether it is sensitive. Requiring `=` avoids
 	// prose, rejecting an initial `=` avoids equality expressions, and newline-
 	// free quote branches keep a match inside one command.
-	credentialAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*=[ \t]*(?P<value>"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&=` + "`" + `][^\s,;&]*)`)
+	credentialAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*=[ \t]*(?P<value>"[^"\r\n]*"|'[^'\r\n]*'|\([a-z][a-z _-]*\)|[^\s,;&=` + "`" + `][^\s,;&]*)`)
 	credentialCodeCallPattern   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\([^()\r\n]*\)$`)
 	credentialCodeRefPattern    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$`)
 	goTemplateReferencePattern  = regexp.MustCompile(`^\{\{[ \t]*\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+[ \t]*\}\}$`)
@@ -615,11 +615,42 @@ func hasNonPlaceholderQuotedPasswordValue(value string, singleQuoted bool) bool 
 	return value != "" && !isPlaceholderSecretValueQuoted(value, singleQuoted)
 }
 
-// isPlaceholderSecretValue checks a bare scanner finding, which carries no
-// surrounding-quote context.
+// isPlaceholderSecretValue checks a bare scanner finding. It stays an exact
+// match on known placeholder shapes: a finding is already a scanner's claim
+// that the span is a secret, and the key/value rules below (ellipses, shell
+// references, code literals) would drop real findings — the betterleaks
+// generic rule's capture can end in `...` when prose follows the secret.
 func isPlaceholderSecretValue(value string) bool {
-	return isPlaceholderSecretValueQuoted(value, false)
+	trimmed := strings.Trim(strings.TrimSpace(value), `"'`)
+	if trimmed == "" {
+		return true
+	}
+	if isBracketedPlaceholder(trimmed) {
+		return true
+	}
+	normalized := strings.ToLower(trimmed)
+	if strings.HasPrefix(normalized, "${") && strings.HasSuffix(normalized, "}") {
+		return true
+	}
+	if _, ok := placeholderSecretValues[normalized]; ok {
+		return true
+	}
+	return isRepeatedCharPlaceholder(normalized)
 }
+
+// codeLiteralPlaceholderValues are values a credential key/value capture
+// meets in code and tool output rather than in secrets: language null/boolean
+// literals (`access_token = None`) and masks other tools print in place of a
+// value (`api_key=hidden`). Key/value captures only — never scanner findings.
+var codeLiteralPlaceholderValues = map[string]struct{}{
+	"none": {}, "null": {}, "nil": {}, "undefined": {},
+	"true": {}, "false": {},
+	"hidden": {},
+}
+
+// parenthesizedPlaceholderPattern matches a "(value hidden)"-style mask:
+// lowercase words in parentheses, the round-bracket analogue of `<your-token>`.
+var parenthesizedPlaceholderPattern = regexp.MustCompile(`^\([a-z][a-z _-]*\)$`)
 
 func isPlaceholderSecretValueQuoted(value string, singleQuoted bool) bool {
 	trimmedSpace := strings.TrimSpace(value)
@@ -651,9 +682,11 @@ func isPlaceholderSecretValueQuoted(value string, singleQuoted bool) bool {
 			return true
 		}
 		// Documentation ellipsis placeholders: `ANTHROPIC_API_KEY=sk-ant-...`.
-		// Real key material never ends in literal dots; anything sensitive
-		// before the ellipsis is still covered by entropy/betterleaks.
-		if strings.HasSuffix(normalized, "...") {
+		// Only a bare prefix (empty, or ending at a `-`/`_` separator) counts:
+		// `hunter2...` is a real value followed by prose, and a short one is
+		// below what entropy catches.
+		if stem, ok := strings.CutSuffix(normalized, "..."); ok &&
+			(stem == "" || strings.HasSuffix(stem, "-") || strings.HasSuffix(stem, "_")) {
 			return true
 		}
 		if isShellVariableReference(trimmed) {
@@ -664,6 +697,12 @@ func isPlaceholderSecretValueQuoted(value string, singleQuoted bool) bool {
 		}
 	}
 	if _, ok := placeholderSecretValues[normalized]; ok {
+		return true
+	}
+	if _, ok := codeLiteralPlaceholderValues[normalized]; ok {
+		return true
+	}
+	if parenthesizedPlaceholderPattern.MatchString(trimmed) {
 		return true
 	}
 	return isRepeatedCharPlaceholder(normalized)
@@ -725,14 +764,40 @@ func isRepeatedCharPlaceholder(s string) bool {
 }
 
 func isCredentialJSONSecretKey(key string, credentialContext bool) bool {
-	normalized := normalizeCredentialJSONKey(key)
-	if isKnownNonSecretTokenKey(normalized) {
-		return false
+	for _, normalized := range credentialJSONKeyForms(key) {
+		if isKnownNonSecretTokenKey(normalized) {
+			continue
+		}
+		if isSensitiveNormalizedJSONValueKey(normalized) || isCredentialIdentifierKey(normalized) {
+			return true
+		}
+		if credentialContext && genericPasswordKeyRegex.MatchString(normalized) {
+			return true
+		}
 	}
-	if isSensitiveNormalizedJSONValueKey(normalized) || isCredentialIdentifierKey(normalized) {
-		return true
+	return false
+}
+
+// credentialJSONKeyForms returns the camel-split normalization of key and,
+// when it differs, the flat one (lowercased, no camel split). Matching either
+// keeps vendor-cased keys detected: camel splitting turns MySQLPassword into
+// my_sql_password and hostName into host_name, which the key shapes and the
+// connection-object case list only know in their flat forms.
+func credentialJSONKeyForms(key string) []string {
+	camel := normalizeCredentialJSONKey(key)
+	flat := flattenCredentialJSONKey(key)
+	if flat == camel {
+		return []string{camel}
 	}
-	return credentialContext && genericPasswordKeyRegex.MatchString(normalized)
+	return []string{camel, flat}
+}
+
+// flattenCredentialJSONKey lowercases key and maps `-`, ` `, and `.` to `_`
+// without splitting camelCase. Flattened-config exporters (Spring, dotnet,
+// Vault) emit dotted keys like "db.password"; treat them like underscored.
+func flattenCredentialJSONKey(key string) string {
+	key = strings.ToLower(strings.TrimSpace(key))
+	return strings.NewReplacer("-", "_", " ", "_", ".", "_").Replace(key)
 }
 
 // isKnownNonSecretTokenKey reports whether the normalized JSON key is
@@ -763,10 +828,12 @@ func isNonSecretIdentifierAssignment(candidate string) bool {
 	if !ok || key == "" || value == "" {
 		return false
 	}
-	normalized := normalizeCredentialJSONKey(key)
-	if isSensitiveNormalizedJSONValueKey(normalized) || genericPasswordKeyRegex.MatchString(normalized) {
-		return false
+	for _, form := range credentialJSONKeyForms(key) {
+		if isSensitiveNormalizedJSONValueKey(form) || genericPasswordKeyRegex.MatchString(form) {
+			return false
+		}
 	}
+	normalized := normalizeCredentialJSONKey(key)
 	// A credential word anywhere in the key disqualifies suppression even
 	// under an id/account suffix: aws_access_key_id names a credential, not
 	// an identifier. This is the only reliable discriminator — Shannon
@@ -811,11 +878,13 @@ func isSensitiveNormalizedJSONValueKey(normalized string) bool {
 func isCredentialJSONObject(obj map[string]any) bool {
 	var hasHost, hasUser bool
 	for key := range obj {
-		switch normalizeCredentialJSONKey(key) {
-		case "host", "hostname", "server", "addr", "address", "datasource", "data_source":
-			hasHost = true
-		case "user", "username", "userid", "user_id", "uid":
-			hasUser = true
+		for _, normalized := range credentialJSONKeyForms(key) {
+			switch normalized {
+			case "host", "hostname", "server", "addr", "address", "datasource", "data_source":
+				hasHost = true
+			case "user", "username", "userid", "user_id", "uid":
+				hasUser = true
+			}
 		}
 		if hasHost && hasUser {
 			return true
