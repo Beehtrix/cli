@@ -141,8 +141,18 @@ func CalculateTokenUsageFromFile(path string, startLine int) (*agent.TokenUsage,
 // When a Task tool completes, the tool_result contains "agentId: <id>" in its content.
 // Returns a map of agentID -> toolUseID for all spawned agents.
 func ExtractSpawnedAgentIDs(transcript []TranscriptLine) map[string]string {
+	return textAgentIDs(transcript, nil)
+}
+
+// textAgentIDs maps the agent each tool result's text names ("agentId:") to
+// that result's tool_use_id, the last result winning, skipping results whose
+// tool_use_id is in skip.
+func textAgentIDs(transcript []TranscriptLine, skip map[string]bool) map[string]string {
 	agentIDs := make(map[string]string)
 	forEachToolResultText(transcript, func(toolUseID, text string) {
+		if skip[toolUseID] {
+			return
+		}
 		// Look for agentId in the text. Drop any ID that isn't path-safe:
 		// callers build agent-<id>.jsonl from it and read that file, so this
 		// is the choke point that keeps the path inside subagentsDir,
@@ -159,13 +169,11 @@ func ExtractSpawnedAgentIDs(transcript []TranscriptLine) map[string]string {
 // result (toolResultAgentIDs), plus, for results that name none (older
 // transcripts), the "agentId:" in their text (ExtractSpawnedAgentIDs). A
 // result that names an agent is never read for text, which can quote other
-// agents' IDs.
+// agents' IDs. They are skipped before the text IDs are collected, so a
+// quote can't take over the result an earlier agent was found in.
 func spawnedAgentIDs(transcriptData []byte, parsed []TranscriptLine) map[string]string {
 	agentIDs, named := toolResultAgentIDs(transcriptData)
-	for agentID, toolUseID := range ExtractSpawnedAgentIDs(parsed) {
-		if named[toolUseID] {
-			continue
-		}
+	for agentID, toolUseID := range textAgentIDs(parsed, named) {
 		if _, ok := agentIDs[agentID]; !ok {
 			agentIDs[agentID] = toolUseID
 		}
