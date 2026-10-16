@@ -16,7 +16,7 @@ require (
 	github.com/entireio/auth-go v0.5.3-0.20260911082959-f3d099d20e7b
 	github.com/go-faster/errors v0.8.0
 	github.com/go-faster/jx v1.2.0
-	github.com/go-git/go-billy/v6 v6.0.0-alpha.2
+	github.com/go-git/go-billy/v6 v6.0.0-beta.1
 	// Floor, not just a bump: c15a9478 adds plumbing.ValidateBranchName with
 	// native branch-creation rules (including HEAD and @ components). Also
 	// retain go-git#2309 (per-directory ignore Scope): the root-level
