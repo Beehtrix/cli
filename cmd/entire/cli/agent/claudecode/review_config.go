@@ -100,6 +100,14 @@ func reviewProfileSettings(profile json.RawMessage) ([]byte, error) {
 			rawHooks = map[string]json.RawMessage{}
 		}
 	}
+	// Entire's hooks are merged by event; an event that isn't a list of
+	// matchers would be dropped without a word.
+	for event, raw := range rawHooks {
+		var matchers []ClaudeHookMatcher
+		if err := json.Unmarshal(raw, &matchers); err != nil || matchers == nil {
+			return nil, fmt.Errorf("review profile settings hooks %s: must be a list of matcher objects", event)
+		}
+	}
 	installHookEntries(rawHooks, false)
 	hooks, err := jsonutil.MarshalWithNoHTMLEscape(rawHooks)
 	if err != nil {

@@ -134,3 +134,12 @@ func TestReviewProfileSettingsNull(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewProfileSettingsRefusesMalformedHookEvent(t *testing.T) {
+	t.Parallel()
+	for _, profile := range []string{`{"hooks":{"Stop":{}}}`, `{"hooks":{"Stop":null}}`, `{"hooks":{"Stop":"x"}}`} {
+		if _, err := reviewProfileSettings(json.RawMessage(profile)); err == nil {
+			t.Errorf("%s: accepted", profile)
+		}
+	}
+}

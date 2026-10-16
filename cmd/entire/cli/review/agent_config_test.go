@@ -37,6 +37,8 @@ func TestValidateAgentConfig(t *testing.T) {
 		{"MCP bad name", "codex", reviewtypes.AgentConfig{MCPServers: map[string]json.RawMessage{"a.b": json.RawMessage(`{"url":"x"}`)}}, "letters, digits"},
 		{"settings null", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`null`)}, "not null"},
 		{"settings hooks null", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`{"hooks":null}`)}, "settings hooks"},
+		{"settings hook event not a list", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`{"hooks":{"Stop":{}}}`)}, "hooks Stop"},
+		{"settings hook event null", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`{"hooks":{"Stop":null}}`)}, "hooks Stop"},
 		{"settings not an object", "claude-code", reviewtypes.AgentConfig{Settings: json.RawMessage(`[]`)}, "settings"},
 		{"codex settings unsupported", "codex", reviewtypes.AgentConfig{Settings: json.RawMessage(`{}`)}, `does not support "settings"`},
 		{"pi MCP unsupported", "pi", reviewtypes.AgentConfig{MCPServers: mcp(`{"url":"x"}`)}, `does not support "mcp_servers"`},

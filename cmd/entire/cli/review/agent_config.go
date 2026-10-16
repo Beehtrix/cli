@@ -66,8 +66,15 @@ func ValidateAgentConfig(agentName string, cfg *reviewtypes.AgentConfig) error {
 			return fmt.Errorf("settings: %w", err)
 		}
 		if hooks, ok := obj["hooks"]; ok {
-			if _, err := jsonObject(hooks); err != nil {
+			events, err := jsonObject(hooks)
+			if err != nil {
 				return fmt.Errorf("settings hooks: %w", err)
+			}
+			for _, event := range sortedStringKeys(events) {
+				var matchers []map[string]json.RawMessage
+				if err := json.Unmarshal(events[event], &matchers); err != nil || matchers == nil || slices.ContainsFunc(matchers, func(m map[string]json.RawMessage) bool { return m == nil }) {
+					return fmt.Errorf("settings hooks %s: must be a list of matcher objects", event)
+				}
 			}
 		}
 	}
