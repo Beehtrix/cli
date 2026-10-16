@@ -20,6 +20,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
+	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/versioninfo"
 	"github.com/entireio/cli/redact"
 	"github.com/spf13/cobra"
@@ -61,6 +62,17 @@ that path is printed to stdout. Use --out to choose a specific path.`,
 			outPath := outFlag
 			if outPath == "" {
 				outPath = filepath.Join(os.TempDir(), fmt.Sprintf("entire-bundle-%s.zip", time.Now().UTC().Format("20060102-150405")))
+			}
+
+			// The redacted bundle leaves the machine, so it must apply the
+			// user's custom rules and packs, not just the built-ins. Doctor's
+			// PreRunE is not inherited, so bundle configures redaction itself
+			// — and only when it redacts, so --raw still works on a repo whose
+			// scanner config is invalid.
+			if !rawFlag {
+				if err := strategy.EnsureRedactionConfigured(ctx); err != nil {
+					return fmt.Errorf("configure redaction before bundling: %w", err)
+				}
 			}
 
 			if err := writeDoctorBundle(ctx, repoRoot, outPath, rawFlag); err != nil {

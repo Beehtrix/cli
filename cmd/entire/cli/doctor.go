@@ -102,18 +102,21 @@ be condensed will be discarded.
 Without a terminal to prompt on (agents, CI), doctor reports each issue and
 points at --force instead of prompting.`,
 		// On the group, not on doctor's own PreRunE, so it also covers
-		// `doctor logs` and `doctor bundle`: bundle redacts everything it
-		// collects and must apply user-defined rules, not just the built-ins.
-		// The broken-.entire report runs first because loading redaction
-		// settings reads .entire/settings.json — itself a read through the
-		// path in question. cobra.EnableTraverseRunHooks runs root's hook
-		// before this one, so redaction diagnostics and the load-time summary
-		// land in .entire/logs/, where a user debugging custom rules greps for
-		// component=redaction.
+		// `doctor logs` and `doctor bundle`, which read .entire/logs. Runs
+		// before the PreRunE below, which loads redaction settings from
+		// .entire/settings.json — itself a read through the path in question.
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
-			if err := reportBrokenEntireDir(cmd); err != nil {
-				return err
-			}
+			return reportBrokenEntireDir(cmd)
+		},
+		PreRunE: func(cmd *cobra.Command, _ []string) error {
+			// Cobra runs the persistent pre-runs before a command's own PreRunE,
+			// so the root hook has already put an initialized logger in this
+			// context: redaction diagnostics and the load-time summary land in
+			// .entire/logs/, which is where `entire doctor bundle` collects them
+			// and where a user debugging custom rules greps for
+			// component=redaction. Answering "did my rules load?" is doctor's
+			// job, so it must not be the one command whose diagnostics go to
+			// bare stderr.
 			return strategy.EnsureRedactionConfigured(cmd.Context())
 		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
