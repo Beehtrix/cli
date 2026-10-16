@@ -295,22 +295,40 @@ func TestCellV4_GivesUpAfterBoundedRetries(t *testing.T) {
 // TestCellV4_429RetryHonoursContext: a caller that gives up during the
 // backoff is not kept waiting for the next attempt.
 func TestCellV4_429RetryHonoursContext(t *testing.T) {
+	var hits int32
+	shed := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
 		w.Header().Set("Retry-After", "5")
 		w.WriteHeader(http.StatusTooManyRequests)
+		select {
+		case shed <- struct{}{}:
+		default:
+		}
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go func() {
+		<-shed
+		// The jittered wait for a 5s hint is at least 2.5s, so after this pause
+		// the client is parked in the backoff, not still reading the 429.
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
 	client := api.NewClientWithBaseURL("id-token-123", srv.URL)
 	start := time.Now()
 	_, err := CellV4(ctx, client, Config{Query: "q", Limit: 10}, nil)
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want context deadline", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	if time.Since(start) > 2*time.Second {
-		t.Fatal("retry backoff outlived the caller's context")
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("CellV4 returned after %v; the backoff outlived the caller's context", elapsed)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("hits = %d, want 1: a cancelled backoff must not send another attempt", got)
 	}
 }
 
