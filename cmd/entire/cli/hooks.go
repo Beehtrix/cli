@@ -1,11 +1,15 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
+	"strconv"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
-	"github.com/entireio/cli/cmd/entire/cli/strategy"
+	"github.com/entireio/cli/cmd/entire/cli/logging"
 )
 
 // SubagentCheckpointHookInput represents the JSON input from PostToolUse hooks for
@@ -49,70 +53,53 @@ func ParseSubagentTypeAndDescription(toolInput json.RawMessage) (agentType, desc
 	return input.SubagentType, input.Description
 }
 
-// todoWriteToolInput represents the tool_input structure for the TodoWrite tool.
-// Used to extract the todos array which is then passed to strategy.ExtractInProgressTodo.
-type todoWriteToolInput struct {
-	Todos json.RawMessage `json:"todos"`
+// backgroundTaskToolInput represents the tool_input structure for the Task
+// tool, used to detect a background subagent launch. RunInBackground stays
+// raw because models send it as a JSON boolean or as a string ("true").
+type backgroundTaskToolInput struct {
+	RunInBackground json.RawMessage `json:"run_in_background"`
 }
 
-// ExtractTodoContentFromToolInput extracts the content of the in-progress todo item from TodoWrite tool_input.
-// Falls back to the first pending item if no in-progress item is found.
-// Returns empty string if no suitable item is found or JSON is invalid.
-//
-// This function unwraps the outer tool_input object to extract the todos array,
-// then delegates to strategy.ExtractInProgressTodo for the actual parsing logic.
-func ExtractTodoContentFromToolInput(toolInput json.RawMessage) string {
-	if len(toolInput) == 0 {
-		return ""
+// isBackgroundLaunch reports whether a launch-time SubagentEnd event is a
+// background launch. A launch mode the agent reported wins; otherwise it
+// falls back to tool_input.run_in_background, accepting a boolean or a
+// boolean string. Returns false (foreground) when neither says background.
+func isBackgroundLaunch(ctx context.Context, event *agent.Event) bool {
+	switch event.SubagentLaunch {
+	case agent.SubagentLaunchBackground:
+		return true
+	case agent.SubagentLaunchForeground:
+		return false
+	case agent.SubagentLaunchUnknown:
 	}
 
-	// First extract the todos array from tool_input
-	var input todoWriteToolInput
-	if err := json.Unmarshal(toolInput, &input); err != nil {
-		return ""
+	if len(event.ToolInput) == 0 {
+		return false
 	}
-
-	// Delegate to strategy package for the actual extraction logic
-	return strategy.ExtractInProgressTodo(input.Todos)
-}
-
-// ExtractLastCompletedTodoFromToolInput extracts the content of the last completed todo item.
-// In PostToolUse[TodoWrite], the tool_input contains the NEW todo list where the
-// just-finished work is marked as "completed". The last completed item represents
-// the work that was just done.
-//
-// Returns empty string if no completed items exist or JSON is invalid.
-func ExtractLastCompletedTodoFromToolInput(toolInput json.RawMessage) string {
-	if len(toolInput) == 0 {
-		return ""
+	var input backgroundTaskToolInput
+	if err := json.Unmarshal(event.ToolInput, &input); err != nil {
+		logging.Debug(ctx, "failed to parse tool_input for background-launch detection; treating as foreground",
+			slog.String("error", err.Error()))
+		return false
 	}
-
-	// First extract the todos array from tool_input
-	var input todoWriteToolInput
-	if err := json.Unmarshal(toolInput, &input); err != nil {
-		return ""
+	if len(input.RunInBackground) == 0 {
+		return false
 	}
-
-	// Delegate to strategy package for the actual extraction logic
-	return strategy.ExtractLastCompletedTodo(input.Todos)
-}
-
-// CountTodosFromToolInput returns the number of todo items in the TodoWrite tool_input.
-// Returns 0 if the JSON is invalid or empty.
-//
-// This function unwraps the outer tool_input object to extract the todos array,
-// then delegates to strategy.CountTodos for the actual count.
-func CountTodosFromToolInput(toolInput json.RawMessage) int {
-	if len(toolInput) == 0 {
-		return 0
+	var flag bool
+	if err := json.Unmarshal(input.RunInBackground, &flag); err == nil {
+		return flag
 	}
-
-	// First extract the todos array from tool_input
-	var input todoWriteToolInput
-	if err := json.Unmarshal(toolInput, &input); err != nil {
-		return 0
+	var text string
+	if err := json.Unmarshal(input.RunInBackground, &text); err == nil {
+		if flag, err := strconv.ParseBool(text); err == nil {
+			return flag
+		}
 	}
-
-	// Delegate to strategy package for the actual count
-	return strategy.CountTodos(input.Todos)
+	// Log only the decoded value's type: the value is model-provided and may
+	// hold anything.
+	var value any
+	_ = json.Unmarshal(input.RunInBackground, &value) //nolint:errcheck // already valid JSON; a nil value still logs a type
+	logging.Warn(ctx, "unrecognized run_in_background value; treating as foreground",
+		slog.String("type", fmt.Sprintf("%T", value)))
+	return false
 }

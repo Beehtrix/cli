@@ -3,13 +3,13 @@
 package integration
 
 import (
-	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,10 +17,16 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
+	"github.com/entireio/cli/internal/coreapi"
 	"github.com/entireio/cli/internal/entireclient/contexts"
 	"github.com/entireio/cli/internal/entireclient/discovery"
 	"github.com/entireio/cli/internal/entireclient/tokenstore"
 )
+
+// trailResumeIntegrationClusterSlug is the fake processing placement's
+// cluster, used to join /api/v1/repos' RepoPlacement.ClusterSlug to
+// /api/v1/clusters' Cluster.Slug (see cell_target.go's cellTargetForPlacement).
+const trailResumeIntegrationClusterSlug = "trail-resume-cluster"
 
 func TestTrailResume_UsesCheckpointSessionsWhenLocalStateIsMissing(t *testing.T) {
 	t.Parallel()
@@ -52,7 +58,7 @@ func TestTrailResume_UsesCheckpointSessionsWhenLocalStateIsMissing(t *testing.T)
 		t.Fatalf("SimulateStop second session: %v", err)
 	}
 
-	env.GitCommitWithShadowHooks("Add hello and goodbye methods", "hello.rb", "goodbye.rb")
+	env.GitCommitWithHooks("Add hello and goodbye methods", "hello.rb", "goodbye.rb")
 	checkpointID := env.GetLatestCheckpointIDFromHistory()
 
 	if err := env.ClearSessionState(firstSession.ID); err != nil {
@@ -63,9 +69,9 @@ func TestTrailResume_UsesCheckpointSessionsWhenLocalStateIsMissing(t *testing.T)
 	}
 
 	trail := api.TrailResource{
-		ID:        "trail-integration-321",
-		Number:    321,
-		URL:       "https://entire.io/gh/entireio/cli/trails/321",
+		ID:        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+		Number:    7,
+		URL:       "https://entire.io/gh/entireio/cli/trails/7",
 		Branch:    env.GetCurrentBranch(),
 		Base:      masterBranch,
 		Title:     "Resume checkpoint sessions from trail",
@@ -78,6 +84,17 @@ func TestTrailResume_UsesCheckpointSessionsWhenLocalStateIsMissing(t *testing.T)
 	defer server.Close()
 	configureTrailResumeIntegrationAuth(t, env, server.URL)
 
+	legacyOutput := env.RunCLI("trail", "--insecure-http-auth", "resume", "7", "--no-resume")
+	for _, want := range []string{"Trail #7", firstSession.ID, secondSession.ID, checkpointID, "entire trail finding 7 --json"} {
+		if !strings.Contains(legacyOutput, want) {
+			t.Fatalf("legacy resume output missing %q:\n%s", want, legacyOutput)
+		}
+	}
+	if strings.Contains(legacyOutput, "--project") {
+		t.Fatalf("legacy resume must not suggest project commands:\n%s", legacyOutput)
+	}
+
+	env.ExtraEnv = append(env.ExtraEnv, "ENTIRE_PROJECT_TRAILS=1")
 	contextOutput := env.RunCLI("trail", "--insecure-http-auth", "resume", "321", "--no-resume")
 	for _, want := range []string{
 		"Trail #321",
@@ -87,8 +104,9 @@ func TestTrailResume_UsesCheckpointSessionsWhenLocalStateIsMissing(t *testing.T)
 		checkpointID,
 		"Create hello method",
 		"Create goodbye method",
-		"entire trail resume 321 --repo entireio/cli --branch feature/test-branch --session " + firstSession.ID,
-		"entire trail resume 321 --repo entireio/cli --branch feature/test-branch --session " + secondSession.ID,
+		"entire trail resume 321 --project gh/entireio --repo gh/entireio/cli --branch feature/test-branch --session " + firstSession.ID,
+		"entire trail resume 321 --project gh/entireio --repo gh/entireio/cli --branch feature/test-branch --session " + secondSession.ID,
+		"entire trail finding 321 --project gh/entireio --repo gh/entireio/cli --branch feature/test-branch --json",
 	} {
 		if !strings.Contains(contextOutput, want) {
 			t.Fatalf("trail resume --no-resume output missing %q:\n%s", want, contextOutput)
@@ -121,37 +139,98 @@ func TestTrailResume_UsesCheckpointSessionsWhenLocalStateIsMissing(t *testing.T)
 
 func newTrailResumeIntegrationAPIServer(t *testing.T, trail api.TrailResource) *httptest.Server {
 	t.Helper()
+	const parentID = "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+	const parentPath = "/api/v1/gh/entireio/trails/" + parentID
+	const projectID = "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+	parent := api.ProjectTrail{ID: parentID, Number: 321, ProjectID: projectID, Title: trail.Title, Status: "open",
+		Changes: []api.ChangeSummary{{ID: trail.ID, RepositoryID: "placement-primary", Repository: "cli", Branch: trail.Branch}}}
 
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/oauth/token":
-			writeTrailResumeIntegrationJSON(t, w, http.StatusOK, map[string]any{
+		case r.Method == http.MethodPost && r.URL.Path == pathOAuthToken:
+			writeTrailResumeIntegrationJSON(t, w, map[string]any{
 				"access_token": "trail-resume-data-token",
 				"token_type":   "Bearer",
 				"expires_in":   3600,
 			})
-		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/trails/gh/entireio/cli":
-			writeTrailResumeIntegrationJSON(t, w, http.StatusOK, api.TrailListResponse{
-				Trails:       []api.TrailResource{trail},
-				Total:        1,
-				Limit:        200,
-				RepoFullName: "entireio/cli",
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos":
+			// Backs resolveRepoCellTarget/resolveRepoCellPlacement's
+			// processing-placement lookup (cell_target.go): a single placement,
+			// named as this repo's processing placement, joined to the cluster
+			// below by ClusterSlug.
+			// *ListReposOutputBody, not the value: its MarshalJSON (which
+			// correctly omits unset Opt* fields via the generated jx encoder)
+			// has a pointer receiver, and stdlib encoding/json only picks that
+			// up if the boxed value's dynamic type is the pointer.
+			writeTrailResumeIntegrationJSON(t, w, &coreapi.ListReposOutputBody{
+				Repos: []coreapi.RepoIndexEntry{
+					{
+						FullName: "entireio/cli",
+						ID:       "repo-entireio-cli",
+						Primaries: coreapi.NewOptRepoPrimaries(coreapi.RepoPrimaries{
+							Processing: "placement-primary",
+							GitData:    "placement-primary",
+						}),
+						Placements: []coreapi.RepoPlacement{
+							{
+								ID:           "placement-primary",
+								ClusterSlug:  trailResumeIntegrationClusterSlug,
+								Cell:         trailResumeIntegrationClusterSlug,
+								Jurisdiction: "us",
+								Status:       coreapi.RepoPlacementStatusReady,
+							},
+						},
+					},
+				},
 			})
-		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/trails/"+url.PathEscape(trail.ID)+"/reviews/comments":
-			writeTrailResumeIntegrationJSON(t, w, http.StatusOK, map[string]any{
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/clusters":
+			writeTrailResumeIntegrationJSON(t, w, &coreapi.ListClustersOutputBody{
+				Clusters: []coreapi.Cluster{
+					{
+						Slug:         trailResumeIntegrationClusterSlug,
+						Jurisdiction: "us",
+						PublicUrl:    serverURLWithPath(r, ""),
+						ApiUrl:       coreapi.NewOptString(serverURLWithPath(r, "")),
+						IsDefault:    true,
+					},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/projects/resolve/gh/entireio":
+			writeTrailResumeIntegrationJSON(t, w, map[string]any{
+				"project": map[string]string{
+					"id": projectID, "name": "entireio", "region": "us", "ownerId": projectID,
+					"ownerType": "org", "createdAt": "2026-09-01T00:00:00Z",
+					"primaryProcessingCell": trailResumeIntegrationClusterSlug, "apiUrl": serverURLWithPath(r, ""),
+				},
+				"reference": map[string]string{"host": "gh", "project": "entireio"},
+			})
+		case r.Method == http.MethodGet && (r.URL.Path == parentPath || r.URL.Path == "/api/v1/gh/entireio/trails/321"):
+			writeTrailResumeIntegrationJSON(t, w, parent)
+		case r.Method == http.MethodGet && r.URL.Path == parentPath+"/changes/"+trail.ID:
+			writeTrailResumeIntegrationJSON(t, w, api.ChangeResource{TrailResource: trail, TrailID: parentID, RepositoryID: "placement-primary"})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/trails/gh/entireio/cli":
+			writeTrailResumeIntegrationJSON(t, w, api.TrailListResponse{
+				Trails: []api.TrailResource{trail},
+				Total:  1,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/trails/gh/entireio/cli/7":
+			writeTrailResumeIntegrationJSON(t, w, trail)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/trails/gh/entireio/cli/7/reviews/comments":
+			writeTrailResumeIntegrationJSON(t, w, map[string]any{
 				"comments": []any{},
-				"has_more": false,
+				"hasMore":  false,
 			})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
+	return server
 }
 
-func writeTrailResumeIntegrationJSON(t *testing.T, w http.ResponseWriter, status int, body any) {
+func writeTrailResumeIntegrationJSON(t *testing.T, w http.ResponseWriter, body any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
+	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(body); err != nil {
 		t.Fatalf("encode JSON response: %v", err)
 	}
@@ -191,7 +270,7 @@ func configureTrailResumeIntegrationAuth(t *testing.T, env *TestEnv, coreURL str
 
 	tokenStore := map[string]map[string]string{
 		service: {
-			handle: tokenstore.EncodeTokenWithExpiration(fakeLoginJWT(coreURL), 7200),
+			handle: tokenstore.EncodeTokenWithExpiration(fakeTrailCellLoginJWT(coreURL), 7200),
 		},
 	}
 	tokenData, err := json.Marshal(tokenStore)
@@ -203,12 +282,22 @@ func configureTrailResumeIntegrationAuth(t *testing.T, env *TestEnv, coreURL str
 	}
 
 	env.ExtraEnv = append(env.ExtraEnv,
+		"ENTIRE_PROJECT_TRAILS=0",
 		"ENTIRE_API_BASE_URL="+coreURL,
 		"ENTIRE_CONFIG_DIR="+configDir,
 		"XDG_CACHE_HOME="+xdgCacheHome,
 		"ENTIRE_TOKEN_STORE=file",
 		"ENTIRE_TOKEN_STORE_PATH="+tokenStorePath,
 	)
+}
+
+func fakeTrailCellLoginJWT(iss string) string {
+	enc := base64.RawURLEncoding
+	header := enc.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	payload := enc.EncodeToString(fmt.Appendf(nil,
+		`{"iss":%q,"sub":"user-123","home_jurisdiction":"us","exp":%d}`,
+		iss, time.Now().Add(time.Hour).Unix()))
+	return header + "." + payload + "." + enc.EncodeToString([]byte("sig"))
 }
 
 func mustTrailResumeIntegrationHost(t *testing.T, rawURL string) string {
@@ -226,12 +315,7 @@ func mustTrailResumeIntegrationHost(t *testing.T, rawURL string) string {
 func addTrailResumeIntegrationOrigin(t *testing.T, env *TestEnv, remoteURL string) {
 	t.Helper()
 
-	cmd := exec.CommandContext(context.Background(), "git", "remote", "add", "origin", remoteURL)
-	cmd.Dir = env.RepoDir
-	cmd.Env = testutil.GitIsolatedEnv()
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git remote add origin: %v\n%s", err, output)
-	}
+	testutil.RunGit(t, env.RepoDir, "remote", "add", "origin", remoteURL)
 
 	configData, err := os.ReadFile(filepath.Join(env.RepoDir, ".git", "config"))
 	if err != nil {

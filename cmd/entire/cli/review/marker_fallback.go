@@ -11,9 +11,10 @@
 //
 // For agents without a review-runner adapter, the marker is purely a record of
 // what the user was asked to do: RunMarkerFallback writes it before printing manual-start
-// guidance, and `entire attach --review <session-id>` reads the marker to tag a
-// manual session after the fact. ReadPendingReviewMarker / ClearPendingReviewMarker
-// are exported for that attach flow; nothing else reads the marker.
+// guidance, and `entire session attach --review <session-id>` reads the marker
+// to tag a manual session after the fact. ReadPendingReviewMarker /
+// ClearPendingReviewMarker are exported for that attach flow; nothing else
+// reads the marker.
 package review
 
 import (
@@ -23,9 +24,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"time"
 
+	"github.com/entireio/cli/cmd/entire/cli/gitdir"
+	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
+	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	reviewtypes "github.com/entireio/cli/cmd/entire/cli/review/types"
 	"github.com/entireio/cli/cmd/entire/cli/session"
 )
@@ -34,8 +37,8 @@ const pendingReviewMarkerFilename = "review-pending.json"
 
 // PendingReviewMarker is written by `entire review` before instructing the
 // user to open an agent manually. The marker records which agent and
-// skills should run so that `entire attach --review` can tag the resulting
-// session after the fact.
+// skills should run so that `entire session attach --review` can tag the
+// resulting session after the fact.
 //
 // WorktreePath scopes the marker to the worktree `entire review` was invoked
 // from: multiple worktrees in one repo share .git/entire-sessions/, so without
@@ -54,28 +57,33 @@ type PendingReviewMarker struct {
 	WorktreePath string    `json:"worktree_path,omitempty"`
 }
 
-func pendingMarkerPath(ctx context.Context) (string, error) {
-	commonDir, err := session.GetGitCommonDir(ctx)
+// pendingMarkerName is the marker's name inside the git common dir's root.
+var pendingMarkerName = session.SessionStateDirName + "/" + pendingReviewMarkerFilename
+
+// pendingMarkerRoot returns the shared *os.Root over the git common dir the
+// marker lives in.
+func pendingMarkerRoot(ctx context.Context) (*os.Root, error) {
+	root, err := gitdir.Open(ctx)
 	if err != nil {
-		return "", fmt.Errorf("locate git common dir: %w", err)
+		return nil, fmt.Errorf("locate git common dir: %w", err)
 	}
-	return filepath.Join(commonDir, session.SessionStateDirName, pendingReviewMarkerFilename), nil
+	return root, nil
 }
 
 // WritePendingReviewMarker persists the marker. Overwrites any existing marker.
 func WritePendingReviewMarker(ctx context.Context, m PendingReviewMarker) error {
-	path, err := pendingMarkerPath(ctx)
+	root, err := pendingMarkerRoot(ctx)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+	if err := osroot.MkdirAllNoSymlink(root, session.SessionStateDirName, 0o750); err != nil {
 		return fmt.Errorf("create sessions dir: %w", err)
 	}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal marker: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := jsonutil.WriteFileAtomicIn(root, pendingMarkerName, data, 0o600); err != nil {
 		return fmt.Errorf("write marker: %w", err)
 	}
 	return nil
@@ -84,11 +92,11 @@ func WritePendingReviewMarker(ctx context.Context, m PendingReviewMarker) error 
 // ReadPendingReviewMarker returns the marker if one exists.
 // ok=false with err=nil indicates "no pending review."
 func ReadPendingReviewMarker(ctx context.Context) (PendingReviewMarker, bool, error) {
-	path, err := pendingMarkerPath(ctx)
+	root, err := pendingMarkerRoot(ctx)
 	if err != nil {
 		return PendingReviewMarker{}, false, err
 	}
-	data, err := os.ReadFile(path) //nolint:gosec // path derived from git dir
+	data, err := osroot.ReadFileNoFollow(root, pendingMarkerName)
 	if errors.Is(err, os.ErrNotExist) {
 		return PendingReviewMarker{}, false, nil
 	}
@@ -104,11 +112,11 @@ func ReadPendingReviewMarker(ctx context.Context) (PendingReviewMarker, bool, er
 
 // ClearPendingReviewMarker removes the marker. Missing file is not an error.
 func ClearPendingReviewMarker(ctx context.Context) error {
-	path, err := pendingMarkerPath(ctx)
+	root, err := pendingMarkerRoot(ctx)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := root.Remove(pendingMarkerName); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove marker: %w", err)
 	}
 	return nil
@@ -122,16 +130,18 @@ func ClearPendingReviewMarker(ctx context.Context) error {
 // The marker is NOT auto-adopted by anything — the lifecycle hook reads
 // ENTIRE_REVIEW_* env vars on the spawned process, not the marker file.
 // For adapterless review agents the user starts the agent manually, so no env
-// inheritance happens. The marker exists purely so that `entire attach
-// --review <session-id>` has a record of what the user was asked to review
-// when tagging the session after the fact.
+// inheritance happens. The marker exists purely so that `entire session
+// attach --review <session-id>` has a record of what the user was asked to
+// review when tagging the session after the fact.
 //
 // agentName must be the agent's registry key (e.g. "cursor").
 // cfg carries skills and the starting SHA.
 // worktreePath scopes the marker so sessions in other worktrees don't claim it.
 // out is the destination for user-facing guidance.
 func RunMarkerFallback(ctx context.Context, agentName string, cfg reviewtypes.RunConfig, worktreePath string, out io.Writer) error {
-	prompt := ComposeReviewPrompt(cfg)
+	// These agents are started by hand, so there is no system-prompt channel:
+	// the guardrail leads the prompt instead.
+	prompt := ReviewerGuardrail + "\n\n" + ComposeReviewPrompt(cfg)
 	if err := WritePendingReviewMarker(ctx, PendingReviewMarker{
 		AgentName:    agentName,
 		Skills:       cfg.Skills,
@@ -151,8 +161,6 @@ func RunMarkerFallback(ctx context.Context, agentName string, cfg reviewtypes.Ru
 		}
 		fmt.Fprintln(out)
 	}
-	if prompt != "" {
-		fmt.Fprintf(out, "Use this prompt:\n\n%s\n", prompt)
-	}
+	fmt.Fprintf(out, "Use this prompt:\n\n%s\n", prompt)
 	return nil
 }

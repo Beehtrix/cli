@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/versioninfo"
+	"github.com/entireio/cli/internal/entireclient/httpclient"
+	"github.com/entireio/cli/internal/entireclient/netcause"
 )
 
 const (
@@ -23,6 +25,8 @@ const (
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
+
+	trailRoutes map[string]string
 
 	// authSessionsPath is the base path for entire-core's login-session
 	// endpoints (list / revoke / current). Set via WithAuthSessionsPath when the
@@ -41,48 +45,60 @@ func (c *Client) WithAuthSessionsPath(path string) *Client {
 	return c
 }
 
-// NewClient creates a new authenticated API client with an explicit bearer
-// token, targeting the data API base URL (BaseURL()).
-func NewClient(token string) *Client {
-	return NewClientWithBaseURL(token, BaseURL())
+// NewClientWithBaseURL creates a new authenticated API client targeting an
+// explicit base URL.
+//
+// Both constructors require the base URL. Their predecessor, NewClient(token),
+// defaulted the host to BaseURL() — ENTIRE_API_BASE_URL or the production apex —
+// which is exactly the ambient default the data plane no longer has: the host
+// belongs to the acting login and comes from auth.ResolveDataAPI /
+// auth.DataBaseURL. Keeping a one-argument constructor around would let the next
+// caller reintroduce that silently, sending a staging login's bearer to
+// entire.io, so the base URL is a required argument and every caller has to say
+// where it got it.
+func NewClientWithBaseURL(token, baseURL string) *Client {
+	return NewClientWithTransport(token, baseURL, nil)
 }
 
-// NewClientWithBaseURL creates a new authenticated API client targeting an
-// explicit base URL. Use this for endpoints that live on a login server
-// rather than the data API (e.g. auth-session management).
-func NewClientWithBaseURL(token, baseURL string) *Client {
+// NewClientWithTransport creates an API client using an injected network
+// transport, retaining the standard bearer and redirect policies. A nil
+// transport uses http.DefaultTransport. The transport must not rewrite the
+// request URL: the redirect policy only sees the URL it was given, so a
+// scheme rewrite beneath it would hide a downgrade.
+func NewClientWithTransport(token, baseURL string, transport http.RoundTripper) *Client {
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
 	return &Client{
-		httpClient: &http.Client{
+		httpClient: httpclient.New(httpclient.Options{
 			Transport: &bearerTransport{
 				token: token,
-				base:  http.DefaultTransport,
+				base:  netcause.Transport(transport),
 			},
 			// A cross-host redirect must never carry the Entire bearer to
 			// another origin; refuse it rather than follow it. Same-origin
 			// requests are guaranteed by the base-host check in do().
 			CheckRedirect: rejectCrossHostRedirect,
-		},
+		}),
 		baseURL: baseURL,
 	}
 }
 
 // rejectCrossHostRedirect stops a redirect chain from leaving the origin the
 // client was built for. Same-host redirects (e.g. a trailing-slash normalize)
-// still follow, up to Go's usual 10-hop cap.
+// still follow; httpclient.New adds the hop cap and HTTPS floor around it.
 func rejectCrossHostRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
-	}
 	if len(via) > 0 && !strings.EqualFold(req.URL.Host, via[0].URL.Host) {
 		return fmt.Errorf("refusing redirect to a different host (%s → %s): the Entire bearer must not leave its origin", via[0].URL.Host, req.URL.Host)
 	}
 	return nil
 }
 
-// requireSameHost rejects an endpoint whose host differs from the base URL's.
-// It guards the direct case (a path that resolved to another host); redirects
+// requireSameOrigin rejects off-host endpoints and downgrades from an HTTPS base.
+// Explicit HTTP bases may upgrade to HTTPS on the same host.
+// It guards direct absolute paths as well as relative paths; redirects
 // are handled by rejectCrossHostRedirect.
-func requireSameHost(baseURL, endpoint string) error {
+func requireSameOrigin(baseURL, endpoint string) error {
 	b, err := url.Parse(baseURL)
 	if err != nil {
 		return fmt.Errorf("parse base URL: %w", err)
@@ -91,8 +107,11 @@ func requireSameHost(baseURL, endpoint string) error {
 	if err != nil {
 		return fmt.Errorf("parse endpoint URL: %w", err)
 	}
+	if b.Scheme == schemeHTTPS && e.Scheme != schemeHTTPS {
+		return fmt.Errorf("%w: refusing an insecure endpoint for an HTTPS API base URL", httpclient.ErrRequestPolicy)
+	}
 	if !strings.EqualFold(b.Host, e.Host) {
-		return fmt.Errorf("refusing to send an authenticated request to %q, which is not the API host %q", e.Host, b.Host)
+		return fmt.Errorf("%w: refusing to send an authenticated request to %q, which is not the API host %q", httpclient.ErrRequestPolicy, e.Host, b.Host)
 	}
 	return nil
 }
@@ -188,7 +207,40 @@ func (c *Client) Request(ctx context.Context, method, path string, headers http.
 	return c.do(ctx, method, path, body, headers)
 }
 
+// SetTrailRoute registers the entire-api base path for a resolved trail, so
+// later requests spelled with the trail's ID are rewritten onto its
+// forge/owner/repo/number route (see rewriteTrailRoute).
+func (c *Client) SetTrailRoute(trailID, path string) {
+	trailID = strings.TrimSpace(trailID)
+	path = strings.TrimRight(strings.TrimSpace(path), "/")
+	if trailID == "" || path == "" {
+		return
+	}
+	if c.trailRoutes == nil {
+		c.trailRoutes = make(map[string]string)
+	}
+	c.trailRoutes[url.PathEscape(trailID)] = path
+}
+
+func (c *Client) rewriteTrailRoute(path string) string {
+	const prefix = "/api/v1/trails/"
+	if !strings.HasPrefix(path, prefix) || len(c.trailRoutes) == 0 {
+		return path
+	}
+	rest := strings.TrimPrefix(path, prefix)
+	id, suffix, _ := strings.Cut(rest, "/")
+	base, ok := c.trailRoutes[id]
+	if !ok {
+		return path
+	}
+	if suffix == "" {
+		return base
+	}
+	return base + "/" + suffix
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, headers http.Header) (*http.Response, error) {
+	path = c.rewriteTrailRoute(path)
 	endpoint, err := ResolveURLFromBase(c.baseURL, path)
 	if err != nil {
 		return nil, fmt.Errorf("resolve URL %s: %w", path, err)
@@ -196,7 +248,7 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, he
 	// The bearer is only ever sent to the API's own host. A path that resolves
 	// to another host (absolute or scheme-relative URL) would otherwise redirect
 	// the Authorization header off-origin.
-	if err := requireSameHost(c.baseURL, endpoint); err != nil {
+	if err := requireSameOrigin(c.baseURL, endpoint); err != nil {
 		return nil, err
 	}
 
@@ -243,16 +295,42 @@ func DecodeJSON(resp *http.Response, dest any) error {
 
 // ErrorResponse represents a standard API error response. Older endpoints
 // return {"error":"message"}; newer endpoints return
-// {"error":{"code":"...","message":"...",...}}.
+// {"error":{"code":"...","message":"...",...}}; entire-api cells return RFC
+// 9457 problem details (application/problem+json), whose human-readable text
+// is detail with title as the coarser fallback. RequestID is a problem-details
+// extension entire-api sets on every error; it is what support needs to find
+// the server-side trace, so it is carried through to HTTPError.
 type ErrorResponse struct {
-	Error any `json:"error"`
+	Error     any    `json:"error"`
+	Detail    string `json:"detail"`
+	Title     string `json:"title"`
+	Code      string `json:"code"`
+	RequestID string `json:"request_id"`
 }
 
-// Message extracts the human-readable error message from either envelope shape.
+// ErrorCode extracts the stable machine-readable code, if the server sent one.
+// entire-api's contract (docs/api-errors.md there) is to branch on code, never
+// on message text: problem details and compact cell errors carry it top-level;
+// the legacy nested envelope carries it as error.code.
+func (e ErrorResponse) ErrorCode() string {
+	if code := strings.TrimSpace(e.Code); code != "" {
+		return code
+	}
+	if v, ok := e.Error.(map[string]any); ok {
+		if code, ok := v["code"].(string); ok {
+			return strings.TrimSpace(code)
+		}
+	}
+	return ""
+}
+
+// Message extracts the human-readable error message from any envelope shape.
 func (e ErrorResponse) Message() string {
 	switch v := e.Error.(type) {
 	case string:
-		return strings.TrimSpace(v)
+		if message := strings.TrimSpace(v); message != "" {
+			return message
+		}
 	case map[string]any:
 		if message, ok := v["message"].(string); ok && strings.TrimSpace(message) != "" {
 			return strings.TrimSpace(message)
@@ -261,7 +339,10 @@ func (e ErrorResponse) Message() string {
 			return strings.TrimSpace(code)
 		}
 	}
-	return ""
+	if detail := strings.TrimSpace(e.Detail); detail != "" {
+		return detail
+	}
+	return strings.TrimSpace(e.Title)
 }
 
 // HTTPError is returned by CheckResponse for non-2xx responses. Callers can use
@@ -269,13 +350,25 @@ func (e ErrorResponse) Message() string {
 type HTTPError struct {
 	StatusCode int
 	Message    string
+	// Code is the server's stable error code (e.g. rate_limited, conflict,
+	// wrong_cell) when it sent one. Branch on it, not on Message, which is
+	// human-readable prose the server may reword.
+	Code string
+	// RequestID is the RFC 9457 request_id extension when the server sent one.
+	RequestID string
 }
 
 func (e *HTTPError) Error() string {
+	var out string
 	if e.Message != "" {
-		return fmt.Sprintf("API error: %s (status %d)", e.Message, e.StatusCode)
+		out = fmt.Sprintf("API error: %s (status %d)", e.Message, e.StatusCode)
+	} else {
+		out = fmt.Sprintf("API error: status %d", e.StatusCode)
 	}
-	return fmt.Sprintf("API error: status %d", e.StatusCode)
+	if e.RequestID != "" {
+		out += fmt.Sprintf(" [request %s]", e.RequestID)
+	}
+	return out
 }
 
 // IsHTTPErrorStatus reports whether err wraps an *HTTPError with the given HTTP status.
@@ -301,6 +394,8 @@ func CheckResponse(resp *http.Response) error {
 
 	var parsed ErrorResponse
 	if err := json.Unmarshal(body, &parsed); err == nil {
+		apiError.RequestID = strings.TrimSpace(parsed.RequestID)
+		apiError.Code = parsed.ErrorCode()
 		if message := parsed.Message(); message != "" {
 			apiError.Message = message
 			return apiError

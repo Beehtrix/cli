@@ -14,6 +14,15 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 )
 
+// flagOutputFormat selects the CLI's response encoding; modelHaiku is the
+// default model for Entire's own generation calls (fast and cheap).
+const (
+	flagOutputFormat   = "--output-format"
+	flagSettingSources = "--setting-sources"
+	flagStrictMCP      = "--strict-mcp-config"
+	modelHaiku         = "haiku"
+)
+
 // buildGenerateArgs assembles the claude CLI argv for a --print text-generation
 // call.
 //
@@ -22,6 +31,19 @@ import (
 // user-level tool permissions (e.g. permissions.defaultMode=bypassPermissions),
 // which would let prompt-injection in the untrusted dispatch data drive tool
 // execution. So we pass --setting-sources "" (load nothing).
+//
+// Settings isolation alone still leaves every built-in tool available, and in
+// the default permission mode Read and read-only Bash run without approval
+// inside the working directory, so an injected "read this file" instruction
+// could copy a file's contents into the summary. --tools "" removes the tools
+// entirely; summary generation needs none, because the transcript is already
+// in the prompt.
+//
+// --tools "" covers the built-in set only: MCP servers from the user's
+// ~/.claude.json keep their tools under it (verified: a user-scope server
+// stayed connected with its 76 tools). --setting-sources "" also drops them on
+// Claude Code 2.1.285, but that is not documented behavior of the flag, so
+// --strict-mcp-config (with no --mcp-config) states it explicitly.
 //
 // The one thing we genuinely need from the user settings is auth. Users on API
 // billing configure it with `apiKeyHelper` (a command that prints the key),
@@ -41,9 +63,33 @@ import (
 // without any injection (settingsPath == "").
 func buildGenerateArgs(model, settingsPath string) []string {
 	args := []string{
-		"--print", "--output-format", "json",
+		"--print", flagOutputFormat, "json",
 		"--model", model,
-		"--setting-sources", "",
+		flagSettingSources, "",
+		"--tools", "",
+		flagStrictMCP,
+	}
+	if settingsPath != "" {
+		args = append(args, "--settings", settingsPath)
+	}
+	return args
+}
+
+// buildStreamingGenerateArgs is buildGenerateArgs for the stream-json path,
+// with the same isolation and auth-injection contract (see buildGenerateArgs).
+// --include-partial-messages enables the per-token stream_event envelopes
+// that PhaseFirstToken and PhaseGenerating are dispatched from, and
+// --verbose is required by the claude CLI for stream-json output.
+func buildStreamingGenerateArgs(model, settingsPath string) []string {
+	args := []string{
+		"--print",
+		flagOutputFormat, "stream-json",
+		"--include-partial-messages",
+		"--verbose",
+		"--model", model,
+		flagSettingSources, "",
+		"--tools", "",
+		flagStrictMCP,
 	}
 	if settingsPath != "" {
 		args = append(args, "--settings", settingsPath)
@@ -85,14 +131,11 @@ func writeAuthSettingsFile(apiKeyHelper string) (string, func(), error) {
 // the claude CLI does: $CLAUDE_CONFIG_DIR/settings.json when set, otherwise
 // ~/.claude/settings.json.
 func userClaudeSettingsPath() (string, error) {
-	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); dir != "" {
-		return filepath.Join(dir, "settings.json"), nil
-	}
-	home, err := os.UserHomeDir()
+	configDir, err := resolveClaudeConfigDir()
 	if err != nil {
-		return "", fmt.Errorf("resolve home directory: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".claude", "settings.json"), nil
+	return filepath.Join(configDir, "settings.json"), nil
 }
 
 // readUserAPIKeyHelper returns the apiKeyHelper field from the user's claude
@@ -131,7 +174,7 @@ func readUserAPIKeyHelper() string {
 func (c *ClaudeCodeAgent) GenerateText(ctx context.Context, prompt string, model string) (string, error) {
 	claudePath := "claude"
 	if model == "" {
-		model = "haiku"
+		model = modelHaiku
 	}
 
 	commandRunner := c.CommandRunner
@@ -152,12 +195,19 @@ func (c *ClaudeCodeAgent) GenerateText(ctx context.Context, prompt string, model
 		defer cleanup()
 	}
 
+	workDir, cleanupDir, err := agent.NewTextGenerationDir()
+	if err != nil {
+		return "", err //nolint:wrapcheck // NewTextGenerationDir already names what failed
+	}
+	defer cleanupDir()
+
 	cmd := commandRunner(ctx, claudePath, buildGenerateArgs(model, settingsPath)...)
 
 	// Isolate from the user's git repo to prevent recursive hook triggers
-	// and index pollution (matches agent.RunIsolatedTextGeneratorCLI behavior).
-	cmd.Dir = os.TempDir()
-	cmd.Env = agent.StripGitEnv(os.Environ())
+	// and index pollution, in an empty directory rather than the shared temp
+	// dir (matches agent.RunIsolatedTextGeneratorCLI behavior).
+	cmd.Dir = workDir
+	cmd.Env = agent.TextGenerationEnv(workDir, os.Environ())
 	cmd.Stdin = strings.NewReader(prompt)
 
 	var stdout, stderr bytes.Buffer
@@ -183,12 +233,21 @@ func (c *ClaudeCodeAgent) GenerateText(ctx context.Context, prompt string, model
 			return "", classifyEnvelopeError(result, env.APIErrorStatus, exitCode)
 		}
 		// No structured signal on stdout — ctx cancellation is next most
-		// informative, since the rest is a guess.
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return "", context.DeadlineExceeded
-		}
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return "", context.Canceled
+		// informative, since the rest is a guess. Wrap the sentinel in a
+		// *agent.TextGenerationError (like the streaming path and every other
+		// provider) so the explain timeout diagnostic still gets captured
+		// stderr and the stdout byte count when this path is reached via the
+		// old-CLI streaming fallback.
+		if ctxErr := ctx.Err(); ctxErr != nil && (errors.Is(ctxErr, context.DeadlineExceeded) || errors.Is(ctxErr, context.Canceled)) {
+			sentinel := context.Canceled
+			if errors.Is(ctxErr, context.DeadlineExceeded) {
+				sentinel = context.DeadlineExceeded
+			}
+			return "", &agent.TextGenerationError{
+				Err:         sentinel,
+				Stderr:      strings.TrimSpace(stderr.String()),
+				StdoutBytes: stdout.Len(),
+			}
 		}
 		if isExecNotFound(err) {
 			return "", &ClaudeError{Kind: ClaudeErrorCLIMissing, Cause: err}

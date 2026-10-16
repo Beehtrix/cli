@@ -27,7 +27,7 @@ func claudeStyleTranscript() []byte {
 // Returns ("", false) when the file does not exist.
 func readBranchFile(t *testing.T, store *GitStore, path string) (string, bool) {
 	t.Helper()
-	tree, err := store.getSessionsBranchTree()
+	tree, err := store.getSessionsBranchTree(t.Context())
 	if err != nil {
 		t.Fatalf("getSessionsBranchTree() error = %v", err)
 	}
@@ -44,7 +44,7 @@ func readBranchFile(t *testing.T, store *GitStore, path string) (string, bool) {
 
 func TestWriteCommitted_WritesCompactTranscript(t *testing.T) {
 	t.Parallel()
-	repo, _ := setupTestRepo(t)
+	repo := setupTestRepo(t)
 	store := NewGitStore(repo, DefaultV1Refs())
 	cpID := id.MustCheckpointID("a1b2c3d4e5f6")
 
@@ -107,7 +107,7 @@ func TestWriteCommitted_WritesCompactTranscript(t *testing.T) {
 // recover this checkpoint's content as fullCompactLines[marker:].
 func TestWriteCommitted_CompactTranscriptFullWithMarker(t *testing.T) {
 	t.Parallel()
-	repo, _ := setupTestRepo(t)
+	repo := setupTestRepo(t)
 	store := NewGitStore(repo, DefaultV1Refs())
 	cpID := id.MustCheckpointID("b2c3d4e5f6a1")
 
@@ -153,7 +153,7 @@ func TestWriteCommitted_CompactTranscriptFullWithMarker(t *testing.T) {
 
 func TestWriteCommitted_NonCompactableTranscriptPointsAtFull(t *testing.T) {
 	t.Parallel()
-	repo, _ := setupTestRepo(t)
+	repo := setupTestRepo(t)
 	store := NewGitStore(repo, DefaultV1Refs())
 	cpID := id.MustCheckpointID("c3d4e5f6a1b2")
 
@@ -192,7 +192,7 @@ func TestWriteCommitted_NonCompactableTranscriptPointsAtFull(t *testing.T) {
 // at it rather than staying omitted.
 func TestUpdateCommitted_RefreshesCompactTranscriptPointer(t *testing.T) {
 	t.Parallel()
-	repo, _ := setupTestRepo(t)
+	repo := setupTestRepo(t)
 	store := NewGitStore(repo, DefaultV1Refs())
 	cpID := id.MustCheckpointID("f6a1b2c3d4e5")
 
@@ -239,12 +239,12 @@ func TestUpdateCommitted_RefreshesCompactTranscriptPointer(t *testing.T) {
 }
 
 // codexTranscriptWithCompactionBeforeStart returns a Codex-format JSONL
-// transcript whose line 1 is a `compaction` entry that
-// codex.SanitizePortableTranscript drops. With a checkpoint start of line 2,
-// slicing the raw (unsanitized) transcript yields [beta, gamma] while slicing
-// the sanitized transcript (compaction removed) yields only [gamma] — so the
-// compact transcript diverges unless the finalize path sanitizes like the
-// initial-write path does.
+// transcript whose line 2 is a `compaction` entry, positioned before the
+// checkpoint start so it exercises offset alignment.
+// codex.SanitizePortableTranscript strips the entry's payload but keeps its line,
+// so the sanitized transcript stays line-aligned with the rollout and a checkpoint
+// start of line 2 yields [beta, gamma] in both. (It used to drop the line, which
+// shifted the window and silently lost "beta".)
 func codexTranscriptWithCompactionBeforeStart() []byte {
 	lines := []string{
 		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alpha"}]}}`,
@@ -261,7 +261,7 @@ func codexTranscriptWithCompactionBeforeStart() []byte {
 // compact transcript.
 func TestUpdateCommitted_CodexCompactSanitizedLikeInitialWrite(t *testing.T) {
 	t.Parallel()
-	repo, _ := setupTestRepo(t)
+	repo := setupTestRepo(t)
 	store := NewGitStore(repo, DefaultV1Refs())
 	cpID := id.MustCheckpointID("e5f6a1b2c3d4")
 
@@ -287,20 +287,20 @@ func TestUpdateCommitted_CodexCompactSanitizedLikeInitialWrite(t *testing.T) {
 	if !ok {
 		t.Fatal("transcript.jsonl missing after WriteCommitted")
 	}
-	// transcript.jsonl is now the full sanitized session: the compaction line is
-	// dropped, so it holds [alpha, beta, gamma]. Scoping is via the marker.
+	// transcript.jsonl is the full sanitized session; scoping is via the marker.
 	if !strings.Contains(initialCompact, "gamma") {
 		t.Errorf("initial compact missing content:\n%s", initialCompact)
 	}
-	// The marker scopes out everything before the checkpoint start. Sanitize
-	// runs before compaction, so the dropped compaction line shifts the window:
-	// fullCompactLines[marker:] must be exactly [gamma], excluding "beta".
+	// The marker scopes out everything before the checkpoint start. Because
+	// sanitization preserves line numbering, a start of line 2 maps to the same
+	// place in the sanitized bytes as in the rollout: fullCompactLines[marker:]
+	// must hold [beta, gamma] and exclude "alpha".
 	initialMeta := readSessionMetadata(t, repo, cpID)
 	initialMarker, ok := initialMeta.GetCompactTranscriptStart()
 	if !ok {
 		t.Fatal("compact_transcript_start not recorded after WriteCommitted")
 	}
-	assertCompactSliceScoped(t, initialCompact, initialMarker, []string{"beta"}, []string{"gamma"})
+	assertCompactSliceScoped(t, initialCompact, initialMarker, []string{"alpha"}, []string{"beta", "gamma"})
 
 	// Finalize with the same raw transcript. replaceTranscript must sanitize
 	// before compaction, exactly like the initial write — otherwise the full
@@ -329,7 +329,7 @@ func TestUpdateCommitted_CodexCompactSanitizedLikeInitialWrite(t *testing.T) {
 	if finalizeMarker != initialMarker {
 		t.Errorf("finalize marker %d diverges from initial marker %d", finalizeMarker, initialMarker)
 	}
-	assertCompactSliceScoped(t, finalizeCompact, finalizeMarker, []string{"beta"}, []string{"gamma"})
+	assertCompactSliceScoped(t, finalizeCompact, finalizeMarker, []string{"alpha"}, []string{"beta", "gamma"})
 }
 
 // assertCompactSliceScoped checks that slicing the full compact transcript at
@@ -361,7 +361,7 @@ func assertCompactSliceScoped(t *testing.T, compactContent string, marker int, w
 // left pointing at content that no longer matches the re-redacted full.jsonl.
 func TestUpdateCommitted_DropsStaleCompactWhenRegenerationProducesNone(t *testing.T) {
 	t.Parallel()
-	repo, _ := setupTestRepo(t)
+	repo := setupTestRepo(t)
 	store := NewGitStore(repo, DefaultV1Refs())
 	cpID := id.MustCheckpointID("a7b8c9d0e1f2")
 
@@ -412,7 +412,7 @@ func TestUpdateCommitted_DropsStaleCompactWhenRegenerationProducesNone(t *testin
 
 func TestUpdateCommitted_RegeneratesCompactTranscript(t *testing.T) {
 	t.Parallel()
-	repo, _ := setupTestRepo(t)
+	repo := setupTestRepo(t)
 	store := NewGitStore(repo, DefaultV1Refs())
 	cpID := id.MustCheckpointID("d4e5f6a1b2c3")
 

@@ -5,16 +5,15 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/entireio/cli/cmd/entire/cli/auth"
-	"github.com/entireio/cli/internal/entireclient/httputil"
 )
 
 func TestInfoFlagText(t *testing.T) {
@@ -90,6 +89,94 @@ func TestParseProtocolVersion(t *testing.T) {
 	}
 }
 
+// fakeEnv builds a LookupEnv stand-in; nil means the variable is unset.
+func fakeEnv(vars map[string]string) func(string) (string, bool) {
+	return func(key string) (string, bool) {
+		v, ok := vars[key]
+		return v, ok
+	}
+}
+
+func TestResolveHTTPUserAgent(t *testing.T) {
+	t.Parallel()
+	const def = "git-remote-entire/1.2.3"
+	tests := []struct {
+		name    string
+		env     map[string]string
+		want    string
+		wantErr string
+	}{
+		{"unset_keeps_default", nil, def, ""},
+		{"set_replaces_verbatim", map[string]string{"GIT_HTTP_USER_AGENT": "git-remote-entire/abc1234 entire-runners/0.1.0"}, "git-remote-entire/abc1234 entire-runners/0.1.0", ""},
+		{"set_any_shape", map[string]string{"GIT_HTTP_USER_AGENT": "Mozilla/4.0"}, "Mozilla/4.0", ""},
+		{"empty_sends_nothing", map[string]string{"GIT_HTTP_USER_AGENT": ""}, "", ""},
+		{"other_vars_ignored", map[string]string{"HTTP_USER_AGENT": "x/1"}, def, ""},
+		{"crlf_names_the_variable", map[string]string{"GIT_HTTP_USER_AGENT": "x/1\r\nX-Injected: y"}, "", "GIT_HTTP_USER_AGENT holds an invalid header character"},
+		{"nul_names_the_variable", map[string]string{"GIT_HTTP_USER_AGENT": "x/1\x00"}, "", "GIT_HTTP_USER_AGENT holds an invalid header character"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := resolveHTTPUserAgent(def, fakeEnv(tc.env))
+			if got != tc.want {
+				t.Errorf("resolveHTTPUserAgent(%v) = %q, want %q", tc.env, got, tc.want)
+			}
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Errorf("unexpected error: %v", err)
+			case tc.wantErr != "" && (err == nil || err.Error() != tc.wantErr):
+				t.Errorf("error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// Uses the auth-path client run() ships and checks what the server
+// receives: the override verbatim, or no header at all for "".
+func TestHTTPUserAgent_ReachesServer(t *testing.T) {
+	t.Parallel()
+	const def = "git-remote-entire/1.2.3"
+	tests := []struct {
+		name string
+		env  map[string]string
+		want []string // nil means no User-Agent header at all
+	}{
+		{"default", nil, []string{def}},
+		{"override", map[string]string{"GIT_HTTP_USER_AGENT": "git-remote-entire/test entire-runners/0.1.0"}, []string{"git-remote-entire/test entire-runners/0.1.0"}},
+		{"empty", map[string]string{"GIT_HTTP_USER_AGENT": ""}, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var got []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = r.Header.Values("User-Agent")
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(server.Close)
+
+			ua, err := resolveHTTPUserAgent(def, fakeEnv(tc.env))
+			if err != nil {
+				t.Fatalf("resolveHTTPUserAgent: %v", err)
+			}
+			client := newAuthHTTPClient(false, ua)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+"/.well-known/entire-cluster.json", nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			_ = resp.Body.Close()
+
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("server saw User-Agent %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestGitActionFromRequest(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -113,61 +200,6 @@ func TestGitActionFromRequest(t *testing.T) {
 			req := httptest.NewRequestWithContext(context.Background(), tc.method, "https://host"+tc.path+"?"+tc.query, nil)
 			if got := gitActionFromRequest(req); got != tc.want {
 				t.Fatalf("gitActionFromRequest(%s %s?%s) = %q, want %q", tc.method, tc.path, tc.query, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestFatalMessage(t *testing.T) {
-	t.Parallel()
-	parsedURL := &url.URL{Scheme: "entire", Host: "aws-us-east-2.entire.io", Path: "/et/paul/dogbark"}
-	wrongCluster := &httputil.OAuthError{
-		Status:      http.StatusBadRequest,
-		Code:        "invalid_target",
-		Description: `audience host "aws-us-east-2.entire.io" does not host this repo; it lives on "aws-eu-central-1.entire.io" — re-target the request there`,
-		Body:        "{...}",
-	}
-	tests := []struct {
-		name        string
-		err         error
-		contains    []string
-		notContains []string
-	}{
-		{
-			name: "wrong cluster names correct host and URL",
-			// Wrapped to mirror production: the OAuthError surfaces buried under
-			// several fmt.Errorf layers, so errors.As must dig it out.
-			err: fmt.Errorf("stateless-connect v2 info/refs: fetching info/refs from entry domain: repo-scoped token exchange: oauth token exchange: %w", wrongCluster),
-			contains: []string{
-				"aws-eu-central-1.entire.io",
-				"git clone entire://aws-eu-central-1.entire.io/et/paul/dogbark",
-			},
-			notContains: []string{"HTTP 400", "invalid_target"},
-		},
-		{
-			name:     "invalid_target without lives-on hint falls back",
-			err:      &httputil.OAuthError{Status: http.StatusBadRequest, Code: "invalid_target", Description: "no servable mirror", Body: "HTTP 400: no servable mirror"},
-			contains: []string{"fatal:", "no servable mirror"},
-		},
-		{
-			name:     "unrelated error falls back verbatim",
-			err:      errors.New("connection refused"),
-			contains: []string{"fatal: connection refused"},
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got := fatalMessage(tc.err, parsedURL)
-			for _, sub := range tc.contains {
-				if !strings.Contains(got, sub) {
-					t.Errorf("fatalMessage() = %q, missing %q", got, sub)
-				}
-			}
-			for _, sub := range tc.notContains {
-				if strings.Contains(got, sub) {
-					t.Errorf("fatalMessage() = %q, should not contain %q", got, sub)
-				}
 			}
 		})
 	}
@@ -242,6 +274,28 @@ func TestMissingClusterHostMessage(t *testing.T) {
 			contains:    []string{`fatal: missing host in URL "entire://gh/owner/repo/extra"`},
 			notContains: []string{"entire repo clone"},
 		},
+		{
+			// The native forge token is recognized in the host slot too, so it
+			// gets the actionable message rather than an attempt to dial a
+			// cluster literally named "et" — and its segments are labelled
+			// <project>/<repo>, which is what /et/ paths actually take.
+			name:   "native forge in host slot is actionable",
+			rawURL: "entire://et/paul/dogbark",
+			contains: []string{
+				`("et" is a forge id, not a host)`,
+				"entire://<cluster-host>/et/<project>/<repo>",
+				"entire repo clone /et/paul/dogbark",
+			},
+			notContains: []string{"<owner>/<repo>"},
+		},
+		{
+			name:   "native forge with empty host is actionable",
+			rawURL: "entire:///et/paul/dogbark",
+			contains: []string{
+				"entire://<cluster-host>/et/<project>/<repo>",
+				"entire repo clone /et/paul/dogbark",
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -308,11 +362,43 @@ func makeTestJWT(t *testing.T, aud string) string {
 	return header + "." + payload + "." + enc.EncodeToString([]byte("sig"))
 }
 
+// testClusterHost is the cluster name the ENTIRE_TOKEN tests dial. It shares
+// entire.io with the cores they advertise, which the same-site gate on
+// discovery requires; the TLS test server itself answers on 127.0.0.1, so
+// pinnedClient rewrites the dial while the URL the code sees keeps this name.
+const testClusterHost = "cluster.entire.io"
+
+// pinnedClient returns srv.Client() with every request redirected to srv,
+// whatever host the URL names. TLS still verifies against 127.0.0.1, which
+// the httptest certificate covers.
+func pinnedClient(t *testing.T, srv *httptest.Server) *http.Client {
+	t.Helper()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	c := srv.Client()
+	c.Transport = pinnedTransport{base: c.Transport, scheme: u.Scheme, host: u.Host}
+	return c
+}
+
+type pinnedTransport struct {
+	base   http.RoundTripper
+	scheme string
+	host   string
+}
+
+func (p pinnedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.URL.Scheme = p.scheme
+	req.URL.Host = p.host
+	return p.base.RoundTrip(req)
+}
+
 // wellKnownServer serves /.well-known/entire-cluster.json advertising the
 // given cores, jurisdiction audience, and jurisdiction core over TLS,
-// returning the server and the host:port to use as clusterHost. An empty
-// audience models a cluster predating jurisdiction-token git auth.
-func wellKnownServer(t *testing.T, cores []string, jurisdictionAudience, jurisdictionCoreURL string) (*httptest.Server, string) {
+// returning a client pinned to it and testClusterHost to use as clusterHost.
+// An empty audience models a cluster predating jurisdiction-token git auth.
+func wellKnownServer(t *testing.T, cores []string, jurisdictionAudience, jurisdictionCoreURL string) (*http.Client, string) {
 	t.Helper()
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/.well-known/entire-cluster.json" {
@@ -329,104 +415,73 @@ func wellKnownServer(t *testing.T, cores []string, jurisdictionAudience, jurisdi
 		_ = json.NewEncoder(w).Encode(body) //nolint:errcheck // best-effort in test stub
 	}))
 	t.Cleanup(srv.Close)
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatalf("parse server URL: %v", err)
-	}
-	return srv, u.Host
+	return pinnedClient(t, srv), testClusterHost
 }
 
 func TestResolveEnvTokenCreds_TrustedAudSucceeds(t *testing.T) {
 	t.Parallel()
 	const core = "https://core.us.entire.io"
 	const audience = "https://us.entire.io"
-	srv, clusterHost := wellKnownServer(t, []string{core}, audience, core)
+	client, clusterHost := wellKnownServer(t, []string{core}, audience, core)
+	envToken := makeTestJWT(t, core)
 
-	creds, err := resolveEnvTokenCreds(
-		t.Context(), makeTestJWT(t, core), clusterHost, t.TempDir(), srv.Client(),
+	creds, _, err := resolveEnvTokenCreds(
+		t.Context(), envToken, clusterHost, t.TempDir(), client,
 	)
 	if err != nil {
 		t.Fatalf("expected trusted aud to succeed, got: %v", err)
 	}
-	if creds == nil {
-		t.Fatal("expected non-nil creds for trusted aud")
+	got, err := creds(t.Context())
+	if err != nil {
+		t.Fatalf("provider: %v", err)
 	}
-	// The exchange must be pinned to the token's own (trust-gated) core with
-	// the cluster's advertised jurisdiction audience, and must never touch
-	// the keychain — CI runners don't have one.
-	if creds.fixedCoreURL != core {
-		t.Errorf("fixedCoreURL = %q, want %q", creds.fixedCoreURL, core)
-	}
-	if creds.audience != audience {
-		t.Errorf("audience = %q, want %q", creds.audience, audience)
-	}
-	if creds.persist {
-		t.Error("env-token creds must not persist to the keychain")
-	}
-	if creds.exchangeHint != "" {
-		t.Errorf("no cross-jurisdiction hint expected when the token's core is the jurisdiction core, got %q", creds.exchangeHint)
+	if got != envToken {
+		t.Errorf("creds = %q, want ENTIRE_TOKEN verbatim", got)
 	}
 }
 
-func TestResolveEnvTokenCreds_CrossJurisdictionTokenGetsHint(t *testing.T) {
+func TestResolveEnvTokenCreds_CrossJurisdictionTokenUsesBearer(t *testing.T) {
 	t.Parallel()
 	// Clusters advertise every jurisdiction's cores, so a token minted at a
-	// sibling core passes the trust gate — but the exchange at that core is
-	// doomed. The resolver must pre-compute the actionable hint that the
-	// eventual exchange failure surfaces.
+	// sibling core passes the trust gate and is used directly as the bearer.
 	const tokenCore = "https://core.eu.entire.io"
 	const jurisdictionCore = "https://core.us.entire.io"
-	srv, clusterHost := wellKnownServer(t, []string{tokenCore, jurisdictionCore}, "https://us.entire.io", jurisdictionCore)
+	client, clusterHost := wellKnownServer(t, []string{tokenCore, jurisdictionCore}, "https://us.entire.io", jurisdictionCore)
+	envToken := makeTestJWT(t, tokenCore)
 
-	creds, err := resolveEnvTokenCreds(
-		t.Context(), makeTestJWT(t, tokenCore), clusterHost, t.TempDir(), srv.Client(),
+	creds, _, err := resolveEnvTokenCreds(
+		t.Context(), envToken, clusterHost, t.TempDir(), client,
 	)
 	if err != nil {
-		t.Fatalf("cross-jurisdiction token must still resolve (it fails at exchange time), got: %v", err)
+		t.Fatalf("cross-jurisdiction token must resolve, got: %v", err)
 	}
-	for _, want := range []string{tokenCore, clusterHost, "point your CI auth url at " + jurisdictionCore} {
-		if !strings.Contains(creds.exchangeHint, want) {
-			t.Errorf("exchangeHint missing %q, got %q", want, creds.exchangeHint)
-		}
+	got, err := creds(t.Context())
+	if err != nil {
+		t.Fatalf("provider: %v", err)
 	}
-}
-
-func TestCrossJurisdictionHint_SameCoreVariantsStaySilent(t *testing.T) {
-	t.Parallel()
-	// Trailing-slash and case differences are the same core — a hint there
-	// would cry wolf on healthy configs. An unadvertised jurisdiction core
-	// (pre-upgrade server) also stays silent: there is nothing to point at.
-	for _, tc := range []struct{ name, coreURL, jurisdictionCoreURL string }{
-		{"exact", "https://core.us.entire.io", "https://core.us.entire.io"},
-		{"trailing slash", "https://core.us.entire.io/", "https://core.us.entire.io"},
-		{"case", "https://CORE.us.entire.io", "https://core.us.entire.io"},
-		{"unadvertised", "https://core.us.entire.io", ""},
-	} {
-		if hint := crossJurisdictionHint(tc.coreURL, "cluster.example.com", tc.jurisdictionCoreURL); hint != "" {
-			t.Errorf("%s: expected no hint, got %q", tc.name, hint)
-		}
+	if got != envToken {
+		t.Errorf("creds = %q, want ENTIRE_TOKEN verbatim", got)
 	}
 }
 
-func TestResolveEnvTokenCreds_MissingJurisdictionAudienceAborts(t *testing.T) {
+func TestResolveEnvTokenCreds_DoesNotRequireJurisdictionAudience(t *testing.T) {
 	t.Parallel()
-	// The cluster's core set trusts the token, but the cluster predates
-	// jurisdiction-token git auth (no jurisdiction_audience). With no
-	// repo-scoped fallback left, this must fail closed with the upgrade hint.
 	const core = "https://core.us.entire.io"
-	srv, clusterHost := wellKnownServer(t, []string{core}, "", "")
+	client, clusterHost := wellKnownServer(t, []string{core}, "", "")
+	envToken := makeTestJWT(t, core)
 
-	creds, err := resolveEnvTokenCreds(
-		t.Context(), makeTestJWT(t, core), clusterHost, t.TempDir(), srv.Client(),
+	creds, _, err := resolveEnvTokenCreds(
+		t.Context(), envToken, clusterHost, t.TempDir(), client,
 	)
-	if err == nil {
-		t.Fatal("expected missing jurisdiction_audience to be rejected")
+	if err != nil {
+		t.Fatalf("resolve direct bearer without jurisdiction audience: %v", err)
 	}
-	if creds != nil {
-		t.Fatal("expected nil creds when the cluster advertises no jurisdiction_audience")
+	got, err := creds(t.Context())
+	if err != nil {
+		t.Fatalf("provider: %v", err)
 	}
-	if !strings.Contains(err.Error(), "jurisdiction_audience") {
-		t.Fatalf("expected jurisdiction_audience error, got: %v", err)
+	if got != envToken {
+		t.Errorf("creds = %q, want ENTIRE_TOKEN verbatim", got)
 	}
 }
 
@@ -438,7 +493,7 @@ func TestResolveCreds_BlankEnvTokenFailsClosed(t *testing.T) {
 	dummyURL := &url.URL{Scheme: "entire", Host: "cluster.example.com"}
 	for _, blank := range []string{"", " ", "\t", "\n", " \t\n "} {
 		t.Setenv(auth.EnvTokenVar, blank)
-		creds, err := resolveCreds(t.Context(), dummyURL, false, nil)
+		creds, _, err := resolveCreds(t.Context(), dummyURL, false, nil)
 		if err == nil {
 			t.Fatalf("blank ENTIRE_TOKEN %q should fail closed", blank)
 		}
@@ -451,14 +506,85 @@ func TestResolveCreds_BlankEnvTokenFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSetAuthWithProvider_ResolvesCredentialPerRequest(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	setAuth := setAuthWithProvider(func(context.Context) (string, error) {
+		calls++
+		return fmt.Sprintf("login-jwt-%d", calls), nil
+	})
+
+	for i, want := range []string{"Bearer login-jwt-1", "Bearer login-jwt-2"} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://cluster.example.com/et/alice/repo/info/refs?service=git-upload-pack", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := setAuth(req); err != nil {
+			t.Fatalf("setAuth[%d]: %v", i, err)
+		}
+		if got := req.Header.Get("Authorization"); got != want {
+			t.Errorf("Authorization[%d] = %q, want %q", i, got, want)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("provider calls = %d, want 2", calls)
+	}
+}
+
+type fakeRefreshableCredential struct {
+	token       string
+	forcedToken string
+	tokenCalls  int
+	forceCalls  int
+	forcedStale string
+}
+
+func (f *fakeRefreshableCredential) Token(context.Context) (string, error) {
+	f.tokenCalls++
+	return f.token, nil
+}
+
+func (f *fakeRefreshableCredential) ForceRefresh(_ context.Context, staleToken string) (string, error) {
+	f.forceCalls++
+	f.forcedStale = staleToken
+	f.token = f.forcedToken
+	return f.token, nil
+}
+
+func TestRefreshingProvider_ForceRefreshesAfterUnauthorized(t *testing.T) {
+	t.Parallel()
+	source := &fakeRefreshableCredential{token: "rejected-jwt", forcedToken: "refreshed-jwt"}
+	provider, onUnauthorized := refreshingProvider(source)
+
+	got, err := provider(t.Context())
+	if err != nil {
+		t.Fatalf("initial provider: %v", err)
+	}
+	if got != "rejected-jwt" {
+		t.Fatalf("initial token = %q, want rejected-jwt", got)
+	}
+
+	onUnauthorized()
+	got, err = provider(t.Context())
+	if err != nil {
+		t.Fatalf("provider after 401: %v", err)
+	}
+	if got != "refreshed-jwt" {
+		t.Fatalf("token after 401 = %q, want refreshed-jwt", got)
+	}
+	if source.forceCalls != 1 || source.forcedStale != "rejected-jwt" {
+		t.Fatalf("ForceRefresh calls = %d with stale %q, want 1 with rejected-jwt", source.forceCalls, source.forcedStale)
+	}
+}
+
 func TestResolveEnvTokenCreds_UntrustedAudAborts(t *testing.T) {
 	t.Parallel()
 	// The cluster advertises only core.us; the token's aud points elsewhere.
 	// The gate must abort before building creds (i.e. before any exchange).
-	srv, clusterHost := wellKnownServer(t, []string{"https://core.us.entire.io"}, "https://us.entire.io", "https://core.us.entire.io")
+	client, clusterHost := wellKnownServer(t, []string{"https://core.us.entire.io"}, "https://us.entire.io", "https://core.us.entire.io")
 
-	creds, err := resolveEnvTokenCreds(
-		t.Context(), makeTestJWT(t, "https://attacker.example.com"), clusterHost, t.TempDir(), srv.Client(),
+	creds, _, err := resolveEnvTokenCreds(
+		t.Context(), makeTestJWT(t, "https://attacker.example.com"), clusterHost, t.TempDir(), client,
 	)
 	if err == nil {
 		t.Fatal("expected untrusted aud to be rejected")
@@ -475,16 +601,44 @@ func TestResolveEnvTokenCreds_EmptyAdvertisedCoresAborts(t *testing.T) {
 	t.Parallel()
 	// Discovery succeeds (HTTP 200) but advertises no cores. With nothing to
 	// trust, the gate must fail closed rather than trusting the token's aud.
-	srv, clusterHost := wellKnownServer(t, []string{}, "https://us.entire.io", "https://core.us.entire.io")
+	client, clusterHost := wellKnownServer(t, []string{}, "https://us.entire.io", "https://core.us.entire.io")
 
-	creds, err := resolveEnvTokenCreds(
-		t.Context(), makeTestJWT(t, "https://core.us.entire.io"), clusterHost, t.TempDir(), srv.Client(),
+	creds, _, err := resolveEnvTokenCreds(
+		t.Context(), makeTestJWT(t, "https://core.us.entire.io"), clusterHost, t.TempDir(), client,
 	)
 	if err == nil {
 		t.Fatal("expected empty advertised core set to be rejected")
 	}
 	if creds != nil {
 		t.Fatal("expected nil creds when no cores are advertised")
+	}
+}
+
+func TestResolveEnvTokenCreds_CrossSiteCoresAbort(t *testing.T) {
+	t.Parallel()
+	// A cluster under one domain advertising a core under another is the
+	// shape of a token-stealing cluster: the token's aud WOULD match the
+	// advertised list, so coreTrusted alone would hand it over. The same-site
+	// gate on discovery must refuse first, naming both sides.
+	const foreignCore = "https://core.us.evil.example"
+	client, clusterHost := wellKnownServer(t, []string{foreignCore}, "https://us.entire.io", foreignCore)
+
+	creds, _, err := resolveEnvTokenCreds(
+		t.Context(), makeTestJWT(t, foreignCore), clusterHost, t.TempDir(), client,
+	)
+	if err == nil {
+		t.Fatal("expected a cross-site core to be refused")
+	}
+	if creds != nil {
+		t.Fatal("expected nil creds when a cross-site core is advertised")
+	}
+	for _, want := range []string{"cluster " + testClusterHost, foreignCore, "outside entire.io", "refusing"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q must contain %q", err.Error(), want)
+		}
+	}
+	if strings.Contains(err.Error(), "not a trusted login server") {
+		t.Fatal("the same-site gate must refuse before the aud comparison runs")
 	}
 }
 
@@ -501,7 +655,7 @@ func TestResolveEnvTokenCreds_DiscoveryFailureAborts(t *testing.T) {
 		t.Fatalf("parse server URL: %v", err)
 	}
 
-	creds, err := resolveEnvTokenCreds(
+	creds, _, err := resolveEnvTokenCreds(
 		t.Context(), makeTestJWT(t, "https://core.us.entire.io"), u.Host, t.TempDir(), srv.Client(),
 	)
 	if err == nil {
@@ -516,7 +670,7 @@ func TestResolveEnvTokenCreds_MalformedTokenAborts(t *testing.T) {
 	t.Parallel()
 	// A malformed aud must fail at the parse/validate step, before any network
 	// discovery happens — so a nil httpClient is safe here.
-	creds, err := resolveEnvTokenCreds(
+	creds, _, err := resolveEnvTokenCreds(
 		t.Context(), makeTestJWT(t, "http://core.us.entire.io"), "cluster.example.com", t.TempDir(), nil,
 	)
 	if err == nil {

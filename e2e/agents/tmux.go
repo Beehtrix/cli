@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -13,6 +14,7 @@ import (
 type TmuxSession struct {
 	name         string
 	stableAtSend string   // stable content snapshot when Send was last called
+	rawAtSend    string   // unstripped snapshot from the same moment
 	cleanups     []func() // run on Close
 }
 
@@ -34,7 +36,7 @@ func NewTmuxSession(name string, dir string, unsetEnv []string, command string, 
 	tmuxArgs := []string{"new-session", "-d", "-s", name, "-c", dir}
 	// Build a shell command string using `env` to:
 	//   1. Propagate PATH from the current process (tmux server may have stale PATH)
-	//   2. Unset variables listed in unsetEnv
+	//   2. Unset harnessOnlyEnv and the variables listed in unsetEnv
 	// All arguments are shell-quoted to prevent injection or splitting.
 	// PATH is always forwarded from the current process so that the freshly-built
 	// "entire" binary (prepended to PATH by main_test.go) is available inside the
@@ -43,7 +45,7 @@ func NewTmuxSession(name string, dir string, unsetEnv []string, command string, 
 	var parts []string
 	parts = append(parts, "env")
 	// Options (-u) must precede variable assignments for BSD env on macOS.
-	for _, v := range unsetEnv {
+	for _, v := range append(slices.Clone(harnessOnlyEnv), unsetEnv...) {
 		parts = append(parts, "-u", shellQuote(v))
 	}
 	parts = append(parts, "PATH="+shellQuote(os.Getenv("PATH")))
@@ -79,6 +81,7 @@ func (s *TmuxSession) Send(input string) error {
 	// on prompt characters (e.g. ❯) in the echoed input. Taken before Enter so
 	// it can never include response output from a fast agent.
 	s.stableAtSend = stableContent(settled)
+	s.rawAtSend = settled
 
 	// Verify the pane reacted to Enter; a swallowed Enter leaves the prompt
 	// sitting unsubmitted in the input box. Retry a couple of times — TUIs
@@ -162,6 +165,17 @@ func stableContent(content string) string {
 	return strings.Join(lines, "\n")
 }
 
+// paneLines counts the lines in a pane capture. WaitFor compares growth
+// rather than raw inequality: the tail lines a capture ends with repaint on
+// their own (spinners, clocks, prompt redraws) without adding lines, so only
+// growth is evidence of appended output.
+func paneLines(content string) int {
+	if content == "" {
+		return 0
+	}
+	return strings.Count(content, "\n") + 1
+}
+
 func (s *TmuxSession) WaitFor(pattern string, timeout time.Duration) (string, error) {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
@@ -191,8 +205,14 @@ func (s *TmuxSession) WaitFor(pattern string, timeout time.Duration) (string, er
 			continue
 		}
 
-		// Detect content change since Send was called
-		if !contentChanged && stable != s.stableAtSend {
+		// Detect content change since Send was called. The stripped compare
+		// aliases when a fast agent's entire response fits in the stripped
+		// tail (a 2-line echo is identical before and after "Working/Done/>"
+		// are appended and stripped), so also accept the raw pane having
+		// grown: an unsubmitted echo plus tail-chrome repaints adds no lines.
+		// Copilot's custom Send leaves rawAtSend unset; the empty check keeps
+		// its exact previous behavior.
+		if !contentChanged && (stable != s.stableAtSend || (s.rawAtSend != "" && paneLines(content) > paneLines(s.rawAtSend))) {
 			contentChanged = true
 		}
 
@@ -240,6 +260,38 @@ func (s *TmuxSession) Close() error {
 	for _, fn := range s.cleanups {
 		fn()
 	}
+	return s.Terminate()
+}
+
+// Quit asks the foreground program to exit the way a user would — by sending
+// Ctrl+C — and waits for the process to actually exit. It sends Ctrl+C again
+// each poll because some TUIs (Codex among them) treat a single Ctrl+C as
+// "cancel the current turn" and need a second press to quit, and that gesture
+// is version-dependent. If the process has still not exited by timeout it falls
+// back to a hard kill: callers use Quit when they need the process gone (e.g.
+// to release a lock it holds) and must not hang on an agent that changed its
+// quit keybinding. Like Terminate, it does NOT run the OnClose cleanups, so a
+// caller that needs a registered resource torn down owns that itself.
+func (s *TmuxSession) Quit(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if s.IsPaneDead() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return s.Terminate()
+		}
+		_ = s.SendKeys("C-c")
+		time.Sleep(pollInterval)
+	}
+}
+
+// Terminate kills the tmux session (and the process it runs) WITHOUT running
+// the registered OnClose cleanups. Use it when the process must die but a
+// resource it registered for teardown — e.g. an isolated HOME that a later
+// step in the same test still reads — has to outlive the process. Callers that
+// bypass Close this way own the surviving resource's cleanup themselves.
+func (s *TmuxSession) Terminate() error {
 	cmd := exec.Command("tmux", "kill-session", "-t", s.name)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

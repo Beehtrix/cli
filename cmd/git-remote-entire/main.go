@@ -14,22 +14,21 @@
 // Authentication resolves the login context for the target cluster from the
 // shared contexts.json: the cluster's cores come from the cluster_cores.json
 // cache (or a live /.well-known fetch on miss), then the account is selected
-// from local contexts. It then mints a jurisdiction access token by
-// exchanging that context's login JWT (or ENTIRE_TOKEN in CI).
+// from local contexts. It uses that context's login JWT (or ENTIRE_TOKEN in
+// CI) directly as the git-transport bearer.
 package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,7 +37,6 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/versioninfo"
 	"github.com/entireio/cli/internal/entireclient/clusterdiscovery"
 	"github.com/entireio/cli/internal/entireclient/httpclient"
-	"github.com/entireio/cli/internal/entireclient/httputil"
 	"github.com/entireio/cli/internal/entireclient/userdirs"
 	"github.com/entireio/cli/internal/remotehelper"
 	"github.com/entireio/cli/internal/remotehelper/debuglog"
@@ -46,6 +44,7 @@ import (
 	"github.com/entireio/cli/internal/remotehelper/httpdebug"
 	"github.com/entireio/cli/internal/remotehelper/replicas"
 	"github.com/entireio/cli/internal/remotehelper/transport"
+	"golang.org/x/net/http/httpguts"
 )
 
 func main() {
@@ -70,16 +69,26 @@ func run(args []string) int {
 	}
 
 	// Build info drives the identifier the helper advertises upstream.
-	// One string covers both surfaces:
+	// One default string covers both surfaces:
 	//   - githelper.Agent rides in the git protocol pkt-line agent=
 	//     capability appended to upload-pack / receive-pack / v2 requests.
 	//   - httpUserAgent rides in the HTTP User-Agent header on every
 	//     outbound request so server access logs can attribute traffic.
-	// Using the same value keeps the two log surfaces correlatable.
+	// They differ only when the user overrides the HTTP header through
+	// git's own GIT_HTTP_USER_AGENT (resolveHTTPUserAgent). The pkt-line
+	// agent is never overridable: the protocol allows one token with no
+	// whitespace, so a free-form user string would corrupt the capability.
 	versioninfo.Load()
 	helperAgent := remotehelper.BinaryName + "/" + versioninfo.Version
 	githelper.Agent = helperAgent
-	httpUserAgent := helperAgent
+	httpUserAgent, err := resolveHTTPUserAgent(helperAgent, os.LookupEnv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		return 128
+	}
+	if httpUserAgent != helperAgent {
+		debuglog.Printf("http user-agent set from %s", httpUserAgentEnvVar)
+	}
 
 	rawURL := args[2]
 	parsedURL, err := url.Parse(rawURL)
@@ -90,7 +99,7 @@ func run(args []string) int {
 	case parsedURL.Scheme != "entire":
 		fmt.Fprintf(os.Stderr, "fatal: unsupported URL scheme %q (expected 'entire')\n", parsedURL.Scheme)
 		return 128
-	case parsedURL.Host == "" || gitremote.IsSupportedForge(parsedURL.Host):
+	case parsedURL.Host == "" || gitremote.IsForgePathToken(parsedURL.Host):
 		// Cluster host absent (empty, or a forge id in its slot);
 		// missingClusterHostMessage renders the actionable hint.
 		fmt.Fprint(os.Stderr, missingClusterHostMessage(parsedURL, rawURL))
@@ -104,47 +113,15 @@ func run(args []string) int {
 
 	nodeCfg := replicas.Resolve(parsedURL)
 
-	// This client drives the auth path only: cluster /.well-known discovery
-	// and the token exchange. Both talk to a single control-plane host with no
-	// failover to fall back on, so they get the patient discovery dial budget
-	// (DiscoveryDialTimeout, i.e. DefaultDiscoveryDialTimeout unless
-	// ENTIRE_CONNECT_TIMEOUT_SECONDS overrides it) rather than the short failover
-	// one — a slow cold connect here would otherwise fail the whole clone/fetch.
-	httpClient := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &httpclient.UserAgentTransport{
-			Next: &httpdebug.TimingRoundTripper{
-				Next:  httpclient.NewDiscoveryTransport(skipTLS),
-				Label: "auth",
-			},
-			UA: httpUserAgent,
-		},
-	}
+	httpClient := newAuthHTTPClient(skipTLS, httpUserAgent)
 
-	creds, err := resolveCreds(ctx, parsedURL, skipTLS, httpClient)
+	creds, onUnauthorized, err := resolveCreds(ctx, parsedURL, skipTLS, httpClient)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		return 128
 	}
 
-	setAuth := func(req *http.Request) error {
-		// Refuse to attach credentials to a request we can't classify as a
-		// known git smart-HTTP endpoint. The jurisdiction token doesn't
-		// need the action, but sending a bearer to an unexpected endpoint
-		// is never right.
-		action := gitActionFromRequest(req)
-		if action == "" {
-			return fmt.Errorf("refusing to attach credentials: %s %s is not a recognised git smart-HTTP endpoint", req.Method, req.URL.Path)
-		}
-		start := time.Now()
-		token, err := creds.Token(req.Context())
-		if err != nil {
-			return fmt.Errorf("git credential exchange: %w", err)
-		}
-		debuglog.Printf("timing: token-acquire action=%s dur_ms=%d (keychain + login refresh + exchange; ~0 when memoized)", action, time.Since(start).Milliseconds())
-		req.Header.Set("Authorization", "Bearer "+token)
-		return nil
-	}
+	setAuth := setAuthWithProvider(creds)
 
 	var onNodeFailed func(string)
 	if nodeCfg.Caching() {
@@ -152,16 +129,11 @@ func run(args []string) int {
 	}
 
 	proxy := transport.New(transport.Config{
-		Nodes:   nodeCfg,
-		Path:    parsedURL.Path,
-		SkipTLS: skipTLS,
-		SetAuth: setAuth,
-		// A 401 means the data plane rejected the credential itself (e.g.
-		// signing-key rotation invalidated a persisted jurisdiction token) —
-		// drop it so the next invocation re-mints instead of failing until
-		// the token's recorded expiry. The env-token source persists
-		// nothing; it drops only its in-process memo.
-		OnUnauthorized: creds.Invalidate,
+		Nodes:          nodeCfg,
+		Path:           parsedURL.Path,
+		SkipTLS:        skipTLS,
+		SetAuth:        setAuth,
+		OnUnauthorized: onUnauthorized,
 		OnNodeFailed:   onNodeFailed,
 		UserAgent:      httpUserAgent,
 	})
@@ -171,46 +143,81 @@ func run(args []string) int {
 
 	helperStart := time.Now()
 	if err := githelper.Run(ctx, proxy, protocolVersion, os.Stdin, os.Stdout); err != nil {
-		fmt.Fprint(os.Stderr, fatalMessage(err, parsedURL))
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		return 128
 	}
 	debuglog.Printf("timing: helper-session dur_ms=%d", time.Since(helperStart).Milliseconds())
 	return 0
 }
 
-// wrongClusterRe extracts the host that actually serves the repo from the
-// data plane's `invalid_target` error_description (RFC 8693). The data plane
-// emits this when the audience host doesn't host the repo but a sibling
-// cluster does, naming the correct host so we can point the user at it. The
-// phrasing is "… it lives on \"<host>\" …"; anchoring on "lives on" keeps the
-// match tied to this specific, actionable case rather than other
-// invalid_target variants (e.g. a suspended mirror).
-var wrongClusterRe = regexp.MustCompile(`lives on "([^"]+)"`)
+type credentialProvider func(context.Context) (string, error)
 
-// fatalMessage renders the stderr "fatal: …" line for a transfer error. When
-// the failure is the data plane reporting that the repo lives on a different
-// cluster, it special-cases the raw OAuth chain into an actionable message
-// naming the correct host (and the corrected entire:// URL). Everything else
-// falls back to the verbatim error.
-func fatalMessage(err error, parsedURL *url.URL) string {
-	var oe *httputil.OAuthError
-	if errors.As(err, &oe) && oe.Code == "invalid_target" {
-		if m := wrongClusterRe.FindStringSubmatch(oe.Description); m != nil {
-			host := m[1]
-			// Copy the URL the user typed and swap only the host, so any
-			// escaped path (RawPath) or query stays byte-identical to what
-			// they originally ran.
-			correctedURL := *parsedURL
-			correctedURL.Scheme = "entire"
-			correctedURL.Host = host
-			correctedURL.User = nil
-			corrected := correctedURL.String()
-			return fmt.Sprintf("fatal: this repository is not hosted on %s; it lives on %s.\n"+
-				"Re-run against the correct host, e.g.:\n\n    git clone %s\n",
-				parsedURL.Host, host, corrected)
+type refreshableCredential interface {
+	Token(ctx context.Context) (string, error)
+	ForceRefresh(ctx context.Context, staleToken string) (string, error)
+}
+
+// refreshingProvider defers reactive refresh work until the transport rebuilds
+// a request after a 401, so the network call uses that request's context. The
+// observer itself only marks the last bearer stale.
+func refreshingProvider(credential refreshableCredential) (credentialProvider, func()) {
+	var mu sync.Mutex
+	var lastToken, rejectedToken string
+
+	provider := func(ctx context.Context) (string, error) {
+		mu.Lock()
+		stale := rejectedToken
+		rejectedToken = ""
+		mu.Unlock()
+
+		var token string
+		var err error
+		if stale != "" {
+			token, err = credential.ForceRefresh(ctx, stale)
+		} else {
+			token, err = credential.Token(ctx)
 		}
+		if err != nil {
+			if stale != "" {
+				mu.Lock()
+				if rejectedToken == "" {
+					rejectedToken = stale
+				}
+				mu.Unlock()
+			}
+			return "", fmt.Errorf("resolve login credential: %w", err)
+		}
+
+		mu.Lock()
+		lastToken = token
+		mu.Unlock()
+		return token, nil
 	}
-	return fmt.Sprintf("fatal: %v\n", err)
+
+	onUnauthorized := func() {
+		mu.Lock()
+		rejectedToken = lastToken
+		mu.Unlock()
+		debuglog.Printf("data plane rejected login bearer; marked it stale for the transport's retry")
+	}
+	return provider, onUnauthorized
+}
+
+func setAuthWithProvider(provider credentialProvider) transport.SetAuthFunc {
+	return func(req *http.Request) error {
+		// Refuse to attach credentials to a request we can't classify as a
+		// known git smart-HTTP endpoint. Sending a bearer to an unexpected
+		// endpoint is never right.
+		if gitActionFromRequest(req) == "" {
+			return fmt.Errorf("refusing to attach credentials: %s %s is not a recognised git smart-HTTP endpoint", req.Method, req.URL.Path)
+		}
+		token, err := provider(req.Context())
+		if err != nil {
+			return fmt.Errorf("resolve git credential: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		return nil
+	}
 }
 
 // missingClusterHostMessage renders the stderr "fatal: …" line for an entire://
@@ -218,10 +225,16 @@ func fatalMessage(err error, parsedURL *url.URL) string {
 // where the host belongs (entire://gh/owner/repo, Host="gh") and an empty host
 // (entire:///gh/owner/repo, Host=""). When the reconstructed shorthand is a
 // complete forge/owner/repo triple that `entire repo clone` can resolve, it
-// points at the interactive picker; a partial path (entire://gh,
-// entire://gh/owner) or a non-forge segment falls back to the plain
-// missing-host error rather than suggesting a clone command that would reject
-// the ref. Kept pure so it's unit-testable.
+// points at that command; a partial path (entire://gh, entire://gh/owner) or a
+// non-forge segment falls back to the plain missing-host error rather than
+// suggesting a clone command that would reject the ref. Kept pure so it's
+// unit-testable.
+//
+// The trailing segments are labelled per forge (gitremote.ForgePathLabels), so
+// a native path reads <project>/<repo> rather than a mirror's <owner>/<repo>.
+// The suggestion stays neutral about what `repo clone` will then do — on
+// either forge it resolves the repo's readable clusters and prompts when there
+// is more than one — because describing that flow here would just drift.
 func missingClusterHostMessage(parsedURL *url.URL, rawURL string) string {
 	// Reconstruct the forge/owner/repo shorthand the user likely intended: a
 	// forge id in the host slot sits in front of the path; an empty host
@@ -234,14 +247,14 @@ func missingClusterHostMessage(parsedURL *url.URL, rawURL string) string {
 	// (the shape parseMirrorCloneRef accepts); anything shorter would relocate
 	// the failure into a clone command that rejects the ref.
 	seg := strings.Split(strings.Trim(shorthand, "/"), "/")
-	if len(seg) != 3 || seg[0] == "" || seg[1] == "" || seg[2] == "" || !gitremote.IsSupportedForge(seg[0]) {
+	if len(seg) != 3 || seg[0] == "" || seg[1] == "" || seg[2] == "" || !gitremote.IsForgePathToken(seg[0]) {
 		return fmt.Sprintf("fatal: missing host in URL %q\n", rawURL)
 	}
 	return fmt.Sprintf(
 		"fatal: entire:// URL is missing its cluster host (%q is a forge id, not a host).\n"+
-			"The full form is entire://<cluster-host>/%s/<owner>/<repo>.\n"+
-			"To pick a mirror interactively, run:\n\n    entire repo clone /%s\n",
-		seg[0], seg[0], strings.Join(seg, "/"))
+			"The full form is entire://<cluster-host>/%s/%s.\n"+
+			"To clone it, run:\n\n    entire repo clone /%s\n",
+		seg[0], seg[0], gitremote.ForgePathLabels(seg[0]), strings.Join(seg, "/"))
 }
 
 // loadedVersion populates the build info and returns the resolved version.
@@ -265,6 +278,57 @@ func infoFlagText(flag, version string) (string, bool) {
 			remotehelper.BinaryName, version), true
 	}
 	return "", false
+}
+
+// httpUserAgentEnvVar is git's own override for the HTTP User-Agent
+// header (git-config(1), http.userAgent: "Can be overridden by the
+// GIT_HTTP_USER_AGENT environment variable"). Git passes its environment
+// through to remote helpers, so the same knob reaches us.
+const httpUserAgentEnvVar = "GIT_HTTP_USER_AGENT"
+
+// newAuthHTTPClient builds the client that drives the auth path only:
+// cluster /.well-known discovery and the token exchange. Both talk to a
+// single control-plane host with no failover to fall back on, so they get
+// the patient discovery dial budget (DiscoveryDialTimeout, i.e.
+// DefaultDiscoveryDialTimeout unless ENTIRE_CONNECT_TIMEOUT_SECONDS
+// overrides it) rather than the short failover one — a slow cold connect
+// here would otherwise fail the whole clone/fetch. Split out of run() so
+// tests exercise the same chain the helper ships.
+func newAuthHTTPClient(skipTLS bool, ua string) *http.Client {
+	return httpclient.New(httpclient.Options{
+		Timeout: 30 * time.Second,
+		Transport: &httpclient.UserAgentTransport{
+			Next: &httpdebug.TimingRoundTripper{
+				Next:  httpclient.NewDiscoveryTransport(skipTLS),
+				Label: "auth",
+			},
+			UA: ua,
+		},
+	})
+}
+
+// resolveHTTPUserAgent returns the HTTP User-Agent to send, matching
+// git's handling of GIT_HTTP_USER_AGENT: a set value replaces defaultUA
+// verbatim, and a set-but-empty value sends no User-Agent header at all
+// (verified against git 2.55.0: curl drops the header for an empty
+// CURLOPT_USERAGENT; Go's net/http does the same for an empty header
+// value). Unset keeps defaultUA. The http.userAgent config key is not
+// read — the helper never shells out to `git config`, and git only
+// forwards -c values, not .gitconfig, in GIT_CONFIG_PARAMETERS.
+//
+// A value net/http would refuse (CR, LF, NUL, …) fails here, naming the
+// variable; otherwise every request dies later with an error that doesn't.
+//
+// lookup is os.LookupEnv in production; injected so tests stay parallel.
+func resolveHTTPUserAgent(defaultUA string, lookup func(string) (string, bool)) (string, error) {
+	ua, ok := lookup(httpUserAgentEnvVar)
+	if !ok {
+		return defaultUA, nil
+	}
+	if !httpguts.ValidHeaderFieldValue(ua) {
+		return "", fmt.Errorf("%s holds an invalid header character", httpUserAgentEnvVar)
+	}
+	return ua, nil
 }
 
 // resolveProtocolVersion reads the effective protocol.version from
@@ -297,19 +361,14 @@ func parseProtocolVersion(raw string, warn io.Writer) int {
 	return defaultVersion
 }
 
-// resolveCreds builds the git-credential source. Both paths mint a
-// jurisdiction access token; they differ in what session credential seeds
-// the exchange and where the token is cached:
+// resolveCreds returns the credential provider used by the git transport:
 //
-//   - ENTIRE_TOKEN set: use the env JWT verbatim as the session credential,
-//     exchanging it at the core derived from its aud claim. Skips
-//     contexts.json and the keyring entirely — the CI / workload path,
-//     memoized in-process only. A non-URL aud is a hard error, never a
-//     silent fallback to context resolution.
+//   - ENTIRE_TOKEN set: use the env JWT verbatim. Skips contexts.json and the
+//     keyring entirely — the CI / workload path. A non-URL aud is a hard error,
+//     never a silent fallback to context resolution.
 //   - otherwise: resolve the login context for this cluster from contexts.json
-//     and mint a keychain-persisted jurisdiction access token from its
-//     stored login JWT.
-func resolveCreds(ctx context.Context, parsedURL *url.URL, skipTLS bool, httpClient *http.Client) (*jurisdictionTokenSource, error) {
+//     and use its refreshed login JWT.
+func resolveCreds(ctx context.Context, parsedURL *url.URL, skipTLS bool, httpClient *http.Client) (credentialProvider, func(), error) {
 	// Presence of ENTIRE_TOKEN is the signal: if it's set at all (LookupEnv,
 	// not Getenv, so we can tell set-empty from unset), we commit to the
 	// env-token path and any failure to use it is fatal — never a silent
@@ -321,114 +380,70 @@ func resolveCreds(ctx context.Context, parsedURL *url.URL, skipTLS bool, httpCli
 	if raw, ok := os.LookupEnv(auth.EnvTokenVar); ok {
 		envToken := strings.TrimSpace(raw)
 		if envToken == "" {
-			return nil, fmt.Errorf("%s is set but blank", auth.EnvTokenVar)
+			return nil, nil, fmt.Errorf("%s is set but blank", auth.EnvTokenVar)
 		}
 		return resolveEnvTokenCreds(ctx, envToken, parsedURL.Host, userdirs.Cache(), httpClient)
 	}
 
 	// Resolve which login context authenticates this cluster: the cluster's
 	// login servers are taken from the cluster_cores.json cache (or a live
-	// /.well-known fetch on miss/expiry), then the account is selected from
-	// local contexts — active context if eligible, else the sole eligible
-	// one, else an explicit-choice error.
+	// /.well-known fetch on miss/expiry), and the ACTIVE context must be issued
+	// by one of them. No other saved login is substituted, so which identity
+	// pushed or fetched is always readable from current_context.
 	cfgDir := userdirs.Config()
-	clusterAuth, err := clusterdiscovery.ResolveClusterAuth(ctx, cfgDir, userdirs.Cache(), parsedURL.Host, httpClient, debuglog.Printf)
+	clusterCtx, err := clusterdiscovery.ResolveContextForCluster(ctx, cfgDir, userdirs.Cache(), parsedURL.Host, httpClient, debuglog.Printf)
 	if err != nil {
-		return nil, err //nolint:wrapcheck // ResolveClusterAuth already returns a user-facing error; preserved verbatim for the "fatal: <msg>" surface
+		return nil, nil, err //nolint:wrapcheck // ResolveContextForCluster already returns a user-facing error; preserved verbatim for the "fatal: <msg>" surface
 	}
-	clusterCtx := clusterAuth.Context
 
 	// The login-JWT provider transparently refreshes an expired login JWT
 	// from the stored refresh token (serialised across processes, rotated
-	// tokens persisted) before the jurisdiction-token exchange consumes it.
-	loginProvider, err := auth.NewRefreshingLoginProvider(clusterCtx, httpClient.Transport, skipTLS)
+	// tokens persisted) before the git transport uses it as the bearer.
+	loginCredential, err := auth.NewRefreshingLoginCredential(clusterCtx, httpClient.Transport, skipTLS)
 	if err != nil {
-		return nil, err //nolint:wrapcheck // NewRefreshingLoginProvider already returns a user-facing error
+		return nil, nil, err //nolint:wrapcheck // NewRefreshingLoginCredential already returns a user-facing error
 	}
 
-	// One keychain-persisted jurisdiction access token authenticates every
-	// repo (authorized live at the data plane) — there is no repo-scoped
-	// fallback on this path. The cluster must advertise its jurisdiction
-	// audience.
-	audience := clusterAuth.JurisdictionAudience
-	if audience == "" {
-		return nil, missingJurisdictionAudienceErr(parsedURL.Host)
-	}
-	debuglog.Printf("auth: jurisdiction access token (aud=%s, core=%s)", audience, clusterCtx.CoreURL)
-	return newJurisdictionTokenSource(clusterCtx.CoreURL, audience, clusterAuth.JurisdictionCoreURL, clusterCtx.Handle, loginProvider, httpClient), nil
+	debuglog.Printf("auth: login token bearer (core=%s)", clusterCtx.CoreURL)
+	provider, onUnauthorized := refreshingProvider(loginCredential)
+	return provider, onUnauthorized, nil
 }
 
-// resolveEnvTokenCreds builds the jurisdiction-token source for the
-// ENTIRE_TOKEN path. Split out of resolveCreds with explicit
-// clusterHost/cacheDir params (no os.Getenv / userdirs.Cache globals) so the
-// trust gate below is unit-testable against a fake well-known server.
-//
-// The exchange runs at the env token's own core with the cluster's advertised
-// jurisdiction audience. No home/cross-jurisdiction routing is needed: the
-// trust gate guarantees that core fronts the target cluster, so it owns the
-// cluster's jurisdiction audience.
+// resolveEnvTokenCreds returns a fixed ENTIRE_TOKEN provider after validating
+// its control-plane audience against the target cluster. Split out of
+// resolveCreds with explicit clusterHost/cacheDir params (no os.Getenv /
+// userdirs.Cache globals) so the trust gate below is unit-testable against a
+// fake well-known server.
 //
 // SECURITY: coreURL is derived from the env token's *unverified* aud claim, and
-// it becomes the host the token is POSTed to as a subject_token during
-// exchange. Before trusting it, we confirm the core is one the target cluster
-// actually advertises — anchored to the clone URL's host the user typed (TLS to
-// its /.well-known/entire-cluster.json), not to the token's own claims. Without
-// this gate a forged aud could redirect the token to an attacker-chosen host.
+// we confirm the core is one the target cluster actually advertises — anchored
+// to the clone URL's host the user typed (TLS to its
+// /.well-known/entire-cluster.json), not to the token's own claims.
 //
 // The gate is only as strong as that TLS verification: with
 // ENTIRE_TLS_SKIP_VERIFY=true (a local-dev escape hatch) the well-known fetch
 // is no longer authenticated, so a MITM could advertise an attacker host as a
 // trusted core. Do not combine ENTIRE_TOKEN with ENTIRE_TLS_SKIP_VERIFY in
 // CI / workload environments.
-func resolveEnvTokenCreds(ctx context.Context, envToken, clusterHost, cacheDir string, httpClient *http.Client) (*jurisdictionTokenSource, error) {
+func resolveEnvTokenCreds(ctx context.Context, envToken, clusterHost, cacheDir string, httpClient *http.Client) (credentialProvider, func(), error) {
 	coreURL, err := auth.CoreURLFromEnvToken(envToken)
 	if err != nil {
-		return nil, err //nolint:wrapcheck // CoreURLFromEnvToken already returns a user-facing, ENTIRE_TOKEN-prefixed error
+		return nil, nil, err //nolint:wrapcheck // CoreURLFromEnvToken already returns a user-facing, ENTIRE_TOKEN-prefixed error
 	}
 	cluster, err := clusterdiscovery.ResolveClusterCores(ctx, cacheDir, clusterHost, httpClient, debuglog.Printf)
 	if err != nil {
-		return nil, err //nolint:wrapcheck // ResolveClusterCores returns a user-facing discovery error
+		return nil, nil, err //nolint:wrapcheck // ResolveClusterCores returns a user-facing discovery error
 	}
 	if !coreTrusted(coreURL, cluster.CoreURLs) {
-		return nil, fmt.Errorf("%s aud %q is not a trusted login server for cluster %s (advertised: %s); the token belongs to a different cluster",
+		return nil, nil, fmt.Errorf("%s aud %q is not a trusted login server for cluster %s (advertised: %s); the token belongs to a different cluster",
 			auth.EnvTokenVar, coreURL, clusterHost, strings.Join(cluster.CoreURLs, ", "))
 	}
-	if cluster.JurisdictionAudience == "" {
-		return nil, missingJurisdictionAudienceErr(clusterHost)
+	debuglog.Printf("auth: %s bearer (core=%s)", auth.EnvTokenVar, coreURL)
+	provider := func(context.Context) (string, error) { return envToken, nil }
+	onUnauthorized := func() {
+		debuglog.Printf("data plane rejected static %s bearer; transport will retry once with the configured token", auth.EnvTokenVar)
 	}
-	hint := crossJurisdictionHint(coreURL, clusterHost, cluster.JurisdictionCoreURL)
-	if hint != "" {
-		debuglog.Printf("auth: %s core %s differs from cluster %s's jurisdiction core %s; the exchange will likely be refused", auth.EnvTokenVar, coreURL, clusterHost, cluster.JurisdictionCoreURL)
-	}
-	debuglog.Printf("auth: %s jurisdiction access token (aud=%s, core=%s)", auth.EnvTokenVar, cluster.JurisdictionAudience, coreURL)
-	return newEnvJurisdictionTokenSource(coreURL, cluster.JurisdictionAudience, envToken, hint, httpClient), nil
-}
-
-// crossJurisdictionHint pre-computes the actionable message for the one
-// misconfiguration the trust gate can't catch: an ENTIRE_TOKEN minted at a
-// core of a different jurisdiction than the cluster's. Clusters advertise
-// every jurisdiction's cores as trusted login servers, so such a token
-// passes the gate — but the exchange is doomed, because only the cluster's
-// own jurisdiction core mints for its audience, and the core-side refusal
-// is an opaque invalid_target. Returned as a suffix for that eventual
-// exchange error rather than a hard pre-flight failure: clusters may
-// advertise several same-jurisdiction core URLs, so inequality here is a
-// strong hint, not proof.
-func crossJurisdictionHint(coreURL, clusterHost, jurisdictionCoreURL string) string {
-	if jurisdictionCoreURL == "" {
-		return ""
-	}
-	if strings.EqualFold(strings.TrimRight(coreURL, "/"), strings.TrimRight(jurisdictionCoreURL, "/")) {
-		return ""
-	}
-	return fmt.Sprintf("\n%s was minted at %s, but cluster %s's jurisdiction core is %s — point your CI auth url at %s",
-		auth.EnvTokenVar, coreURL, clusterHost, jurisdictionCoreURL, jurisdictionCoreURL)
-}
-
-// missingJurisdictionAudienceErr names the one condition both auth paths
-// refuse on: a cluster that predates jurisdiction-token git auth.
-func missingJurisdictionAudienceErr(clusterHost string) error {
-	return fmt.Errorf("cluster %s advertises no jurisdiction_audience at %s; its entire-server predates jurisdiction-token git auth", clusterHost, clusterdiscovery.Path)
+	return provider, onUnauthorized, nil
 }
 
 // coreTrusted reports whether coreURL is in the cluster's advertised core
@@ -445,10 +460,9 @@ func coreTrusted(coreURL string, trusted []string) bool {
 }
 
 // gitActionFromRequest classifies a smart-HTTP request as "pull" or "push".
-// The jurisdiction token doesn't vary by action, but the classification
-// still gates which endpoints may carry credentials (and labels the timing
-// logs). Returns "" when the endpoint isn't a recognised git smart-HTTP
-// route.
+// The bearer doesn't vary by action, but the classification still gates
+// which endpoints may carry credentials (and labels the timing logs).
+// Returns "" when the endpoint isn't a recognised git smart-HTTP route.
 func gitActionFromRequest(req *http.Request) string {
 	path := req.URL.Path
 	switch req.Method {

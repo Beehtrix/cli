@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -37,6 +38,11 @@ func testProxy(server *httptest.Server) *Proxy {
 }
 
 func proxyWithClient(nodes []string, path, entryURL, clusterHost string, client *http.Client) *Proxy {
+	// Test-only HTTP loopback compatibility: production replicas.Resolve
+	// always supplies HTTPS. These fixtures exercise failover without TLS.
+	if entryURL == "" && len(nodes) > 0 {
+		entryURL = nodes[0]
+	}
 	p := New(Config{
 		Nodes: replicas.NodeConfig{
 			InitialNodes: nodes,
@@ -151,12 +157,14 @@ func TestProxy_SetsUserAgentHeader(t *testing.T) {
 	}
 }
 
-func TestProxy_OmitsUserAgentWrapperWhenEmpty(t *testing.T) {
+// An empty UserAgent must send no header, as git does for
+// GIT_HTTP_USER_AGENT="" — not fall back to Go's default.
+func TestProxy_EmptyUserAgentSendsNoHeader(t *testing.T) {
 	t.Parallel()
 
-	var got string
+	var got []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Get("User-Agent")
+		got = r.Header.Values("User-Agent")
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(server.Close)
@@ -177,8 +185,8 @@ func TestProxy_OmitsUserAgentWrapperWhenEmpty(t *testing.T) {
 	}
 	_ = resp.Close()
 
-	if !strings.HasPrefix(got, "Go-http-client/") {
-		t.Errorf("User-Agent = %q, want Go's default when wrapper omitted", got)
+	if len(got) != 0 {
+		t.Errorf("User-Agent = %q, want no header for empty UserAgent", got)
 	}
 }
 
@@ -311,8 +319,7 @@ func TestUnauthorized(t *testing.T) {
 
 func TestFailover(t *testing.T) {
 	t.Parallel()
-	down := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	down.Close()
+	down := deadServerURL(t)
 
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -320,7 +327,7 @@ func TestFailover(t *testing.T) {
 	}))
 	defer up.Close()
 
-	p := proxyWithClient([]string{down.URL, up.URL}, "/et/alice/repo", "", "", &http.Client{})
+	p := proxyWithClient([]string{down, up.URL}, "/et/alice/repo", "", "", &http.Client{})
 
 	resp, err := p.InfoRefs(context.Background(), "git-upload-pack")
 	if err != nil {
@@ -362,14 +369,14 @@ func TestFailover5xx(t *testing.T) {
 
 func TestOnNodeFailedCalledOnConnectionError(t *testing.T) {
 	t.Parallel()
-	down := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	down.Close()
+	down := deadServerURL(t)
 
 	var failed []string
 	p := New(Config{
 		Nodes: replicas.NodeConfig{
-			InitialNodes: []string{down.URL},
-			ClusterHost:  mustHost(t, down.URL),
+			InitialNodes: []string{down},
+			EntryURL:     down,
+			ClusterHost:  mustHost(t, down),
 		},
 		Path:         "/et/alice/repo",
 		OnNodeFailed: func(node string) { failed = append(failed, node) },
@@ -379,8 +386,8 @@ func TestOnNodeFailedCalledOnConnectionError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error with single unreachable node")
 	}
-	if len(failed) != 1 || failed[0] != down.URL {
-		t.Errorf("onNodeFailed = %v, want [%s]", failed, down.URL)
+	if len(failed) != 1 || failed[0] != down {
+		t.Errorf("onNodeFailed = %v, want [%s]", failed, down)
 	}
 }
 
@@ -395,6 +402,7 @@ func TestOnNodeFailedCalledOn5xx(t *testing.T) {
 	p := New(Config{
 		Nodes: replicas.NodeConfig{
 			InitialNodes: []string{bad.URL},
+			EntryURL:     bad.URL,
 			ClusterHost:  mustHost(t, bad.URL),
 		},
 		Path:         "/et/alice/repo",
@@ -445,7 +453,7 @@ func TestFailoverAll5xx(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when all nodes return 5xx")
 	}
-	if !strings.Contains(err.Error(), "all 2 nodes failed") {
+	if !strings.Contains(err.Error(), "all 2 attempted nodes failed") {
 		t.Errorf("error = %v", err)
 	}
 }
@@ -459,14 +467,8 @@ func TestNoFailoverOn401(t *testing.T) {
 	defer server.Close()
 
 	var failedCalled bool
-	p := New(Config{
-		Nodes: replicas.NodeConfig{
-			InitialNodes: []string{server.URL},
-			ClusterHost:  mustHost(t, server.URL),
-		},
-		Path:         "/et/alice/repo",
-		OnNodeFailed: func(string) { failedCalled = true },
-	})
+	p := testProxy(server)
+	p.onNodeFailed = func(string) { failedCalled = true }
 
 	_, err := p.InfoRefs(context.Background(), "git-upload-pack")
 	if err == nil {
@@ -489,14 +491,8 @@ func TestNoFailoverOn404(t *testing.T) {
 	defer server.Close()
 
 	var failedCalled bool
-	p := New(Config{
-		Nodes: replicas.NodeConfig{
-			InitialNodes: []string{server.URL},
-			ClusterHost:  mustHost(t, server.URL),
-		},
-		Path:         "/et/alice/repo",
-		OnNodeFailed: func(string) { failedCalled = true },
-	})
+	p := testProxy(server)
+	p.onNodeFailed = func(string) { failedCalled = true }
 
 	_, err := p.InfoRefs(context.Background(), "git-upload-pack")
 	if err == nil {
@@ -681,7 +677,7 @@ func TestInfoRefsWarmPathRefreshesCache(t *testing.T) {
 	newReplica = brandNew.URL
 
 	entryHost := mustHost(t, old.URL)
-	p := proxyWithClient([]string{old.URL}, "/et/alice/repo", "http://unused.example", entryHost, old.Client())
+	p := proxyWithClient([]string{old.URL}, "/et/alice/repo", "http://127.0.0.1:1", entryHost, old.Client())
 
 	body, err := p.InfoRefs(context.Background(), "git-upload-pack")
 	if err != nil {
@@ -864,17 +860,42 @@ func TestProxyConsumesServerHeaderFormat(t *testing.T) {
 	}
 }
 
-// closedServerURL returns the URL of an httptest.Server that has been
-// closed — a guaranteed-dead 127.0.0.1:port a request will fail to dial.
-func closedServerURL() string {
-	s := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	url := s.URL
-	s.Close()
-	return url
+// deadServerURL returns the URL of a 127.0.0.1:port that accepts connections
+// and immediately closes them, so every request against it fails.
+//
+// Do not build this by starting an httptest.Server and closing it: closing
+// hands the port back to the OS, and tests in this file run with t.Parallel(),
+// so another test's httptest.NewServer can be given the same port while the
+// first test still treats it as dead. That failed
+// TestColdPathRedirectAllReplicasFail and TestServiceRPC together — one saw
+// its "dead" node answer 200, the other saw the foreign request land in its
+// handler. Here the listener stays bound for the test's lifetime, so nothing
+// else can take the port.
+func deadServerURL(t *testing.T) string {
+	t.Helper()
+	var lc net.ListenConfig
+	l, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		// If Accept ever fails for a reason other than our own Close, drop the
+		// listener with it. A bound port with nobody accepting completes the
+		// handshake from the kernel backlog, so requests would hang instead of
+		// failing — and these callers pass no timeout.
+		defer func() { _ = l.Close() }()
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	return "http://" + l.Addr().String()
 }
 
 func TestColdPathFailoverWhenRedirectTargetUnreachable(t *testing.T) {
-	dead := closedServerURL()
+	dead := deadServerURL(t)
 
 	var aliveURL string
 	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -960,8 +981,8 @@ func TestColdPathDoesNotFollowRedirectAuto(t *testing.T) {
 
 func TestColdPathRedirectAllReplicasFail(t *testing.T) {
 	t.Parallel()
-	dead1 := closedServerURL()
-	dead2 := closedServerURL()
+	dead1 := deadServerURL(t)
+	dead2 := deadServerURL(t)
 
 	entry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Entire-Replicas", buildReplicasHeader(dead1, dead2))
@@ -973,7 +994,7 @@ func TestColdPathRedirectAllReplicasFail(t *testing.T) {
 
 	_, err := p.InfoRefs(context.Background(), "git-upload-pack")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "all 2 nodes failed")
+	assert.Contains(t, err.Error(), "all 2 attempted nodes failed")
 	assert.Contains(t, err.Error(), "after entry-domain redirect")
 }
 
@@ -1003,8 +1024,8 @@ func TestColdPathRedirectMissingHeaderFollows(t *testing.T) {
 func TestColdPathRedirectFailureDoesNotPoisonCache(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 
-	dead1 := closedServerURL()
-	dead2 := closedServerURL()
+	dead1 := deadServerURL(t)
+	dead2 := deadServerURL(t)
 
 	entry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Entire-Replicas", buildReplicasHeader(dead1, dead2))
@@ -1034,8 +1055,8 @@ func TestColdPathRedirectFailureDoesNotPoisonCache(t *testing.T) {
 func TestColdPathRedirectStaleHeaderFallsBackToLocation(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 
-	dead1 := closedServerURL()
-	dead2 := closedServerURL()
+	dead1 := deadServerURL(t)
+	dead2 := deadServerURL(t)
 
 	var aliveURL string
 	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1252,7 +1273,9 @@ func TestNoRedirectClientShareTransport(t *testing.T) {
 	if got.CheckRedirect == nil {
 		t.Fatal("NoRedirectClient must set CheckRedirect")
 	}
-	if err := got.CheckRedirect(nil, nil); !errors.Is(err, http.ErrUseLastResponse) {
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://cluster.example", nil)
+	require.NoError(t, err)
+	if err := got.CheckRedirect(req, nil); !errors.Is(err, http.ErrUseLastResponse) {
 		t.Errorf("CheckRedirect returned %v, want http.ErrUseLastResponse", err)
 	}
 }
@@ -1273,9 +1296,9 @@ func TestNoRedirectClientPrefersDiscoveryTransport(t *testing.T) {
 
 func TestInfoRefsWarmAndColdBothFailSurfacesBoth(t *testing.T) {
 	t.Parallel()
-	deadReplica1 := closedServerURL()
-	deadReplica2 := closedServerURL()
-	deadEntry := closedServerURL()
+	deadReplica1 := deadServerURL(t)
+	deadReplica2 := deadServerURL(t)
+	deadEntry := deadServerURL(t)
 
 	p := proxyWithClient([]string{deadReplica1, deadReplica2}, "/et/alice/repo", deadEntry, "127.0.0.1", &http.Client{})
 
@@ -1283,7 +1306,7 @@ func TestInfoRefsWarmAndColdBothFailSurfacesBoth(t *testing.T) {
 	require.Error(t, err)
 	msg := err.Error()
 	assert.Contains(t, msg, "cached replicas")
-	assert.Contains(t, msg, "all 2 nodes failed")
+	assert.Contains(t, msg, "all 2 attempted nodes failed")
 	assert.Contains(t, msg, "entry domain")
 }
 
@@ -1409,7 +1432,7 @@ func TestColdPathDropsOutOfClusterReplicasFromHeader(t *testing.T) {
 
 func TestColdPathRefusesOutOfClusterLocationSalvage(t *testing.T) {
 	t.Parallel()
-	deadReplica := closedServerURL() // in-cluster (127.0.0.1) but unreachable
+	deadReplica := deadServerURL(t) // in-cluster (127.0.0.1) but never answers
 
 	entry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// The only replica is dead, forcing the salvage path; Location points
@@ -1501,6 +1524,7 @@ func authRetryProxy(t *testing.T, serverURL string, src *fakeTokenSource) *Proxy
 	return New(Config{
 		Nodes: replicas.NodeConfig{
 			InitialNodes: []string{serverURL},
+			EntryURL:     serverURL,
 			ClusterHost:  mustHost(t, serverURL),
 		},
 		Path: "/et/alice/repo",

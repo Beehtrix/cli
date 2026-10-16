@@ -3,11 +3,14 @@
 package id
 
 import (
+	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"time"
 
 	ulid "github.com/oklog/ulid/v2"
 )
@@ -15,8 +18,6 @@ import (
 // CheckpointID identifies a checkpoint. It comes in two formats: a legacy
 // 12-character lowercase hex ID and a 26-character Crockford base32 ULID (see
 // Kind / CheckpointPattern). It links code commits to their checkpoint metadata.
-//
-//nolint:recvcheck // UnmarshalJSON requires pointer receiver, others use value receiver - standard pattern
 type CheckpointID string
 
 // EmptyCheckpointID represents an unset or invalid checkpoint ID.
@@ -186,6 +187,24 @@ func GenerateULID() (CheckpointID, error) {
 	return CheckpointID(u.String()), nil
 }
 
+// DeriveULID builds a deterministic ULID checkpoint ID: the same t and seed
+// always yield the same ID, for callers that must re-derive an ID instead of
+// minting a fresh one (import's idempotency). The timestamp is t in Unix
+// milliseconds, clamped to 0 for t before the epoch (including the zero time);
+// the entropy is the first 80 bits of SHA-256(seed).
+func DeriveULID(t time.Time, seed []byte) (CheckpointID, error) {
+	var ms uint64
+	if t.After(time.Unix(0, 0)) {
+		ms = ulid.Timestamp(t)
+	}
+	sum := sha256.Sum256(seed)
+	u, err := ulid.New(ms, bytes.NewReader(sum[:10]))
+	if err != nil {
+		return EmptyCheckpointID, fmt.Errorf("failed to derive ULID checkpoint ID: %w", err)
+	}
+	return CheckpointID(u.String()), nil
+}
+
 // Validate checks if a string is a valid checkpoint ID format: either a legacy
 // 12-character lowercase hex ID or a 26-character Crockford base32 ULID.
 // Returns an error if invalid, nil if valid.
@@ -222,6 +241,24 @@ func (id CheckpointID) DisplayShort() string {
 // IsEmpty returns true if the checkpoint ID is empty or unset.
 func (id CheckpointID) IsEmpty() bool {
 	return id == EmptyCheckpointID
+}
+
+// Time returns the creation time encoded in this ID and whether one is
+// available. A ULID embeds a millisecond Unix timestamp in its leading
+// characters, so the time is recoverable from the ID alone — no store read
+// required. This is what lets remote-ref discovery (which learns only ref names
+// via ls-remote) present and sort a not-yet-hydrated checkpoint by its real
+// creation time. Legacy 12-hex IDs carry no timestamp, so this returns
+// (zero, false) for them.
+func (id CheckpointID) Time() (time.Time, bool) {
+	if id.Kind() != KindULID {
+		return time.Time{}, false
+	}
+	u, err := ulid.ParseStrict(string(id))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ulid.Time(u.Time()), true
 }
 
 // Path returns the sharded path for this checkpoint ID on entire/checkpoints/v1.

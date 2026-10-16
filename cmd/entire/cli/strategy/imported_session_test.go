@@ -35,7 +35,7 @@ func saveImportedState(t *testing.T) string {
 	return sid
 }
 
-// Imported sessions are read-only and commit-less (no shadow branch, empty
+// Imported sessions are read-only and commit-less (no pending work, empty
 // BaseCommit); neither cleanup path may purge or flag them.
 func TestImportedSessions_SurviveCleanup(t *testing.T) {
 	sid := saveImportedState(t)
@@ -47,16 +47,6 @@ func TestImportedSessions_SurviveCleanup(t *testing.T) {
 	}
 	if !containsSessionID(states, sid) {
 		t.Error("listAllSessionStates purged the imported session")
-	}
-
-	items, err := ListOrphanedSessionStates(ctx)
-	if err != nil {
-		t.Fatalf("ListOrphanedSessionStates: %v", err)
-	}
-	for _, it := range items {
-		if it.ID == sid {
-			t.Error("entire clean flagged the imported session as orphaned")
-		}
 	}
 }
 

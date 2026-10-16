@@ -10,6 +10,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
 )
 
@@ -21,7 +22,8 @@ func (claudeImporter) Name() string { return "claude-code" }
 func (claudeImporter) AgentType() types.AgentType { return agent.AgentTypeClaudeCode }
 
 // Discover returns Claude transcript files for the repo modified within the
-// lookback window. overridePath replaces the default ~/.claude/projects/<slug>
+// lookback window whose recorded cwd is inside repoRoot (see
+// recordedCwdIn). overridePath replaces the default ~/.claude/projects/<slug>
 // dir; sessionFilter, when non-empty, keeps only matching session IDs (the
 // file stem).
 func (claudeImporter) Discover(repoRoot, overridePath string, now time.Time, sessionFilter []string) ([]SessionFile, error) {
@@ -29,7 +31,7 @@ func (claudeImporter) Discover(repoRoot, overridePath string, now time.Time, ses
 	if err != nil {
 		return nil, err
 	}
-	return discoverSessionFiles(dir, now, sessionFilter, jsonlSessionResolver(".jsonl", identitySessionID))
+	return discoverSessionFiles(dir, now, sessionFilter, jsonlSessionResolver(identitySessionID), recordedCwdIn(repoRoot))
 }
 
 // SplitTurns produces one Turn per user-prompt line. Main-agent token usage for
@@ -39,7 +41,7 @@ func (claudeImporter) Discover(repoRoot, overridePath string, now time.Time, ses
 // rescopeSubagentTokensToDeltas). tool_result lines (Type == "user" but no text
 // content) do not start a turn.
 func (claudeImporter) SplitTurns(sf SessionFile, full []byte) ([]Turn, error) {
-	subagentsDir := filepath.Join(filepath.Dir(sf.Path), sf.SessionID, "subagents")
+	subagentsDir := paths.SubagentsDir(filepath.Dir(sf.Path), sf.SessionID)
 	ag := &claudecode.ClaudeCodeAgent{}
 	return splitLineTurns(splitRawLines(full), isUserPromptLine,
 		func(rawLines [][]byte, start, end int, truncated []byte) (*Turn, error) {
@@ -57,11 +59,12 @@ func (claudeImporter) SplitTurns(sf SessionFile, full []byte) ([]Turn, error) {
 				return nil, nil
 			}
 			return &Turn{
-				UUID:      rec.UUID,
-				Prompt:    transcript.ExtractUserContent(rec.Message),
-				Model:     modelInRange(rawLines, start, end),
-				CreatedAt: parseTimestamp(rec.Timestamp),
-				Tokens:    tokens,
+				UUID:       rec.UUID,
+				Prompt:     transcript.ExtractUserContent(rec.Message),
+				Model:      modelInRange(rawLines, start, end),
+				CreatedAt:  parseTimestamp(rec.Timestamp),
+				Tokens:     tokens,
+				CommitSHAs: commitSHAsInRange(rawLines, start, end),
 			}, nil
 		})
 }
@@ -98,6 +101,35 @@ func modelInRange(rawLines [][]byte, start, end int) string {
 	return ""
 }
 
+// commitSHAsInRange returns the commit SHAs recorded by gitOperation
+// tool-result records within [start, end), in order. Only kind "committed"
+// is collected — other kinds (or commit-less gitOperation records like
+// push/branch/pr) are ignored. SHAs may be abbreviated; resolution happens
+// in Run.
+func commitSHAsInRange(rawLines [][]byte, start, end int) []string {
+	var shas []string
+	for i := start; i < end && i < len(rawLines); i++ {
+		var rec struct {
+			ToolUseResult struct {
+				GitOperation struct {
+					Commit struct {
+						SHA  string `json:"sha"`
+						Kind string `json:"kind"`
+					} `json:"commit"`
+				} `json:"gitOperation"`
+			} `json:"toolUseResult"`
+		}
+		if err := json.Unmarshal(rawLines[i], &rec); err != nil {
+			continue
+		}
+		c := rec.ToolUseResult.GitOperation.Commit
+		if c.SHA != "" && c.Kind == "committed" {
+			shas = append(shas, c.SHA)
+		}
+	}
+	return shas
+}
+
 // isUserPromptLine reports whether a raw JSONL line is a genuine user-prompt
 // turn start: type "user" (or role "user") with non-empty extractable text.
 // tool_result lines are type "user" but carry no text, so they return false.
@@ -116,9 +148,8 @@ func isUserPromptLine(raw []byte) bool {
 	return transcript.ExtractUserContent(line.Message) != ""
 }
 
-// splitRawLines splits content into raw lines in the same index space as
-// transcript.SliceFromLine (newline-counted). Trailing empty segment from a
-// final newline is dropped.
+// splitRawLines splits content into raw lines using the same newline-counted
+// indices as transcript.SliceFromLine. A trailing empty segment is dropped.
 func splitRawLines(content []byte) [][]byte {
 	if len(content) == 0 {
 		return nil

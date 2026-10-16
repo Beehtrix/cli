@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	git "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -17,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+	"github.com/entireio/cli/cmd/entire/cli/internal/flock"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/redact"
 )
@@ -131,7 +134,7 @@ func TestMigrateBranchToRefs(t *testing.T) {
 
 	// Each ref carries the branch subtree with a normalized root metadata.json
 	// and reads back through the git-refs store.
-	branchTree, err := branch.getSessionsBranchTree()
+	branchTree, err := branch.getSessionsBranchTree(t.Context())
 	require.NoError(t, err)
 	refsStore := newGitRefsStore(repo)
 	for _, cid := range []id.CheckpointID{cid1, cid2} {
@@ -199,6 +202,93 @@ func TestMigrateBranchToRefs(t *testing.T) {
 	assert.Equal(t, 2, result2.Skipped)
 	assert.Equal(t, before[cid1.String()], refHash(t, repo, cid1), "idempotent re-run must not move refs")
 	assert.Equal(t, before[cid2.String()], refHash(t, repo, cid2))
+}
+
+func TestMigrateBranchToRefs_IdempotentRerunDoesNotUpdateRef(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		block func(*testing.T, *git.Repository, plumbing.ReferenceName)
+	}{
+		{
+			name: "persistent ref flock held",
+			block: func(t *testing.T, repo *git.Repository, refName plumbing.ReferenceName) {
+				t.Helper()
+				_, commonDir, err := repositoryDirs(repo)
+				require.NoError(t, err)
+				lockRoot, lockName, err := persistentRefLock(commonDir, refName)
+				require.NoError(t, err)
+				release, err := flock.AcquireIn(lockRoot, lockName)
+				require.NoError(t, err)
+				t.Cleanup(release)
+			},
+		},
+		{
+			name: "native git ref lock held",
+			block: func(t *testing.T, repo *git.Repository, refName plumbing.ReferenceName) {
+				t.Helper()
+				_, commonDir, err := repositoryDirs(repo)
+				require.NoError(t, err)
+				lockPath := filepath.Join(commonDir, filepath.FromSlash(refName.String())+".lock")
+				require.NoError(t, os.MkdirAll(filepath.Dir(lockPath), 0o750))
+				require.NoError(t, os.WriteFile(lockPath, nil, 0o600))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			repo, _ := setupBranchTestRepo(t)
+			branch := NewGitStore(repo, DefaultV1Refs())
+			cid := id.MustCheckpointID("a1b2c3d4e5f6")
+			seedBranchCheckpoint(t, branch, cid, "s1")
+
+			_, err := MigrateBranchToRefs(t.Context(), repo, false)
+			require.NoError(t, err)
+			refName, err := RefName(cid)
+			require.NoError(t, err)
+			tc.block(t, repo, refName)
+
+			ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+			defer cancel()
+			result, err := MigrateBranchToRefs(ctx, repo, false)
+			require.NoError(t, err)
+			assert.Equal(t, 1, result.Skipped)
+			assert.Empty(t, result.Migrated)
+		})
+	}
+}
+
+func TestMigrateBranchToRefs_RechecksIdempotencyAfterConcurrentImport(t *testing.T) {
+	t.Parallel()
+	repo, _ := setupBranchTestRepo(t)
+	branch := NewGitStore(repo, DefaultV1Refs())
+	cid := id.MustCheckpointID("a1b2c3d4e5f6")
+	seedBranchCheckpoint(t, branch, cid, "s1")
+
+	var imported plumbing.Hash
+	updateCalls := 0
+	concurrentImport := func(
+		ctx context.Context,
+		repo *git.Repository,
+		refName plumbing.ReferenceName,
+		build persistentRefBuilder,
+	) error {
+		updateCalls++
+
+		// Another importer wins the lock after this migration's unlocked check,
+		// then this migration acquires it and must recognize the imported tree.
+		require.NoError(t, updatePersistentRef(ctx, repo, refName, build))
+		imported = refHash(t, repo, cid)
+		return updatePersistentRef(ctx, repo, refName, build)
+	}
+
+	result, err := migrateBranchToRefs(t.Context(), repo, false, concurrentImport)
+	require.NoError(t, err)
+	assert.Equal(t, 1, updateCalls, "the unlocked check must miss before the concurrent import")
+	assert.Empty(t, result.Migrated)
+	assert.Equal(t, 1, result.Skipped)
+	assert.Equal(t, imported, refHash(t, repo, cid), "the second importer must leave the winning ref unchanged")
 }
 
 // TestMigrateBranchToRefs_MetadataMatchesNativeRefsLayout pins the migration's
@@ -481,4 +571,37 @@ func TestMigrateBranchToRefs_NoBranchIsNoop(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, result.Total)
 	assert.Empty(t, result.Migrated)
+}
+
+// A checkpoint `entire checkpoint delete` removed must not be re-created by a
+// migration that still sees it on the v1 branch (e.g. through a stale
+// remote-tracking ref the delete could not reach).
+func TestMigrateBranchToRefs_SkipsDeletedCheckpoints(t *testing.T) {
+	t.Parallel()
+	repo, _ := setupBranchTestRepo(t)
+	ctx := context.Background()
+	branch := NewGitStore(repo, DefaultV1Refs())
+	deleted := id.MustCheckpointID("a1b2c3d4e5f6")
+	kept := id.MustCheckpointID("b2c3d4e5f6a1")
+	seedBranchCheckpoint(t, branch, deleted, "s1")
+	seedBranchCheckpoint(t, branch, kept, "s2")
+
+	list, err := DeletedCheckpointsForRepo(repo)
+	require.NoError(t, err)
+	require.NoError(t, list.Record(deleted))
+
+	result, err := MigrateBranchToRefs(ctx, repo, false)
+	require.NoError(t, err)
+	assert.Equal(t, []id.CheckpointID{kept}, result.Migrated)
+
+	refName, err := RefName(deleted)
+	require.NoError(t, err)
+	_, err = repo.Reference(refName, true)
+	require.ErrorIs(t, err, plumbing.ErrReferenceNotFound, "a deleted checkpoint must not get a ref")
+
+	queue, err := PushQueueForRepo(ctx, repo)
+	require.NoError(t, err)
+	queued, err := queue.Drain()
+	require.NoError(t, err)
+	assert.NotContains(t, queued, refName, "a deleted checkpoint must not be queued for push")
 }

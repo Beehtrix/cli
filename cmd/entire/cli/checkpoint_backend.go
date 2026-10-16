@@ -7,8 +7,6 @@ import (
 	"slices"
 	"strings"
 
-	"charm.land/huh/v2"
-
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
@@ -21,6 +19,19 @@ const (
 	checkpointBackendBranchAlias = "branch"
 	checkpointBackendRefsAlias   = "refs"
 )
+
+// checkpointBackendFlagUsage is the shared --checkpoint-backend help text. Both
+// `enable` and `configure` register the flag, so it lives here rather than being
+// spelled twice: the two commands drifting would advertise two different stories
+// about which backend a repo gets.
+//
+// It names refs as the default rather than merely "recommended", because that is
+// what a first-time `entire enable` writes, with no prompt (see
+// resolveFirstRunCheckpointBackend). branch is labelled legacy: it is an explicit
+// escape hatch for interoperating with older clients, not a co-equal choice.
+const checkpointBackendFlagUsage = "Checkpoint storage backend: " +
+	checkpointBackendRefsAlias + " (default; one git ref per checkpoint) or " +
+	checkpointBackendBranchAlias + " (legacy shared entire/checkpoints/v1 branch)"
 
 // resolveCheckpointBackendType maps a user-facing backend name to the canonical
 // settings backend type and validates it may serve as the primary. It accepts
@@ -105,37 +116,4 @@ func updateCheckpointBackend(ctx context.Context, w io.Writer, opts EnableOption
 
 	fmt.Fprintf(w, "✓ Checkpoint backend set to %s (%s)\n", typ, configDisplay)
 	return nil
-}
-
-// promptCheckpointBackend asks the user to choose a checkpoint storage backend
-// during first-time interactive setup. The default is the git-branch backend;
-// the git-refs backend is offered as the selectable alternative. It returns the
-// canonical backend type, or "" when the user kept the default (or cancelled) so
-// the caller can skip writing a redundant config block. Callers must gate this
-// on an interactive terminal.
-//
-// Cancellation (Ctrl+C or a cancelled ctx) is treated like keeping the default:
-// it prints a "cancelled" line and returns ("", nil) so enable continues with
-// the default backend, matching the optional-prompt behavior elsewhere in setup.
-func promptCheckpointBackend(ctx context.Context, w io.Writer) (string, error) {
-	choice := checkpoint.BackendTypeGitBranch
-	form := NewAccessibleForm(
-		huh.NewGroup(
-			huh.NewSelect[string]().
-				Title("Checkpoint storage backend").
-				Description("How Entire stores committed session checkpoints in your repo.").
-				Options(
-					huh.NewOption("Branch — one shared branch, entire/checkpoints/v1 (default)", checkpoint.BackendTypeGitBranch),
-					huh.NewOption("Refs — one git ref per checkpoint", checkpoint.BackendTypeGitRefs),
-				).
-				Value(&choice),
-		),
-	)
-	if err := form.RunWithContext(ctx); err != nil {
-		return "", handleFormCancellation(w, "Checkpoint backend selection", err)
-	}
-	if choice == checkpoint.BackendTypeGitBranch {
-		return "", nil
-	}
-	return choice, nil
 }

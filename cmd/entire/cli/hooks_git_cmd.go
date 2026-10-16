@@ -4,25 +4,18 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent/external"
-	"github.com/entireio/cli/cmd/entire/cli/checkpointpolicy"
-	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
-	"github.com/entireio/cli/cmd/entire/cli/interactive"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
-	"github.com/entireio/cli/cmd/entire/cli/telemetry"
-	"github.com/entireio/cli/cmd/entire/cli/versioncheck"
-	"github.com/entireio/cli/cmd/entire/cli/versioninfo"
 	"github.com/entireio/cli/perf"
 
 	"github.com/spf13/cobra"
 )
 
-// gitHooksDisabled is set by PersistentPreRunE when Entire is not set up or disabled.
+// gitHooksDisabled is set by PersistentPreRun when Entire is not set up or disabled.
 // When true, all git hook commands return early without doing any work.
 var gitHooksDisabled bool
 
@@ -66,93 +59,39 @@ func (g *gitHookContext) logCompleted(err error) {
 	g.span.RecordError(err)
 }
 
-func (g *gitHookContext) skipUnsupportedCheckpointPolicy() bool {
-	// Callers return success when this is true because policy failures should
-	// disable Entire checkpoint work, not make Git reject the user's operation.
-	repo, err := gitrepo.OpenCurrent(g.ctx)
-	if err != nil {
-		return g.skipUnreadableCheckpointPolicy(err)
-	}
-	defer repo.Close()
+// withHookSession adds the session the root pre-run cannot know without
+// scanning session state on every command, and configures redaction. Returns
+// the context to pass down with cmd.SetContext.
+//
+// Every caller must gate on settings.IsSetUpAndEnabled first — it scans session
+// state and loads redactors, neither of which may touch a repo that never
+// enabled Entire. The check is not repeated here: it costs an uncached
+// settings.Load, and this runs on the per-commit and per-turn paths.
+func withHookSession(ctx context.Context) context.Context {
+	// Resolve the caller rather than the most recent session: a git hook an
+	// agent triggered inherits that agent's session ID in its environment, so
+	// log lines get attributed to the session that actually ran the commit
+	// instead of whichever session in the shared store moved last.
+	ctx = logging.WithSessionID(ctx, strategy.ResolveCallerSession(ctx).SessionID)
 
-	state, err := checkpointpolicy.ReadLocal(g.ctx, repo)
-	if err != nil {
-		return g.skipUnreadableCheckpointPolicy(err)
+	// Hooks are the checkpoint-writing path, so this cannot be left to the root
+	// pre-run: without it only always-on secret scanning would run.
+	//
+	// A scanner-config failure is logged, not propagated: callers gate on
+	// IsSetUpAndEnabled, which already fails closed on the settings error that
+	// carries ErrScannerConfig, and the built-in goredact config cannot fail to
+	// construct — so this branch is unreachable from a hook. The loud paths for
+	// a bad scanner config are status, doctor, import, and attach. If a future
+	// engine constructor ever does fail here, the process falls back to the
+	// default betterleaks-only set: different coverage, not merely less.
+	if err := strategy.EnsureRedactionConfigured(ctx); err != nil {
+		logging.Error(logging.WithComponent(ctx, "redaction"),
+			"redaction scanner configuration failed",
+			slog.String("error", err.Error()))
 	}
 
-	policy := state.Policy
-	if checkpointpolicy.CanSatisfyPolicy(policy) {
-		return false
-	}
-
-	logging.Warn(g.ctx, "checkpoint policy unsupported; skipping git hook",
-		slog.String("checkpoint_version", policy.CheckpointVersion),
-		slog.String("checkpoint_min_version", policy.CheckpointMinVersion))
-	if interactive.CanPromptInteractively() {
-		fmt.Fprint(os.Stderr, checkpointpolicy.UnsupportedPolicyMessage(
-			policy,
-			versioncheck.UpdateCommandForCurrentBinary(versioninfo.Version),
-		))
-	}
-	emitCheckpointPolicyBlocked(g.ctx, telemetry.CheckpointPolicyBlockedEvent{
-		Hook:                 g.hookName,
-		HookType:             telemetry.PolicyBlockedHookTypeGit,
-		Reason:               telemetry.PolicyBlockedReasonUnsupported,
-		Outcome:              telemetry.PolicyBlockedOutcomeSkipped,
-		CheckpointVersion:    policy.CheckpointVersion,
-		CheckpointMinVersion: policy.CheckpointMinVersion,
-	})
-	return true
+	return ctx
 }
-
-// skipUnreadableCheckpointPolicy warns, notifies the user, and reports the
-// policy-blocked telemetry event for a hook whose checkpoint policy could not be
-// read. It always returns true so callers skip Entire checkpoint work.
-func (g *gitHookContext) skipUnreadableCheckpointPolicy(err error) bool {
-	logging.Warn(g.ctx, "checkpoint policy read failed; skipping git hook",
-		slog.String("error", err.Error()))
-	if interactive.CanPromptInteractively() {
-		fmt.Fprintf(os.Stderr, "[entire] Could not read checkpoint policy; skipping Entire checkpoint work: %v\n", err)
-	}
-	emitCheckpointPolicyBlocked(g.ctx, telemetry.CheckpointPolicyBlockedEvent{
-		Hook:     g.hookName,
-		HookType: telemetry.PolicyBlockedHookTypeGit,
-		Reason:   telemetry.PolicyBlockedReasonUnreadable,
-		Outcome:  telemetry.PolicyBlockedOutcomeSkipped,
-	})
-	return true
-}
-
-// initHookLogging initializes logging for hooks by finding the most recent session.
-// Returns a cleanup function that should be deferred.
-// If Entire is not set up or disabled, returns a no-op to avoid creating files.
-func initHookLogging(ctx context.Context) func() {
-	// Don't create any files if Entire is not set up or disabled.
-	// This is checked here as defense-in-depth (also checked in PersistentPreRunE).
-	if !settings.IsSetUpAndEnabled(ctx) {
-		return func() {}
-	}
-
-	// Set up log level getter so logging can read from settings
-	logging.SetLogLevelGetter(GetLogLevel)
-
-	// Read session ID for the slog attribute (empty string is fine - log file is fixed)
-	sessionID := strategy.FindMostRecentSession(ctx)
-	if err := logging.Init(ctx, sessionID); err != nil {
-		// Init failed - logging will use stderr fallback
-		return func() {}
-	}
-
-	// Configure redaction once at startup: PII (opt-in), inline custom_redactions,
-	// and rule packs discovered under .entire/redactors/. No-op if nothing is configured.
-	strategy.EnsureRedactionConfigured()
-
-	return logging.Close
-}
-
-// hookLogCleanup stores the cleanup function for hook logging.
-// Set by PersistentPreRunE, called by PersistentPostRunE.
-var hookLogCleanup func()
 
 func newHooksGitCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -160,14 +99,14 @@ func newHooksGitCmd() *cobra.Command {
 		Short:  "Git hook handlers",
 		Long:   "Commands called by git hooks. These delegate to the current strategy.",
 		Hidden: true, // Internal command, not for direct user use
-		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+		PersistentPreRun: func(cmd *cobra.Command, _ []string) {
 			ctx := cmd.Context()
 			// Check if Entire is set up and enabled before doing any work.
 			// This prevents global git hooks from doing anything in repos where
 			// Entire was never enabled or has been disabled.
 			if !settings.IsSetUpAndEnabled(ctx) {
 				gitHooksDisabled = true
-				return nil
+				return
 			}
 			// Discover external agent plugins so GetByAgentType works correctly
 			// during condensation (e.g. post-commit). Without this, external agents
@@ -176,14 +115,10 @@ func newHooksGitCmd() *cobra.Command {
 			discoveryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			external.DiscoverAndRegister(discoveryCtx)
-			hookLogCleanup = initHookLogging(ctx)
-			return nil
-		},
-		PersistentPostRunE: func(_ *cobra.Command, _ []string) error {
-			if hookLogCleanup != nil {
-				hookLogCleanup()
-			}
-			return nil
+			// Cobra invokes this PersistentPreRun with the leaf command, so
+			// SetContext hands the session-stamped context straight to the
+			// verb's RunE via cmd.Context().
+			cmd.SetContext(withHookSession(ctx))
 		},
 	}
 
@@ -216,9 +151,6 @@ func newHooksGitPrepareCommitMsgCmd() *cobra.Command {
 			defer g.span.End()
 			g.logInvoked(slog.String("source", source))
 
-			if g.skipUnsupportedCheckpointPolicy() {
-				return nil
-			}
 			hookErr := g.strategy.PrepareCommitMsg(g.ctx, commitMsgFile, source)
 			g.logCompleted(hookErr)
 
@@ -243,9 +175,6 @@ func newHooksGitCommitMsgCmd() *cobra.Command {
 			defer g.span.End()
 			g.logInvoked()
 
-			if g.skipUnsupportedCheckpointPolicy() {
-				return nil
-			}
 			hookErr := g.strategy.CommitMsg(g.ctx, commitMsgFile)
 			g.logCompleted(hookErr)
 			return hookErr //nolint:wrapcheck // Thin delegation layer - wrapping adds no value
@@ -267,9 +196,7 @@ func newHooksGitPostCommitCmd() *cobra.Command {
 			defer g.span.End()
 			g.logInvoked()
 
-			if g.skipUnsupportedCheckpointPolicy() {
-				return nil
-			}
+			strategy.SetBeforeCondense(refreshCodexInventoriesBeforeCondense)
 			hookErr := g.strategy.PostCommit(g.ctx)
 			g.logCompleted(hookErr)
 
@@ -292,9 +219,6 @@ func newHooksGitPostRewriteCmd() *cobra.Command {
 			defer g.span.End()
 			g.logInvoked(slog.String("rewrite_type", args[0]))
 
-			if g.skipUnsupportedCheckpointPolicy() {
-				return nil
-			}
 			hookErr := g.strategy.PostRewrite(g.ctx, args[0], cmd.InOrStdin())
 			g.logCompleted(hookErr)
 
@@ -333,7 +257,8 @@ func newHooksGitPrePushCmd() *cobra.Command {
 			// git push aborts the entire batch. PrePush itself only
 			// returns errors for privacy-critical failures (OPF rewrite —
 			// e.g., V1DivergedError, BootstrapTooLargeError,
-			// V1RefMovedError, OPFRuntimeFailedError); transient
+			// V1RefMovedError, OPFRuntimeFailedError,
+			// OPFNoCategoriesError); transient
 			// checkpoint-push failures are logged and swallowed before
 			// reaching this point. See strategy/manual_commit_push.go
 			// for the contract. We wrap with a short "pre-push:" prefix

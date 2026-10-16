@@ -15,14 +15,19 @@ import (
 func TestResolveTrailBySelector_FindsBySelector(t *testing.T) {
 	// Not t.Parallel(): the subtests share one httptest server closed on
 	// return, so they must run synchronously before the deferred Close.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if err := json.NewEncoder(w).Encode(api.TrailListResponse{
-			Trails: []api.TrailResource{
-				{ID: "trl_a", Number: 1, Branch: "feature/a", Title: "Alpha"},
-				{ID: "trl_b", Number: 575, Branch: "feature/b", Title: "Bravo"},
-			},
-			Total: 2,
-		}); err != nil {
+	alpha := api.TrailResource{ID: "trl_a", Number: 1, Branch: "feature/a", Title: "Alpha"}
+	bravo := api.TrailResource{ID: "trl_b", Number: 575, Branch: "feature/b", Title: "Bravo"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A numeric selector resolves through the direct number route; the other
+		// selectors fall back to scanning the list.
+		var payload any = api.TrailListResponse{Trails: []api.TrailResource{alpha, bravo}, Total: 2}
+		switch r.URL.Path {
+		case trailTestBasePath + "/1":
+			payload = alpha
+		case trailTestBasePath + "/575":
+			payload = bravo
+		}
+		if err := json.NewEncoder(w).Encode(payload); err != nil {
 			t.Errorf("encode response: %v", err)
 		}
 	}))
@@ -42,7 +47,7 @@ func TestResolveTrailBySelector_FindsBySelector(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			found, err := resolveTrailBySelector(context.Background(), client, "gh", "acme", "repo", tc.selector, "")
+			found, err := resolveTrailBySelectorAtPath(context.Background(), client, trailTestBasePath, "gh", "acme", "repo", tc.selector, "")
 			if err != nil {
 				t.Fatalf("resolveTrailBySelector: %v", err)
 			}
@@ -64,7 +69,7 @@ func TestResolveTrailBySelector_NotFoundIsAnError(t *testing.T) {
 	defer srv.Close()
 
 	client := api.NewClientWithBaseURL("tok", srv.URL)
-	found, err := resolveTrailBySelector(context.Background(), client, "gh", "acme", "repo", "does-not-exist", "")
+	found, err := resolveTrailBySelectorAtPath(context.Background(), client, trailTestBasePath, "gh", "acme", "repo", "does-not-exist", "")
 	if err == nil {
 		t.Fatalf("expected error for missing trail, got found = %#v", found)
 	}
@@ -89,6 +94,8 @@ func TestDescribeTrailRef(t *testing.T) {
 		{"title without number", api.TrailResource{Title: "Add foo"}, `trail "Add foo"`},
 		{"neither", api.TrailResource{}, "trail"},
 		{"title trimmed", api.TrailResource{Number: 1, Title: "  Add foo  "}, "trail #1 (Add foo)"},
+		{"project branch", api.TrailResource{Number: 7, Branch: "feature/x", Parent: &api.TrailParentReference{Number: 42}}, "trail #42 (branch feature/x)"},
+		{"project merged branch", api.TrailResource{Number: 7, OriginalBranch: "feature/old", Parent: &api.TrailParentReference{Number: 42}}, "trail #42 (branch feature/old)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -107,7 +114,7 @@ func TestDescribeTrailRef(t *testing.T) {
 func TestTrailCheckoutRejectsArgWithTrailFlag(t *testing.T) {
 	t.Parallel()
 
-	cmd := newTrailCheckoutCmd()
+	cmd := newTrailCheckoutCmd(legacyTrailMode)
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	cmd.SetArgs([]string{"feature/b", "--trail", "575"})
@@ -124,7 +131,7 @@ func TestTrailCheckoutRejectsArgWithTrailFlag(t *testing.T) {
 func TestTrailCheckoutHasWorktreeFlag(t *testing.T) {
 	t.Parallel()
 
-	cmd := newTrailCheckoutCmd()
+	cmd := newTrailCheckoutCmd(legacyTrailMode)
 	flag := cmd.Flags().Lookup("worktree")
 	if flag == nil {
 		t.Fatal("worktree flag not registered")

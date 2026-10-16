@@ -10,14 +10,16 @@ import (
 	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/agent/antigravity"
 	"github.com/entireio/cli/cmd/entire/cli/agent/factoryaidroid"
-	"github.com/entireio/cli/cmd/entire/cli/agent/geminicli"
 	"github.com/entireio/cli/cmd/entire/cli/agent/opencode"
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
 	"github.com/entireio/cli/cmd/entire/cli/transcript/compact"
+	"github.com/entireio/cli/cmd/entire/cli/transcript/geminilegacy"
 	"github.com/entireio/cli/redact"
+	transcriptlib "github.com/entireio/cli/transcript"
 )
 
 // GenerateFromTranscript generates a summary from pre-redacted transcript bytes.
@@ -29,9 +31,17 @@ import (
 //   - filesTouched: list of files modified during the session
 //   - agentType: the agent type to determine transcript format
 //   - generator: summary generator to use (if nil, uses default ClaudeGenerator)
+//   - progress: optional callback for streaming progress updates; nil suppresses reporting
 //
 // Returns nil, error if transcript is empty or cannot be parsed.
-func GenerateFromTranscript(ctx context.Context, transcriptBytes redact.RedactedBytes, filesTouched []string, agentType types.AgentType, generator Generator) (*checkpoint.Summary, error) {
+func GenerateFromTranscript(
+	ctx context.Context,
+	transcriptBytes redact.RedactedBytes,
+	filesTouched []string,
+	agentType types.AgentType,
+	generator Generator,
+	progress agent.ProgressFn,
+) (*checkpoint.Summary, error) {
 	if transcriptBytes.Len() == 0 {
 		return nil, errors.New("empty transcript")
 	}
@@ -52,6 +62,19 @@ func GenerateFromTranscript(ctx context.Context, transcriptBytes redact.Redacted
 
 	if generator == nil {
 		generator = &ClaudeGenerator{}
+	}
+
+	// Forward progress to streaming-capable generators without changing the
+	// Generator interface. Production callers (resolveCheckpointSummaryProvider)
+	// always pass *TextGeneratorAdapter; *ClaudeGenerator is the
+	// fallback when GenerateFromTranscript is called with a nil generator
+	// (some tests and legacy paths). Both implementations have a private
+	// progress field — type-assert each shape and set it.
+	switch g := generator.(type) {
+	case *ClaudeGenerator:
+		g.progress = progress
+	case *TextGeneratorAdapter:
+		g.progress = progress
 	}
 
 	summary, err := generator.Generate(ctx, input)
@@ -129,7 +152,7 @@ var minimalDetailTools = map[string]bool{
 
 // BuildCondensedTranscriptFromBytes parses pre-redacted transcript bytes and extracts a condensed view.
 // This is a convenience function that combines parsing and condensing.
-// The agentType parameter determines which parser to use (Claude/OpenCode JSONL vs Gemini JSON).
+// The agentType parameter determines which parser to use (Claude/OpenCode JSONL vs JSON from historical Gemini CLI checkpoints).
 func BuildCondensedTranscriptFromBytes(content redact.RedactedBytes, agentType types.AgentType) ([]Entry, error) {
 	switch agentType {
 	case agent.AgentTypeGemini:
@@ -140,6 +163,10 @@ func BuildCondensedTranscriptFromBytes(content redact.RedactedBytes, agentType t
 		return buildCondensedTranscriptFromOpenCode(content)
 	case agent.AgentTypeCodex:
 		return buildCondensedTranscriptFromCodex(content)
+	case agent.AgentTypePi:
+		return buildCondensedTranscriptFromPi(content)
+	case agent.AgentTypeAntigravity:
+		return buildCondensedTranscriptFromAntigravity(content), nil
 	case agent.AgentTypeClaudeCode, agent.AgentTypeCursor, agent.AgentTypeUnknown:
 		// Claude/cursor format - fall through to shared logic below
 	}
@@ -159,6 +186,24 @@ func BuildCondensedTranscriptFromBytes(content redact.RedactedBytes, agentType t
 		return compactEntries, nil
 	}
 	return entries, nil
+}
+
+// buildCondensedTranscriptFromPi accepts both native Pi v3 session JSONL and
+// already-compacted Pi JSONL. Check compact form first because feeding compact
+// lines back through Compact would treat them as generic Claude-style JSONL.
+func buildCondensedTranscriptFromPi(content redact.RedactedBytes) ([]Entry, error) {
+	if entries, err := buildCondensedTranscriptFromCompact(content); err == nil && len(entries) > 0 {
+		return entries, nil
+	}
+
+	compacted, err := compact.Compact(content, compact.MetadataFields{
+		Agent:      "pi",
+		CLIVersion: "summarize",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to compact Pi transcript: %w", err)
+	}
+	return buildCondensedTranscriptFromCompact(redact.AlreadyRedacted(compacted))
 }
 
 func buildCondensedTranscriptFromCompact(redacted redact.RedactedBytes) ([]Entry, error) {
@@ -193,7 +238,7 @@ func buildCondensedTranscriptFromCompact(redacted redact.RedactedBytes) ([]Entry
 
 // buildCondensedTranscriptFromGemini parses Gemini JSON transcript and extracts a condensed view.
 func buildCondensedTranscriptFromGemini(redacted redact.RedactedBytes) ([]Entry, error) {
-	geminiTranscript, err := geminicli.ParseTranscript(redacted.Bytes())
+	geminiTranscript, err := geminilegacy.ParseTranscript(redacted.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse Gemini transcript: %w", err)
 	}
@@ -201,14 +246,14 @@ func buildCondensedTranscriptFromGemini(redacted redact.RedactedBytes) ([]Entry,
 	var entries []Entry
 	for _, msg := range geminiTranscript.Messages {
 		switch msg.Type {
-		case geminicli.MessageTypeUser:
+		case geminilegacy.MessageTypeUser:
 			if msg.Content != "" {
 				entries = append(entries, Entry{
 					Type:    EntryTypeUser,
 					Content: msg.Content,
 				})
 			}
-		case geminicli.MessageTypeGemini:
+		case geminilegacy.MessageTypeGemini:
 			// Add assistant content
 			if msg.Content != "" {
 				entries = append(entries, Entry{
@@ -228,6 +273,32 @@ func buildCondensedTranscriptFromGemini(redacted redact.RedactedBytes) ([]Entry,
 	}
 
 	return entries, nil
+}
+
+// buildCondensedTranscriptFromAntigravity condenses agy's step JSONL. The
+// format knowledge lives in the antigravity package (CondenseTranscript); this
+// only maps its roles onto Entry. agy tool args name the file as TargetFile,
+// which extractGenericToolDetail does not know, so it is offered as file_path
+// too.
+func buildCondensedTranscriptFromAntigravity(redacted redact.RedactedBytes) []Entry {
+	var entries []Entry
+	for _, step := range antigravity.CondenseTranscript(redacted.Bytes()) {
+		switch step.Role {
+		case antigravity.CondensedRoleUser:
+			entries = append(entries, Entry{Type: EntryTypeUser, Content: step.Text})
+		case antigravity.CondensedRoleAssistant:
+			entries = append(entries, Entry{Type: EntryTypeAssistant, Content: step.Text})
+		case antigravity.CondensedRoleTool:
+			args := step.ToolArgs
+			if target, ok := args["TargetFile"].(string); ok && target != "" {
+				if _, has := args["file_path"]; !has {
+					args["file_path"] = target
+				}
+			}
+			entries = append(entries, Entry{Type: EntryTypeTool, ToolName: step.ToolName, ToolDetail: extractGenericToolDetail(args)})
+		}
+	}
+	return entries
 }
 
 // buildCondensedTranscriptFromOpenCode parses OpenCode export JSON transcript and extracts a condensed view.
@@ -307,7 +378,7 @@ func buildCondensedTranscriptFromCodex(content redact.RedactedBytes) ([]Entry, e
 		}
 
 		switch line.Type {
-		case transcript.TypeUser:
+		case transcriptlib.TypeUser:
 			var blocks []compactUserTextBlock
 			if err := json.Unmarshal(line.Content, &blocks); err != nil {
 				continue
@@ -320,21 +391,21 @@ func buildCondensedTranscriptFromCodex(content redact.RedactedBytes) ([]Entry, e
 					})
 				}
 			}
-		case transcript.TypeAssistant:
+		case transcriptlib.TypeAssistant:
 			var blocks []compactAssistantBlock
 			if err := json.Unmarshal(line.Content, &blocks); err != nil {
 				continue
 			}
 			for _, block := range blocks {
 				switch block.Type {
-				case transcript.ContentTypeText:
+				case transcriptlib.ContentTypeText:
 					if block.Text != "" {
 						entries = append(entries, Entry{
 							Type:    EntryTypeAssistant,
 							Content: block.Text,
 						})
 					}
-				case transcript.ContentTypeToolUse:
+				case transcriptlib.ContentTypeToolUse:
 					var input map[string]interface{}
 					if err := json.Unmarshal(block.Input, &input); err != nil {
 						input = nil
@@ -405,11 +476,11 @@ func BuildCondensedTranscript(lines []transcript.Line) []Entry {
 
 	for _, line := range lines {
 		switch line.Type {
-		case transcript.TypeUser:
+		case transcriptlib.TypeUser:
 			if entry := extractUserEntry(line); entry != nil {
 				entries = append(entries, *entry)
 			}
-		case transcript.TypeAssistant:
+		case transcriptlib.TypeAssistant:
 			assistantEntries := extractAssistantEntries(line)
 			entries = append(entries, assistantEntries...)
 		}
@@ -456,14 +527,14 @@ func extractAssistantEntries(line transcript.Line) []Entry {
 
 	for _, block := range msg.Content {
 		switch block.Type {
-		case transcript.ContentTypeText:
+		case transcriptlib.ContentTypeText:
 			if block.Text != "" {
 				entries = append(entries, Entry{
 					Type:    EntryTypeAssistant,
 					Content: block.Text,
 				})
 			}
-		case transcript.ContentTypeToolUse:
+		case transcriptlib.ContentTypeToolUse:
 			var input transcript.ToolInput
 			_ = json.Unmarshal(block.Input, &input) //nolint:errcheck // Best-effort parsing
 
@@ -515,7 +586,7 @@ func extractToolDetail(toolName string, input transcript.ToolInput) string {
 	return input.Pattern
 }
 
-// FormatCondensedTranscript formats an Input into a human-readable string for LLM.
+// FormatCondensedTranscript formats an Input into a human-readable string.
 // The format is:
 //
 //	[User] user prompt here
@@ -523,7 +594,22 @@ func extractToolDetail(toolName string, input transcript.ToolInput) string {
 //	[Assistant] assistant response here
 //
 //	[Tool] ToolName: description or file path
+//
+// It is unbounded: `entire explain --full` renders it for a reader who asked
+// for the whole transcript. Summary prompts go through
+// FormatCondensedTranscriptForPrompt, which applies the size bounds.
 func FormatCondensedTranscript(input Input) string {
+	return formatCondensedTranscript(input, false)
+}
+
+// FormatCondensedTranscriptForPrompt is FormatCondensedTranscript with the
+// transcript and file-list bounds a summary prompt needs (see
+// maxCondensedTranscriptBytes). Every LLM-bound caller uses this one.
+func FormatCondensedTranscriptForPrompt(input Input) string {
+	return formatCondensedTranscript(input, true)
+}
+
+func formatCondensedTranscript(input Input, bounded bool) string {
 	var sb strings.Builder
 
 	for i, entry := range input.Transcript {
@@ -551,12 +637,70 @@ func FormatCondensedTranscript(input Input) string {
 		}
 	}
 
-	if len(input.FilesTouched) > 0 {
-		sb.WriteString("\n[Files Modified]\n")
-		for _, file := range input.FilesTouched {
-			fmt.Fprintf(&sb, "- %s\n", file)
-		}
+	out := sb.String()
+	if bounded {
+		out = boundTranscriptText(out)
 	}
 
+	// Appended after the transcript bound, under its own: the file list is the
+	// part a summary can least afford to lose, but it is not short by
+	// construction — a wide refactor names thousands of paths — and the argv
+	// ceiling that sizes maxCondensedTranscriptBytes applies to the whole
+	// prompt, so an unbounded tail would reopen the E2BIG failure the
+	// transcript bound closed.
+	if len(input.FilesTouched) > 0 {
+		out += formatFilesList(input.FilesTouched, bounded)
+	}
+
+	return out
+}
+
+// maxCondensedTranscriptBytes bounds the transcript text a summary prompt
+// carries. Every byte here becomes prompt tokens, on every provider, on every
+// checkpoint; long sessions were previously unbounded.
+//
+// The number was originally sized to keep Antigravity's prompt, then a single
+// argv element, inside Linux's 128 KiB MAX_ARG_STRLEN. Antigravity now reads
+// the prompt from stdin (see antigravity.GenerateText); the budget stays as a
+// cost bound.
+const maxCondensedTranscriptBytes = 96 * 1024
+
+// maxCondensedFilesBytes bounds the [Files Modified] list that follows the
+// transcript. 16 KiB is a few hundred paths; past that a summary needs the
+// count, not the names.
+const maxCondensedFilesBytes = 16 * 1024
+
+// formatFilesList renders the [Files Modified] section. When bounded, it
+// keeps whole lines up to maxCondensedFilesBytes and closes with how many
+// paths were left out.
+func formatFilesList(files []string, bounded bool) string {
+	var sb strings.Builder
+	sb.WriteString("\n[Files Modified]\n")
+	for i, file := range files {
+		line := "- " + file + "\n"
+		if bounded && sb.Len()+len(line) > maxCondensedFilesBytes {
+			fmt.Fprintf(&sb, "- [... %d more files omitted to fit the summary prompt ...]\n", len(files)-i)
+			break
+		}
+		sb.WriteString(line)
+	}
 	return sb.String()
+}
+
+// boundTranscriptText caps transcript text at maxCondensedTranscriptBytes,
+// dropping from the middle. Both ends carry the most signal for a summary —
+// the opening says what was asked, the tail says how it ended — and a middle
+// cut is the one that keeps both.
+func boundTranscriptText(s string) string {
+	if len(s) <= maxCondensedTranscriptBytes {
+		return s
+	}
+
+	const marker = "\n[... transcript truncated to fit the summary prompt ...]\n"
+	keep := maxCondensedTranscriptBytes - len(marker)
+	head := keep / 2
+
+	// ToValidUTF8 drops the partial rune a byte-offset cut can leave at either
+	// new edge.
+	return strings.ToValidUTF8(s[:head], "") + marker + strings.ToValidUTF8(s[len(s)-(keep-head):], "")
 }

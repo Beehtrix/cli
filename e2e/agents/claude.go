@@ -12,19 +12,11 @@ import (
 	"time"
 )
 
-// cleanEnv returns os.Environ() with agent-incompatible variables removed.
-// It strips CLAUDECODE (so Claude Code doesn't refuse to start inside this
-// test runner) and ENTIRE_TEST_TTY (so agents exercise the real TTY detection
-// paths instead of the test override).
+// cleanEnv returns os.Environ() as Claude Code should see it: agentEnv's
+// harness-only variables removed, plus CLAUDECODE so Claude Code doesn't
+// refuse to start inside this test runner.
 func cleanEnv() []string {
-	var env []string
-	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, "CLAUDECODE=") || strings.HasPrefix(e, "ENTIRE_TEST_TTY=") {
-			continue
-		}
-		env = append(env, e)
-	}
-	return env
+	return agentEnv(os.Environ(), "CLAUDECODE")
 }
 
 func init() {
@@ -87,6 +79,12 @@ func (c *Claude) RunPrompt(ctx context.Context, dir string, prompt string, opts 
 	for _, o := range opts {
 		o(cfg)
 	}
+
+	ctx, cancel, err := boundPrompt(ctx, 0, cfg)
+	if err != nil {
+		return Output{}, err
+	}
+	defer cancel()
 
 	configDir, err := cleanConfigDir()
 	if err != nil {
@@ -163,7 +161,7 @@ func (c *Claude) StartSession(ctx context.Context, dir string) (Session, error) 
 
 	args := append([]string{"env"}, envArgs...)
 	args = append(args, c.Binary(), "--dangerously-skip-permissions")
-	s, err := NewTmuxSession(name, dir, []string{"CLAUDECODE", "ENTIRE_TEST_TTY"}, args[0], args[1:]...)
+	s, err := NewTmuxSession(name, dir, []string{"CLAUDECODE"}, args[0], args[1:]...)
 	if err != nil {
 		_ = os.RemoveAll(configDir)
 		return nil, err
@@ -180,11 +178,27 @@ func (c *Claude) StartSession(ctx context.Context, dir string) (Session, error) 
 		if !strings.Contains(content, "Enter to confirm") {
 			break
 		}
-		// The bypass permissions dialog defaults to "No, exit" —
-		// arrow down to "Yes, I accept" before confirming.
-		if strings.Contains(content, "Yes, I accept") {
-			_ = s.SendKeys("Down")
-			time.Sleep(200 * time.Millisecond)
+		// Permission and workspace-trust dialogs both default to a negative
+		// option, so walk down to the affirmative one before confirming. Only
+		// dialogs that offer such a choice get the walk — first-run dialogs
+		// like theme selection also say "Enter to confirm" and are answered by
+		// their default. Once committed to the walk, bail rather than confirm
+		// blind: Enter on the wrong option quits Claude, and that surfaces as
+		// the next iteration's "waiting for startup prompt" timeout, which
+		// hides the cause.
+		if claudeStartupOffersYes(content) {
+			for range 3 {
+				if claudeStartupSelectionIsYes(content) {
+					break
+				}
+				_ = s.SendKeys("Down")
+				time.Sleep(200 * time.Millisecond)
+				content = s.Capture()
+			}
+			if !claudeStartupSelectionIsYes(content) {
+				_ = s.Close()
+				return nil, fmt.Errorf("startup dialog: affirmative option not reachable, wording may have changed\n%s", content)
+			}
 		}
 		_ = s.SendKeys("Enter")
 		time.Sleep(500 * time.Millisecond)
@@ -192,6 +206,31 @@ func (c *Claude) StartSession(ctx context.Context, dir string) (Session, error) 
 	s.stableAtSend = ""
 
 	return s, nil
+}
+
+// claudeStartupOffersYes reports whether the dialog presents an affirmative
+// option at all, distinguishing a trust/permission choice from a first-run
+// dialog whose default answer is the right one.
+func claudeStartupOffersYes(content string) bool {
+	return strings.Contains(strings.ToLower(content), "yes")
+}
+
+// claudeStartupSelectionIsYes reports whether the highlighted option in a
+// startup dialog is the affirmative one. It keys on the affirmative wording
+// rather than the negative because both are release-dependent, and only one of
+// them is safe to press Enter on: a reworded negative ("No, cancel") read as
+// affirmative quits Claude, while a reworded affirmative merely costs another
+// Down keypress.
+// The dialog renders below whatever it was drawn over, so the last cursor line
+// in the pane is its selection; an earlier "❯" belongs to prior content.
+func claudeStartupSelectionIsYes(content string) bool {
+	selected := ""
+	for line := range strings.SplitSeq(content, "\n") {
+		if strings.Contains(line, "❯") {
+			selected = line
+		}
+	}
+	return strings.Contains(strings.ToLower(selected), "yes")
 }
 
 // cleanConfigDir creates an isolated temp directory for CLAUDE_CONFIG_DIR so

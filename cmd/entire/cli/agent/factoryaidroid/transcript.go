@@ -3,6 +3,7 @@ package factoryaidroid
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,8 @@ import (
 	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/logging"
+	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
 	"github.com/entireio/cli/cmd/entire/cli/validation"
 )
@@ -296,7 +299,7 @@ type droidSettings struct {
 // The settings file contains the actual model being used, unlike the transcript's
 // system-reminder text which can be stale after provider switches.
 // Returns empty string if the settings file cannot be read or has no model.
-func ExtractModelFromTranscript(transcriptPath string) string {
+func ExtractModelFromTranscript(ctx context.Context, transcriptPath string) string {
 	if transcriptPath == "" {
 		return ""
 	}
@@ -309,9 +312,9 @@ func ExtractModelFromTranscript(transcriptPath string) string {
 
 	var settings droidSettings
 	if err := json.Unmarshal(data, &settings); err != nil {
-		slog.Warn("corrupt settings file, cannot extract model",
+		logging.Warn(ctx, "factoryai-droid: corrupt settings file, cannot extract model",
 			slog.String("path", settingsPath),
-			slog.Any("error", err))
+			slog.String("error", err.Error()))
 		return ""
 	}
 
@@ -394,7 +397,7 @@ func CalculateTotalTokenUsageFromBytes(data []byte, startLine int, subagentsDir 
 	if len(agentIDs) > 0 {
 		subagentUsage := &agent.TokenUsage{}
 		for agentID := range agentIDs {
-			agentPath := filepath.Join(subagentsDir, fmt.Sprintf("agent-%s.jsonl", agentID))
+			agentPath := filepath.Join(subagentsDir, paths.AgentTranscriptFileName(agentID))
 			agentUsage, err := CalculateTokenUsageFromFile(agentPath, 0)
 			if err != nil {
 				continue
@@ -451,7 +454,7 @@ func ExtractAllModifiedFilesFromBytes(data []byte, startLine int, subagentsDir s
 	}
 	agentIDs := ExtractSpawnedAgentIDs(fullParsed)
 	for agentID := range agentIDs {
-		agentPath := filepath.Join(subagentsDir, fmt.Sprintf("agent-%s.jsonl", agentID))
+		agentPath := filepath.Join(subagentsDir, paths.AgentTranscriptFileName(agentID))
 		agentLines, _, agentErr := ParseDroidTranscript(agentPath, 0)
 		if agentErr != nil {
 			continue

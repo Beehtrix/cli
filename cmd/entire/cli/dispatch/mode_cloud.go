@@ -13,37 +13,33 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 )
 
-// requireSecureDispatchURL is the secure-base-URL guard used before the cloud
-// client sends a bearer token. Tests swap it to allow httptest.NewServer
-// (http://127.0.0.1:...) endpoints; production always routes through
-// api.RequireSecureURL and rejects plain HTTP.
-var requireSecureDispatchURL = api.RequireSecureURL
+// newDispatchCellClient builds the client for the entire-api cell that
+// generates the dispatch — jurisdiction's, or the caller's home cell when it is
+// empty — and reports the caller's home jurisdiction. Tests swap in a client
+// for an httptest server.
+var newDispatchCellClient = defaultNewDispatchCellClient
+
+func defaultNewDispatchCellClient(ctx context.Context, insecureHTTP bool, jurisdiction string) (*api.Client, string, error) {
+	factory, err := auth.NewEntireAPICellClientFactory(ctx, insecureHTTP)
+	if err != nil {
+		return nil, "", err //nolint:wrapcheck // runServer wraps; ErrNotLoggedIn must stay matchable
+	}
+	var target *auth.CellTarget
+	if j := strings.TrimSpace(jurisdiction); j != "" {
+		target = &auth.CellTarget{Jurisdiction: j}
+	}
+	client, err := factory.ClientFor(ctx, target)
+	if err != nil {
+		return nil, "", err //nolint:wrapcheck // runServer wraps
+	}
+	if target != nil {
+		return client, "", nil // home only labels a not-found error with no selector
+	}
+	home, _ := factory.HomeJurisdiction() //nolint:errcheck // best-effort label for a repo-not-found error
+	return client, home, nil
+}
 
 func runServer(ctx context.Context, opts Options) (*Dispatch, error) {
-	baseURL := api.BaseURL()
-	if opts.InsecureHTTPAuth {
-		auth.EnableInsecureHTTP()
-	} else {
-		if err := requireSecureDispatchURL(baseURL); err != nil {
-			return nil, fmt.Errorf("dispatch base URL: %w", err)
-		}
-	}
-
-	// Resolve a bearer scoped to the dispatch service host. In split-host
-	// deployments the tokenmanager runs an RFC 8693 exchange so the
-	// bearer carries the data-API audience rather than the auth-host
-	// one; single-host setups hit the same-host shortcut and return the
-	// core token unchanged. OriginOnly strips any path the operator may
-	// have included in ENTIRE_API_BASE_URL — tokenmanager validates
-	// Resource as a strict origin URL.
-	token, err := lookupResourceToken(ctx, api.OriginOnly(baseURL))
-	if errors.Is(err, auth.ErrNotLoggedIn) {
-		return nil, errors.New("dispatch requires login — run `entire login`")
-	}
-	if err != nil {
-		return nil, fmt.Errorf("reading credentials: %w", err)
-	}
-
 	now := nowUTC()
 	sinceInput := strings.TrimSpace(opts.Since)
 	if sinceInput == "" {
@@ -74,23 +70,39 @@ func runServer(ctx context.Context, opts Options) (*Dispatch, error) {
 		}
 		defer repo.Close()
 
-		repoFullName, err := resolveRepoFullName(ctx, repo)
+		// The slug names the origin's forge (gh/ or et/), so a same-named
+		// repo on the other forge cannot answer for this checkout.
+		repoSlug, err := resolveOriginRepoSlug(ctx, repo)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w (or pass --repos %s to name the repo)", err, RepoSlugShapes)
 		}
-		repos = []string{repoFullName}
+		repos = []string{repoSlug}
 	}
 
-	cloud := NewCloudClient(CloudConfig{BaseURL: baseURL, Token: token})
-	reqBody := CreateDispatchRequest{
-		Repos:    repos,
-		Since:    normalizedSince.Format(time.RFC3339),
-		Until:    normalizedUntil.Format(time.RFC3339),
-		Generate: true,
-		Voice:    resolvedDispatchVoicePreference(opts.Voice),
+	// Local inputs are settled first: building the client already dials (login
+	// refresh, cell catalog).
+	client, home, err := newDispatchCellClient(ctx, opts.InsecureHTTPAuth, opts.Jurisdiction)
+	if errors.Is(err, auth.ErrNotLoggedIn) {
+		return nil, errors.New("dispatch requires login — run `entire login`")
 	}
-	response, err := cloud.CreateDispatch(ctx, reqBody)
 	if err != nil {
+		return nil, fmt.Errorf("dispatch service: %w", err)
+	}
+
+	reqBody := CreateDispatchRequest{
+		Repos: repos,
+		Since: normalizedSince.Format(time.RFC3339),
+		Until: normalizedUntil.Format(time.RFC3339),
+		Voice: resolvedDispatchVoicePreference(opts.Voice),
+	}
+	response, err := NewCloudClient(client).CreateDispatch(ctx, reqBody, opts.Jurisdiction)
+	if err != nil {
+		// With no selector the home cell answered; say which one so the hint
+		// can exclude it.
+		var notFound *RepoNotFoundError
+		if errors.As(err, &notFound) && notFound.Jurisdiction == "" {
+			notFound.Home = home
+		}
 		return nil, err
 	}
 
@@ -101,7 +113,7 @@ func runServer(ctx context.Context, opts Options) (*Dispatch, error) {
 	return dispatch, nil
 }
 
-func apiToDispatch(response *CreateDispatchResponse) *Dispatch {
+func apiToDispatch(response *APIRun) *Dispatch {
 	if response == nil {
 		return &Dispatch{}
 	}
@@ -134,9 +146,6 @@ func apiToDispatch(response *CreateDispatchResponse) *Dispatch {
 	}
 
 	generatedText := strings.TrimSpace(response.GeneratedMarkdown)
-	if generatedText == "" {
-		generatedText = strings.TrimSpace(response.GeneratedText)
-	}
 
 	return &Dispatch{
 		Window: Window{

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -33,20 +34,43 @@ var (
 	sessionImportRun      = runSelectedImports
 )
 
+// importHistoryFlagUsage is the --import-history help text. It lives here, next
+// to the behavior it describes, so the advertised lookback cannot drift from
+// agentimport's.
+var importHistoryFlagUsage = fmt.Sprintf(
+	"During first-time setup, import the selected agents' existing session history (last %d days) without prompting",
+	agentimport.LookbackDays)
+
+// noteImportHistoryNotApplicable tells a user who asked for a history import
+// that this run cannot do one. The offer is first-time-setup only, so on an
+// already-configured repo the standalone command is the way in; silently
+// dropping the flag would leave them believing history had been imported.
+func noteImportHistoryNotApplicable(w io.Writer) {
+	fmt.Fprintf(w, "Note: --%s applies to first-time setup. Run 'entire import <agent>' to import existing history.\n",
+		flagImportHistory)
+}
+
 // maybeOfferSessionImport offers, on first-time enable only, to import
 // pre-existing agent history for the just-selected agents. Granularity is
 // agent-level: choosing an agent imports all its discoverable sessions (30-day
 // lookback, matching `entire import`). It is best-effort — discovery or import
 // failures are logged and reported to the user but never fail enable.
 //
-// Import only happens on an explicit choice: an interactive run presents a
-// multi-select (nothing pre-checked) and imports what the user selects; `--yes`
-// ("accept all defaults") auto-imports all eligible agents. A non-interactive
-// run without `--yes` (a script, a piped shell, or an agent with no TTY) makes
-// no choice, so it imports nothing and just points at `entire import` — silently
-// importing history there would be surprising.
+// Import only happens on an explicit choice. An interactive run presents a
+// multi-select with nothing pre-checked, so its default is to import nothing;
+// `--import-history` is the non-interactive way to say yes.
+//
+// `--yes` deliberately does NOT import. It means "accept all defaults", and the
+// interactive default here is to skip — so implying an import from it would
+// make the unattended path do the opposite of the attended one. Ingesting a
+// month of local transcripts (which a later push publishes) is its own
+// decision, not a setup default, so `--yes` takes the same path as any other
+// run that makes no choice: import nothing, and point at `entire import`.
 func maybeOfferSessionImport(ctx context.Context, w io.Writer, agents []agent.Agent, opts EnableOptions, firstRun bool) {
 	if !firstRun {
+		if opts.ImportHistory {
+			noteImportHistoryNotApplicable(w)
+		}
 		return
 	}
 
@@ -57,20 +81,38 @@ func maybeOfferSessionImport(ctx context.Context, w io.Writer, agents []agent.Ag
 		return
 	}
 
-	eligible := sessionImportDiscover(ctx, agents, repoRoot)
+	eligible := sessionImportDiscover(ctx, w, agents, repoRoot)
 	if len(eligible) == 0 {
 		return
 	}
 
+	// Resolve the anchor before asking. Every imported checkpoint needs one
+	// (agentimport.Run refuses without it), so in a repo that cannot produce
+	// one the honest move is to not ask the question rather than to ask it and
+	// discard the answer. Placed after discovery so an anchorless repo with no
+	// importable history stays silent, and before the prompt because that is
+	// the thing being kept honest. It runs ahead of the checkpoint-policy and
+	// redaction gates inside sessionImportRun; those guard writes, which still
+	// happen after them.
+	linkCommitSHA, err := resolveImportAnchorForOnboarding(ctx, w)
+	if err != nil {
+		return
+	}
+
+	// No explicit opt-in, and no way (or no intent) to ask: don't silently
+	// import. Leave a pointer so scripted/agent/--yes enables can still import
+	// on demand. The hint names the standalone command rather than the flag:
+	// by the time this prints, setup has written its settings, so a re-run of
+	// enable is no longer a first run and the flag would not apply.
+	if !opts.ImportHistory && (opts.Yes || !interactive.CanPromptInteractively()) {
+		logging.Info(ctx, "session import offer skipped: no explicit opt-in",
+			"eligible", len(eligible), "yes", opts.Yes)
+		fmt.Fprintf(w, "Found importable history for %s. Run 'entire import <agent>' to import it.\n", pluralAgents(len(eligible)))
+		return
+	}
+
 	selected := eligible
-	if !opts.Yes {
-		if !interactive.CanPromptInteractively() {
-			// Non-interactive without --yes: don't silently import. Leave a
-			// pointer so scripted/agent enables can still import on demand.
-			logging.Info(ctx, "session import offer skipped: non-interactive without --yes", "eligible", len(eligible))
-			fmt.Fprintf(w, "Found importable history for %s. Run 'entire import <agent>' to import it.\n", pluralAgents(len(eligible)))
-			return
-		}
+	if !opts.ImportHistory {
 		selected, err = sessionImportPrompt(ctx, w, eligible)
 		if err != nil {
 			// Best-effort: a prompt/UI failure must never fail enable. Log,
@@ -84,12 +126,40 @@ func maybeOfferSessionImport(ctx context.Context, w io.Writer, agents []agent.Ag
 		return
 	}
 
-	sessionImportRun(ctx, w, repoRoot, selected)
+	sessionImportRun(ctx, w, repoRoot, linkCommitSHA, selected)
+}
+
+// resolveImportAnchorForOnboarding resolves the anchor every imported
+// checkpoint is stamped with, reporting the skip itself so the caller only has
+// to stop. Never fails enable: an unanchorable repo loses the optional import,
+// not the setup.
+func resolveImportAnchorForOnboarding(ctx context.Context, w io.Writer) (string, error) {
+	repo, err := openRepository(ctx)
+	if err != nil {
+		logging.Warn(ctx, "session import skipped: open repository failed", "error", err)
+		fmt.Fprintf(w, "Note: could not import agent history: %v\n", err)
+		return "", err
+	}
+	defer repo.Close()
+
+	linkCommitSHA, err := resolveImportLinkCommitSHA(ctx, repo)
+	if err != nil {
+		logging.Warn(ctx, "session import skipped: no valid anchor", "error", err)
+		// The offer is first-time-setup only, so the standalone command is the
+		// only way back in, as noteImportHistoryNotApplicable says for the same
+		// dead end.
+		fmt.Fprintf(w, "Note: skipping agent history import: %v\n", err)
+		fmt.Fprintln(w, "      Run 'entire import <agent>' once this repo can anchor an import.")
+		return "", err
+	}
+	return linkCommitSHA, nil
 }
 
 // discoverImportableAgents keeps the selected agents that have a registered
-// importer and at least one discoverable session for the repo.
-func discoverImportableAgents(ctx context.Context, agents []agent.Agent, repoRoot string) []eligibleImport {
+// importer and at least one discoverable session for the repo. An agent whose
+// discovery fails is skipped with a note saying why: the error can be a refusal
+// the user can act on (Cursor's names the --path rerun).
+func discoverImportableAgents(ctx context.Context, w io.Writer, agents []agent.Agent, repoRoot string) []eligibleImport {
 	now := time.Now()
 	var out []eligibleImport
 	for _, ag := range agents {
@@ -100,6 +170,7 @@ func discoverImportableAgents(ctx context.Context, agents []agent.Agent, repoRoo
 		sessions, err := imp.Discover(repoRoot, "", now, nil)
 		if err != nil {
 			logging.Warn(ctx, "session import discovery failed", "agent", string(ag.Type()), "error", err)
+			fmt.Fprintf(w, "Note: skipping %s history import: %v\n", ag.Type(), err)
 			continue
 		}
 		if len(sessions) == 0 {
@@ -198,7 +269,7 @@ func promptImportConfirmSingle(ctx context.Context, w io.Writer, e eligibleImpor
 // runSelectedImports imports each chosen agent's history, mirroring the
 // standalone `entire import` command. Per-agent failures are logged and
 // reported but do not stop the remaining imports or fail enable.
-func runSelectedImports(ctx context.Context, w io.Writer, repoRoot string, selected []eligibleImport) {
+func runSelectedImports(ctx context.Context, w io.Writer, repoRoot, linkCommitSHA string, selected []eligibleImport) {
 	repo, err := openRepository(ctx)
 	if err != nil {
 		logging.Warn(ctx, "session import skipped: open repository failed", "error", err)
@@ -207,33 +278,55 @@ func runSelectedImports(ctx context.Context, w io.Writer, repoRoot string, selec
 	}
 	defer repo.Close()
 
-	// Gate on the checkpoint policy before writing any checkpoint data, matching
-	// the standalone `entire import` command. Best-effort: an unsupported or
-	// unreadable policy skips the import (logged and noted) instead of failing
-	// enable, since the offer must never break enable.
-	if err := ensureCheckpointPolicyAllowsCheckpointData(ctx, repo); err != nil {
-		logging.Warn(ctx, "session import skipped: checkpoint policy not satisfied", "error", err)
+	// Load repo/user-configured redaction before any checkpoint write, matching
+	// import_cmd.go; without it only always-on secret scanning would run.
+	// Scanner-config failures skip the import (this offer must never break
+	// enable).
+	if err := strategy.EnsureRedactionConfigured(ctx); err != nil {
+		logging.Warn(ctx, "session import skipped: redaction configuration failed", "error", err)
 		fmt.Fprintf(w, "Note: skipping agent history import: %v\n", err)
 		return
 	}
 
-	// Load repo/user-configured redaction before any checkpoint write, matching
-	// import_cmd.go; without it only always-on secret scanning would run.
-	strategy.EnsureRedactionConfigured()
-
+	var importedLocalHistory bool
 	for _, e := range selected {
+		progress, stopProgress := newImportProgressReporter(w, e.displayName)
 		res, err := agentimport.Run(ctx, repo, e.imp, agentimport.Options{
-			RepoRoot: repoRoot,
-			Now:      time.Now(),
+			LinkCommitSHA:   linkCommitSHA,
+			RepoRoot:        repoRoot,
+			Now:             time.Now(),
+			Progress:        progress,
+			ReadRemotes:     strategy.CheckpointReadRemotes(ctx),
+			RemoteRefLister: ListCheckpointRefsOnRemote,
 		})
+		stopProgress(err == nil)
 		if err != nil {
+			// Ctrl-C: stop here instead of moving on to the next agent's
+			// history, which is the last thing a user who just interrupted
+			// wants. Report what landed and how to finish it.
+			if errors.Is(err, context.Canceled) {
+				logging.Info(ctx, "session import interrupted",
+					"agent", e.imp.Name(), "turns", res.TurnsImported)
+				if res.TurnsImported > 0 {
+					importedLocalHistory = true
+				}
+				fmt.Fprintf(w, "Import interrupted after %d turn(s). Run 'entire import %s' to finish.\n",
+					res.TurnsImported, e.imp.Name())
+				break
+			}
 			logging.Warn(ctx, "session import failed", "agent", e.imp.Name(), "error", err)
 			fmt.Fprintf(w, "Note: could not import %s history: %v\n", e.displayName, err)
 			continue
 		}
+		if res.TurnsImported > 0 || res.TurnsSkipped > 0 {
+			importedLocalHistory = true
+		}
 		fmt.Fprintf(w, "Imported %d turn(s) from %d session(s) (%d already imported).\n",
 			res.TurnsImported, res.SessionsScanned, res.TurnsSkipped)
 	}
+	// Enable often runs before the user has logged in; surface once that a
+	// logged-out import stays local and won't reach the dashboard (issue #1773).
+	warnIfImportNotSynced(w, importedLocalHistory)
 }
 
 // pluralSessions renders a session count with correct pluralization.

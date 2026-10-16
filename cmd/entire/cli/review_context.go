@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -13,10 +12,13 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	checkpointid "github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+	"github.com/entireio/cli/cmd/entire/cli/entiredir"
 	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/session"
+	"github.com/entireio/cli/cmd/entire/cli/settings"
+	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/stringutil"
 	"github.com/entireio/cli/cmd/entire/cli/trailers"
 )
@@ -94,7 +96,8 @@ func reviewCommittedCheckpointContext(ctx context.Context, worktreeRoot string, 
 		return ""
 	}
 	defer repo.Close()
-	stores, err := checkpoint.Open(ctx, repo, checkpoint.OpenOptions{})
+	repoCtx := settings.WithWorktreeRoot(ctx, worktreeRoot)
+	stores, err := checkpoint.Open(repoCtx, repo, checkpoint.OpenOptions{ReadRemotes: strategy.CheckpointReadRemotes(repoCtx)})
 	if err != nil {
 		logging.Debug(ctx, "review checkpoint context: open store", slog.String("error", err.Error()))
 		return ""
@@ -116,12 +119,12 @@ func reviewCommittedCheckpointContext(ctx context.Context, worktreeRoot string, 
 				continue
 			}
 
-			summary, err := checkpoint.ReadCheckpoint(ctx, store, cpID)
+			summary, err := checkpoint.ReadCheckpoint(repoCtx, store, cpID)
 			if err != nil {
 				lines = append(lines, fmt.Sprintf("- %s: checkpoint metadata unavailable", cpID))
 				continue
 			}
-			detail := reviewCheckpointDetail(ctx, store, cpID, summary)
+			detail := reviewCheckpointDetail(repoCtx, store, cpID, summary)
 			if detail == "" {
 				detail = "no summary or prompt recorded"
 			}
@@ -140,7 +143,7 @@ func reviewCommittedCheckpointContext(ctx context.Context, worktreeRoot string, 
 
 	return "Checkpoint context from commits in scope:\n" +
 		strings.Join(lines, "\n") +
-		"\n\nUse `entire explain <id>` for full checkpoint context, or `entire explain <id> --raw-transcript` for raw transcripts."
+		"\n\nUse `entire checkpoint explain <id>` for full checkpoint context, or `entire checkpoint explain <id> --raw-transcript` for raw transcripts."
 }
 
 // reviewSessionContext returns a "In-progress session context (uncommitted):"
@@ -165,10 +168,10 @@ func reviewCommittedCheckpointContext(ctx context.Context, worktreeRoot string, 
 // Best-effort: any error path returns "" so the run continues. Sessions whose
 // prompt.txt is missing or empty are skipped silently.
 //
-// Why filesystem-not-shadow-branch: for active sessions prompts are written to
-// disk at lifecycle.go:294-310 on every turn for mid-turn commit availability,
-// before SaveStep copies them onto the shadow branch. Filesystem is canonical
-// for in-progress reads; the shadow-branch copy is only canonical post-condensation.
+// Why the filesystem: for active sessions prompts are written to disk on every
+// turn start, and nothing else holds them until condensation copies them into
+// a checkpoint. Filesystem is canonical for in-progress reads; the checkpoint
+// copy is only canonical post-condensation.
 func reviewSessionContext(ctx context.Context, worktreeRoot, headSHA string) string {
 	if worktreeRoot == "" || headSHA == "" {
 		return ""
@@ -236,8 +239,11 @@ func canonicalisePath(p string) string {
 // formatReviewSessionLine renders one entry of the in-progress section.
 // Returns "" when the session has no prompt content to report.
 func formatReviewSessionLine(worktreeRoot string, st *session.State) string {
-	promptPath := filepath.Join(worktreeRoot, paths.SessionMetadataDirFromSessionID(st.SessionID), paths.PromptFileName)
-	raw, err := os.ReadFile(promptPath) //nolint:gosec // path constructed from validated session ID + fixed constants
+	root, err := entiredir.OpenAtForRead(worktreeRoot)
+	if err != nil {
+		return ""
+	}
+	raw, err := entiredir.ReadFile(root, sessionMetadataName(st.SessionID)+"/"+paths.PromptFileName)
 	if err != nil {
 		return ""
 	}

@@ -16,11 +16,17 @@ import (
 	"time"
 
 	"charm.land/lipgloss/v2"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/stretchr/testify/require"
+
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+	"github.com/entireio/cli/cmd/entire/cli/gitdir"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
@@ -29,10 +35,6 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/trailers"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
 	"github.com/entireio/cli/redact"
-	"github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/object"
-	"github.com/stretchr/testify/require"
 )
 
 func TestNewExplainCmd(t *testing.T) {
@@ -93,7 +95,7 @@ func rowsHaveValue(rows []explainRow, want string) bool {
 
 func TestFormatCheckpointSummaryError_Auth(t *testing.T) {
 	t.Parallel()
-	label, rows, err := formatCheckpointSummaryError(&claudecode.ClaudeError{Kind: claudecode.ClaudeErrorAuth, Message: "Invalid API key"}, 0)
+	label, rows, err := formatCheckpointSummaryError(&claudecode.ClaudeError{Kind: claudecode.ClaudeErrorAuth, Message: "Invalid API key"}, newSummaryAttempt("claude-code", 0))
 	if !strings.Contains(strings.ToLower(label), "authentication failed") {
 		t.Errorf("missing 'authentication failed' in label %q", label)
 	}
@@ -107,7 +109,7 @@ func TestFormatCheckpointSummaryError_Auth(t *testing.T) {
 
 func TestFormatCheckpointSummaryError_RateLimit(t *testing.T) {
 	t.Parallel()
-	label, _, err := formatCheckpointSummaryError(&claudecode.ClaudeError{Kind: claudecode.ClaudeErrorRateLimit, Message: "429"}, 0)
+	label, _, err := formatCheckpointSummaryError(&claudecode.ClaudeError{Kind: claudecode.ClaudeErrorRateLimit, Message: "429"}, newSummaryAttempt("claude-code", 0))
 	if !strings.Contains(label, "rate limit") {
 		t.Errorf("missing rate-limit phrasing in label: %q", label)
 	}
@@ -118,7 +120,7 @@ func TestFormatCheckpointSummaryError_RateLimit(t *testing.T) {
 
 func TestFormatCheckpointSummaryError_Config(t *testing.T) {
 	t.Parallel()
-	_, rows, err := formatCheckpointSummaryError(&claudecode.ClaudeError{Kind: claudecode.ClaudeErrorConfig, Message: "model not found"}, 0)
+	_, rows, err := formatCheckpointSummaryError(&claudecode.ClaudeError{Kind: claudecode.ClaudeErrorConfig, Message: "model not found"}, newSummaryAttempt("claude-code", 0))
 	if !rowsHaveValue(rows, "model not found") {
 		t.Errorf("envelope message not surfaced in rows: %+v", rows)
 	}
@@ -129,7 +131,7 @@ func TestFormatCheckpointSummaryError_Config(t *testing.T) {
 
 func TestFormatCheckpointSummaryError_CLIMissing(t *testing.T) {
 	t.Parallel()
-	label, _, err := formatCheckpointSummaryError(&claudecode.ClaudeError{Kind: claudecode.ClaudeErrorCLIMissing}, 0)
+	label, _, err := formatCheckpointSummaryError(&claudecode.ClaudeError{Kind: claudecode.ClaudeErrorCLIMissing}, newSummaryAttempt("claude-code", 0))
 	if !strings.Contains(label, "not installed") {
 		t.Errorf("missing cli-missing phrasing in label: %q", label)
 	}
@@ -152,7 +154,7 @@ func TestFormatCheckpointSummaryError_TypedBranchesHandleEmptyMessage(t *testing
 	for _, kind := range kinds {
 		t.Run(string(kind), func(t *testing.T) {
 			t.Parallel()
-			label, rows, err := formatCheckpointSummaryError(&claudecode.ClaudeError{Kind: kind}, 0)
+			label, rows, err := formatCheckpointSummaryError(&claudecode.ClaudeError{Kind: kind}, newSummaryAttempt("claude-code", 0))
 			if err == nil {
 				t.Fatal("expected structured error")
 			}
@@ -172,8 +174,9 @@ func TestFormatCheckpointSummaryError_TypedBranchesHandleEmptyMessage(t *testing
 
 func TestFormatCheckpointSummaryError_DeadlineExceeded(t *testing.T) {
 	t.Parallel()
-	label, rows, err := formatCheckpointSummaryError(fmt.Errorf("wrapped: %w", context.DeadlineExceeded), 5*time.Minute)
-	if !strings.Contains(label, "timed out") {
+	attempt := newSummaryAttempt("codex", 5*time.Minute)
+	label, rows, err := formatCheckpointSummaryError(fmt.Errorf("wrapped: %w", context.DeadlineExceeded), attempt)
+	if !strings.Contains(strings.ToLower(label), "timed out") {
 		t.Errorf("expected 'timed out' in label, got %q", label)
 	}
 	if !strings.Contains(label, "5m") {
@@ -190,7 +193,7 @@ func TestFormatCheckpointSummaryError_DeadlineExceeded(t *testing.T) {
 	}
 	// Negative guards against regressions:
 	//   - Hardcoded "Claude" / "sonnet" / "Anthropic" would misdirect users of
-	//     alternate summary providers (codex, gemini).
+	//     alternate summary providers (codex, cursor).
 	combined := label + "\n" + err.Error()
 	var combinedSb194 strings.Builder
 	for _, r := range rows {
@@ -206,7 +209,7 @@ func TestFormatCheckpointSummaryError_DeadlineExceeded(t *testing.T) {
 
 func TestFormatCheckpointSummaryError_Canceled(t *testing.T) {
 	t.Parallel()
-	label, _, err := formatCheckpointSummaryError(fmt.Errorf("wrapped: %w", context.Canceled), 0)
+	label, _, err := formatCheckpointSummaryError(fmt.Errorf("wrapped: %w", context.Canceled), newSummaryAttempt("claude-code", 0))
 	if !strings.Contains(label, "canceled") {
 		t.Errorf("missing canceled in label: %q", label)
 	}
@@ -217,7 +220,7 @@ func TestFormatCheckpointSummaryError_Canceled(t *testing.T) {
 
 func TestFormatCheckpointSummaryError_Passthrough(t *testing.T) {
 	t.Parallel()
-	_, rows, err := formatCheckpointSummaryError(errors.New("something else"), 0)
+	_, rows, err := formatCheckpointSummaryError(errors.New("something else"), newSummaryAttempt("claude-code", 0))
 	if err == nil {
 		t.Fatal("expected structured error")
 	}
@@ -252,7 +255,7 @@ func TestFormatCheckpointSummaryError_Unknown(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			label, rows, err := formatCheckpointSummaryError(tc.err, 0)
+			label, rows, err := formatCheckpointSummaryError(tc.err, newSummaryAttempt("claude-code", 0))
 			if err == nil {
 				t.Fatal("expected structured error")
 			}
@@ -476,11 +479,113 @@ func TestRunExplainAuto_CommitWithoutTrailer(t *testing.T) {
 	}
 }
 
+// TestShouldFallBackToCommitResolution pins runExplainAuto's fallback
+// decision: commit resolution may run ONLY when the positional target matched
+// no committed checkpoint. A failure from a step AFTER a
+// successful match that merely wraps checkpoint.ErrCheckpointNotFound (in the
+// field: "failed to save summary: checkpoint not found", from a summary
+// backfill against a backend missing the checkpoint) must NOT trigger the
+// fallback — it was masked as `no checkpoint or commit found matching ...`
+// for a checkpoint the same command had just resolved.
+func TestShouldFallBackToCommitResolution(t *testing.T) {
+	runExplainAutoTestRepo(t)
+
+	// A genuine target miss, produced by the real checkpoint path.
+	var out, errOut bytes.Buffer
+	missErr := runExplainCheckpoint(context.Background(), &out, &errOut, "abababababab", false, false, false, false, false, false, false, 0)
+	require.Error(t, missErr)
+	require.True(t, shouldFallBackToCommitResolution(missErr),
+		"a genuine target miss must fall back to commit resolution")
+	require.ErrorIs(t, missErr, checkpoint.ErrCheckpointNotFound,
+		"the target-miss error must keep wrapping the public sentinel")
+
+	// A post-resolution failure that wraps the same sentinel must not.
+	saveErr := fmt.Errorf("failed to save summary: %w", checkpoint.ErrCheckpointNotFound)
+	require.False(t, shouldFallBackToCommitResolution(saveErr),
+		"a post-resolution failure wrapping ErrCheckpointNotFound must surface verbatim, not be masked by the commit fallback")
+
+	require.False(t, shouldFallBackToCommitResolution(errors.New("network down")),
+		"unrelated errors never fall back")
+}
+
+// TestRunExplainAuto_PostResolutionErrorSurfacesVerbatim guards the adjacent
+// contract end-to-end, for both the read-only and --generate entry points:
+// when the target RESOLVES via the committed-checkpoint prefix match but a
+// later read step fails hard, runExplainAuto must surface that failure —
+// naming the resolved checkpoint — instead of running the commit fallback.
+// The fault injector is the pinned "a ULID is never read from the branch"
+// routing contract: the checkpoint is listed (List unions both backends) but
+// its read routes to refs only, where the on-demand ref fetch fails hard in a
+// repo with no reachable remote.
+func TestRunExplainAuto_PostResolutionErrorSurfacesVerbatim(t *testing.T) {
+	for _, generate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("generate=%v", generate), func(t *testing.T) {
+			repo, _ := runExplainAutoTestRepo(t)
+			ctx := context.Background()
+
+			ulidID := id.MustCheckpointID("01KVBJCWYA4YW6J5M9GP655HZN")
+			require.NoError(t, checkpoint.NewGitStore(repo, checkpoint.DefaultV1Refs()).Write(ctx, checkpoint.Session{
+				CheckpointID: ulidID,
+				SessionID:    "session-stray-ulid",
+				Strategy:     "manual-commit",
+				Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n")),
+				AuthorName:   "Test",
+				AuthorEmail:  "test@example.com",
+			}))
+
+			var out, errOut bytes.Buffer
+			err := runExplainAuto(ctx, &out, &errOut, ulidID.String(), true, false, false, false, generate, false, false, 0)
+
+			require.Error(t, err)
+			require.ErrorContains(t, err, "failed to read checkpoint",
+				"the post-resolution failure must surface as-is")
+			require.ErrorContains(t, err, ulidID.String(),
+				"the error must name the checkpoint the target resolved to")
+			require.NotContains(t, err.Error(), "no checkpoint or commit found",
+				"a post-resolution failure must not be masked by the commit fallback")
+			require.False(t, shouldFallBackToCommitResolution(err),
+				"a post-resolution failure must not classify as a target miss")
+		})
+	}
+}
+
+// TestRunExplainAuto_TrailerReferencedCheckpointMissing: when the positional
+// target is a commit whose Entire-Checkpoint trailer references a checkpoint
+// that no longer resolves, the error must name the commit and the trailer
+// linkage — the user typed a commit SHA and would otherwise see "checkpoint
+// not found: <id>" for an ID they never entered.
+func TestRunExplainAuto_TrailerReferencedCheckpointMissing(t *testing.T) {
+	repo, _ := runExplainAutoTestRepo(t)
+	ctx := context.Background()
+
+	cpID := id.MustCheckpointID("deadbeefcafe")
+	wt, err := repo.Worktree()
+	require.NoError(t, err)
+	tmpDir := wt.Filesystem().Root()
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "feature.txt"), []byte("feature"), 0o644))
+	_, err = wt.Add("feature.txt")
+	require.NoError(t, err)
+	commitHash, err := wt.Commit(trailers.AppendCheckpointTrailer("Implement feature", cpID.String()), &git.CommitOptions{
+		Author: &object.Signature{Name: "Test", Email: "test@example.com", When: time.Now()},
+	})
+	require.NoError(t, err)
+
+	var out, errOut bytes.Buffer
+	err = runExplainAuto(ctx, &out, &errOut, commitHash.String(), true, false, false, false, false, false, false, 0)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, checkpoint.ErrCheckpointNotFound)
+	require.ErrorContains(t, err, cpID.String())
+	require.ErrorContains(t, err, commitHash.String()[:7],
+		"the error must name the commit the user actually typed")
+	require.ErrorContains(t, err, "Entire-Checkpoint trailer",
+		"the error must explain how the commit led to the checkpoint")
+}
+
 // TestRunExplainCheckpoint_NotFoundSentinels verifies the typed-error
 // contract runExplainAuto depends on: non-matching targets return an error
 // wrapping checkpoint.ErrCheckpointNotFound (for errors.Is detection),
-// regardless of --generate. The old code returned the temp-checkpoint
-// sentinel speculatively for --generate, breaking fallback routing.
+// regardless of --generate.
 func TestRunExplainCheckpoint_NotFoundSentinels(t *testing.T) {
 	runExplainAutoTestRepo(t)
 
@@ -491,93 +596,7 @@ func TestRunExplainCheckpoint_NotFoundSentinels(t *testing.T) {
 
 			require.Error(t, err)
 			require.ErrorIs(t, err, checkpoint.ErrCheckpointNotFound)
-			require.NotErrorIs(t, err, errCannotGenerateTemporaryCheckpoint,
-				"sentinel must not fire unless a real temp checkpoint was matched")
 		})
-	}
-}
-
-func writeTemporaryCheckpointForExplainTest(t *testing.T) string {
-	t.Helper()
-
-	tmpDir := t.TempDir()
-	t.Chdir(tmpDir)
-
-	testutil.InitRepo(t, tmpDir)
-	repo, err := git.PlainOpen(tmpDir)
-	require.NoError(t, err)
-
-	wt, err := repo.Worktree()
-	require.NoError(t, err)
-
-	testFile := filepath.Join(tmpDir, "temp.txt")
-	require.NoError(t, os.WriteFile(testFile, []byte("initial content"), 0o644))
-	_, err = wt.Add("temp.txt")
-	require.NoError(t, err)
-	initialCommit, err := wt.Commit("initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@example.com", When: time.Now()},
-	})
-	require.NoError(t, err)
-
-	sessionID := "2026-01-27-temp-session"
-	metadataDir := filepath.Join(tmpDir, ".entire", "metadata", sessionID)
-	require.NoError(t, os.MkdirAll(metadataDir, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(metadataDir, paths.PromptFileName), []byte("temporary checkpoint prompt"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"type":"user","message":{"content":[{"type":"text","text":"temporary checkpoint"}]}}`+"\n"), 0o644))
-
-	require.NoError(t, os.WriteFile(testFile, []byte("updated content"), 0o644))
-
-	result, err := checkpoint.NewEphemeralStore(repo, checkpoint.DefaultV1Refs()).Write(context.Background(), checkpoint.Step{
-		SessionID:         sessionID,
-		BaseCommit:        initialCommit.String()[:7],
-		ModifiedFiles:     []string{"temp.txt"},
-		MetadataDir:       ".entire/metadata/" + sessionID,
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "temporary checkpoint with code changes",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@example.com",
-		IsFirstCheckpoint: false,
-	})
-	require.NoError(t, err)
-	require.False(t, result.Skipped)
-
-	return result.CommitHash.String()
-}
-
-func TestRunExplainAuto_GenerateTemporaryCheckpointDoesNotFallBackToCommit(t *testing.T) {
-	tempCheckpointSHA := writeTemporaryCheckpointForExplainTest(t)
-
-	var out, errOut bytes.Buffer
-	err := runExplainAuto(context.Background(), &out, &errOut, tempCheckpointSHA, true, false, false, false, true, false, false, 0)
-
-	require.Error(t, err)
-	require.ErrorIs(t, err, errCannotGenerateTemporaryCheckpoint)
-	require.NotErrorIs(t, err, checkpoint.ErrCheckpointNotFound)
-	require.NotContains(t, err.Error(), "no Entire-Checkpoint trailer")
-}
-
-// TestRunExplainAuto_TemporaryCheckpointRendersIdentityBullet verifies the
-// brand identity-bullet shape is used for temporary checkpoints, with the
-// "after commit" affordance text in the summary block.
-func TestRunExplainAuto_TemporaryCheckpointRendersIdentityBullet(t *testing.T) {
-	tempCheckpointSHA := writeTemporaryCheckpointForExplainTest(t)
-	shortID := tempCheckpointSHA[:7]
-
-	var out, errOut bytes.Buffer
-	// noPager=true to suppress the pager's terminal-only path so output lands
-	// in the buffer; generate=false so we read (and don't try to summarize).
-	err := runExplainAuto(context.Background(), &out, &errOut, tempCheckpointSHA, true, false, false, false, false, false, false, 0)
-	require.NoError(t, err)
-
-	output := out.String()
-	if !strings.Contains(output, fmt.Sprintf("● Checkpoint %s [temporary]", shortID)) {
-		t.Errorf("expected '● Checkpoint %s [temporary]' identity bullet, got:\n%s", shortID, output)
-	}
-	if !strings.Contains(output, "## Summary") {
-		t.Errorf("expected '## Summary' heading in temporary output, got:\n%s", output)
-	}
-	if !strings.Contains(output, "Temporary checkpoints can be summarized after commit") {
-		t.Errorf("expected 'after commit' affordance in temporary output, got:\n%s", output)
 	}
 }
 
@@ -810,15 +829,12 @@ func TestExplainCmd_CommitFlagWithGenerateValidates(t *testing.T) {
 	}
 }
 
-func TestGenerateCheckpointAISummary_AddsDefaultTimeoutWithoutParentDeadline(t *testing.T) {
-	tmpTimeout := checkpointSummaryTimeout
+// Cannot use t.Parallel() — mutates package-level generateTranscriptSummary.
+func TestGenerateCheckpointAISummary_ExplicitTimeoutApplied(t *testing.T) {
 	tmpGenerator := generateTranscriptSummary
-	t.Cleanup(func() {
-		checkpointSummaryTimeout = tmpTimeout
-		generateTranscriptSummary = tmpGenerator
-	})
+	t.Cleanup(func() { generateTranscriptSummary = tmpGenerator })
 
-	checkpointSummaryTimeout = 50 * time.Millisecond
+	const explicitTimeout = 50 * time.Millisecond
 
 	var gotDeadline time.Time
 	generateTranscriptSummary = func(
@@ -827,17 +843,18 @@ func TestGenerateCheckpointAISummary_AddsDefaultTimeoutWithoutParentDeadline(t *
 		_ []string,
 		_ types.AgentType,
 		_ summarize.Generator,
+		_ agent.ProgressFn,
 	) (*checkpoint.Summary, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok {
-			return nil, errors.New("expected deadline on summary context")
+			return nil, errors.New("expected deadline on summary context when timeout > 0")
 		}
 		gotDeadline = deadline
 		return &checkpoint.Summary{Intent: "intent", Outcome: "outcome"}, nil
 	}
 
 	start := time.Now()
-	summary, _, err := generateCheckpointAISummary(context.Background(), []byte("transcript"), nil, agent.AgentTypeClaudeCode, nil, checkpointSummaryTimeout)
+	summary, err := generateCheckpointAISummary(context.Background(), []byte("transcript"), nil, agent.AgentTypeClaudeCode, nil, explicitTimeout, nil, newSummaryAttempt("claude-code", explicitTimeout))
 	if err != nil {
 		t.Fatalf("generateCheckpointAISummary() error = %v", err)
 	}
@@ -848,7 +865,7 @@ func TestGenerateCheckpointAISummary_AddsDefaultTimeoutWithoutParentDeadline(t *
 		t.Fatal("expected deadline to be set")
 	}
 	if remaining := gotDeadline.Sub(start); remaining < 30*time.Millisecond || remaining > 200*time.Millisecond {
-		t.Fatalf("deadline offset = %s, want around %s", remaining, checkpointSummaryTimeout)
+		t.Fatalf("deadline offset = %s, want around %s", remaining, explicitTimeout)
 	}
 }
 
@@ -866,7 +883,14 @@ func TestMaybeCompactExternalTranscriptForSummary_RedactsExternalOutput(t *testi
 	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, ".entire"), 0o755))
 	require.NoError(t, os.WriteFile(
 		filepath.Join(tmpDir, ".entire", "settings.json"),
-		[]byte(`{"enabled":true,"external_agents":true}`),
+		[]byte(`{"enabled":true}`),
+		0o644,
+	))
+	// external_agents lives in the local file: it grants execution of
+	// entire-agent-* binaries on $PATH, so the loader honors it only there.
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tmpDir, ".entire", "settings.local.json"),
+		[]byte(`{"external_agents":true}`),
 		0o644,
 	))
 
@@ -879,7 +903,7 @@ func TestMaybeCompactExternalTranscriptForSummary_RedactsExternalOutput(t *testi
 	script := `#!/bin/sh
 case "$1" in
   info)
-    echo '{"protocol_version":1,"name":"` + name + `","type":"` + string(kind) + `","description":"External redaction test agent","is_preview":false,"protected_dirs":[],"hook_names":[],"capabilities":{"hooks":false,"transcript_analyzer":false,"transcript_preparer":false,"token_calculator":false,"compact_transcript":true,"text_generator":false,"hook_response_writer":false,"subagent_aware_extractor":false}}'
+    echo '{"protocol_version":1,"name":"` + name + `","type":"` + string(kind) + `","description":"External redaction test agent","protected_dirs":[],"hook_names":[],"capabilities":{"hooks":false,"transcript_analyzer":false,"transcript_preparer":false,"token_calculator":false,"compact_transcript":true,"text_generator":false,"hook_response_writer":false,"subagent_aware_extractor":false}}'
     ;;
   compact-transcript)
     echo '{"transcript":"eyJ2IjoxLCJhZ2VudCI6InN1bW1hcnktcmVkYWN0IiwiY2xpX3ZlcnNpb24iOiJ0ZXN0IiwidHlwZSI6InVzZXIiLCJ0cyI6IjIwMjYtMDEtMDFUMDA6MDA6MDBaIiwiY29udGVudCI6W3sidGV4dCI6ImtleT1xOVh2MkxtOFJ0MVlwNEtkN1d6MEhzNk5jM0JmNUpnIn1dfQo="}'
@@ -901,55 +925,35 @@ esac
 	}
 }
 
-func TestGenerateCheckpointAISummary_UsesParentDeadlineAndWrapsSentinel(t *testing.T) {
-	tmpTimeout := checkpointSummaryTimeout
+// TestGenerateCheckpointAISummary_NoTimeoutInheritsParent verifies that when
+// timeout == 0 the provider call inherits the parent context unchanged, so a
+// tight parent deadline fires and the error wraps DeadlineExceeded.
+//
+// Cannot use t.Parallel() — mutates package-level generateTranscriptSummary.
+func TestGenerateCheckpointAISummary_NoTimeoutInheritsParent(t *testing.T) {
 	tmpGenerator := generateTranscriptSummary
-	t.Cleanup(func() {
-		checkpointSummaryTimeout = tmpTimeout
-		generateTranscriptSummary = tmpGenerator
-	})
+	t.Cleanup(func() { generateTranscriptSummary = tmpGenerator })
 
-	checkpointSummaryTimeout = 30 * time.Second
-
-	parentCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	parentDeadline, _ := parentCtx.Deadline()
-
-	var gotDeadline time.Time
+	// Use a mock that blocks until ctx is done, so the parent deadline fires.
 	generateTranscriptSummary = func(
 		ctx context.Context,
 		_ redact.RedactedBytes,
 		_ []string,
 		_ types.AgentType,
 		_ summarize.Generator,
+		_ agent.ProgressFn,
 	) (*checkpoint.Summary, error) {
-		gotDeadline, _ = ctx.Deadline()
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
 
-	_, appliedDeadline, err := generateCheckpointAISummary(parentCtx, []byte("transcript"), nil, agent.AgentTypeClaudeCode, nil, checkpointSummaryTimeout)
-	if err == nil {
-		t.Fatal("expected timeout error")
-	}
+	parentCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := generateCheckpointAISummary(parentCtx, []byte("transcript"), nil, agent.AgentTypeClaudeCode, nil, 0, nil, newSummaryAttempt("claude-code", 0))
+	// Parent deadline (50ms) should fire, not our absence of a deadline.
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected DeadlineExceeded, got %v", err)
-	}
-	if gotDeadline.IsZero() {
-		t.Fatal("expected deadline to be captured")
-	}
-	// The applied deadline must reflect the shorter parent-ctx deadline,
-	// not the package-default checkpointSummaryTimeout. Otherwise
-	// formatCheckpointSummaryError would report the wrong timeout to users.
-	if appliedDeadline >= checkpointSummaryTimeout {
-		t.Fatalf("appliedDeadline = %s; want shorter than %s (parent had tighter deadline)",
-			appliedDeadline, checkpointSummaryTimeout)
-	}
-	if delta := gotDeadline.Sub(parentDeadline); delta < -5*time.Millisecond || delta > 5*time.Millisecond {
-		t.Fatalf("deadline delta = %s, want near 0", delta)
-	}
-	if strings.Contains(err.Error(), "30s") {
-		t.Fatalf("timeout error should not report default timeout when parent deadline fired: %v", err)
+		t.Fatalf("expected DeadlineExceeded from parent, got %v", err)
 	}
 }
 
@@ -959,15 +963,11 @@ func TestGenerateCheckpointAISummary_UsesParentDeadlineAndWrapsSentinel(t *testi
 // timeoutCtx.Err() and unconditionally wrapped with %w context.DeadlineExceeded,
 // which discarded the typed error and routed the user to the wrong
 // "safety deadline" guidance instead of the auth/rate-limit message.
+//
+// Cannot use t.Parallel() — mutates package-level generateTranscriptSummary.
 func TestGenerateCheckpointAISummary_PreservesClaudeErrorWhenCtxIsDone(t *testing.T) {
-	tmpTimeout := checkpointSummaryTimeout
 	tmpGenerator := generateTranscriptSummary
-	t.Cleanup(func() {
-		checkpointSummaryTimeout = tmpTimeout
-		generateTranscriptSummary = tmpGenerator
-	})
-
-	checkpointSummaryTimeout = 30 * time.Second
+	t.Cleanup(func() { generateTranscriptSummary = tmpGenerator })
 
 	// Cancel the parent before we even call — ctx.Err() will be non-nil.
 	parentCtx, cancel := context.WithCancel(context.Background())
@@ -980,11 +980,12 @@ func TestGenerateCheckpointAISummary_PreservesClaudeErrorWhenCtxIsDone(t *testin
 		[]string,
 		types.AgentType,
 		summarize.Generator,
+		agent.ProgressFn,
 	) (*checkpoint.Summary, error) {
 		return nil, claudeErr
 	}
 
-	_, _, err := generateCheckpointAISummary(parentCtx, []byte("transcript"), nil, agent.AgentTypeClaudeCode, nil, checkpointSummaryTimeout)
+	_, err := generateCheckpointAISummary(parentCtx, []byte("transcript"), nil, agent.AgentTypeClaudeCode, nil, 0, nil, newSummaryAttempt("claude-code", 0))
 	var ce *claudecode.ClaudeError
 	if !errors.As(err, &ce) {
 		t.Fatalf("errors.As did not recover *ClaudeError; got %v", err)
@@ -1076,7 +1077,7 @@ func stubSummaryProviderForTest(t *testing.T) {
 		return &stubTextAgent{name: name, kind: agent.AgentTypeClaudeCode}, nil
 	}
 	isSummaryCLIAvailable = func(types.AgentName) bool { return true }
-	generateTranscriptSummary = func(context.Context, redact.RedactedBytes, []string, types.AgentType, summarize.Generator) (*checkpoint.Summary, error) {
+	generateTranscriptSummary = func(context.Context, redact.RedactedBytes, []string, types.AgentType, summarize.Generator, agent.ProgressFn) (*checkpoint.Summary, error) {
 		return &checkpoint.Summary{Intent: "i", Outcome: "o"}, nil
 	}
 }
@@ -1103,48 +1104,16 @@ func TestGenerateCheckpointSummary_AdvancesV1Metadata(t *testing.T) {
 	require.NotEqual(t, fixture.v1Hash, v1After.Hash(), "v1 metadata branch must advance after UpdateSummary")
 }
 
-func TestRunExplainGenerateBlocksWhenPolicyWriteUnsupported(t *testing.T) {
-	fixture := setupGenerateSummaryFixture(t)
-	stubSummaryProviderForTest(t)
-	writeUnsupportedCheckpointPolicyForCLITest(t, fixture.repo)
-
-	lookup, err := newExplainCheckpointLookup(context.Background())
-	require.NoError(t, err)
-	defer lookup.Close()
-
-	var stdout, stderr bytes.Buffer
-	err = runExplainCheckpointWithLookup(
-		fixture.ctx,
-		&stdout,
-		&stderr,
-		fixture.cpID.String(),
-		false,
-		false,
-		false,
-		false,
-		true,
-		false,
-		false,
-		lookup,
-		nil,
-		0,
-	)
-	require.ErrorContains(t, err, "checkpoint policy cannot be satisfied by this Entire CLI")
-
-	v1After, refErr := fixture.repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
-	require.NoError(t, refErr)
-	require.Equal(t, fixture.v1Hash, v1After.Hash(), "summary write must not advance metadata")
-}
-
-func TestGenerateCheckpointAISummary_ClampsLongParentDeadlineToDefaultTimeout(t *testing.T) {
-	tmpTimeout := checkpointSummaryTimeout
+// TestGenerateCheckpointAISummary_ExplicitTimeoutNarrowsLongParent verifies
+// that an explicit timeout (e.g. from --summary-timeout-seconds) takes effect
+// even when the parent context has a much longer deadline.
+//
+// Cannot use t.Parallel() — mutates package-level generateTranscriptSummary.
+func TestGenerateCheckpointAISummary_ExplicitTimeoutNarrowsLongParent(t *testing.T) {
 	tmpGenerator := generateTranscriptSummary
-	t.Cleanup(func() {
-		checkpointSummaryTimeout = tmpTimeout
-		generateTranscriptSummary = tmpGenerator
-	})
+	t.Cleanup(func() { generateTranscriptSummary = tmpGenerator })
 
-	checkpointSummaryTimeout = 50 * time.Millisecond
+	const explicitTimeout = 50 * time.Millisecond
 
 	parentCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -1156,17 +1125,18 @@ func TestGenerateCheckpointAISummary_ClampsLongParentDeadlineToDefaultTimeout(t 
 		_ []string,
 		_ types.AgentType,
 		_ summarize.Generator,
+		_ agent.ProgressFn,
 	) (*checkpoint.Summary, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok {
-			return nil, errors.New("expected deadline on summary context")
+			return nil, errors.New("expected deadline on summary context when timeout > 0")
 		}
 		gotDeadline = deadline
 		return &checkpoint.Summary{Intent: "intent", Outcome: "outcome"}, nil
 	}
 
 	start := time.Now()
-	summary, _, err := generateCheckpointAISummary(parentCtx, []byte("transcript"), nil, agent.AgentTypeClaudeCode, nil, checkpointSummaryTimeout)
+	summary, err := generateCheckpointAISummary(parentCtx, []byte("transcript"), nil, agent.AgentTypeClaudeCode, nil, explicitTimeout, nil, newSummaryAttempt("claude-code", explicitTimeout))
 	if err != nil {
 		t.Fatalf("generateCheckpointAISummary() error = %v", err)
 	}
@@ -1177,17 +1147,14 @@ func TestGenerateCheckpointAISummary_ClampsLongParentDeadlineToDefaultTimeout(t 
 		t.Fatal("expected deadline to be set")
 	}
 	if remaining := gotDeadline.Sub(start); remaining < 30*time.Millisecond || remaining > 200*time.Millisecond {
-		t.Fatalf("deadline offset = %s, want around %s", remaining, checkpointSummaryTimeout)
+		t.Fatalf("deadline offset = %s, want around %s", remaining, explicitTimeout)
 	}
 }
 
+// Cannot use t.Parallel() — mutates package-level generateTranscriptSummary.
 func TestGenerateCheckpointAISummary_UsesCancellationSentinel(t *testing.T) {
-	tmpTimeout := checkpointSummaryTimeout
 	tmpGenerator := generateTranscriptSummary
-	t.Cleanup(func() {
-		checkpointSummaryTimeout = tmpTimeout
-		generateTranscriptSummary = tmpGenerator
-	})
+	t.Cleanup(func() { generateTranscriptSummary = tmpGenerator })
 
 	parentCtx, cancel := context.WithCancel(context.Background())
 
@@ -1197,13 +1164,14 @@ func TestGenerateCheckpointAISummary_UsesCancellationSentinel(t *testing.T) {
 		_ []string,
 		_ types.AgentType,
 		_ summarize.Generator,
+		_ agent.ProgressFn,
 	) (*checkpoint.Summary, error) {
 		cancel()
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
 
-	_, _, err := generateCheckpointAISummary(parentCtx, []byte("transcript"), nil, agent.AgentTypeClaudeCode, nil, checkpointSummaryTimeout)
+	_, err := generateCheckpointAISummary(parentCtx, []byte("transcript"), nil, agent.AgentTypeClaudeCode, nil, 0, nil, newSummaryAttempt("claude-code", 0))
 	if err == nil {
 		t.Fatal("expected cancellation error")
 	}
@@ -1267,8 +1235,8 @@ func TestResolveSummaryTimeout_DefaultWhenBothUnset(t *testing.T) {
 
 	got := resolveSummaryTimeout(context.Background(), 0)
 
-	if got != checkpointSummaryTimeout {
-		t.Fatalf("resolveSummaryTimeout(flag=0, setting=0) = %s, want %s (package default)", got, checkpointSummaryTimeout)
+	if got != 0 {
+		t.Fatalf("resolveSummaryTimeout(flag=0, setting=0) = %s, want 0 (no deadline)", got)
 	}
 }
 
@@ -1280,18 +1248,27 @@ func TestResolveSummaryTimeout_NegativeSettingTreatedAsUnset(t *testing.T) {
 
 	got := resolveSummaryTimeout(context.Background(), 0)
 
-	if got != checkpointSummaryTimeout {
-		t.Fatalf("resolveSummaryTimeout(flag=0, setting=-1) = %s, want %s (package default)", got, checkpointSummaryTimeout)
+	if got != 0 {
+		t.Fatalf("resolveSummaryTimeout(flag=0, setting=-1) = %s, want 0 (no deadline)", got)
 	}
 }
 
-// Locks in 5 minutes as the package default so a casual edit doesn't silently
-// regress to the prior 30s — issue #1198 raised the default specifically
-// because 30s was too tight for large transcripts.
-func TestDefaultCheckpointSummaryTimeout_IsFiveMinutes(t *testing.T) {
-	t.Parallel()
-	if defaultCheckpointSummaryTimeout != 5*time.Minute {
-		t.Fatalf("defaultCheckpointSummaryTimeout = %s, want 5m (see issue #1198)", defaultCheckpointSummaryTimeout)
+// TestResolveSummaryTimeout_DefaultZero locks in that with no flag and no
+// settings file, --generate has no automatic deadline. The opt-in surface
+// (--summary-timeout-seconds flag and summary_timeout_seconds setting) is
+// the only way to introduce a cap. See
+// docs/superpowers/specs/2026-05-13-explain-summary-streaming-design.md.
+//
+// Cannot use t.Parallel() — t.Chdir mutates process-global state.
+func TestResolveSummaryTimeout_DefaultZero(t *testing.T) {
+	// settings.Load reads .entire/settings.json from CWD; redirect to a
+	// temp dir that has none.
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	got := resolveSummaryTimeout(context.Background(), 0)
+	if got != 0 {
+		t.Errorf("resolveSummaryTimeout(ctx, 0) = %v, want 0 (no deadline)", got)
 	}
 }
 
@@ -1406,7 +1383,7 @@ func TestExplainCommit_WithMetadataTrailerButNoCheckpoint(t *testing.T) {
 
 	// Commit with Entire-Metadata trailer (no Entire-Checkpoint)
 	metadataDir := ".entire/metadata/" + sessionID
-	commitMessage := trailers.FormatMetadata("Add new feature", metadataDir)
+	commitMessage := fmt.Sprintf("Add new feature\n\n%s: %s\n", trailers.MetadataTrailerKey, metadataDir)
 	commitHash, err := w.Commit(commitMessage, &git.CommitOptions{
 		Author: &object.Signature{
 			Name:  "Test",
@@ -1607,12 +1584,12 @@ func TestRunExplainCheckpoint_GenerateV1OnlyReloadsFromV1(t *testing.T) {
 
 	originalGet := getSummaryAgent
 	originalCLI := isSummaryCLIAvailable
-	originalDiscover := discoverSummaryProviders
+	originalDiscover := discoverSummaryProvidersAlways
 	originalGenerate := generateTranscriptSummary
 	t.Cleanup(func() {
 		getSummaryAgent = originalGet
 		isSummaryCLIAvailable = originalCLI
-		discoverSummaryProviders = originalDiscover
+		discoverSummaryProvidersAlways = originalDiscover
 		generateTranscriptSummary = originalGenerate
 	})
 
@@ -1620,7 +1597,7 @@ func TestRunExplainCheckpoint_GenerateV1OnlyReloadsFromV1(t *testing.T) {
 		return &stubTextAgent{name: name, kind: agent.AgentTypeClaudeCode}, nil
 	}
 	isSummaryCLIAvailable = func(types.AgentName) bool { return true }
-	discoverSummaryProviders = func(context.Context) {}
+	discoverSummaryProvidersAlways = func(context.Context) {}
 
 	var sawV1Transcript bool
 	generateTranscriptSummary = func(
@@ -1629,6 +1606,7 @@ func TestRunExplainCheckpoint_GenerateV1OnlyReloadsFromV1(t *testing.T) {
 		_ []string,
 		_ types.AgentType,
 		_ summarize.Generator,
+		_ agent.ProgressFn,
 	) (*checkpoint.Summary, error) {
 		sawV1Transcript = strings.Contains(string(transcript.Bytes()), "v1-only generate prompt")
 		return &checkpoint.Summary{Intent: "generated intent", Outcome: "generated outcome"}, nil
@@ -1676,12 +1654,12 @@ func TestRunExplainCheckpoint_GenerateV1ModeUsesSelectedStore(t *testing.T) {
 
 	originalGet := getSummaryAgent
 	originalCLI := isSummaryCLIAvailable
-	originalDiscover := discoverSummaryProviders
+	originalDiscover := discoverSummaryProvidersAlways
 	originalGenerate := generateTranscriptSummary
 	t.Cleanup(func() {
 		getSummaryAgent = originalGet
 		isSummaryCLIAvailable = originalCLI
-		discoverSummaryProviders = originalDiscover
+		discoverSummaryProvidersAlways = originalDiscover
 		generateTranscriptSummary = originalGenerate
 	})
 
@@ -1689,7 +1667,7 @@ func TestRunExplainCheckpoint_GenerateV1ModeUsesSelectedStore(t *testing.T) {
 		return &stubTextAgent{name: name, kind: agent.AgentTypeClaudeCode}, nil
 	}
 	isSummaryCLIAvailable = func(types.AgentName) bool { return true }
-	discoverSummaryProviders = func(context.Context) {}
+	discoverSummaryProvidersAlways = func(context.Context) {}
 
 	var sawV1Transcript bool
 	generateTranscriptSummary = func(
@@ -1698,6 +1676,7 @@ func TestRunExplainCheckpoint_GenerateV1ModeUsesSelectedStore(t *testing.T) {
 		_ []string,
 		_ types.AgentType,
 		_ summarize.Generator,
+		_ agent.ProgressFn,
 	) (*checkpoint.Summary, error) {
 		sawV1Transcript = strings.Contains(string(transcript.Bytes()), "v1-mode generate prompt")
 		return &checkpoint.Summary{Intent: "generated v1 intent", Outcome: "generated v1 outcome"}, nil
@@ -1754,12 +1733,12 @@ func TestRunExplainCheckpoint_GenerateWritesV1Store(t *testing.T) {
 
 	originalGet := getSummaryAgent
 	originalCLI := isSummaryCLIAvailable
-	originalDiscover := discoverSummaryProviders
+	originalDiscover := discoverSummaryProvidersAlways
 	originalGenerate := generateTranscriptSummary
 	t.Cleanup(func() {
 		getSummaryAgent = originalGet
 		isSummaryCLIAvailable = originalCLI
-		discoverSummaryProviders = originalDiscover
+		discoverSummaryProvidersAlways = originalDiscover
 		generateTranscriptSummary = originalGenerate
 	})
 
@@ -1767,13 +1746,14 @@ func TestRunExplainCheckpoint_GenerateWritesV1Store(t *testing.T) {
 		return &stubTextAgent{name: name, kind: agent.AgentTypeClaudeCode}, nil
 	}
 	isSummaryCLIAvailable = func(types.AgentName) bool { return true }
-	discoverSummaryProviders = func(context.Context) {}
+	discoverSummaryProvidersAlways = func(context.Context) {}
 	generateTranscriptSummary = func(
 		_ context.Context,
 		_ redact.RedactedBytes,
 		_ []string,
 		_ types.AgentType,
 		_ summarize.Generator,
+		_ agent.ProgressFn,
 	) (*checkpoint.Summary, error) {
 		return &checkpoint.Summary{Intent: "selected v1 intent", Outcome: "selected v1 outcome"}, nil
 	}
@@ -1804,6 +1784,98 @@ func TestRunExplainCheckpoint_GenerateWritesV1Store(t *testing.T) {
 	require.Equal(t, "selected v1 intent", v1Metadata.Summary.Intent)
 }
 
+// TestRunExplainAuto_GeneratePersistsHexOnBranchUnderRefsPrimary is the
+// end-to-end regression test for the motivating field bug: under a git-refs
+// primary, `entire checkpoint explain --generate <hex-id>` for a pre-migration
+// checkpoint that lives only on the v1 branch generated the AI summary and
+// then discarded it (the summary backfill went refs-only), reporting
+// `no checkpoint or commit found`. The whole CLI path must work: auto target
+// resolution → routed read → summary generation → kind-routed backfill →
+// summary persisted on the v1 branch.
+func TestRunExplainAuto_GeneratePersistsHexOnBranchUnderRefsPrimary(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Chdir(tmpDir)
+
+	testutil.InitRepo(t, tmpDir)
+	repo, err := git.PlainOpen(tmpDir)
+	require.NoError(t, err)
+
+	wt, err := repo.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "test.txt"), []byte("test"), 0o644))
+	_, err = wt.Add("test.txt")
+	require.NoError(t, err)
+	_, err = wt.Commit("initial commit", &git.CommitOptions{
+		Author: &object.Signature{Name: "Test", Email: "test@example.com", When: time.Now()},
+	})
+	require.NoError(t, err)
+
+	// git-refs is the configured primary — the field configuration in which
+	// the backfill was discarded.
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, ".entire"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tmpDir, ".entire", "settings.json"),
+		[]byte(`{"enabled": true, "summary_generation": {"provider": "claude-code"}, "checkpoints": {"primary": {"type": "git-refs"}}}`),
+		0o644,
+	))
+
+	originalGet := getSummaryAgent
+	originalCLI := isSummaryCLIAvailable
+	originalDiscover := discoverSummaryProvidersAlways
+	originalGenerate := generateTranscriptSummary
+	t.Cleanup(func() {
+		getSummaryAgent = originalGet
+		isSummaryCLIAvailable = originalCLI
+		discoverSummaryProvidersAlways = originalDiscover
+		generateTranscriptSummary = originalGenerate
+	})
+
+	getSummaryAgent = func(name types.AgentName) (agent.Agent, error) {
+		return &stubTextAgent{name: name, kind: agent.AgentTypeClaudeCode}, nil
+	}
+	isSummaryCLIAvailable = func(types.AgentName) bool { return true }
+	discoverSummaryProvidersAlways = func(context.Context) {}
+	generateTranscriptSummary = func(
+		_ context.Context,
+		_ redact.RedactedBytes,
+		_ []string,
+		_ types.AgentType,
+		_ summarize.Generator,
+		_ agent.ProgressFn,
+	) (*checkpoint.Summary, error) {
+		return &checkpoint.Summary{Intent: "backfilled intent", Outcome: "backfilled outcome"}, nil
+	}
+
+	// The checkpoint exists ONLY on the pre-migration v1 branch.
+	branchStore := checkpoint.NewGitStore(repo, checkpoint.DefaultV1Refs())
+	cpID := id.MustCheckpointID("aabbccddeeff")
+	ctx := context.Background()
+
+	transcript := []byte(`{"type":"user","message":{"content":[{"type":"text","text":"generate test"}]}}` + "\n" +
+		`{"type":"assistant","message":{"content":"done"}}` + "\n")
+
+	require.NoError(t, branchStore.Write(ctx, checkpoint.Session{
+		CheckpointID: cpID,
+		SessionID:    "session-hex-on-branch",
+		Strategy:     "manual-commit",
+		Transcript:   redact.AlreadyRedacted(transcript),
+		AuthorName:   "Test",
+		AuthorEmail:  "test@example.com",
+	}))
+
+	var buf, errBuf bytes.Buffer
+	err = runExplainAuto(ctx, &buf, &errBuf, cpID.String(), true, false, false, false, true, false, false, 0)
+	require.NoError(t, err, "generate for a hex checkpoint on the branch must succeed under a refs primary")
+	require.NotContains(t, errBuf.String(), "no checkpoint or commit found",
+		"the resolved checkpoint must not be misreported as missing")
+
+	// The summary must be readable back from the v1 branch copy.
+	meta, err := branchStore.ReadSessionMetadata(ctx, cpID, 0)
+	require.NoError(t, err)
+	require.NotNil(t, meta.Summary, "the generated summary must persist on the v1 branch")
+	require.Equal(t, "backfilled intent", meta.Summary.Intent)
+}
+
 func TestRunExplainCheckpoint_GenerateReloadsAfterV1Write(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Chdir(tmpDir)
@@ -1831,12 +1903,12 @@ func TestRunExplainCheckpoint_GenerateReloadsAfterV1Write(t *testing.T) {
 
 	originalGet := getSummaryAgent
 	originalCLI := isSummaryCLIAvailable
-	originalDiscover := discoverSummaryProviders
+	originalDiscover := discoverSummaryProvidersAlways
 	originalGenerate := generateTranscriptSummary
 	t.Cleanup(func() {
 		getSummaryAgent = originalGet
 		isSummaryCLIAvailable = originalCLI
-		discoverSummaryProviders = originalDiscover
+		discoverSummaryProvidersAlways = originalDiscover
 		generateTranscriptSummary = originalGenerate
 	})
 
@@ -1844,13 +1916,14 @@ func TestRunExplainCheckpoint_GenerateReloadsAfterV1Write(t *testing.T) {
 		return &stubTextAgent{name: name, kind: agent.AgentTypeClaudeCode}, nil
 	}
 	isSummaryCLIAvailable = func(types.AgentName) bool { return true }
-	discoverSummaryProviders = func(context.Context) {}
+	discoverSummaryProvidersAlways = func(context.Context) {}
 	generateTranscriptSummary = func(
 		_ context.Context,
 		_ redact.RedactedBytes,
 		_ []string,
 		_ types.AgentType,
 		_ summarize.Generator,
+		_ agent.ProgressFn,
 	) (*checkpoint.Summary, error) {
 		return &checkpoint.Summary{Intent: "generated v1 intent", Outcome: "generated v1 outcome"}, nil
 	}
@@ -1995,7 +2068,7 @@ type externalTranscriptCompactorOptions struct {
 	fail              bool
 }
 
-func setupExternalTranscriptExplainRepo(t *testing.T) (*git.Repository, string) {
+func setupExternalTranscriptExplainRepo(t *testing.T) *git.Repository {
 	t.Helper()
 
 	if _, err := exec.LookPath("sh"); err != nil {
@@ -2016,11 +2089,18 @@ func setupExternalTranscriptExplainRepo(t *testing.T) (*git.Repository, string) 
 	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, ".entire"), 0o755))
 	require.NoError(t, os.WriteFile(
 		filepath.Join(tmpDir, ".entire", "settings.json"),
-		[]byte(`{"enabled":true,"external_agents":true}`),
+		[]byte(`{"enabled":true}`),
+		0o644,
+	))
+	// external_agents lives in the local file: it grants execution of
+	// entire-agent-* binaries on $PATH, so the loader honors it only there.
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tmpDir, ".entire", "settings.local.json"),
+		[]byte(`{"external_agents":true}`),
 		0o644,
 	))
 
-	return repo, tmpDir
+	return repo
 }
 
 func compactTranscriptForExternalDisplayTest(agentName, userText, assistantText string) []byte {
@@ -2056,7 +2136,7 @@ func installExternalTranscriptCompactor(t *testing.T, opts externalTranscriptCom
 	script := `#!/bin/sh
 case "$1" in
   info)
-    echo '{"protocol_version":1,"name":"` + opts.name + `","type":"` + string(opts.agentType) + `","description":"External checkpoint display test agent","is_preview":false,"protected_dirs":[],"hook_names":[],"capabilities":{"hooks":false,"transcript_analyzer":false,"transcript_preparer":false,"token_calculator":false,"compact_transcript":true,"text_generator":false,"hook_response_writer":false,"subagent_aware_extractor":false}}'
+    echo '{"protocol_version":1,"name":"` + opts.name + `","type":"` + string(opts.agentType) + `","description":"External checkpoint display test agent","protected_dirs":[],"hook_names":[],"capabilities":{"hooks":false,"transcript_analyzer":false,"transcript_preparer":false,"token_calculator":false,"compact_transcript":true,"text_generator":false,"hook_response_writer":false,"subagent_aware_extractor":false}}'
     ;;
   compact-transcript)
     if [ "$2" != "--session-ref" ] || ! grep -q '` + opts.requiredMarker + `' "$3"; then
@@ -2075,53 +2155,10 @@ esac
 	t.Setenv("PATH", externalDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
-func writeExternalTemporaryCheckpointForExplainTest(
-	t *testing.T,
-	repo *git.Repository,
-	tmpDir string,
-	sessionID string,
-	agentType types.AgentType,
-	nativeTranscript []byte,
-	fileContent string,
-) string {
-	t.Helper()
-
-	metadataDir := filepath.Join(tmpDir, ".entire", "metadata", sessionID)
-	require.NoError(t, os.MkdirAll(metadataDir, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(metadataDir, paths.PromptFileName), []byte("temporary external checkpoint prompt"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(metadataDir, paths.TranscriptFileName), nativeTranscript, 0o644))
-	require.NoError(t, os.WriteFile(
-		filepath.Join(metadataDir, paths.MetadataFileName),
-		[]byte(fmt.Sprintf(`{"agent":%q}`+"\n", agentType)),
-		0o644,
-	))
-
-	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "test.txt"), []byte(fileContent), 0o644))
-
-	head, err := repo.Head()
-	require.NoError(t, err)
-
-	result, err := checkpoint.NewEphemeralStore(repo, checkpoint.DefaultV1Refs()).Write(context.Background(), checkpoint.Step{
-		SessionID:         sessionID,
-		BaseCommit:        head.Hash().String()[:7],
-		ModifiedFiles:     []string{"test.txt"},
-		MetadataDir:       ".entire/metadata/" + sessionID,
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "temporary external checkpoint",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@example.com",
-		IsFirstCheckpoint: false,
-	})
-	require.NoError(t, err)
-	require.False(t, result.Skipped)
-
-	return result.CommitHash.String()
-}
-
 func TestRunExplainCheckpoint_FullCompactsExternalNativeTranscript(t *testing.T) {
 	// Cannot use t.Parallel() because external agent discovery mutates the
 	// package-level agent registry and this test changes cwd/PATH.
-	repo, _ := setupExternalTranscriptExplainRepo(t)
+	repo := setupExternalTranscriptExplainRepo(t)
 
 	const (
 		name      = "checkpoint-display-full"
@@ -2162,7 +2199,7 @@ func TestRunExplainCheckpoint_FullCompactsExternalNativeTranscript(t *testing.T)
 func TestRunExplainCheckpoint_VerboseCompactsScopedExternalNativeTranscript(t *testing.T) {
 	// Cannot use t.Parallel() because external agent discovery mutates the
 	// package-level agent registry and this test changes cwd/PATH.
-	repo, _ := setupExternalTranscriptExplainRepo(t)
+	repo := setupExternalTranscriptExplainRepo(t)
 
 	const (
 		name      = "checkpoint-display-verbose"
@@ -2203,95 +2240,60 @@ func TestRunExplainCheckpoint_VerboseCompactsScopedExternalNativeTranscript(t *t
 	require.NotContains(t, output, "(failed to parse transcript)")
 }
 
-func TestRunExplainAuto_TemporaryFullCompactsExternalNativeTranscript(t *testing.T) {
-	// Cannot use t.Parallel() because external agent discovery mutates the
-	// package-level agent registry and this test changes cwd/PATH.
-	repo, tmpDir := setupExternalTranscriptExplainRepo(t)
+func TestFormatTranscriptBytes_PiNativeJSONL(t *testing.T) {
+	t.Parallel()
 
-	const (
-		name      = "temporary-display-full"
-		agentType = types.AgentType("Temporary Display Full Agent")
-	)
-	installExternalTranscriptCompactor(t, externalTranscriptCompactorOptions{
-		name:              name,
-		agentType:         agentType,
-		compactTranscript: compactTranscriptForExternalDisplayTest(name, "temporary external prompt", "temporary external reply"),
-		requiredMarker:    "TEMP_EXTERNAL_NATIVE_TRANSCRIPT",
-	})
+	piJSONL := []byte(`{"type":"session","version":3,"id":"pi-session","cwd":"/tmp/repo"}
+{"type":"message","id":"m1","parentId":null,"timestamp":"2026-07-25T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Review this trail"}]}}
+{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-07-25T10:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"The trail needs two fixes."}],"model":"gpt-5.6-sol"}}
+`)
 
-	tempCheckpointSHA := writeExternalTemporaryCheckpointForExplainTest(
-		t,
-		repo,
-		tmpDir,
-		"session-temp-external-full",
-		agentType,
-		[]byte("TEMP_EXTERNAL_NATIVE_TRANSCRIPT\nuser=temporary external prompt\nassistant=temporary external reply\n"),
-		"temporary full content",
-	)
-
-	var buf, errBuf bytes.Buffer
-	err := runExplainAuto(context.Background(), &buf, &errBuf, tempCheckpointSHA, true, false, true, false, false, false, false, 0)
-	require.NoError(t, err)
-
-	output := buf.String()
-	require.Contains(t, output, "Transcript (full session)")
-	require.Contains(t, output, "[User] temporary external prompt")
-	require.Contains(t, output, "[Assistant] temporary external reply")
+	output := formatTranscriptBytes(piJSONL, "", agent.AgentTypePi)
+	require.Contains(t, output, "[User] Review this trail")
+	require.Contains(t, output, "[Assistant] The trail needs two fixes.")
 	require.NotContains(t, output, "(failed to parse transcript)")
 }
 
-func TestRunExplainAuto_TemporaryVerboseCompactsScopedExternalNativeTranscript(t *testing.T) {
-	// Cannot use t.Parallel() because external agent discovery mutates the
-	// package-level agent registry and this test changes cwd/PATH.
-	repo, tmpDir := setupExternalTranscriptExplainRepo(t)
+func TestFormatTranscriptBytes_SanitizesTerminalSequences(t *testing.T) {
+	t.Parallel()
 
-	const (
-		name      = "temporary-display-verbose"
-		agentType = types.AgentType("Temporary Display Verbose Agent")
-	)
-	installExternalTranscriptCompactor(t, externalTranscriptCompactorOptions{
-		name:              name,
-		agentType:         agentType,
-		compactTranscript: compactTranscriptForExternalDisplayTest(name, "temporary scoped prompt", "temporary scoped reply"),
-		requiredMarker:    "TEMP_EXTERNAL_NATIVE_SCOPE",
-		forbiddenMarker:   "TEMP_EXTERNAL_NATIVE_BEFORE",
-	})
+	// Transcript content is agent and user influenced and is rendered straight
+	// to the reader's terminal, so CSI and OSC sequences must be stripped
+	// whole at this display boundary while tabs and newlines survive.
+	piJSONL := []byte(`{"type":"session","version":3,"id":"pi-session","cwd":"/tmp/repo"}
+{"type":"message","id":"m1","parentId":null,"timestamp":"2026-07-25T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"one \u001b[31mred\u001b[0m\u001b]0;title\u0007 two\tthree\nfour"}]}}
+`)
 
-	sessionID := "session-temp-external-verbose"
-	_ = writeExternalTemporaryCheckpointForExplainTest(
-		t,
-		repo,
-		tmpDir,
-		sessionID,
-		agentType,
-		[]byte("TEMP_EXTERNAL_NATIVE_BEFORE\n"),
-		"temporary verbose parent content",
-	)
-	tempCheckpointSHA := writeExternalTemporaryCheckpointForExplainTest(
-		t,
-		repo,
-		tmpDir,
-		sessionID,
-		agentType,
-		[]byte("TEMP_EXTERNAL_NATIVE_BEFORE\nTEMP_EXTERNAL_NATIVE_SCOPE\nuser=temporary scoped prompt\nassistant=temporary scoped reply\n"),
-		"temporary verbose child content",
-	)
+	output := formatTranscriptBytes(piJSONL, "", agent.AgentTypePi)
+	require.NotContains(t, output, "\x1b")
+	require.NotContains(t, output, "[31m")
+	require.Contains(t, output, "one red two\tthree\nfour")
+}
 
-	var buf, errBuf bytes.Buffer
-	err := runExplainAuto(context.Background(), &buf, &errBuf, tempCheckpointSHA, true, true, false, false, false, false, false, 0)
-	require.NoError(t, err)
+func TestFormatTranscriptBytes_SanitizesFallbackText(t *testing.T) {
+	t.Parallel()
 
-	output := buf.String()
-	require.Contains(t, output, "Transcript (checkpoint scope)")
-	require.Contains(t, output, "[User] temporary scoped prompt")
-	require.Contains(t, output, "[Assistant] temporary scoped reply")
-	require.NotContains(t, output, "(failed to parse transcript)")
+	output := formatTranscriptBytes(nil, "plain \x1b[31mred\x1b[0m text", agent.AgentTypeClaudeCode)
+	require.Equal(t, "plain red text\n", output)
+}
+
+// The default explain body (stored AI summary, extracted intent) is the same
+// trust class as transcript content, and the non-color path returns the
+// markdown source without a renderer in between, so the sanitizer must be in
+// renderExplainBody itself.
+func TestRenderExplainBody_SanitizesTerminalSequencesOnNonColorPath(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	got := renderExplainBody(&buf, "## Summary\n\nplain \x1b[31mred\x1b[0m\x1b]0;title\x07 text")
+	require.NotContains(t, got, "\x1b")
+	require.Contains(t, got, "plain red text")
 }
 
 func TestRunExplainCheckpoint_FullFallsBackWhenExternalCompactionFails(t *testing.T) {
 	// Cannot use t.Parallel() because external agent discovery mutates the
 	// package-level agent registry and this test changes cwd/PATH.
-	repo, _ := setupExternalTranscriptExplainRepo(t)
+	repo := setupExternalTranscriptExplainRepo(t)
 
 	const (
 		name      = "checkpoint-display-fallback"
@@ -2427,8 +2429,8 @@ func TestFormatCheckpointOutput_Short(t *testing.T) {
 	if !strings.Contains(output, "## Summary") {
 		t.Errorf("expected '## Summary' heading in no-color output, got:\n%s", output)
 	}
-	if !strings.Contains(output, "entire explain --generate") {
-		t.Errorf("expected --generate hint in summary affordance, got:\n%s", output)
+	if !strings.Contains(output, "entire checkpoint explain --generate") {
+		t.Errorf("expected canonical `entire checkpoint explain --generate` hint in summary affordance, got:\n%s", output)
 	}
 	// Should NOT show full file list in default mode
 	if strings.Contains(output, "main.go") {
@@ -3168,7 +3170,7 @@ func TestBuildPagerCmd_HonorsCustomPager(t *testing.T) {
 
 func TestFormatBranchCheckpoints_BasicOutput(t *testing.T) {
 	now := time.Now()
-	points := []strategy.RewindPoint{
+	points := []strategy.PendingCheckpoint{
 		{
 			ID:            "abc123def456",
 			Message:       "Add feature X",
@@ -3213,7 +3215,7 @@ func TestFormatBranchCheckpoints_GroupedByCheckpointID(t *testing.T) {
 	today := time.Date(2026, 1, 22, 10, 0, 0, 0, time.UTC)
 	yesterday := time.Date(2026, 1, 21, 14, 0, 0, 0, time.UTC)
 
-	points := []strategy.RewindPoint{
+	points := []strategy.PendingCheckpoint{
 		{
 			ID:            "abc123def456",
 			Message:       "Today checkpoint 1",
@@ -3282,7 +3284,7 @@ func TestFormatBranchCheckpoints_NoCheckpoints(t *testing.T) {
 
 func TestFormatBranchCheckpoints_ShowsSessionInfo(t *testing.T) {
 	now := time.Now()
-	points := []strategy.RewindPoint{
+	points := []strategy.PendingCheckpoint{
 		{
 			ID:            "abc123def456",
 			Message:       "Test checkpoint",
@@ -3301,47 +3303,9 @@ func TestFormatBranchCheckpoints_ShowsSessionInfo(t *testing.T) {
 	}
 }
 
-func TestFormatBranchCheckpoints_ShowsTemporaryIndicator(t *testing.T) {
-	now := time.Now()
-	points := []strategy.RewindPoint{
-		{
-			ID:           "abc123def456",
-			Message:      "Committed checkpoint",
-			Date:         now,
-			CheckpointID: "chk123456789",
-			IsLogsOnly:   true, // Committed = logs only, no indicator shown
-			SessionID:    "2026-01-22-session-1",
-		},
-		{
-			ID:           "def456ghi789",
-			Message:      "Active checkpoint",
-			Date:         now.Add(-time.Hour),
-			CheckpointID: "chk987654321",
-			IsLogsOnly:   false, // Temporary = can be rewound, shows [temporary]
-			SessionID:    "2026-01-22-session-1",
-		},
-	}
-
-	output := formatBranchCheckpoints(io.Discard, "main", points, "")
-
-	// Should indicate temporary (non-committed) checkpoints with [temporary]
-	if !strings.Contains(output, "[temporary]") {
-		t.Errorf("expected [temporary] indicator for non-committed checkpoint, got:\n%s", output)
-	}
-
-	// Committed checkpoints should NOT have [temporary] indicator
-	// Find the line with the committed checkpoint and verify it doesn't have [temporary]
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "chk123456789") && strings.Contains(line, "[temporary]") {
-			t.Errorf("committed checkpoint should not have [temporary] indicator, got:\n%s", output)
-		}
-	}
-}
-
 func TestFormatBranchCheckpoints_ShowsTaskCheckpoints(t *testing.T) {
 	now := time.Now()
-	points := []strategy.RewindPoint{
+	points := []strategy.PendingCheckpoint{
 		{
 			ID:               "abc123def456",
 			Message:          "Running tests (toolu_01ABC)",
@@ -3369,9 +3333,8 @@ func TestFormatCheckpointGroup_NoPromptNoCommitShowsPlaceholder(t *testing.T) {
 	var sb strings.Builder
 	styles := newStatusStyles(io.Discard)
 	formatCheckpointGroup(&sb, checkpointGroup{
-		checkpointID: "temporary",
+		checkpointID: "2026-01-22-session-1",
 		prompt:       "",
-		isTemporary:  true,
 		commits:      []commitEntry{{date: time.Now(), gitSHA: "deadbee", message: ""}},
 	}, styles)
 	out := sb.String()
@@ -3407,7 +3370,7 @@ func TestFormatCheckpointGroup_FallsBackToCommitMessage(t *testing.T) {
 func TestFormatBranchCheckpoints_TruncatesLongMessages(t *testing.T) {
 	now := time.Now()
 	longMessage := strings.Repeat("a", 200) // 200 character message
-	points := []strategy.RewindPoint{
+	points := []strategy.PendingCheckpoint{
 		{
 			ID:           "abc123def456",
 			Message:      longMessage,
@@ -3428,298 +3391,6 @@ func TestFormatBranchCheckpoints_TruncatesLongMessages(t *testing.T) {
 	if !strings.Contains(output, "...") {
 		t.Errorf("expected truncation indicator '...' for long message, got:\n%s", output)
 	}
-}
-
-func TestGetBranchCheckpoints_ReadsPromptFromShadowBranch(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Chdir(tmpDir)
-
-	// Initialize git repo with an initial commit
-	testutil.InitRepo(t, tmpDir)
-	repo, err := git.PlainOpen(tmpDir)
-	require.NoError(t, err)
-
-	w, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create and commit initial file
-	testFile := filepath.Join(tmpDir, "test.txt")
-	if err := os.WriteFile(testFile, []byte("initial content"), 0o644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
-	}
-	if _, err := w.Add("test.txt"); err != nil {
-		t.Fatalf("failed to add test file: %v", err)
-	}
-	initialCommit, err := w.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com", When: time.Now()},
-	})
-	if err != nil {
-		t.Fatalf("failed to create initial commit: %v", err)
-	}
-
-	// Create .entire directory
-	if err := os.MkdirAll(filepath.Join(tmpDir, ".entire"), 0o750); err != nil {
-		t.Fatalf("failed to create .entire dir: %v", err)
-	}
-
-	// Create metadata directory with prompt.txt
-	sessionID := "2026-01-27-test-session"
-	metadataDir := filepath.Join(tmpDir, ".entire", "metadata", sessionID)
-	if err := os.MkdirAll(metadataDir, 0o755); err != nil {
-		t.Fatalf("failed to create metadata dir: %v", err)
-	}
-
-	expectedPrompt := "This is my test prompt for the checkpoint"
-	if err := os.WriteFile(filepath.Join(metadataDir, paths.PromptFileName), []byte(expectedPrompt), 0o644); err != nil {
-		t.Fatalf("failed to write prompt file: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(metadataDir, "full.jsonl"), []byte(`{"test": true}`), 0o644); err != nil {
-		t.Fatalf("failed to write transcript: %v", err)
-	}
-
-	// Create first checkpoint (baseline copy) - this one gets filtered out
-	store := checkpoint.NewEphemeralStore(repo, checkpoint.DefaultV1Refs())
-	baseCommit := initialCommit.String()[:7]
-	_, err = store.Write(context.Background(), checkpoint.Step{
-		SessionID:         sessionID,
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{"test.txt"},
-		MetadataDir:       ".entire/metadata/" + sessionID,
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "First checkpoint (baseline)",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: true,
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() first checkpoint error = %v", err)
-	}
-
-	// Modify test file again for a second checkpoint with actual code changes
-	if err := os.WriteFile(testFile, []byte("second modification"), 0o644); err != nil {
-		t.Fatalf("failed to modify test file: %v", err)
-	}
-
-	// Create second checkpoint (has code changes, won't be filtered)
-	_, err = store.Write(context.Background(), checkpoint.Step{
-		SessionID:         sessionID,
-		BaseCommit:        baseCommit,
-		ModifiedFiles:     []string{"test.txt"},
-		MetadataDir:       ".entire/metadata/" + sessionID,
-		MetadataDirAbs:    metadataDir,
-		CommitMessage:     "Second checkpoint with code changes",
-		AuthorName:        "Test",
-		AuthorEmail:       "test@test.com",
-		IsFirstCheckpoint: false, // Not first, has parent
-	})
-	if err != nil {
-		t.Fatalf("WriteTemporary() second checkpoint error = %v", err)
-	}
-
-	// Now call getBranchCheckpoints and verify the prompt is read
-	points, _, err := getBranchCheckpoints(context.Background(), repo, 10)
-	if err != nil {
-		t.Fatalf("getBranchCheckpoints() error = %v", err)
-	}
-
-	// Should have at least one temporary checkpoint (the second one with code changes)
-	var foundTempCheckpoint bool
-	for _, point := range points {
-		if !point.IsLogsOnly && point.SessionID == sessionID {
-			foundTempCheckpoint = true
-			// Verify the prompt was read correctly from the shadow branch tree
-			if point.SessionPrompt != expectedPrompt {
-				t.Errorf("expected prompt %q, got %q", expectedPrompt, point.SessionPrompt)
-			}
-			break
-		}
-	}
-
-	if !foundTempCheckpoint {
-		t.Errorf("expected to find temporary checkpoint with session ID %s, got points: %+v", sessionID, points)
-	}
-}
-
-func TestGetCurrentWorktreeHash_MainWorktree(t *testing.T) {
-	// In a temp dir with a real .git directory (main worktree), getCurrentWorktreeHash
-	// should return the hash of empty string (main worktree ID is "").
-	tmpDir := t.TempDir()
-	t.Chdir(tmpDir)
-
-	testutil.InitRepo(t, tmpDir)
-
-	hash := getCurrentWorktreeHash(context.Background())
-	expected := checkpoint.HashWorktreeID("") // Main worktree has empty ID
-	if hash != expected {
-		t.Errorf("getCurrentWorktreeHash(context.Background()) = %q, want %q (hash of empty worktree ID)", hash, expected)
-	}
-}
-
-func TestGetReachableTemporaryCheckpoints_FiltersByWorktree(t *testing.T) {
-	// Shadow branches are namespaced by worktree hash (entire/<commit>-<worktreeHash>).
-	// Only shadow branches matching the current worktree should be included.
-	tmpDir := t.TempDir()
-	t.Chdir(tmpDir)
-
-	testutil.InitRepo(t, tmpDir)
-	repo, err := git.PlainOpen(tmpDir)
-	require.NoError(t, err)
-
-	w, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create initial commit
-	testFile := filepath.Join(tmpDir, "test.txt")
-	if err := os.WriteFile(testFile, []byte("initial"), 0o644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
-	}
-	if _, err := w.Add("test.txt"); err != nil {
-		t.Fatalf("failed to add test file: %v", err)
-	}
-	initialCommit, err := w.Commit("initial commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@test.com", When: time.Now()},
-	})
-	if err != nil {
-		t.Fatalf("failed to create initial commit: %v", err)
-	}
-
-	// Setup metadata for both sessions
-	sessionIDLocal := "2026-02-10-local-session"
-	sessionIDOther := "2026-02-10-other-session"
-	for _, sid := range []string{sessionIDLocal, sessionIDOther} {
-		metaDir := filepath.Join(tmpDir, ".entire", "metadata", sid)
-		if err := os.MkdirAll(metaDir, 0o755); err != nil {
-			t.Fatalf("failed to create metadata dir: %v", err)
-		}
-		if err := os.WriteFile(filepath.Join(metaDir, paths.PromptFileName), []byte("test"), 0o644); err != nil {
-			t.Fatalf("failed to write prompt: %v", err)
-		}
-		if err := os.WriteFile(filepath.Join(metaDir, "full.jsonl"), []byte(`{"test":true}`), 0o644); err != nil {
-			t.Fatalf("failed to write transcript: %v", err)
-		}
-	}
-
-	store := checkpoint.NewEphemeralStore(repo, checkpoint.DefaultV1Refs())
-	baseCommit := initialCommit.String()[:7]
-
-	writeCheckpoints := func(sessionID, worktreeID string) {
-		t.Helper()
-		metaDirAbs := filepath.Join(tmpDir, ".entire", "metadata", sessionID)
-		// Baseline
-		if _, err := store.Write(context.Background(), checkpoint.Step{
-			SessionID: sessionID, BaseCommit: baseCommit, WorktreeID: worktreeID,
-			ModifiedFiles: []string{"test.txt"}, MetadataDir: ".entire/metadata/" + sessionID,
-			MetadataDirAbs: metaDirAbs, CommitMessage: "baseline", AuthorName: "Test",
-			AuthorEmail: "test@test.com", IsFirstCheckpoint: true,
-		}); err != nil {
-			t.Fatalf("WriteTemporary baseline error: %v", err)
-		}
-		// Code change checkpoint
-		if err := os.WriteFile(testFile, []byte(sessionID+" changes"), 0o644); err != nil {
-			t.Fatalf("failed to modify test file: %v", err)
-		}
-		if _, err := store.Write(context.Background(), checkpoint.Step{
-			SessionID: sessionID, BaseCommit: baseCommit, WorktreeID: worktreeID,
-			ModifiedFiles: []string{"test.txt"}, MetadataDir: ".entire/metadata/" + sessionID,
-			MetadataDirAbs: metaDirAbs, CommitMessage: "code changes", AuthorName: "Test",
-			AuthorEmail: "test@test.com", IsFirstCheckpoint: false,
-		}); err != nil {
-			t.Fatalf("WriteTemporary code changes error: %v", err)
-		}
-	}
-
-	writeCheckpoints(sessionIDLocal, "")               // Main worktree (matches test env)
-	writeCheckpoints(sessionIDOther, "other-worktree") // Different worktree
-
-	// getBranchCheckpoints should only include local worktree's checkpoints
-	points, _, err := getBranchCheckpoints(context.Background(), repo, 20)
-	if err != nil {
-		t.Fatalf("getBranchCheckpoints error: %v", err)
-	}
-
-	for _, p := range points {
-		if p.SessionID == sessionIDOther {
-			t.Errorf("found checkpoint from other worktree (session %s) - should be filtered out", sessionIDOther)
-		}
-	}
-	var foundLocal bool
-	for _, p := range points {
-		if p.SessionID == sessionIDLocal {
-			foundLocal = true
-		}
-	}
-	if !foundLocal {
-		t.Errorf("expected local worktree checkpoint (session %s), got: %+v", sessionIDLocal, points)
-	}
-}
-
-func TestIsAncestorOf(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Chdir(tmpDir)
-
-	// Initialize git repo
-	testutil.InitRepo(t, tmpDir)
-	repo, err := git.PlainOpen(tmpDir)
-	require.NoError(t, err)
-
-	w, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("failed to get worktree: %v", err)
-	}
-
-	// Create first commit
-	testFile := filepath.Join(tmpDir, "test.txt")
-	if err := os.WriteFile(testFile, []byte("v1"), 0o644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
-	}
-	if _, err := w.Add("test.txt"); err != nil {
-		t.Fatalf("failed to add test file: %v", err)
-	}
-	commit1, err := w.Commit("first commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@example.com"},
-	})
-	if err != nil {
-		t.Fatalf("failed to create first commit: %v", err)
-	}
-
-	// Create second commit
-	if err := os.WriteFile(testFile, []byte("v2"), 0o644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
-	}
-	if _, err := w.Add("test.txt"); err != nil {
-		t.Fatalf("failed to add test file: %v", err)
-	}
-	commit2, err := w.Commit("second commit", &git.CommitOptions{
-		Author: &object.Signature{Name: "Test", Email: "test@example.com"},
-	})
-	if err != nil {
-		t.Fatalf("failed to create second commit: %v", err)
-	}
-
-	t.Run("commit is ancestor of later commit", func(t *testing.T) {
-		// commit1 should be an ancestor of commit2
-		if !strategy.IsAncestorOf(context.Background(), repo, commit1, commit2) {
-			t.Error("expected commit1 to be ancestor of commit2")
-		}
-	})
-
-	t.Run("commit is not ancestor of earlier commit", func(t *testing.T) {
-		// commit2 should NOT be an ancestor of commit1
-		if strategy.IsAncestorOf(context.Background(), repo, commit2, commit1) {
-			t.Error("expected commit2 to NOT be ancestor of commit1")
-		}
-	})
-
-	t.Run("commit is ancestor of itself", func(t *testing.T) {
-		// A commit should be considered an ancestor of itself
-		if !strategy.IsAncestorOf(context.Background(), repo, commit1, commit1) {
-			t.Error("expected commit to be ancestor of itself")
-		}
-	})
 }
 
 func TestGetBranchCheckpoints_OnFeatureBranch(t *testing.T) {
@@ -4139,11 +3810,30 @@ func TestRunExplainCommit_WithCheckpointTrailer(t *testing.T) {
 	if !strings.Contains(err.Error(), "checkpoint not found") && !strings.Contains(err.Error(), "abc123def456") {
 		t.Errorf("expected error about checkpoint not found, got: %v", err)
 	}
+	// Only a checkpoint this clone deleted is called deleted.
+	if strings.Contains(err.Error(), "deleted") {
+		t.Errorf("a checkpoint that was never deleted must not be called deleted, got: %v", err)
+	}
+
+	// A trailer can outlive its checkpoint (`entire checkpoint delete`): once
+	// the ID is on the deleted list the miss says so.
+	gitdir.ClearCache()
+	commonDir, err := gitdir.CommonDir(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, checkpoint.NewDeletedCheckpoints(commonDir).Record(id.MustCheckpointID(checkpointID)))
+	err = runExplainCommit(context.Background(), &buf, &buf, hash.String()[:7], false, false, false, false, false, false, false, 0)
+	require.Error(t, err)
+	if !strings.Contains(err.Error(), "checkpoint not found (deleted with `entire checkpoint delete`)") {
+		t.Errorf("expected the deleted hint, got: %v", err)
+	}
+	if !errors.Is(err, checkpoint.ErrCheckpointNotFound) {
+		t.Errorf("error must still match checkpoint.ErrCheckpointNotFound: %v", err)
+	}
 }
 
 func TestFormatBranchCheckpoints_SessionFilter(t *testing.T) {
 	now := time.Now()
-	points := []strategy.RewindPoint{
+	points := []strategy.PendingCheckpoint{
 		{
 			ID:            "abc123def456",
 			Message:       "Checkpoint from session 1",
@@ -4230,6 +3920,45 @@ func TestFormatBranchCheckpoints_SessionFilter(t *testing.T) {
 			t.Errorf("expected 'session ... nonexistent-session' in output, got:\n%s", output)
 		}
 	})
+
+	t.Run("filter matches archived SessionIDs contributor", func(t *testing.T) {
+		// Multi-session checkpoint: latest SessionID is beta, but alpha is still
+		// in SessionIDs. The shared matcher must keep it when filtering for alpha.
+		multi := []strategy.PendingCheckpoint{
+			{
+				ID:           "abc123def456",
+				Message:      "multi-session checkpoint",
+				Date:         now,
+				CheckpointID: "chk444444444",
+				SessionID:    "2026-01-22-session-beta",
+				SessionIDs:   []string{"2026-01-22-session-alpha", "2026-01-22-session-beta"},
+			},
+		}
+		output := formatBranchCheckpoints(io.Discard, "main", multi, "2026-01-22-session-alpha")
+		if !strings.Contains(output, "checkpoints  1") {
+			t.Errorf("expected archived contributor to match session filter, got:\n%s", output)
+		}
+	})
+
+	t.Run("unhydrated remote stub does not match session filter", func(t *testing.T) {
+		// Documents the pre-hydrate failure mode trail 871 caught: a names-only
+		// List stub has empty SessionID, so --session would drop it. Production
+		// collectCheckpoint hydrates before formatting; this asserts the filter
+		// itself does not invent a match for an empty SessionID.
+		stub := []strategy.PendingCheckpoint{
+			{
+				ID:           "abc123def456",
+				Message:      "remote-discovered stub",
+				Date:         now,
+				CheckpointID: "01KVBJCWYA4YW6J5M9GP655HZN",
+				SessionID:    "",
+			},
+		}
+		output := formatBranchCheckpoints(io.Discard, "main", stub, "2026-01-22-session-alpha")
+		if !strings.Contains(output, "checkpoints  0") {
+			t.Errorf("empty SessionID stub must not match a session filter, got:\n%s", output)
+		}
+	})
 }
 
 func TestRunExplain_SessionFlagFiltersListView(t *testing.T) {
@@ -4243,12 +3972,7 @@ func TestRunExplain_SessionFlagFiltersListView(t *testing.T) {
 		{"config", "user.name", "Test User"},
 		{"commit", "--allow-empty", "-m", "init"},
 	} {
-		cmd := exec.CommandContext(context.Background(), "git", args...)
-		cmd.Dir = tmp
-		cmd.Env = testutil.GitIsolatedEnv()
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
+		testutil.RunGit(t, tmp, args...)
 	}
 	t.Chdir(tmp)
 
@@ -5317,7 +5041,7 @@ func TestGetBranchCheckpoints_DefaultBranchFindsMergedCheckpoints(t *testing.T) 
 }
 
 func TestGetBranchCheckpoints_ReadsPromptFromCommittedCheckpoint(t *testing.T) {
-	// Verifies that getBranchCheckpoints populates RewindPoint.SessionPrompt
+	// Verifies that getBranchCheckpoints populates PendingCheckpoint.SessionPrompt
 	// from prompt.txt on entire/checkpoints/v1 (committed checkpoint) without
 	// needing to read/parse the full transcript.
 	tmpDir := t.TempDir()
@@ -5449,7 +5173,7 @@ func TestGetBranchCheckpoints_PopulatesCommittedSessionIDs(t *testing.T) {
 	points, _, err := getBranchCheckpoints(context.Background(), repo, 10)
 	require.NoError(t, err)
 
-	var found *strategy.RewindPoint
+	var found *strategy.PendingCheckpoint
 	for i := range points {
 		if points[i].CheckpointID == cpID {
 			found = &points[i]
@@ -5697,13 +5421,13 @@ func TestExtractIntent_TruncatesLongPrompts(t *testing.T) {
 
 func TestBuildNoSummaryMarkdown_IntentAndAffordance(t *testing.T) {
 	t.Parallel()
-	got := buildNoSummaryMarkdown("add explain --generate flag", nil, "Run `entire explain --generate abc`.")
+	got := buildNoSummaryMarkdown("add explain --generate flag", nil, "Run `entire checkpoint explain --generate abc`.")
 	if !strings.Contains(got, "## Intent\n\nadd explain --generate flag\n") {
 		t.Fatalf("missing intent section:\n%s", got)
 	}
 	// escapeSummaryText replaces every backtick with U+2018 (‘), so both
-	// backticks in "Run `entire explain --generate abc`." map to ‘.
-	if !strings.Contains(got, "## Summary\n\n*Run ‘entire explain --generate abc‘.*\n") {
+	// backticks in "Run `entire checkpoint explain --generate abc`." map to ‘.
+	if !strings.Contains(got, "## Summary\n\n*Run ‘entire checkpoint explain --generate abc‘.*\n") {
 		t.Fatalf("missing italic summary affordance:\n%s", got)
 	}
 	if strings.Contains(got, "## Files") {
@@ -5859,7 +5583,7 @@ func TestRunExplainBranchWithFilter_NoCheckpoints_ShowsHelpfulMessage(t *testing
 	if !strings.Contains(output, "checkpoints  0") {
 		t.Errorf("expected 'checkpoints  0' in output, got: %s", output)
 	}
-	if !strings.Contains(output, "Checkpoints will appear") || !strings.Contains(output, "agent session") {
+	if !strings.Contains(output, "after you commit agent work") || !strings.Contains(output, "entire checkpoint list --pending") {
 		t.Errorf("expected helpful message about checkpoints, got: %s", output)
 	}
 }
@@ -5886,3 +5610,213 @@ func TestRunExplainBranchWithFilter_DetachedHead(t *testing.T) {
 		t.Errorf("expected output to indicate detached HEAD state, got: %s", output)
 	}
 }
+func TestSummaryProgressWriter_NonTTY(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	attempt := newSummaryAttempt("claude-code", 0)
+	pw := newSummaryProgressWriter(&buf, attempt)
+
+	// Throttling rule: emit on first PhaseGenerating, then on 500ms OR 25% jump.
+	// The two events here are back-to-back (~0ms) but the second is a 100% jump,
+	// so both should emit.
+	pw.handle(agent.GenerationProgress{Phase: agent.PhaseConnecting})
+	pw.handle(agent.GenerationProgress{Phase: agent.PhaseFirstToken, TTFTms: 935, CachedInputTokens: 35892})
+	pw.handle(agent.GenerationProgress{Phase: agent.PhaseGenerating, OutputTokens: 100})
+	pw.handle(agent.GenerationProgress{Phase: agent.PhaseGenerating, OutputTokens: 200})
+	pw.handle(agent.GenerationProgress{Phase: agent.PhaseDone, OutputTokens: 200, DurationMs: 3100})
+
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("expected 5 lines, got %d: %q", len(lines), buf.String())
+	}
+	wantSubstr := []string{
+		"Sending request to provider",
+		"Provider responded",
+		"Writing summary",
+		"Writing summary",
+		"Summary generated",
+	}
+	for i, ws := range wantSubstr {
+		if !strings.Contains(lines[i], ws) {
+			t.Errorf("line %d = %q, want substring %q", i, lines[i], ws)
+		}
+	}
+	if strings.Contains(buf.String(), "\r") {
+		t.Error("non-TTY output should not contain carriage returns")
+	}
+}
+
+func TestSummaryProgressWriter_NonTTYGenerateThrottle(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	attempt := newSummaryAttempt("claude-code", 0)
+	pw := newSummaryProgressWriter(&buf, attempt)
+
+	// First Generating event always emits (no prior state).
+	pw.handle(agent.GenerationProgress{Phase: agent.PhaseGenerating, OutputTokens: 100})
+	// Tiny jump (10%) within 500ms → suppressed.
+	pw.handle(agent.GenerationProgress{Phase: agent.PhaseGenerating, OutputTokens: 110})
+	// 30% jump from baseline of 100 → emits (>=25% rule).
+	pw.handle(agent.GenerationProgress{Phase: agent.PhaseGenerating, OutputTokens: 130})
+
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Errorf("expected 2 emitted Generating lines, got %d: %q", len(lines), buf.String())
+	}
+}
+
+func TestSummaryProgressWriter_Accessible(t *testing.T) {
+	// Cannot use t.Parallel() — t.Setenv mutates process-global state.
+	// (Strictly, t.Setenv IS compatible with t.Parallel() in Go 1.17+ when
+	// Setenv is called BEFORE Parallel, but the project convention is to
+	// avoid pairing them to keep the rules simple.)
+	t.Setenv("ACCESSIBLE", "1")
+	var buf bytes.Buffer
+	attempt := newSummaryAttempt("claude-code", 0)
+	pw := newSummaryProgressWriter(&buf, attempt)
+	pw.handle(agent.GenerationProgress{Phase: agent.PhaseConnecting})
+
+	out := buf.String()
+	if strings.Contains(out, "→") {
+		t.Errorf("accessible mode should not contain unicode arrow: %q", out)
+	}
+	if !strings.Contains(out, "->") {
+		t.Errorf("accessible mode should contain ASCII arrow: %q", out)
+	}
+	if strings.Contains(out, "\x1b[") {
+		t.Errorf("accessible mode should not contain ANSI escapes: %q", out)
+	}
+}
+
+func TestSummaryProgressWriter_PopulatesAttempt(t *testing.T) {
+	t.Parallel()
+
+	attempt := newSummaryAttempt("claude-code", 30*time.Second)
+	pw := newSummaryProgressWriter(&bytes.Buffer{}, attempt)
+	pw.handle(agent.GenerationProgress{Phase: agent.PhaseConnecting})
+	pw.handle(agent.GenerationProgress{Phase: agent.PhaseFirstToken})
+
+	if !attempt.streaming {
+		t.Error("expected attempt.streaming=true after any progress event")
+	}
+	if !attempt.phasesReached[agent.PhaseConnecting] {
+		t.Error("expected PhaseConnecting recorded in attempt")
+	}
+	if !attempt.phasesReached[agent.PhaseFirstToken] {
+		t.Error("expected PhaseFirstToken recorded in attempt")
+	}
+	if attempt.phasesReached[agent.PhaseDone] {
+		t.Error("did not expect PhaseDone yet")
+	}
+}
+
+func TestTimeoutDiagnostic_StreamingStuckBeforeConnecting(t *testing.T) {
+	t.Parallel()
+	attempt := newSummaryAttempt("claude-code", 5*time.Second)
+	attempt.streaming = true // streaming was attempted but no events fired
+
+	label, rows := timeoutDiagnostic(context.DeadlineExceeded, attempt)
+	if !strings.Contains(label, "never sent its request") {
+		t.Errorf("label = %q, want 'never sent its request'", label)
+	}
+	if !rowsHaveValue(rows, "claude") {
+		t.Errorf("rows should suggest running 'claude' directly: %v", rows)
+	}
+}
+
+func TestTimeoutDiagnostic_StreamingStuckBeforeFirstToken(t *testing.T) {
+	t.Parallel()
+	attempt := newSummaryAttempt("claude-code", 5*time.Second)
+	attempt.streaming = true
+	attempt.phasesReached[agent.PhaseConnecting] = true
+
+	label, _ := timeoutDiagnostic(context.DeadlineExceeded, attempt)
+	if !strings.Contains(label, "received no response") {
+		t.Errorf("label = %q, want 'received no response'", label)
+	}
+}
+
+func TestTimeoutDiagnostic_StreamingStuckMidGeneration(t *testing.T) {
+	t.Parallel()
+	attempt := newSummaryAttempt("claude-code", 5*time.Second)
+	attempt.streaming = true
+	attempt.phasesReached[agent.PhaseConnecting] = true
+	attempt.phasesReached[agent.PhaseFirstToken] = true
+	attempt.phasesReached[agent.PhaseGenerating] = true
+
+	label, _ := timeoutDiagnostic(context.DeadlineExceeded, attempt)
+	if !strings.Contains(label, "did not finish") {
+		t.Errorf("label = %q, want 'did not finish'", label)
+	}
+}
+
+func TestTimeoutDiagnostic_StreamingFirstTokenWithoutConnecting(t *testing.T) {
+	t.Parallel()
+	// Older CLIs can reach FirstToken without ever emitting the
+	// version-dependent "requesting" status event. The diagnostic must key
+	// off the furthest phase reached — reporting "never sent its request"
+	// here would contradict the progress lines the user just watched.
+	attempt := newSummaryAttempt("claude-code", 5*time.Second)
+	attempt.streaming = true
+	attempt.phasesReached[agent.PhaseFirstToken] = true
+
+	label, _ := timeoutDiagnostic(context.DeadlineExceeded, attempt)
+	if !strings.Contains(label, "did not finish") {
+		t.Errorf("label = %q, want 'did not finish' (furthest phase reached wins)", label)
+	}
+}
+
+func TestTimeoutDiagnostic_StreamingDoneButDeadlineFired(t *testing.T) {
+	t.Parallel()
+	// All phases including Done were reached, yet the deadline still fired
+	// (e.g. while the result was being read). Must not fall through to the
+	// non-streaming branch and claim the provider produced no output.
+	attempt := newSummaryAttempt("claude-code", 5*time.Second)
+	attempt.streaming = true
+	attempt.phasesReached[agent.PhaseConnecting] = true
+	attempt.phasesReached[agent.PhaseFirstToken] = true
+	attempt.phasesReached[agent.PhaseGenerating] = true
+	attempt.phasesReached[agent.PhaseDone] = true
+
+	label, _ := timeoutDiagnostic(context.DeadlineExceeded, attempt)
+	if !strings.Contains(label, "was not delivered in time") {
+		t.Errorf("label = %q, want 'was not delivered in time'", label)
+	}
+	if strings.Contains(label, "produced no output") {
+		t.Errorf("label = %q must not claim the provider produced no output", label)
+	}
+}
+
+func TestTimeoutDiagnostic_NonStreamingNoOutput(t *testing.T) {
+	t.Parallel()
+	attempt := newSummaryAttempt("codex", 5*time.Second)
+	attempt.stderrCaptured = "failed to look up host: nodename nor servname provided"
+	attempt.stdoutByteCount = 0
+
+	label, rows := timeoutDiagnostic(context.DeadlineExceeded, attempt)
+	if !strings.Contains(label, "produced no output") {
+		t.Errorf("label = %q, want 'produced no output'", label)
+	}
+	if !rowsHaveValue(rows, "failed to look up host") {
+		t.Errorf("rows should surface stderr, got: %v", rows)
+	}
+}
+
+func TestTimeoutDiagnostic_NonStreamingWithOutput(t *testing.T) {
+	t.Parallel()
+	attempt := newSummaryAttempt("codex", 5*time.Second)
+	attempt.stderrCaptured = "model is processing your request"
+	attempt.stdoutByteCount = 1024
+
+	label, rows := timeoutDiagnostic(context.DeadlineExceeded, attempt)
+	if !strings.Contains(label, "was generating output when killed") {
+		t.Errorf("label = %q, want 'was generating output when killed'", label)
+	}
+	if !rowsHaveValue(rows, "model is processing") {
+		t.Errorf("rows should surface stderr, got: %v", rows)
+	}
+}
+
+const lessRawControlEnv = "LESS=-R"

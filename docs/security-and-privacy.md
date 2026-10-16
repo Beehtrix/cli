@@ -6,27 +6,90 @@ Entire stores AI session transcripts and metadata in your git repository. This d
 
 ### Where data is stored
 
-When you use Entire with an AI agent (Claude Code, Codex, Gemini CLI, OpenCode, Cursor, Factory AI Droid, Copilot CLI, Pi), session transcripts, user prompts, and checkpoint metadata are committed to a dedicated branch in your git repository (`entire/checkpoints/v1`). This branch is separate from your working branches, your code commits stay clean, but it lives in the same repository.
+When you use Entire with an AI agent (Claude Code, Codex, Antigravity, OpenCode, Cursor, Factory AI Droid, Copilot CLI, Pi), session transcripts, user prompts, and checkpoint metadata are committed to **your own git repository**. They stay out of your working branches' history, but they live in the same repo and travel with it.
 
-Entire also creates temporary local branches (e.g., `entire/<short-hash>`) as working storage during a session. Metadata written to these shadow branches — transcripts, prompts, incremental checkpoint data, subagent transcripts — goes through the same redaction pipeline as `entire/checkpoints/v1`. **Code-file snapshots, however, are written as raw blobs of your working tree without redaction**, so any hardcoded secrets in your source code would appear unredacted on the shadow branch. Gitignored files (e.g., `.env`) are filtered out of these snapshots as a partial defense. Shadow branches are **not** pushed by Entire; do not push them manually, because unredacted source content would be visible on the remote. They are cleaned up when session data is condensed into `entire/checkpoints/v1` at commit time.
+Exactly where depends on the [checkpoint backend](architecture/ref-checkpoint-backend.md) the repo uses:
 
-Anyone with access to your repository can view the transcript data on the `entire/checkpoints/v1` branch. This includes the full prompt/response history and session metadata. Note that transcripts capture all tool interactions — including file contents, MCP server calls, and other data exchanged during the session.
+| Backend | Committed checkpoints land in | Notes |
+|---|---|---|
+| `git-refs` (default for new repos) | One ref per checkpoint: `refs/entire/checkpoints/<shard>/<id>` | Not a branch. Pushed individually, and fetched individually on demand |
+| `git-branch` (legacy) | Subtrees of one long-lived branch, `entire/checkpoints/v1` | A branch, so it shows up in branch listings, CI branch triggers, and platform previews |
+
+Which one a repo is on is recorded as `checkpoints.primary.type` in `.entire/settings.json` (or `settings.local.json`); an absent `checkpoints` block means `git-branch`. The redaction described in this document applies identically to both — the pipeline is shared, and only the destination differs. Where the distinction matters below, it is called out.
+
+Between commits, Entire writes nothing to git. At the end of each agent turn it records the paths the agent touched and their git blob hashes in local session state (`.git/entire-sessions/`), and keeps the sanitized transcript in `.entire/metadata/<session>/full.jsonl` (see [Local copies of transcript content](#local-copies-of-transcript-content)). Older Entire versions instead wrote local **shadow branches** (`entire/<commit>-<worktree>`) at turn end, whose code-file snapshots were raw, unredacted blobs of your working tree. Current versions do not delete them automatically: `entire doctor` reports them and `entire doctor --force` deletes the `entire/<commit>-<worktree>` form without touching session state. Plain `entire clean` deletes them too, but also clears the state of every session based on HEAD, which is now the only record of pending agent work. `entire disable --uninstall` deletes the `entire/<commit>-<worktree>` form as well, and lists the oldest `entire/<commit>` form by name without deleting it (a user's own branch named like a short SHA matches it); `entire clean --all` deletes that form after you confirm. Deleting a branch leaves its objects unreachable until git prunes them: `git gc` reclaims the space once they are two weeks old (git's default `gc.pruneExpire`). `git gc --prune=now` frees it at once but drops every unreachable object, recently dropped stashes included, and must only run when no other git process is active.
+
+**Antigravity title-tee (machine-global):** setting up the Antigravity agent installs `entire hooks antigravity title-tee` into agy's *global* settings (`~/.gemini/antigravity-cli/settings.json`), because agy exposes token usage only through its window-title/statusline feed. Once installed, the tee runs on every agy state change on the machine — including in repositories where Entire is not enabled — and persists **only** the conversation ID and token counts (`context_window` totals) to Entire's local cache directory; the rest of the payload is discarded and no prompt or file content is captured. Stale per-conversation snapshots are cleaned up after 14 days. Removing the Antigravity agent (`entire agent remove antigravity`) uninstalls the tee.
+
+Anyone with access to your repository can read committed checkpoint data: the full prompt/response history and session metadata. Note that transcripts capture all tool interactions — including file contents, MCP server calls, and other data exchanged during the session. Per-checkpoint refs are less *visible* than a branch, but they are not less accessible: a `git fetch` of `refs/entire/checkpoints/*` reads them just as well.
 
 If your repository is **public**, this data is visible to the entire internet.
 
 ### What Entire redacts automatically
 
-Entire automatically scans transcript and metadata content before writing it to the `entire/checkpoints/v1` branch. Seven always-on secret detection methods run during condensation, plus a conditional eighth pass for user-defined secret rules (see [Customizing redaction](#customizing-redaction) below), an opt-in ninth pass for PII (see [Optional PII redaction](#optional-pii-redaction) below), and an opt-in tenth pass that shells out to the OpenAI Privacy Filter model (see [Optional OpenAI Privacy Filter](#optional-openai-privacy-filter-opf) below):
+Entire automatically scans transcript and metadata content before writing it to a git object. Six always-on secret detection methods plus a configurable scanner layer (pattern matching, method 2 below) run during condensation, plus a conditional eighth pass for user-defined secret rules (see [Customizing redaction](#customizing-redaction) below), and an opt-in ninth pass for PII (see [Optional PII redaction](#optional-pii-redaction) below):
 
-1. **Entropy scoring** — Identifies high-entropy strings (Shannon entropy > 4.5) that look like randomly generated secrets, even if they don't match a known pattern.
-2. **Pattern matching** — Uses [Betterleaks](https://github.com/betterleaks/betterleaks) built-in rules to detect known secret formats.
+1. **Entropy scoring** — Identifies high-entropy strings (Shannon entropy > 4.5) that look like randomly generated secrets, even if they don't match a known pattern. One exact shape is exempt from this layer only: a string that is, in its entirety, a Claude Code tool-use id (`toolu_01` plus 22 letters or digits). The other layers still scan it, and a secret attached to an id forms a longer string that is not exempt.
+2. **Pattern matching** — Runs one or both configurable scanner engines against known secret formats: [Betterleaks](https://github.com/betterleaks/betterleaks) (default on) and/or [goredact](https://github.com/lastpersonlabs/goredact) (default off). See [Choosing secret-scanner engines](#choosing-secret-scanner-engines) below.
 3. **Provider token prefixes** — Deterministically redacts known secret-key prefixes (e.g. Supabase `sb_secret_`, `sbp_`) regardless of entropy or surrounding context.
 4. **Credentialed URI detection** — Redacts URLs with embedded passwords, such as `scheme://user:password@host`.
 5. **Database connection-string detection** — Redacts JDBC, Postgres keyword DSN, SQL Server, and ODBC-style connection strings containing passwords.
 6. **Shell-stdin secret literals** — Redacts literals `printf`-piped into `secrets put/set/add/create` commands, such as `printf 'value' | mycli secrets put API_KEY`, while preserving the command itself.
 7. **Bounded credential value detection** — Redacts credential-shaped config values such as `DB_PASSWORD=...`, `GITHUB_CLIENT_SECRET=...`, and `AUTH_TOKEN=...` while preserving the surrounding key.
 
-Detected secrets are replaced with `REDACTED` before the data is ever written to a git object. The seven secret-detection passes above are **always on** and cannot be disabled. User-defined rules (inline `custom_redactions` and rule packs) add an eighth secret-detection pass that only runs when configured.
+Detected secrets are replaced with `REDACTED` before the data is ever written to a git object. Of the seven secret-detection passes above, the scanner layer (pass 2) is configurable — see [Choosing secret-scanner engines](#choosing-secret-scanner-engines) below — while the other six are **always on** and cannot be disabled. User-defined rules (inline `custom_redactions` and rule packs) add an eighth secret-detection pass that only runs when configured.
+
+### What Entire does NOT understand: pasted images and screenshots
+
+**Every layer described above — all nine passes, including the opt-in PII layer — reads transcript *text*. There is no OCR pass, no vision-model PII or secret scan, and no gate that holds an image back until someone reviews it. Nothing in Entire ever reads what an image depicts.**
+
+What that means for an image you paste is **not uniform across agents**, because it depends on how the agent writes the image into its transcript. There are three outcomes, and only the first is an exposure:
+
+| Agent | Default | With `redaction.externalize_images` on |
+| --- | --- | --- |
+| Claude Code | **Stored unredacted**, inline in the transcript as base64. The text scanner skips it (the `type: image` / `type: base64` skip rule below) rather than scanning it. | **Stored unredacted** as a raw binary blob under the checkpoint's `assets/` folder. |
+| Codex | **Destroyed.** Codex writes images as `data:` URIs inside `image_url` and tool-output strings, which the skip rule does not match, so the entropy layer treats the base64 as a secret and replaces it. The stored transcript keeps the surrounding message; the image is gone. | **Stored unredacted** under `assets/` (externalization runs before redaction, which is what preserves it). |
+| Cursor | **Not stored in the repository at all.** Cursor keeps images in its own per-session SQLite store, never in the transcript Entire reads. | **Stored unredacted** under `assets/`, captured from that store. |
+| OpenCode, Copilot CLI, Factory Droid, Pi | Depends on the agent's own transcript shape; Entire has no image handling for these. Assume the Claude Code row unless you have checked. | Unchanged — the setting only affects the three agents above. |
+
+**Do not treat the Codex row as a protection.** It is a side effect of a skip rule not matching a shape, not a deliberate safeguard: it destroys data you may want, it does not apply to the `assets/` path, and a change to either the rule or Codex's format would flip it to the exposure case without notice.
+
+Where an image *is* stored, it is byte-for-byte what you pasted — completely unredacted — because byte-level regex and entropy redaction cannot inspect binary image data without corrupting it, so Entire does not attempt it. That is a deliberate design choice, not a bug.
+
+Two things about *when* those bytes reach git:
+
+- **A checkpoint's copy** lands on `entire/checkpoints/v1` (or the equivalent per-checkpoint ref on the `git-refs` backend). Like all checkpoint data it is written locally and pushed separately, so it reaches your remote only when checkpoint data is pushed — see the **Review before pushing** bullet under [Recommendations](#recommendations).
+- **Before you commit**, the image exists only in the agent's own transcript and in Entire's local sanitized copy (`.entire/metadata/<session>/full.jsonl`); nothing is written to git at turn end.
+
+**If you would not commit an image to your repository unredacted, do not paste it into an agent conversation.** This applies equally to a private repository — anyone with read access to checkpoint data can see it — and especially to a public one.
+
+### Choosing secret-scanner engines
+
+Pattern matching (layer 2 above) is served by two independent scanner engines, each of which can be turned on or off:
+
+- **Betterleaks** — a broad rule-set auditor with several hundred built-in detectors for known secret formats (cloud providers, VCS platforms, payment processors, private key blocks, generic credentials, and more). Default: **on**.
+- **goredact** — a streaming, validator-based scanner that checks a smaller set of provider/contextual token shapes against structural validators (e.g. checksum or length checks) rather than pure regex. Default: **off**.
+
+Configure them under `redaction.betterleaks` / `redaction.goredact` in `.entire/settings.json`:
+
+```json
+"redaction": {
+  "betterleaks": { "enabled": true },
+  "goredact":   { "enabled": false }
+}
+```
+
+Omitting either key, or the key's `enabled` field, keeps that engine at its default. All other redaction layers — entropy scoring, provider token prefixes, credentialed URI detection, connection-string detection, custom rules, shell-stdin literal detection, bounded credential key/value detection, and PII — are unaffected by these two toggles; they keep running exactly as described elsewhere in this document regardless of which scanner engine(s) are selected.
+
+**Fail-closed rules:**
+
+- At least one scanner engine must be enabled. Setting both `betterleaks.enabled` and `goredact.enabled` to `false` is a settings error: Entire refuses to load the (merged) settings rather than run condensation with no pattern-matching coverage at all.
+- Scanner selection is honored **only** from the committed `.entire/settings.json`. A `betterleaks` or `goredact` key present in `.entire/settings.local.json` is ignored, and Entire logs a warning naming the ignored key. This is deliberate: unlike most `settings.local.json` overrides, which are personal and don't affect anyone else, the scanner selection changes what gets redacted into checkpoints that every reader of the repository's history will see — so it has to be a team-visible, committed decision, not a per-developer one.
+- Disabling Betterleaks narrows layer-2 coverage to whatever engine(s) remain enabled. The first time a hook or CLI command runs with Betterleaks disabled, Entire logs a one-time notice to that effect (printed on the terminal when stderr is a TTY; suppressed on subsequent runs via a marker file under `.entire/tmp/`).
+
+**Runtime degradation:** if goredact is the only enabled scanner and it fails at runtime (a scan error, not a missing finding), Entire treats that as scanner degradation and fails the transcript write rather than persisting content that only received partial pattern-matching coverage. This is a deliberate fail-closed choice: with Betterleaks also enabled, a goredact failure degrades gracefully to Betterleaks-only coverage for that write; with Betterleaks disabled, there is no fallback engine left, so the write itself must fail instead of shipping under-scanned content.
+
+**The coverage trade-off, honestly stated:** Betterleaks' several-hundred-rule set covers a long tail of structured, often low-entropy token formats that a smaller rule set would miss; goredact covers roughly 67 provider/contextual token shapes but checks each one with a dedicated validator, trading breadth for precision. Neither engine is a strict superset of the other — running both (the default plus opting into goredact) gives the widest coverage.
 
 ### Optional PII redaction
 
@@ -37,7 +100,7 @@ Built-in categories (when `enabled` is `true`):
 | Category | Default | Replacement token |
 |---|---|---|
 | `email` | on | `[REDACTED_EMAIL]` |
-| `phone` | on | `[REDACTED_PHONE]` |
+| `phone` (North American / NANP formats) | on | `[REDACTED_PHONE]` |
 | `address` (US street addresses) | off (more false-positive prone) | `[REDACTED_ADDRESS]` |
 
 Common bot/CI email addresses are not redacted (`noreply@*`, `actions@*`, `*@users.noreply.github.com`, `*@noreply.github.com`).
@@ -62,191 +125,40 @@ Teams can add their own regex patterns via `custom_patterns`. Each key is a labe
 
 If a custom pattern itself reveals sensitive structure (e.g. an internal ID format), put it in `.entire/settings.local.json` (gitignored) instead of `.entire/settings.json`.
 
-### Optional OpenAI Privacy Filter (`opf`)
+### Local copies of transcript content
 
-A separate, **opt-in** layer that shells out to the [OpenAI Privacy Filter](https://github.com/openai/privacy-filter) (`opf`) — a 1.5B-parameter token-classification model that finds names, emails, phone numbers, addresses, dates, URLs, account numbers, and secrets that pure regex can miss. Disabled by default. Runs *in addition to* the nine built-in layers, **only at push time** — never per-turn and never at commit time. Local commits stay on the fast 9-layer pipeline so per-commit latency is unchanged; OPF only re-redacts checkpoints right before they leave the machine via `git push`.
+Two local copies of transcript content are never redacted and never reach the remote:
 
-Prerequisites:
+`.entire/metadata/<session>/full.jsonl` is Entire's own local working copy of the transcript, written mode `0600`. It is *sanitized* (agent state that cannot be replayed out of a checkpoint is stripped) but **not redacted** — redaction happens on the way into a git object, not on this file. It is the input condensation reads from when the live agent transcript is no longer available.
 
-```bash
-pip install opf
-```
-
-Verify `opf --help` works; the CLI defaults to resolving the binary via `$PATH`. Override with the `command` setting if you need a specific path.
-
-Enable in `.entire/settings.json`:
-
-```json
-{
-  "redaction": {
-    "openai_privacy_filter": {
-      "enabled": true,
-      "categories": {
-        "private_person": true
-      }
-    }
-  }
-}
-```
-
-Available categories (set to `true` to enable, `false` or omit to skip):
-
-| Category | Replacement token | Notes |
-|---|---|---|
-| `private_person` | `[REDACTED_PERSON]` | Person names |
-| `private_email` | `[REDACTED_EMAIL]` | Email addresses |
-| `private_phone` | `[REDACTED_PHONE]` | Phone numbers |
-| `private_address` | `[REDACTED_ADDRESS]` | Street addresses |
-| `private_url` | `[REDACTED_URL]` | URLs that may identify a person/account |
-| `private_date` | `[REDACTED_DATE]` | Dates (DOB, etc.) |
-| `account_number` | `[REDACTED_ACCOUNT_NUMBER]` | Account / card / SSN-shaped numbers |
-| `secret` | `REDACTED` | Generic credential-shaped values |
-
-Unknown category names are rejected at settings load time so typos surface immediately instead of silently disabling a category.
-
-Full settings reference:
-
-```json
-{
-  "redaction": {
-    "openai_privacy_filter": {
-      "enabled": true,
-      "categories": {
-        "private_person": true,
-        "private_email": true,
-        "private_phone": true,
-        "private_address": false,
-        "private_url": false,
-        "private_date": false,
-        "account_number": false,
-        "secret": false
-      },
-      "command": "opf",
-      "timeout_seconds": 30
-    }
-  }
-}
-```
-
-- `command` — path or PATH-resolvable name of the `opf` binary. Defaults to `opf`.
-- `timeout_seconds` — per-invocation timeout. Defaults to `30`.
-- `prompt_default` — `"ask"` (default), `"never"`, or `"always"`. Controls whether the pre-push hook surfaces an interactive prompt before running OPF. `ENTIRE_OPF=yes` or `ENTIRE_OPF=no` on a single `git push` invocation overrides this for that push only.
-
-The interactive prompt offers three options and reacts to **Ctrl-C** for cancellation:
-
-```
-Run OpenAI Privacy Filter on these checkpoints?
-Adds ~30s but redacts names/PII the regex layers can't catch.
-Ctrl-C to cancel the push.
-
-  ▸ Yes — run OPF this push
-    No — skip OPF, push as-is
-    Always — run OPF on every push from now on
-```
-
-- **Yes** runs OPF for this push only.
-- **No** skips OPF for this push only; the 9-layer-redacted content reaches the remote.
-- **Always** runs OPF this push AND writes `prompt_default: "always"` to `.entire/settings.local.json` so future pushes don't ask.
-- **Ctrl-C** aborts the push entirely — `git push` exits non-zero, no refs go to the remote.
-
-Non-interactive contexts (CI, scripted pipes with no TTY) skip the prompt and run OPF automatically when enabled, printing `→ OpenAI Privacy Filter: scanning checkpoints…` to stderr so the wait isn't silent. Set `ENTIRE_OPF=no` to skip OPF in those contexts without disabling the feature globally.
-
-**CI consideration**: if you've enabled OPF locally and your CI runs `git push` (e.g. an agent-driven workflow), the CI push will attempt to run OPF too. If the `opf` binary isn't installed in CI, the push will abort with `OPFRuntimeFailedError` rather than silently shipping under-redacted content — by design, since "I enabled OPF" should mean "no content leaves my machines without OPF." The remedies are (a) install `opf` in CI, (b) set `ENTIRE_OPF=no` for CI pushes, or (c) set `prompt_default: "never"` if you only want OPF on interactive pushes.
-
-OPF failures at push time are **fail-closed**: if OPF is not on PATH, fails to start, or times out during the pre-push rewrite, the per-process circuit breaker trips and the rewrite aborts the push with `OPF runtime failed; aborting push`. Nothing reaches the remote. The intent is that "the user enabled OPF" means "I do not want unredacted content leaving this machine" — falling back to 9-layer silently on the push path would violate that contract. Fix the install or set `ENTIRE_OPF=no` for a one-off push.
-
-(The circuit breaker is per-process, so a broken install costs one warning instead of one timeout per blob — but the push still aborts.)
-
-Cost note: each shell-out loads the OPF model (~1.5B parameters on CPU). The pre-push rewrite batches **every redactable leaf across every unpushed v1 commit** into a single inference pass, so a typical real-world push pays the model-load cost once (~6s) plus inference (~5s per 100KB of leaf content) — not multiplied by the number of commits or blobs. A 3-commit push with ~250KB of total prose content runs in ~12–15s, not the ~50–100s a per-blob flow would take. Per-commit latency is unaffected because OPF doesn't run at commit time.
-
-#### When OPF actually runs
-
-OPF execution lives in the pre-push hook. The flow:
-
-1. **Post-commit** writes the checkpoint with **9-layer-only** redaction to your local `entire/checkpoints/v1` branch. Fast, predictable, no OPF cost on the hot path.
-2. **Pre-push** (`git push`): if OPF is enabled, the hook re-reads each unpushed `entire/checkpoints/v1` commit, runs the OpenAI Privacy Filter over its blobs to add the categories the regex layers don't catch (person names, addresses, etc.), and builds **new commits** carrying an `Entire-OPF-Applied: true` trailer. The local v1 ref fast-forwards atomically to the new tip, and the (now 10-layer-redacted) commits are what get pushed.
-3. The original 9-layer-only commits become **unreachable** in the local git object database and eventually get swept by `git gc`.
-
-This means:
-
-- **The remote only ever sees 10-layer-redacted content** when OPF is enabled.
-- **Local-only commits are 9-layer-redacted** until the moment you push. If you never push, OPF never runs.
-- **Re-running pre-push is idempotent** — commits already carrying the trailer get re-parented into the chain but are not re-redacted.
-
-#### Force-pushed remote, bootstrap, and concurrent pushes
-
-The rewrite refuses to proceed and aborts the push when it detects a divergent state, so checkpoints on the remote are never silently rebased:
-
-- **Diverged remote**: if local `entire/checkpoints/v1` has commits that aren't ancestors of `<remote>/entire/checkpoints/v1`, the hook exits with a `entire/checkpoints/v1 has diverged from remote` error. Fetch the remote and either reset local v1 to the remote tip or resolve manually before pushing.
-- **Bootstrap** (remote has no `entire/checkpoints/v1` yet, e.g. first push): the cap is `100` unpushed commits by default. Override via the env var on the push invocation:
-
-  ```fish
-  set -x ENTIRE_OPF_BOOTSTRAP_LIMIT 500; git push
-  # or fully unbounded:
-  set -x ENTIRE_OPF_BOOTSTRAP_LIMIT unlimited; git push
-  ```
-
-- **Batch-size cap**: independent of commit count, the rewrite refuses pushes whose cumulative prose-leaf content exceeds `ENTIRE_OPF_BATCH_LIMIT` bytes (default: 2 MiB ≈ ~110s of inference). The two caps protect different failure modes — the bootstrap cap stops "100 throwaway commits", the batch cap stops "one commit with 50 MB of pasted transcript". An `OPF would run inference on …` error means you've hit this; bump the env var or push without OPF for that push:
-
-  ```fish
-  set -x ENTIRE_OPF_BATCH_LIMIT 10485760; git push   # 10 MiB
-  # or fully unbounded:
-  set -x ENTIRE_OPF_BATCH_LIMIT unlimited; git push
-  ```
-
-- **Concurrent push** from another worktree: the rewrite uses a CAS to update the local v1 ref. If another process moved the ref while OPF was running, the hook exits with a "concurrent push detected" error and `git push` aborts the whole batch. Fetch and retry.
-
-#### Persistence of un-redacted-by-OPF content
-
-Three places retain content that OPF *didn't* redact, with different lifetimes. Understanding them matters if your threat model goes beyond "what reaches the remote":
-
-| Location | Redaction level | Lifetime | Reaches remote? |
-|---|---|---|---|
-| `.entire/<session>.jsonl` | **None — raw** | Until session is deleted (managed by the agent) | No |
-| Shadow branch `entire/<commit>-<worktree>` | 9-layer | Auto-deleted after the next successful push (only when its session has ended cleanly) | No |
-| Unreachable git objects after pre-push rewrite | 9-layer | Until `git gc --prune` (default `gc.pruneExpire` is 2 weeks) | No |
-| Reflog `git reflog show entire/checkpoints/v1` | 9-layer tips | Default `gc.reflogExpire` is 90 days | No |
-| `<remote>/entire/checkpoints/v1` | 10-layer (after OPF rewrite) | Until you delete the branch on the remote | Yes |
-
-The `.entire/<session>.jsonl` files are raw working state owned by the agent (Claude Code, etc.) — Entire reads from them but does not redact them in place, because the agent is reading and writing them continuously and editing under the agent's feet would corrupt the session.
-
-To aggressively scrub the unreachable git objects from the pre-push rewrite (instead of waiting for the 2-week GC window):
-
-```fish
-git reflog expire --expire-unreachable=now refs/heads/entire/checkpoints/v1
-git gc --prune=now
-```
-
-This is I/O-heavy on large repositories; it's not run automatically. If you want it as part of your push workflow, wrap `git push` in a script that invokes it after a successful push.
-
-Verifying it's working:
-
-```fish
-# After enabling OPF, run an agent turn that includes a name in the prompt,
-# e.g. "Create notes.txt with: Alice Johnson reviewed the proposal."
-# Commit (this stays on the fast 9-layer pipeline), then push. OPF runs
-# during the pre-push step:
-git commit -m "demo"
-git push   # → "→ OpenAI Privacy Filter: scanning N checkpoints (~30s)…"
-git log --oneline entire/checkpoints/v1 | head -2
-entire checkpoint explain HEAD | grep -i 'REDACTED_PERSON'
-```
-
-If `[REDACTED_PERSON]` appears in the prompt or transcript section and the latest `entire/checkpoints/v1` commit carries `Entire-OPF-Applied: true`, OPF is active.
+The agent's own transcript is never modified at all. Entire reads from it and leaves it alone, because the agent is writing to it continuously and editing under the agent's feet would corrupt the session.
 
 ### Recommendations
 
 If your AI sessions will touch sensitive data:
 
-- **Use a private repository.** This is the simplest and most complete protection. Transcripts on `entire/checkpoints/v1` are only visible to collaborators.
+- **Use a private repository.** This is the simplest and most complete protection. Committed checkpoints are then only visible to collaborators.
 - **Avoid passing sensitive files to your agent.** Content that never enters the agent conversation never appears in transcripts.
-- **Review before pushing.** You can inspect the `entire/checkpoints/v1` branch locally before pushing it to a remote.
+- **Never paste a screenshot or image containing secrets or personal data.** Nothing in Entire reads what an image depicts, and on most agents the image is stored unredacted — see [What Entire does NOT understand: pasted images and screenshots](#what-entire-does-not-understand-pasted-images-and-screenshots).
+- **Review before pushing.** Checkpoints are written locally — at commit time, or when a session with no file changes is snapshotted with the hidden `entire checkpoint create` — and pushed separately, so there is always a window to inspect them:
+
+  ```fish
+  # git-refs: list local checkpoint refs, then read one
+  git for-each-ref refs/entire/checkpoints
+  entire checkpoint list
+  entire checkpoint explain <id>
+
+  # git-branch: inspect the branch directly
+  git log --oneline entire/checkpoints/v1
+  ```
+
+- **Know your push destination.** Checkpoint data syncs to exactly one elected remote; `entire status` names it and reports how many checkpoints are still unpushed.
 
 ## What Gets Redacted
 
 ### Secrets (always on)
 
-Betterleaks pattern matching covers cloud providers (AWS, GCP, Azure), version control platforms (GitHub, GitLab, Bitbucket), payment processors (Stripe, Square), communication tools (Slack, Discord, Twilio), private key blocks (RSA, DSA, EC, PGP, OpenSSH), and generic credentials (bearer tokens, basic auth, JWTs). Dedicated credentialed URI detection covers URLs that embed passwords. Additional database connection-string detection covers DB DSNs and query-parameter passwords not reliably covered by generic secret rules. Entropy scoring catches secrets that don't match any known pattern.
+Secret detection as a whole is always on, though the pattern-matching scanner layer within it is configurable per [Choosing secret-scanner engines](#choosing-secret-scanner-engines). Betterleaks pattern matching covers cloud providers (AWS, GCP, Azure), version control platforms (GitHub, GitLab, Bitbucket), payment processors (Stripe, Square), communication tools (Slack, Discord, Twilio), private key blocks (RSA, DSA, EC, PGP, OpenSSH), and generic credentials (bearer tokens, basic auth, JWTs). Dedicated credentialed URI detection covers URLs that embed passwords. Additional database connection-string detection covers DB DSNs and query-parameter passwords not reliably covered by generic secret rules. Entropy scoring catches secrets that don't match any known pattern.
 
 All detected secrets are replaced with `REDACTED`. PII matches are replaced with category-tagged tokens like `[REDACTED_EMAIL]` (see [Optional PII redaction](#optional-pii-redaction)).
 
@@ -378,7 +290,8 @@ File an issue when the rule would benefit every Entire user (e.g., a major SaaS 
 
 - **Best-effort.** Novel or low-entropy secrets (short passwords, predictable tokens) may not be caught.
 - **Filenames and binary data.** Secrets in filenames, binary files, or deeply nested structures may not be detected.
-- **JSONL skip rules.** Entire skips scanning fields named `signature`, fields ending in `id`/`ids`, structural-path fields (`filepath`, `file_path`, `cwd`, `root`, `directory`, `dir`, `path`), and objects whose `type` starts with `image` or equals `base64` — all to avoid false positives.
+- **JSONL skip rules.** Entire skips scanning fields whose name *ends in* `signature` (so `thinkingSignature` too), fields ending in `id`/`ids`, and structural-path fields (`filepath`, `file_path`, `cwd`, `root`, `directory`, `dir`, `path`) to avoid false positives. Objects whose `type` starts with `image` or equals `base64` are also skipped — and that skip is what leaves a pasted image unredacted rather than merely unflagged. It matches some agents' image shapes and not others, which is why the outcome differs per agent: see [What Entire does NOT understand: pasted images and screenshots](#what-entire-does-not-understand-pasted-images-and-screenshots) above.
+- **Built-in PII patterns are US-centric.** `phone` matches North American (NANP) formats only — international formats, including E.164 numbers outside `+1`, are not detected. `address` matches the street line only; city, state, and ZIP/postcode are preserved. If you handle personal data from other regions, add `custom_patterns` for your locale rather than relying on the built-in categories alone.
 - **Custom PII patterns are user-authored.** Teams own the correctness of their `custom_patterns`. An invalid regex is logged and skipped, not enforced.
 - **Users are ultimately responsible** for reviewing what they commit and push. Redaction is a safety net, not a guarantee.
 
@@ -394,6 +307,78 @@ Opt out via any one of:
 - `"telemetry": false` in `.entire/settings.json` or `.entire/settings.local.json`.
 - `ENTIRE_TELEMETRY_OPTOUT=1` in the environment.
 
+## Why `external_agents` is local-only
+
+`external_agents` turns on the `$PATH` scan that looks for `entire-agent-*`
+binaries and runs each one's `info` subcommand, then keeps running the ones it
+registered for every hook thereafter. It is an execution grant, not a
+preference, so it is honored only when it is genuinely developer-owned: only
+from `.entire/settings.local.json`, and only when that file is untracked in both
+the index and `HEAD`. Reading it from the committed `.entire/settings.json` would
+let an ordinary pull request turn on execution of whatever `entire-agent-*`
+binary it could get onto a developer's `$PATH`, and one line of JSON does not
+read as executable to a reviewer. There is no prompt in front of this one at all.
+
+The untracked check matters because the filename alone proves nothing:
+`.gitignore` does not apply to a path that is already tracked, so
+`git add -f .entire/settings.local.json` commits it and a fresh clone
+materializes it with the committed content. A tracked
+`.entire/settings.local.json` is ignored in its entirety, because it is not
+local to your clone — it arrives with the repository and would override project
+settings for everyone. Entire warns on stderr and tells you to run
+`git rm --cached .entire/settings.local.json`. The load still succeeds using
+project settings, so a committed file cannot brick the repository.
+
+Rejection is a downgrade, never an error: discovery simply does not run.
+`entire status` names the setting and where it has to move, and the same reason
+is logged. The interactive setup flows (`entire enable`, `entire configure`,
+`entire agent add`, `entire plugin uninstall`) reach external agents regardless
+of the setting, so the remedy stays available from the commands that need it —
+and when one of them enables an external agent for you, it writes the setting to
+`.entire/settings.local.json`, which is where it takes effect.
+
+Every `$PATH` scanner in the CLI also drops non-absolute entries. A relative
+entry resolves against the process's working directory, which for a git hook is
+whatever repository the caller was standing in, so a file committed to that
+repository would otherwise be a binary Entire executes.
+
+## Why agent instruction fields are local-only
+
+Every review `prompt` (per-agent and judge, in
+`review_profiles` and the legacy `review` map) and every review profile's
+`task` are placed verbatim in the prompts of agents that
+`entire review` spawns with approval checks disabled (claude-code's
+`bypassPermissions`, codex's `--dangerously-bypass-approvals-and-sandbox`). The
+prompt is the stated control for those spawns, so whoever writes these strings
+gets the last word in it. `task` and `prompt` are adjacent sections of the same
+composed prompt, so they are gated together — a gate on one alone would just
+move the attacker's text to the other field. Honoring any of them from the
+committed `.entire/settings.json` would let an ordinary pull request steer an
+approvals-disabled agent on every developer who pulls — the same delivery route
+as [`external_agents`](#why-external_agents-is-local-only), carrying
+instructions instead of an execution grant.
+
+They are therefore honored only from layers that are this developer's own:
+clone-local review preferences (stored inside `.git/`, which a clone never
+populates) or `.entire/settings.local.json` verified untracked in both the
+index and `HEAD`. Rejection is a downgrade, never an error — a dropped task
+falls back to the built-in text for conventional profile names, and
+`entire review` prints a one-line notice naming the
+dropped field and where it has to move (suppressed when the dropped task equals
+the built-in default, since that drop changes nothing).
+
+The `entire-investigate` plugin applies the same reasoning to its own
+`always_prompt`, against its own `.entire/investigate.local.json`. That file
+has no committed counterpart at all, so there is no layer to gate — only a
+check that the file itself is untracked. It is outside this repository's
+control; see the plugin's `internal/config`.
+
+Deliberately not gated: `skills` (review validates every configured skill
+against the locally installed set before spawning, so free text there fails the
+run rather than reaching an agent), `agent` and `model` (registry keys and
+routing hints, not instruction text), and `review_default_profile` (it only
+selects among profiles whose instruction content is itself gated).
+
 ## Reporting a vulnerability
 
 For vulnerability disclosure, see [SECURITY.md](../SECURITY.md) at the repo root: email `security@entire.io`, expect acknowledgment within 48 hours and resolution of criticals within 90 days.
@@ -401,4 +386,4 @@ For vulnerability disclosure, see [SECURITY.md](../SECURITY.md) at the repo root
 ## Related
 
 - [Checkpoint commit signing](architecture/checkpoint-signing.md) — best-effort GPG/SSH signing of checkpoint commits, opt-out via `sign_checkpoint_commits: false`.
-- External agent plugins are arbitrary executables on `$PATH` invoked by the CLI; only install plugins you trust.
+- External agent plugins are arbitrary executables on `$PATH` invoked by the CLI; only install plugins you trust. Discovery is off unless you turn it on in `.entire/settings.local.json` — see [Why `external_agents` is local-only](#why-external_agents-is-local-only).

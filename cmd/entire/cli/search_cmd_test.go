@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -39,6 +40,23 @@ func TestSearchCmd_AccessibleModeRequiresQuery(t *testing.T) {
 	want := "query required when using --json, accessible mode, or piped output"
 	if !strings.Contains(err.Error(), want) {
 		t.Errorf("error = %q, want containing %q", err.Error(), want)
+	}
+}
+
+// Each instance's examples must use its own command path: the top-level alias
+// is `entire search`, the canonical form under the checkpoint group is
+// `entire checkpoint search`. A shared prefix would mislead one command's help.
+func TestSearchCmd_ExamplesMatchCommandPath(t *testing.T) {
+	t.Parallel()
+
+	topLevel := newSearchCmd().Example
+	if !strings.Contains(topLevel, "entire search ") || strings.Contains(topLevel, "checkpoint search") {
+		t.Fatalf("top-level search examples must use the `entire search` prefix:\n%s", topLevel)
+	}
+
+	checkpoint := newCheckpointSearchCmd().Example
+	if !strings.Contains(checkpoint, "entire checkpoint search ") {
+		t.Fatalf("checkpoint search examples must use the `entire checkpoint search` prefix:\n%s", checkpoint)
 	}
 }
 
@@ -90,47 +108,214 @@ func TestWriteSearchJSON_ZeroLimitFallsBackToDefaultPageSize(t *testing.T) {
 	}
 }
 
-func TestCodeSearchEnabled_EnvGate(t *testing.T) {
-	// Modifies process-global env, no t.Parallel().
-	for _, tc := range []struct {
-		val  string
-		want bool
-	}{
-		{"", false},
-		{"0", false},
-		{"false", false},
-		{"true", false},
-		{"1", true},
+func TestWriteSearchCompactJSON_TrimsResults(t *testing.T) {
+	t.Parallel()
+
+	resp := &search.Response{
+		Results: testResults(),
+		Total:   2,
+		Page:    1,
+	}
+
+	var buf bytes.Buffer
+	if err := writeSearchCompactJSON(&buf, resp, 0, 1); err != nil {
+		t.Fatalf("writeSearchCompactJSON returned error: %v", err)
+	}
+
+	output := buf.String()
+	// Identifiers, ranking, and files survive.
+	for _, want := range []string{
+		`"id": "a3b2c4d5e6f7"`,
+		`"type": "checkpoint"`,
+		`"repo": "entirehq/entire.io"`,
+		`"branch": "main"`,
+		`"author": "alicecodes"`,
+		`"date": "2026-03-24T10:30:00Z"`,
+		`"src/middleware/auth.go"`,
+		`"score": 0.042`,
+		`"title": "Implement auth middleware"`,
+		`"snippet": "added auth middleware for JWT validation"`,
+		`"matchType": "semantic"`,
+		`"total_pages": 1`,
 	} {
-		t.Setenv("ENTIRE_CODE_SEARCH", tc.val)
-		if got := codeSearchEnabled(); got != tc.want {
-			t.Errorf("ENTIRE_CODE_SEARCH=%q: codeSearchEnabled() = %v, want %v", tc.val, got, tc.want)
+		if !strings.Contains(output, want) {
+			t.Errorf("compact output missing %s:\n%s", want, output)
 		}
+	}
+	// The full prompt must NOT be embedded (that's the whole point).
+	if strings.Contains(output, "add auth middleware to protect API routes") {
+		t.Errorf("compact output must not contain the full prompt:\n%s", output)
 	}
 }
 
-func TestSearchCmd_CodeFlagGated(t *testing.T) {
-	// --code without ENTIRE_CODE_SEARCH should fail with gate message.
-	t.Setenv("ENTIRE_CODE_SEARCH", "")
+// Repo/pr rows (reachable via --all-repos) have no typed struct; compact hits
+// must still carry identifying info from the raw payload instead of collapsing
+// to just {id, type, score}. checkpointCount is carried through (core
+// repo_facts); the repo description is not — its only source was the retired
+// MySQL repos table and the v1 wire now sends it as always-null (ENT-1912,
+// entire-search#198). The fixture sends a non-null value to prove the CLI
+// drops it regardless of what an un-redeployed cell still emits.
+func TestWriteSearchCompactJSON_RepoAndPRRowsKeepIdentifyingFields(t *testing.T) {
+	t.Parallel()
 
+	wire := `{"results":[
+		{"type":"repo","data":{"id":"01JREPO","name":"backend","org":"acme","fullName":"acme/backend","description":"Backend services","checkpointCount":18},"searchMeta":{"score":0.9}},
+		{"type":"pr","data":{"id":"pr-9","title":"Fix login retry","repo":"backend","userLogin":"alice"},"searchMeta":{"score":0.5}}
+	],"total":2,"page":1}`
+	var resp search.Response
+	if err := json.Unmarshal([]byte(wire), &resp); err != nil {
+		t.Fatalf("unmarshaling wire response: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := writeSearchCompactJSON(&buf, &resp, 0, 1); err != nil {
+		t.Fatalf("writeSearchCompactJSON returned error: %v", err)
+	}
+
+	output := buf.String()
+	for _, want := range []string{
+		`"id": "01JREPO"`,
+		`"repo": "acme/backend"`,
+		`"title": "backend"`,
+		`"checkpointCount": 18`,
+		`"id": "pr-9"`,
+		`"title": "Fix login retry"`,
+		`"author": "alice"`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("compact output missing %s:\n%s", want, output)
+		}
+	}
+	// The owner must never be doubled when the payload carries a qualified fullName.
+	if strings.Contains(output, "acme/acme/") {
+		t.Errorf("compact output doubled the repo owner:\n%s", output)
+	}
+	// The MySQL-era repo description is never surfaced, even when a cell sends it.
+	if strings.Contains(output, `"description"`) {
+		t.Errorf("compact output carries retired repo description:\n%s", output)
+	}
+}
+
+// A checkpoint with no commit subject titles itself with the prompt, and the
+// backend's snippet for that row is the prompt's first indexed chunk
+// ("Prompt: " + the same text) — emitting both would carry the same 200 runes
+// twice. The duplicate snippet is dropped; a snippet from a later chunk (not
+// a title prefix) survives because it shows where the match landed.
+func TestWriteSearchCompactJSON_DropsSnippetDuplicatingTitle(t *testing.T) {
+	t.Parallel()
+
+	subject := "fix login"
+	longPrompt := strings.TrimSpace(strings.Repeat("word ", 50)) // 249 runes, past the 200-rune cap
+	cases := []struct {
+		name        string
+		checkpoint  *search.CheckpointResult
+		snippet     string
+		wantSnippet bool
+	}{
+		{
+			name:       "prompt-title duplicate dropped",
+			checkpoint: &search.CheckpointResult{ID: "cp1", Prompt: "add rate limiting to the public API", Org: "o", Repo: "r"},
+			snippet:    "Prompt: add rate limiting to the public API",
+		},
+		{
+			name:       "duplicate survives truncation on both sides",
+			checkpoint: &search.CheckpointResult{ID: "cp2", Prompt: longPrompt, Org: "o", Repo: "r"},
+			snippet:    "Prompt: " + longPrompt,
+		},
+		{
+			name:        "later-chunk snippet kept",
+			checkpoint:  &search.CheckpointResult{ID: "cp3", Prompt: "add rate limiting to the public API", Org: "o", Repo: "r"},
+			snippet:     "Prompt: retry the bucket refill when redis is down",
+			wantSnippet: true,
+		},
+		{
+			name:        "snippet extending a commit-subject title kept",
+			checkpoint:  &search.CheckpointResult{ID: "cp4", Prompt: "fix login retries in the auth flow", CommitSubject: &subject, Org: "o", Repo: "r"},
+			snippet:     "Prompt: fix login retries in the auth flow",
+			wantSnippet: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			resp := &search.Response{
+				Results: []search.Result{{
+					Type:       search.TypeCheckpoint,
+					Checkpoint: tc.checkpoint,
+					Meta:       search.Meta{Snippet: tc.snippet, Score: 1},
+				}},
+				Total: 1,
+			}
+			var buf bytes.Buffer
+			if err := writeSearchCompactJSON(&buf, resp, 0, 1); err != nil {
+				t.Fatalf("writeSearchCompactJSON returned error: %v", err)
+			}
+			if got := strings.Contains(buf.String(), `"snippet"`); got != tc.wantSnippet {
+				t.Errorf("snippet present = %v, want %v:\n%s", got, tc.wantSnippet, buf.String())
+			}
+		})
+	}
+}
+
+func TestWriteSearchCompactJSON_TruncatesLongPromptTitle(t *testing.T) {
+	t.Parallel()
+
+	longPrompt := strings.Repeat("word ", 200) // ~1000 chars, no commit message fallback
+	resp := &search.Response{
+		Results: []search.Result{{
+			Type: search.TypeCheckpoint,
+			Checkpoint: &search.CheckpointResult{
+				ID:     "cp1",
+				Prompt: longPrompt,
+				Org:    "o",
+				Repo:   "r",
+			},
+		}},
+		Total: 1,
+	}
+
+	var buf bytes.Buffer
+	if err := writeSearchCompactJSON(&buf, resp, 0, 1); err != nil {
+		t.Fatalf("writeSearchCompactJSON returned error: %v", err)
+	}
+
+	output := buf.String()
+	if strings.Contains(output, strings.TrimSpace(longPrompt)) {
+		t.Error("expected long prompt title to be truncated")
+	}
+	if !strings.Contains(output, "…") {
+		t.Errorf("expected truncated title to end with ellipsis:\n%s", output)
+	}
+}
+
+func TestSearchCmd_CompactWithCodeRejected(t *testing.T) {
+	t.Parallel()
+
+	root := NewRootCmd()
+	root.SetArgs([]string{"search", "--code", "--compact", "handleRequest"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected error when --compact used with --code")
+	}
+	if !strings.Contains(err.Error(), "--compact cannot be used with --code") {
+		t.Errorf("error = %q, want containing '--compact cannot be used with --code'", err.Error())
+	}
+}
+
+func TestSearchCmd_CodeFlagUngated(t *testing.T) {
+	// Code search is generally available: --code must never fail with the old
+	// feature-gate message (it may still fail later at auth/network).
 	root := NewRootCmd()
 	root.SetArgs([]string{"search", "--code", "test query"})
 
 	err := root.Execute()
-	if err == nil {
-		t.Fatal("expected error when --code used without ENTIRE_CODE_SEARCH")
-	}
-	if !strings.Contains(err.Error(), "not yet available") {
-		t.Errorf("error = %q, want containing 'not yet available'", err.Error())
-	}
-	if strings.Contains(err.Error(), "ENTIRE_CODE_SEARCH") {
-		t.Errorf("gate error should not mention env var, got: %q", err.Error())
+	if err != nil && strings.Contains(err.Error(), "not yet available") {
+		t.Errorf("--code should not be feature-gated, got: %q", err.Error())
 	}
 }
 
 func TestSearchCmd_CodeFlagRequiresQuery(t *testing.T) {
-	t.Setenv("ENTIRE_CODE_SEARCH", "1")
-
 	root := NewRootCmd()
 	root.SetArgs([]string{"search", "--code"})
 
@@ -378,6 +563,48 @@ func TestWriteCodeSearchText_Empty(t *testing.T) {
 	}
 }
 
+// TestWriteCodeSearchText_SkippedRepos pins the skipped-repo channel in both
+// shapes: the empty-results explanation (a search emptied by skips must not
+// print a bare "no results") and the trailing warning under real results.
+func TestWriteCodeSearchText_SkippedRepos(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	writeCodeSearchText(&buf, &codesearch.SearchResponse{SkippedRepos: []string{"acme/cloning"}}, newStatusStyles(&buf), false)
+	if got := buf.String(); !strings.Contains(got, "skipped repos with no searchable placement: acme/cloning") {
+		t.Errorf("empty-results output missing skip explanation:\n%s", got)
+	}
+
+	buf.Reset()
+	writeCodeSearchText(&buf, &codesearch.SearchResponse{
+		Results:      []codesearch.Result{{Repo: "acme/web", Path: "main.go", Line: 1, ContextLine: "x"}},
+		SkippedRepos: []string{"acme/cloning"},
+	}, newStatusStyles(&buf), false)
+	if got := buf.String(); !strings.Contains(got, "Warning: skipped repo(s) with no searchable placement (missing or not ready): acme/cloning") {
+		t.Errorf("results output missing skip warning:\n%s", got)
+	}
+}
+
+// TestWriteCodeSearchJSON_SkippedRepos pins skipped_repos in the JSON shape —
+// the agent-facing channel for a narrowed scope.
+func TestWriteCodeSearchJSON_SkippedRepos(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	if err := writeCodeSearchJSON(&buf, &codesearch.SearchResponse{SkippedRepos: []string{"acme/cloning"}}); err != nil {
+		t.Fatalf("writeCodeSearchJSON: %v", err)
+	}
+	var out struct {
+		SkippedRepos []string `json:"skipped_repos"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if strings.Join(out.SkippedRepos, ",") != "acme/cloning" {
+		t.Fatalf("skipped_repos = %v, want [acme/cloning]", out.SkippedRepos)
+	}
+}
+
 func TestMergeSearchResults(t *testing.T) {
 	t.Parallel()
 
@@ -546,12 +773,12 @@ func TestMergeSearchResults_DeduplicatesOverlappingCells(t *testing.T) {
 func TestMergeSearchResults_MirrorPlacementsDoNotDoubleCount(t *testing.T) {
 	t.Parallel()
 
-	// A US-homed repo with an EU mirror indexes the same content, so the
-	// fan-out queries both cells and each returns the SAME matches. Merged
-	// results dedupe by repo+path+line; the stats must dedupe too, or the
-	// summary reports "6 matches across 4 files in 2 repos" for 3 unique
-	// results (and falsely claims truncation). Regression guard for the
-	// mirror fan-out this trail introduced.
+	// Two cells answering with the SAME repo's content (the fan-out is
+	// canonical-only since ENT-1672, but overlapping cell scopes — e.g. an
+	// empty-jurisdiction group queried via both home and an explicit cell —
+	// can still do this). Merged results dedupe by repo+path+line; the stats
+	// must dedupe too, or the summary reports "6 matches across 4 files in
+	// 2 repos" for 3 unique results (and falsely claims truncation).
 	matches := []codesearch.Result{
 		{Repo: "acme/web", Path: "main.go", Line: 1, Column: 0, Score: 0.9},
 		{Repo: "acme/web", Path: "main.go", Line: 2, Column: 0, Score: 0.8},
@@ -615,12 +842,10 @@ func TestResolveRepoFilters_GhPrefix(t *testing.T) {
 	}
 }
 
-func TestResolveRepoFilters_EtPrefixNoStrip(t *testing.T) {
+func TestResolveRepoFilters_EtPrefixLegacyRows(t *testing.T) {
 	t.Parallel()
 
-	// BFF only strips gh/, not et/. "et/myproj/backend" is tried as-is
-	// against full_name. It won't match "myproj/backend" — this aligns
-	// with the BFF behavior.
+	// A legacy bare row with no provider signal is GitHub, not native.
 	repos := []coreapi.RepoIndexEntry{
 		{ID: testRepoID2, FullName: "myproj/backend"},
 	}
@@ -629,8 +854,7 @@ func TestResolveRepoFilters_EtPrefixNoStrip(t *testing.T) {
 		t.Fatalf("et/ prefix should not match stripped FullName: ids = %v, want empty", ids)
 	}
 
-	// But if FullName is stored with the et/ prefix, it matches via the
-	// unstripped fallback (full_name === filter).
+	// A legacy native row explicitly names its forge in FullName.
 	repos2 := []coreapi.RepoIndexEntry{
 		{ID: testRepoID2, FullName: "et/myproj/backend"},
 	}
@@ -744,8 +968,6 @@ func TestResolveRepoFilters_MultipleReposMixed(t *testing.T) {
 
 func TestSearchCmd_CaseSensitiveWithCodeFlagParsesCorrectly(t *testing.T) {
 	// --case-sensitive with --code should be accepted (fails later at auth, not at validation).
-	t.Setenv("ENTIRE_CODE_SEARCH", "1")
-
 	root := NewRootCmd()
 	root.SetArgs([]string{"search", "--code", "--case-sensitive", "HandleRequest"})
 
@@ -758,8 +980,6 @@ func TestSearchCmd_CaseSensitiveWithCodeFlagParsesCorrectly(t *testing.T) {
 
 func TestSearchCmd_LimitFlagAccepted(t *testing.T) {
 	// --limit with --code should parse correctly.
-	t.Setenv("ENTIRE_CODE_SEARCH", "1")
-
 	root := NewRootCmd()
 	root.SetArgs([]string{"search", "--code", "--limit", "50", "handleRequest"})
 
@@ -772,8 +992,6 @@ func TestSearchCmd_LimitFlagAccepted(t *testing.T) {
 
 func TestSearchCmd_InlineRepoStarTreatedAsAllRepos(t *testing.T) {
 	// repo:* inline should be treated as "all repos" (no filter).
-	t.Setenv("ENTIRE_CODE_SEARCH", "1")
-
 	root := NewRootCmd()
 	root.SetArgs([]string{"search", "--code", "auth repo:*"})
 
@@ -786,8 +1004,6 @@ func TestSearchCmd_InlineRepoStarTreatedAsAllRepos(t *testing.T) {
 
 func TestSearchCmd_MultipleInlineRepoFilters(t *testing.T) {
 	// Multiple inline repo: filters should all be collected.
-	t.Setenv("ENTIRE_CODE_SEARCH", "1")
-
 	root := NewRootCmd()
 	root.SetArgs([]string{"search", "--code", "auth repo:gh/entirehq/entire.io repo:gh/entirehq/cli"})
 
@@ -795,6 +1011,40 @@ func TestSearchCmd_MultipleInlineRepoFilters(t *testing.T) {
 	// Will fail at auth, but should NOT fail at filter parsing.
 	if err != nil && strings.Contains(err.Error(), "invalid") {
 		t.Errorf("multiple repo: filters should be accepted, got: %v", err)
+	}
+}
+
+func TestSearchCmd_SemanticMultipleRepoFlags(t *testing.T) {
+	// Semantic search (no --code) must accept multiple repos via a repeatable
+	// --repo flag (ENT-1047) — parity with code search. It fails later at
+	// auth/git, but must not be rejected as an invalid/unsupported filter.
+	root := NewRootCmd()
+	root.SetArgs([]string{"search", "auth", "--repo", "entirehq/entire.io", "--repo", "entireio/cli"})
+
+	err := root.Execute()
+	if err != nil {
+		if strings.Contains(err.Error(), "validating repo filter") {
+			t.Errorf("multiple --repo flags should pass validation, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "only one explicit repo filter") {
+			t.Errorf("multiple repos should no longer be rejected, got: %v", err)
+		}
+	}
+}
+
+func TestSearchCmd_SemanticCommaSeparatedRepoFlag(t *testing.T) {
+	// A single comma-separated --repo value must expand to multiple repos.
+	root := NewRootCmd()
+	root.SetArgs([]string{"search", "auth", "--repo", "entirehq/entire.io,entireio/cli"})
+
+	err := root.Execute()
+	if err != nil {
+		if strings.Contains(err.Error(), "validating repo filter") {
+			t.Errorf("comma-separated --repo should pass validation, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "only one explicit repo filter") {
+			t.Errorf("comma-separated repos should no longer be rejected, got: %v", err)
+		}
 	}
 }
 
@@ -860,8 +1110,6 @@ func TestExtractInlineRepoFilters(t *testing.T) {
 
 func TestSearchCmd_CodePreservesNonRepoFiltersInQuery(t *testing.T) {
 	// Ensure author:foo is NOT consumed by code search query parsing.
-	t.Setenv("ENTIRE_CODE_SEARCH", "1")
-
 	root := NewRootCmd()
 	root.SetArgs([]string{"search", "--code", "author:foo TODO"})
 

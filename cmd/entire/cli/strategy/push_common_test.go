@@ -119,8 +119,9 @@ func TestDoPushRef_UnreachableTarget_ReturnsNil(t *testing.T) {
 	// 2. Try to fetch+rebase (fails — can't fetch from non-existent path)
 	// 3. Log warning and return nil (graceful degradation)
 	nonExistentPath := filepath.Join(t.TempDir(), "does-not-exist")
-	err := doPushRef(ctx, nonExistentPath, plumbing.NewBranchReferenceName(paths.MetadataBranchName))
-	assert.NoError(t, err, "doPushRef should return nil when target is unreachable (graceful degradation)")
+	delivered, err := doPushRef(ctx, nonExistentPath, plumbing.NewBranchReferenceName(paths.MetadataBranchName))
+	require.NoError(t, err, "doPushRef should return nil when target is unreachable (graceful degradation)")
+	assert.False(t, delivered, "an unreachable target delivered nothing, which err cannot express")
 }
 
 // TestPushRefIfNeeded_UnreachableTarget_ReturnsNil exercises the full push path
@@ -142,8 +143,9 @@ func TestPushRefIfNeeded_UnreachableTarget_ReturnsNil(t *testing.T) {
 	//    which finds no remote tracking ref -> returns true (has unpushed)
 	// 4. Call doPushRef which fails gracefully
 	nonExistentPath := filepath.Join(t.TempDir(), "does-not-exist")
-	err := pushRefIfNeeded(ctx, nonExistentPath, plumbing.NewBranchReferenceName(paths.MetadataBranchName))
-	assert.NoError(t, err, "pushRefIfNeeded should return nil when target is unreachable")
+	delivered, err := pushRefIfNeeded(ctx, nonExistentPath, plumbing.NewBranchReferenceName(paths.MetadataBranchName))
+	require.NoError(t, err, "pushRefIfNeeded should return nil when target is unreachable")
+	assert.False(t, delivered, "an unreachable target delivered nothing, which err cannot express")
 }
 
 // TestPushRefIfNeeded_NonBranchRef verifies that pushRefIfNeeded accepts
@@ -166,17 +168,13 @@ func TestPushRefIfNeeded_NonBranchRef(t *testing.T) {
 
 	// Create a bare repo as the push target.
 	bareDir := t.TempDir()
-	initCmd := exec.CommandContext(ctx, "git", "init", "--bare")
-	initCmd.Dir = bareDir
-	initCmd.Env = testutil.GitIsolatedEnv()
-	if output, err := initCmd.CombinedOutput(); err != nil {
-		t.Fatalf("git init --bare failed: %v\n%s", err, output)
-	}
+	testutil.RunGit(t, bareDir, "init", "--bare")
 
 	t.Chdir(tmpDir)
 
-	require.NoError(t, pushRefIfNeeded(ctx, bareDir, customRef),
-		"pushRefIfNeeded should accept a non-branch ref")
+	delivered, err := pushRefIfNeeded(ctx, bareDir, customRef)
+	require.NoError(t, err, "pushRefIfNeeded should accept a non-branch ref")
+	require.True(t, delivered, "the ref reached the bare remote")
 
 	// Verify the ref arrived on the bare remote at the right hash.
 	bareRepo, err := git.PlainOpen(bareDir)
@@ -200,18 +198,14 @@ func TestPushRefIfNeeded_LocalBareRepo_PushesSuccessfully(t *testing.T) {
 
 	// Create a bare repo as the push target.
 	bareDir := t.TempDir()
-	initCmd := exec.CommandContext(ctx, "git", "init", "--bare")
-	initCmd.Dir = bareDir
-	initCmd.Env = testutil.GitIsolatedEnv()
-	if output, err := initCmd.CombinedOutput(); err != nil {
-		t.Fatalf("git init --bare failed: %v\n%s", err, output)
-	}
+	testutil.RunGit(t, bareDir, "init", "--bare")
 
 	t.Chdir(tmpDir)
 
 	// Push using pushRefIfNeeded with the bare repo path as target.
-	err := pushRefIfNeeded(ctx, bareDir, plumbing.NewBranchReferenceName(paths.MetadataBranchName))
+	delivered, err := pushRefIfNeeded(ctx, bareDir, plumbing.NewBranchReferenceName(paths.MetadataBranchName))
 	require.NoError(t, err, "pushRefIfNeeded should succeed with a local bare repo target")
+	require.True(t, delivered, "a successful push reports delivery")
 
 	// Verify the ref arrived on the bare repo.
 	verifyCmd := exec.CommandContext(ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+paths.MetadataBranchName)
@@ -247,12 +241,7 @@ func TestFetchAndRebase_NonBranchRef(t *testing.T) {
 	for _, args := range [][]string{
 		{"init", "--bare"},
 	} {
-		c := exec.CommandContext(ctx, "git", args...)
-		c.Dir = bareDir
-		c.Env = testutil.GitIsolatedEnv()
-		if out, err := c.CombinedOutput(); err != nil {
-			t.Fatalf("git %v failed: %v\n%s", args, err, out)
-		}
+		testutil.RunGit(t, bareDir, args...)
 	}
 	bareRepo, err := git.PlainOpen(bareDir)
 	require.NoError(t, err)
@@ -280,11 +269,7 @@ func TestFetchAndRebase_NonBranchRefDisconnected(t *testing.T) {
 
 	gitRun := func(dir string, args ...string) {
 		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = testutil.GitIsolatedEnv()
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "git %v in %s failed: %s", args, dir, out)
+		testutil.RunGit(t, dir, args...)
 	}
 
 	gitRun(bareDir, "init", "--bare", "-b", "main")
@@ -366,11 +351,7 @@ func TestFetchAndRebase_DivergedBranches(t *testing.T) {
 	bareDir := t.TempDir()
 	workDir := t.TempDir()
 	gitRun := func(dir string, args ...string) {
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = testutil.GitIsolatedEnv()
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "git %v in %s failed: %s", args, dir, out)
+		testutil.RunGit(t, dir, args...)
 	}
 
 	// Init bare + push initial main commit
@@ -494,12 +475,7 @@ func TestFetchAndRebase_SharedCloneLocalCommitInAlternate(t *testing.T) {
 	remoteWorkDir := filepath.Join(t.TempDir(), "remote-work")
 	cloneDir := filepath.Join(t.TempDir(), "shared-clone")
 	gitRun := func(dir string, args ...string) string {
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = testutil.GitIsolatedEnv()
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "git %v in %s failed: %s", args, dir, out)
-		return string(out)
+		return testutil.RunGit(t, dir, args...)
 	}
 	writeCheckpoint := func(dir, shard, rest, checkpointID string) {
 		t.Helper()
@@ -571,11 +547,7 @@ func TestFetchAndRebase_LocalBehind(t *testing.T) {
 	bareDir := t.TempDir()
 	workDir := t.TempDir()
 	gitRun := func(dir string, args ...string) {
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = testutil.GitIsolatedEnv()
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "git %v in %s failed: %s", args, dir, out)
+		testutil.RunGit(t, dir, args...)
 	}
 
 	gitRun(bareDir, "init", "--bare", "-b", "main")
@@ -653,11 +625,7 @@ func TestFetchAndRebase_MergeBaseOnSecondParent_DoesNotReplayAncestors(t *testin
 	setupDir := t.TempDir()
 	gitRun := func(dir string, args ...string) {
 		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = testutil.GitIsolatedEnv()
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "git %v in %s failed: %s", args, dir, out)
+		testutil.RunGit(t, dir, args...)
 	}
 
 	// Initialize origin and seed main.
@@ -785,11 +753,7 @@ func TestFetchAndRebase_DoesNotResurrectRemoteOnlyCheckpointFromMerge(t *testing
 	setupDir := t.TempDir()
 	gitRun := func(dir string, args ...string) {
 		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = testutil.GitIsolatedEnv()
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "git %v in %s failed: %s", args, dir, out)
+		testutil.RunGit(t, dir, args...)
 	}
 
 	gitRun(bareDir, "init", "--bare", "-b", "main")
@@ -901,11 +865,7 @@ func TestFetchAndRebase_NonOriginRemote_ReconcilesFetchedRef(t *testing.T) {
 	setupDir := t.TempDir()
 	gitRun := func(dir string, args ...string) {
 		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = testutil.GitIsolatedEnv()
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "git %v in %s failed: %s", args, dir, out)
+		testutil.RunGit(t, dir, args...)
 	}
 
 	gitRun(bareDir, "init", "--bare", "-b", "main")
@@ -1002,11 +962,7 @@ func TestFetchAndRebase_URLTarget_ReconcilesFetchedTempRef(t *testing.T) {
 	setupDir := t.TempDir()
 	gitRun := func(dir string, args ...string) {
 		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = testutil.GitIsolatedEnv()
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "git %v in %s failed: %s", args, dir, out)
+		testutil.RunGit(t, dir, args...)
 	}
 
 	gitRun(bareDir, "init", "--bare", "-b", "main")
@@ -1100,11 +1056,7 @@ func TestFetchAndRebase_FlaggedOriginTarget_UsesTempRef(t *testing.T) {
 	setupDir := t.TempDir()
 	gitRun := func(dir string, args ...string) {
 		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = testutil.GitIsolatedEnv()
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "git %v in %s failed: %s", args, dir, out)
+		testutil.RunGit(t, dir, args...)
 	}
 
 	gitRun(bareDir, "init", "--bare", "-b", "main")
@@ -1502,23 +1454,14 @@ func captureStderr(t *testing.T) func() string {
 // Caller must t.Chdir(workDir) before calling push functions.
 func setupBareRemoteWithCheckpointBranch(t *testing.T) (string, string) {
 	t.Helper()
-	ctx := context.Background()
 
 	workDir := setupRepoWithCheckpointBranch(t)
 
 	bareDir := t.TempDir()
-	initCmd := exec.CommandContext(ctx, "git", "init", "--bare")
-	initCmd.Dir = bareDir
-	initCmd.Env = testutil.GitIsolatedEnv()
-	out, err := initCmd.CombinedOutput()
-	require.NoError(t, err, "git init --bare failed: %s", out)
+	testutil.RunGit(t, bareDir, "init", "--bare")
 
 	// Push the checkpoint branch to the bare remote
-	pushCmd := exec.CommandContext(ctx, "git", "push", bareDir, paths.MetadataBranchName)
-	pushCmd.Dir = workDir
-	pushCmd.Env = testutil.GitIsolatedEnv()
-	out, err = pushCmd.CombinedOutput()
-	require.NoError(t, err, "initial push failed: %s", out)
+	testutil.RunGit(t, workDir, "push", bareDir, paths.MetadataBranchName)
 
 	return workDir, bareDir
 }
@@ -1532,10 +1475,11 @@ func TestDoPushRef_AlreadyUpToDate(t *testing.T) {
 	t.Chdir(workDir)
 
 	restore := captureStderr(t)
-	err := doPushRef(context.Background(), bareDir, plumbing.NewBranchReferenceName(paths.MetadataBranchName))
+	delivered, err := doPushRef(context.Background(), bareDir, plumbing.NewBranchReferenceName(paths.MetadataBranchName))
 	output := restore()
 
 	require.NoError(t, err)
+	assert.True(t, delivered, "already up-to-date is delivered: the ref is on the target")
 	assert.Contains(t, output, "already up-to-date", "should indicate nothing was pushed")
 	assert.NotContains(t, output, " done", "should not say 'done' when nothing was pushed")
 }
@@ -1549,19 +1493,16 @@ func TestDoPushRef_NewContent_SaysDone(t *testing.T) {
 
 	// Create a bare remote with no checkpoint branch yet
 	bareDir := t.TempDir()
-	initCmd := exec.CommandContext(context.Background(), "git", "init", "--bare")
-	initCmd.Dir = bareDir
-	initCmd.Env = testutil.GitIsolatedEnv()
-	out, err := initCmd.CombinedOutput()
-	require.NoError(t, err, "git init --bare failed: %s", out)
+	testutil.RunGit(t, bareDir, "init", "--bare")
 
 	t.Chdir(workDir)
 
 	restore := captureStderr(t)
-	err = doPushRef(context.Background(), bareDir, plumbing.NewBranchReferenceName(paths.MetadataBranchName))
+	delivered, err := doPushRef(context.Background(), bareDir, plumbing.NewBranchReferenceName(paths.MetadataBranchName))
 	output := restore()
 
 	require.NoError(t, err)
+	assert.True(t, delivered, "a fresh push reports delivery")
 	assert.Contains(t, output, " done", "should say 'done' when new content was pushed")
 	assert.NotContains(t, output, "already up-to-date", "should not say 'already up-to-date' when content was pushed")
 }

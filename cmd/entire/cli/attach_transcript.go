@@ -2,9 +2,12 @@ package cli
 
 import (
 	"encoding/json"
+	"strings"
 
-	"github.com/entireio/cli/cmd/entire/cli/agent/geminicli"
+	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
+	transcriptlib "github.com/entireio/cli/transcript"
 )
 
 // transcriptMetadata holds metadata extracted from a single transcript parse pass.
@@ -15,24 +18,35 @@ type transcriptMetadata struct {
 }
 
 // extractTranscriptMetadata parses transcript bytes once and extracts the first user prompt,
-// user turn count, and model name. Supports both JSONL (Claude Code, Cursor, OpenCode) and
-// Gemini JSON format.
+// user turn count, and model name from JSONL transcripts (Claude Code, Cursor, OpenCode).
 func extractTranscriptMetadata(data []byte) transcriptMetadata {
 	var meta transcriptMetadata
+
+	// firstUserPrompt is the unfiltered first prompt, kept as a last-resort title
+	// for a transcript whose every user message is agent-injected.
+	var firstUserPrompt string
 
 	// Try JSONL format first (Claude Code, Cursor, OpenCode, etc.)
 	lines, err := transcript.ParseFromBytes(data)
 	if err == nil {
 		for _, line := range lines {
-			if line.Type == transcript.TypeUser {
+			if line.Type == transcriptlib.TypeUser {
 				if prompt := transcript.ExtractUserContent(line.Message); prompt != "" {
+					if firstUserPrompt == "" {
+						firstUserPrompt = prompt
+					}
+					// An injected preamble is not a user turn: counting it
+					// inflates the step count attach reports.
+					if transcriptlib.IsInjectedPrompt(prompt) {
+						continue
+					}
 					meta.TurnCount++
 					if meta.FirstPrompt == "" {
 						meta.FirstPrompt = prompt
 					}
 				}
 			}
-			if line.Type == transcript.TypeAssistant && meta.Model == "" {
+			if line.Type == transcriptlib.TypeAssistant && meta.Model == "" {
 				var msg struct {
 					Model string `json:"model"`
 				}
@@ -41,16 +55,74 @@ func extractTranscriptMetadata(data []byte) transcriptMetadata {
 				}
 			}
 		}
-		if meta.TurnCount > 0 || meta.Model != "" {
-			return meta
+		// A checkpoint with no prompt at all is worse than one titled with a
+		// noisy-but-present preamble, and an empty FirstPrompt alongside a
+		// non-zero TurnCount would also suppress warnEmptyTranscriptMetadata.
+		if meta.FirstPrompt == "" {
+			meta.FirstPrompt = firstUserPrompt
 		}
 	}
 
-	// Fallback: try Gemini JSON format {"messages": [...]}
-	if prompts, gemErr := geminicli.ExtractAllUserPrompts(data); gemErr == nil && len(prompts) > 0 {
-		meta.FirstPrompt = prompts[0]
-		meta.TurnCount = len(prompts)
+	return meta
+}
+
+// countUserTurns counts the prompts that represent an actual user turn, skipping
+// agent-injected preambles and notifications. Once a prompt is deemed not to be
+// user-authored it must not be counted as a user turn either, or attach reports
+// more steps than the session had.
+func countUserTurns(prompts []string) int {
+	turns := 0
+	for _, prompt := range prompts {
+		if strings.TrimSpace(prompt) == "" || transcriptlib.IsInjectedPrompt(prompt) {
+			continue
+		}
+		turns++
+	}
+	return turns
+}
+
+// extractTranscriptMetadataForAgent augments the generic attach parser with
+// agent-native prompt and model extraction when available. Native extractors
+// are authoritative because they understand format-specific nesting and
+// conversation branches (Pi, Codex, Droid, etc.); failures remain best-effort
+// and preserve whatever the generic parser found. Prompts and turns are counted
+// from start, a transcript position in the agent's own metric (0 for the whole
+// session); the model is read from the whole transcript.
+func extractTranscriptMetadataForAgent(ag agent.Agent, sessionRef string, data []byte, start int) transcriptMetadata {
+	meta := extractTranscriptMetadata(sliceTranscriptFrom(ag, data, start))
+
+	if extractor, ok := agent.AsPromptExtractor(ag); ok {
+		if prompts, err := extractor.ExtractPrompts(sessionRef, start); err == nil && len(prompts) > 0 {
+			// Native extractors return every user-role item in transcript order,
+			// including the agent's own injected preambles (Codex leads with an
+			// AGENTS.md dump and/or <environment_context>). Title from the first
+			// genuine prompt, falling back to the raw first one so the checkpoint
+			// is never left untitled.
+			if first := strategy.FirstDisplayPrompt(prompts); first != "" {
+				meta.FirstPrompt = first
+			} else {
+				meta.FirstPrompt = prompts[0]
+			}
+			meta.TurnCount = countUserTurns(prompts)
+		}
+	}
+	if extractor, ok := agent.AsModelExtractor(ag); ok {
+		if model, err := extractor.ExtractModel(data); err == nil && model != "" {
+			meta.Model = model
+		}
 	}
 
 	return meta
+}
+
+// sliceTranscriptFrom returns the part of data after start, counted by the
+// agent's own position metric where it has one, else by JSONL lines.
+func sliceTranscriptFrom(ag agent.Agent, data []byte, start int) []byte {
+	if start <= 0 {
+		return data
+	}
+	if lw, ok := agent.AsLateTranscriptWriter(ag); ok {
+		return lw.SliceTranscriptFromPosition(data, start)
+	}
+	return transcriptlib.SliceFromLine(data, start)
 }

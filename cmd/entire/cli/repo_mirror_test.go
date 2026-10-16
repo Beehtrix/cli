@@ -3,11 +3,17 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,22 +23,6 @@ import (
 
 	"github.com/entireio/cli/internal/coreapi"
 )
-
-// mirrorsAPIPath is the control-plane mirrors collection endpoint, shared by the
-// fake servers in these tests.
-const mirrorsAPIPath = "/api/v1/mirrors"
-
-func TestExplainSuspendedMirror(t *testing.T) {
-	t.Parallel()
-	const id = "01KS6KFJR2XS6PZ188MVYE07AN"
-	var buf bytes.Buffer
-	explainSuspendedMirror(&buf, id)
-	out := buf.String()
-	require.Contains(t, out, id, "message must name the mirror")
-	require.Contains(t, out, "suspended")
-	require.Contains(t, out, "Contact support", "must point at support, not an internal admin command")
-	require.NotContains(t, out, "entire-core", "must not leak internal terminology")
-}
 
 // fakeMirrorGetter feeds awaitMirrorReady a scripted sequence of statuses (the
 // last entry repeats) or a fixed error, standing in for *coreapi.Client.GetMirror.
@@ -76,7 +66,7 @@ func TestAwaitMirrorReady(t *testing.T) {
 
 	t.Run("ready resolves with no error", func(t *testing.T) {
 		f := &fakeMirrorGetter{statuses: []coreapi.MirrorStatus{coreapi.MirrorStatusReady}}
-		status, err := awaitMirrorReady(ctx, f, "m", time.Second, nil)
+		status, err := awaitMirrorReady(ctx, f, "m", time.Second)
 		require.NoError(t, err)
 		require.Equal(t, coreapi.MirrorStatusReady, status)
 	})
@@ -85,7 +75,7 @@ func TestAwaitMirrorReady(t *testing.T) {
 		f := &fakeMirrorGetter{statuses: []coreapi.MirrorStatus{
 			coreapi.MirrorStatusProcessing, coreapi.MirrorStatusProcessing, coreapi.MirrorStatusReady,
 		}}
-		status, err := awaitMirrorReady(ctx, f, "m", time.Second, nil)
+		status, err := awaitMirrorReady(ctx, f, "m", time.Second)
 		require.NoError(t, err)
 		require.Equal(t, coreapi.MirrorStatusReady, status)
 		require.GreaterOrEqual(t, f.calls, 3)
@@ -93,241 +83,182 @@ func TestAwaitMirrorReady(t *testing.T) {
 
 	t.Run("failed returns errMirrorCloneFailed", func(t *testing.T) {
 		f := &fakeMirrorGetter{statuses: []coreapi.MirrorStatus{coreapi.MirrorStatusFailed}}
-		status, err := awaitMirrorReady(ctx, f, "m", time.Second, nil)
+		status, err := awaitMirrorReady(ctx, f, "m", time.Second)
 		require.ErrorIs(t, err, errMirrorCloneFailed)
 		require.Equal(t, coreapi.MirrorStatusFailed, status)
 	})
 
 	t.Run("suspended returns errMirrorSuspended", func(t *testing.T) {
 		f := &fakeMirrorGetter{statuses: []coreapi.MirrorStatus{coreapi.MirrorStatusSuspended}}
-		status, err := awaitMirrorReady(ctx, f, "m", time.Second, nil)
+		status, err := awaitMirrorReady(ctx, f, "m", time.Second)
 		require.ErrorIs(t, err, errMirrorSuspended)
 		require.Equal(t, coreapi.MirrorStatusSuspended, status)
 	})
 
 	t.Run("never-ready times out", func(t *testing.T) {
 		f := &fakeMirrorGetter{statuses: []coreapi.MirrorStatus{coreapi.MirrorStatusProcessing}}
-		_, err := awaitMirrorReady(ctx, f, "m", 20*time.Millisecond, nil)
+		_, err := awaitMirrorReady(ctx, f, "m", 20*time.Millisecond)
 		require.ErrorIs(t, err, context.DeadlineExceeded)
 	})
 
 	t.Run("transient errors are tolerated, then ready", func(t *testing.T) {
 		// Fewer consecutive errors than the cap, so the poll rides them out.
 		f := &fakeMirrorGetter{errsBefore: maxConsecutivePollErrors - 1, statuses: []coreapi.MirrorStatus{coreapi.MirrorStatusReady}}
-		status, err := awaitMirrorReady(ctx, f, "m", time.Second, nil)
+		status, err := awaitMirrorReady(ctx, f, "m", time.Second)
 		require.NoError(t, err)
 		require.Equal(t, coreapi.MirrorStatusReady, status)
 	})
 
 	t.Run("persistent errors give up after the cap", func(t *testing.T) {
 		f := &fakeMirrorGetter{err: errors.New("boom")}
-		_, err := awaitMirrorReady(ctx, f, "m", time.Second, nil)
+		_, err := awaitMirrorReady(ctx, f, "m", time.Second)
 		require.ErrorContains(t, err, "poll mirror status")
 		require.Equal(t, maxConsecutivePollErrors, f.calls, "should stop at the cap, not spin to the deadline")
 	})
 }
 
-// serveMirrorCreate stands up a control plane that answers POST /mirrors with
-// the given CreatedMirror (or a 500 when createErr) and GET /mirrors/{id} with
-// a Ready status, then points createAndAwaitMirror's client at it. It records
-// the ordered request paths so tests can assert create-before-poll sequencing.
-func serveMirrorCreate(t *testing.T, created *coreapi.CreatedMirror, createErr bool) (*coreapi.Client, *[]string) {
-	t.Helper()
-	var paths []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.URL.Path)
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == mirrorsAPIPath:
-			if createErr {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			w.WriteHeader(http.StatusCreated)
-			if err := printJSON(w, created); err != nil {
-				t.Errorf("encode created response: %v", err)
-			}
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/mirrors/"):
-			m := &coreapi.Mirror{}
-			m.Status = coreapi.NewOptMirrorStatus(coreapi.MirrorStatusReady)
-			if err := printJSON(w, m); err != nil {
-				t.Errorf("encode mirror response: %v", err)
-			}
-		default:
-			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(srv.Close)
-	c, err := coreapi.NewWithBearer(srv.URL, "tok")
-	require.NoError(t, err)
-	return c, &paths
-}
-
-// TestCreateAndAwaitMirror_OnCreated pins the onCreated callback contract: it
-// delimits the placing vs cloning phases, so it must fire exactly once on
-// CreateMirror success (before any clone polling / onStatus), and never on a
-// CreateMirror error.
+// TestRepoMirrorAdd_Flags pins the one-shot flags: the wait bound is
+// TestTargetingClusterFlagsTakeAHost pins the one spelling --cluster takes
+// wherever it names a cluster to ACT on. These verbs do not share a flag
+// registration — each declares its own — and one that delegates its logic to
+// repo clone's shared resolver can drift into promising a slug that resolver
+// then rejects, with nothing to catch it when its behaviour test passes a host.
 //
-// Not parallel: shortens the package-level mirrorPollInterval.
-func TestCreateAndAwaitMirror_OnCreated(t *testing.T) {
-	prev := mirrorPollInterval
-	mirrorPollInterval = time.Millisecond
-	t.Cleanup(func() { mirrorPollInterval = prev })
-	ctx := t.Context()
-
-	mk := func() *coreapi.CreatedMirror {
-		return &coreapi.CreatedMirror{Created: true, MirrorId: "m1", MirrorUrl: "entire://c/gh/o/r"}
-	}
-
-	t.Run("fires once before onStatus on success", func(t *testing.T) {
-		c, _ := serveMirrorCreate(t, mk(), false)
-		var events []string
-		outcome, err := createAndAwaitMirror(ctx, c, "o", "r", "c", false, time.Second,
-			func(m *coreapi.CreatedMirror) {
-				require.Equal(t, "m1", m.MirrorId, "onCreated receives the create response")
-				events = append(events, "created")
-			},
-			func(coreapi.MirrorStatus) { events = append(events, "status") },
-		)
-		require.NoError(t, err)
-		require.Equal(t, coreapi.MirrorStatusReady, outcome.status)
-		require.NotEmpty(t, events)
-		require.Equal(t, "created", events[0], "onCreated must fire before any onStatus")
-		require.Equal(t, 1, countEq(events, "created"), "onCreated fires exactly once")
-	})
-
-	t.Run("does not fire on CreateMirror error", func(t *testing.T) {
-		c, _ := serveMirrorCreate(t, nil, true)
-		fired := 0
-		outcome, err := createAndAwaitMirror(ctx, c, "o", "r", "c", false, time.Second,
-			func(*coreapi.CreatedMirror) { fired++ }, nil)
-		require.Error(t, err)
-		require.Nil(t, outcome.created)
-		require.Zero(t, fired, "onCreated must not fire when create fails")
-	})
-
-	t.Run("fires once even with no-wait (no polling)", func(t *testing.T) {
-		c, paths := serveMirrorCreate(t, mk(), false)
-		fired := 0
-		_, err := createAndAwaitMirror(ctx, c, "o", "r", "c", true, time.Second,
-			func(*coreapi.CreatedMirror) { fired++ }, nil)
-		require.NoError(t, err)
-		require.Equal(t, 1, fired)
-		require.Equal(t, []string{mirrorsAPIPath}, *paths, "no-wait must not poll GetMirror")
-	})
-
-	t.Run("suspended placement short-circuits without polling or error", func(t *testing.T) {
-		suspended := &coreapi.CreatedMirror{MirrorId: "m1", MirrorUrl: "entire://c/gh/o/r", Suspended: true}
-		c, paths := serveMirrorCreate(t, suspended, false)
-		fired := 0
-		outcome, err := createAndAwaitMirror(ctx, c, "o", "r", "c", false, time.Second,
-			func(*coreapi.CreatedMirror) { fired++ }, nil)
-		require.NoError(t, err, "an admin-suspended placement is non-fatal")
-		require.Equal(t, 1, fired, "onCreated still fires for a suspended placement")
-		require.False(t, outcome.polled, "a suspended placement is never polled for readiness")
-		require.Equal(t, []string{mirrorsAPIPath}, *paths, "suspended must not poll GetMirror")
-	})
-}
-
-func countEq(xs []string, want string) int {
-	n := 0
-	for _, x := range xs {
-		if x == want {
-			n++
-		}
-	}
-	return n
-}
-
-// TestReportOneShotMirror exercises the one-shot create's presentation across
-// the shared lifecycle outcomes — the branching finishMirrorCreate used to own,
-// now driven by mirrorCreateOutcome (and shared with the wizard).
-func TestReportOneShotMirror(t *testing.T) {
+// `repo mirror list --cluster` is deliberately absent: it is a server-side
+// filter that takes either spelling, not a target.
+func TestTargetingClusterFlagsTakeAHost(t *testing.T) {
 	t.Parallel()
-	const id = "01KS6KFJR2XS6PZ188MVYE07AN"
-	const mirrorURL = "entire://eu-west-1.entire.io/gh/octocat/hello-world"
-	mk := func(created, empty bool) *coreapi.CreatedMirror {
-		return &coreapi.CreatedMirror{Created: created, Empty: empty, MirrorId: id, MirrorUrl: mirrorURL}
+	for name, newCmd := range map[string]func() *cobra.Command{
+		"repo mirror add":    newRepoMirrorAddCmd,
+		"repo mirror remove": newRepoMirrorRemoveCmd,
+		"repo clone":         newRepoCloneCmd,
+		"repo remote add":    newRepoRemoteAddCmd,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cmd := newCmd()
+			flag := cmd.Flags().Lookup("cluster")
+			require.NotNil(t, flag)
+			require.Contains(t, flag.Usage, "Cluster host", "--cluster names a cluster by its public host")
+			require.NotContains(t, flag.Usage, "slug")
+			for _, line := range strings.Split(cmd.Example, "\n") {
+				if _, after, found := strings.Cut(line, "--cluster "); found {
+					require.Contains(t, strings.Fields(after)[0], ".",
+						"an example must show a host, which a bare slug is not: %s", strings.TrimSpace(line))
+				}
+			}
+		})
 	}
+}
 
-	t.Run("create failure surfaces with nothing printed", func(t *testing.T) {
+// --timeout and the cluster host is --cluster, not a positional.
+func TestRepoMirrorAdd_Flags(t *testing.T) {
+	t.Parallel()
+
+	add := newRepoMirrorAddCmd()
+	timeout := add.Flags().Lookup("timeout")
+	require.NotNil(t, timeout)
+	require.Equal(t, "How long to wait for mirror request submission, placement, and clone readiness (0 waits indefinitely)", timeout.Usage)
+	require.NotNil(t, add.Flags().Lookup("cluster"))
+	require.ErrorContains(t, add.Args(add, []string{"github.com/o/r", "aws-us-east-2.entire.io"}), "accepts at most 1 arg")
+}
+
+// TestReportMirrorResults pins the presentation every add now shares — one
+// repo on one cluster reports exactly like several on several, because the
+// one-shot path and the wizard hand the same results to the same reporter.
+func TestReportMirrorResults(t *testing.T) {
+	t.Parallel()
+	const mirrorURL = "entire://eu-west-1.entire.io/gh/octocat/hello-world"
+
+	t.Run("a ready row is listed and offered as clone and remote commands", func(t *testing.T) {
 		t.Parallel()
 		var out, errW bytes.Buffer
-		wantErr := errors.New("boom")
-		err := reportOneShotMirror(&out, &errW, mirrorCreateOutcome{}, wantErr)
-		require.ErrorIs(t, err, wantErr)
-		require.Empty(t, out.String())
-	})
-
-	t.Run("empty upstream prints nothing-to-clone", func(t *testing.T) {
-		t.Parallel()
-		var out, errW bytes.Buffer
-		err := reportOneShotMirror(&out, &errW, mirrorCreateOutcome{created: mk(true, true)}, nil)
+		err := reportMirrorResults(&out, &errW, []mirrorResult{
+			{forge: mirrorCloneForge, owner: "octocat", repo: "hello-world", regionLabel: "eu-west-1", clusterHost: "eu-west-1.entire.io", status: mirrorStatusReady, cloneURL: mirrorURL},
+		})
 		require.NoError(t, err)
-		require.Contains(t, out.String(), "Registered mirror "+id)
-		require.Contains(t, out.String(), "nothing to clone")
-	})
-
-	t.Run("no-wait prints in-progress hint", func(t *testing.T) {
-		t.Parallel()
-		var out, errW bytes.Buffer
-		err := reportOneShotMirror(&out, &errW, mirrorCreateOutcome{created: mk(true, false)}, nil)
-		require.NoError(t, err)
-		require.Contains(t, out.String(), "still be in progress")
-	})
-
-	t.Run("ready prints clone hint", func(t *testing.T) {
-		t.Parallel()
-		var out, errW bytes.Buffer
-		outcome := mirrorCreateOutcome{created: mk(true, false), status: coreapi.MirrorStatusReady, polled: true}
-		err := reportOneShotMirror(&out, &errW, outcome, nil)
-		require.NoError(t, err)
+		require.Contains(t, out.String(), "/gh/octocat/hello-world")
 		require.Contains(t, out.String(), "git clone "+mirrorURL)
+		require.Contains(t, out.String(), "entire repo remote add origin --override --cluster eu-west-1.entire.io\n")
+		require.Contains(t, out.String(), "(replaces its current URL)", "--override drops the old URL, so the hint must say so")
+		require.NotContains(t, out.String(), "run one line", "a single cluster has no choice to make")
 	})
 
-	t.Run("suspended surfaces support guidance as SilentError", func(t *testing.T) {
+	// The remote command reads the repo from the checkout it runs in, so it is
+	// one line per cluster however many repos landed there: several repos on
+	// one cluster share a line, and each extra cluster adds one.
+	t.Run("remote commands are one per cluster, not per mirror", func(t *testing.T) {
 		t.Parallel()
 		var out, errW bytes.Buffer
-		outcome := mirrorCreateOutcome{created: mk(false, false), status: coreapi.MirrorStatusSuspended, polled: true}
-		err := reportOneShotMirror(&out, &errW, outcome, errMirrorSuspended)
+		err := reportMirrorResults(&out, &errW, []mirrorResult{
+			{forge: mirrorCloneForge, owner: "octocat", repo: "hello-world", regionLabel: "eu-west-1", clusterHost: "eu-west-1.entire.io", status: mirrorStatusReady, cloneURL: mirrorURL},
+			{forge: mirrorCloneForge, owner: "octocat", repo: "spoon-knife", regionLabel: "eu-west-1", clusterHost: "eu-west-1.entire.io", status: mirrorStatusReady, cloneURL: "entire://eu-west-1.entire.io/gh/octocat/spoon-knife"},
+			{forge: mirrorCloneForge, owner: "octocat", repo: "hello-world", regionLabel: "aws-us-east-2", clusterHost: "aws-us-east-2.entire.io", status: mirrorStatusReady, cloneURL: "entire://aws-us-east-2.entire.io/gh/octocat/hello-world"},
+		})
+		require.NoError(t, err)
+		require.Equal(t, 3, strings.Count(out.String(), "git clone "))
+		require.Equal(t, 2, strings.Count(out.String(), "entire repo remote add origin"))
+		require.Contains(t, out.String(), "--cluster eu-west-1.entire.io\n")
+		require.Contains(t, out.String(), "--cluster aws-us-east-2.entire.io\n")
+		require.Contains(t, out.String(), "run one line", "two clusters are alternatives, not steps")
+	})
+
+	// An IPv6 literal is a valid cluster host, and pasted bare into zsh its
+	// brackets glob ("no matches found") before git or entire ever runs. The
+	// quotes follow the platform: cmd.exe keeps single quotes as part of the
+	// argument, which validateClusterHost would then reject.
+	t.Run("an IPv6 cluster host is shell-quoted in both commands", func(t *testing.T) {
+		t.Parallel()
+		const host = "[::1]:8080"
+		const cloneURL = "entire://" + host + "/gh/octocat/hello-world"
+		quote := func(s string) string { return "'" + s + "'" }
+		if runtime.GOOS == "windows" {
+			quote = func(s string) string { return `"` + s + `"` }
+		}
+		var out, errW bytes.Buffer
+		err := reportMirrorResults(&out, &errW, []mirrorResult{
+			{forge: mirrorCloneForge, owner: "octocat", repo: "hello-world", regionLabel: "local", clusterHost: host, status: mirrorStatusReady, cloneURL: cloneURL},
+		})
+		require.NoError(t, err)
+		require.Contains(t, out.String(), "git clone "+quote(cloneURL)+"\n")
+		require.Contains(t, out.String(), "entire repo remote add origin --override --cluster "+quote(host)+"\n")
+	})
+
+	// A placement that is registered but not yet cloned must not be offered as
+	// a clone command: the URL does not work yet.
+	t.Run("a registered row is listed without a clone command", func(t *testing.T) {
+		t.Parallel()
+		var out, errW bytes.Buffer
+		err := reportMirrorResults(&out, &errW, []mirrorResult{
+			{forge: mirrorCloneForge, owner: "octocat", repo: "hello-world", regionLabel: "eu-west-1", status: mirrorStatusRegistered, cloneURL: mirrorURL},
+		})
+		require.NoError(t, err)
+		require.Contains(t, out.String(), mirrorStatusRegistered)
+		require.NotContains(t, out.String(), "git clone")
+		require.NotContains(t, out.String(), "entire repo remote add")
+	})
+
+	// One failure fails the command but must not hide the ones that worked:
+	// the table still lists everything, and the error names only the failures.
+	t.Run("a partial failure exits non-zero and still reports the successes", func(t *testing.T) {
+		t.Parallel()
+		var out, errW bytes.Buffer
+		err := reportMirrorResults(&out, &errW, []mirrorResult{
+			{forge: mirrorCloneForge, owner: "octocat", repo: "hello-world", regionLabel: "eu-west-1", status: mirrorStatusReady, cloneURL: mirrorURL},
+			{forge: nativeCloneForge, owner: "acme", repo: "web", regionLabel: "aws-ap-south-1", status: mirrorStatusFailed, err: errors.New("the seed failed")},
+		})
 		var silent *SilentError
 		require.ErrorAs(t, err, &silent)
-		require.Contains(t, errW.String(), "Contact support")
-		require.NotContains(t, errW.String(), "entire-core")
-		require.NotContains(t, out.String(), "git clone")
+		require.ErrorContains(t, err, "1 mirror(s) failed")
+		require.Contains(t, out.String(), "git clone "+mirrorURL, "the successful one is still usable")
+		require.Contains(t, errW.String(), "/et/acme/web @ aws-ap-south-1: the seed failed")
 	})
 
-	t.Run("suspended placement warns after the placement and exits non-zero", func(t *testing.T) {
+	t.Run("no results prints nothing", func(t *testing.T) {
 		t.Parallel()
 		var out, errW bytes.Buffer
-		created := &coreapi.CreatedMirror{Created: false, MirrorId: id, MirrorUrl: mirrorURL, Suspended: true}
-		err := reportOneShotMirror(&out, &errW, mirrorCreateOutcome{created: created}, nil)
-		var silent *SilentError
-		require.ErrorAs(t, err, &silent, "a suspended re-create must exit non-zero")
-		require.ErrorIs(t, err, errMirrorSuspended)
-		require.Contains(t, out.String(), "Mirror exists ("+id, "the placement is still echoed")
-		require.Contains(t, errW.String(), "WARNING: this mirror has been suspended by an admin and won't be usable.")
-		require.NotContains(t, out.String(), "git clone")
-		require.NotContains(t, out.String(), "still be in progress")
-	})
-
-	t.Run("failed returns an error naming the mirror", func(t *testing.T) {
-		t.Parallel()
-		var out, errW bytes.Buffer
-		outcome := mirrorCreateOutcome{created: mk(true, false), status: coreapi.MirrorStatusFailed, polled: true}
-		err := reportOneShotMirror(&out, &errW, outcome, errMirrorCloneFailed)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), id)
-	})
-
-	t.Run("timeout propagates the wait error", func(t *testing.T) {
-		t.Parallel()
-		var out, errW bytes.Buffer
-		wantErr := errors.New("timed out waiting for initial clone")
-		outcome := mirrorCreateOutcome{created: mk(true, false), status: coreapi.MirrorStatusProcessing, polled: true}
-		err := reportOneShotMirror(&out, &errW, outcome, wantErr)
-		require.ErrorIs(t, err, wantErr)
+		require.NoError(t, reportMirrorResults(&out, &errW, nil))
+		require.Empty(t, out.String())
 	})
 }
 
@@ -339,34 +270,93 @@ type recordedRequest struct {
 	query  url.Values
 }
 
-// serveMirrorList stands up a fake control-plane that records the inbound
-// request and answers /mirrors and /mirrors/available with the given payloads,
-// then points the active-context client seam at it for the duration of the
-// test. Each request is delivered on the returned channel: receiving from it
-// after the command runs is the happens-before edge that synchronises the
-// handler-goroutine writes with the test-goroutine reads — HTTP completion
-// alone is not an edge the race detector recognises (see
-// TestBearerOnlySource_NoCookieOnTheWire). Buffered so the handler never
-// blocks on the send.
-func serveMirrorList(t *testing.T, mirrors []coreapi.Mirror, available []coreapi.AvailableMirror) <-chan recordedRequest {
+// onboardedEntry builds a /repos index entry for a GitHub mirror with a single
+// ready placement on the given cluster slug — provider and the placement flag
+// set the way the live index sets them for a mirror.
+func onboardedEntry(fullName, visibility, slug string) coreapi.RepoIndexEntry {
+	return coreapi.RepoIndexEntry{
+		FullName:   fullName,
+		Visibility: visibility,
+		Provider:   coreapi.NewOptString(repoProviderGitHub),
+		Placements: []coreapi.RepoPlacement{{ClusterSlug: slug, Status: coreapi.RepoPlacementStatusReady, Mirror: true}},
+	}
+}
+
+// nativeEntry is an Entire-native repo, e.g. one created by `entire repo
+// create`: provider "entire" and every placement mirror:false, as the live
+// index returns them.
+func nativeEntry(fullName, visibility, slug string) coreapi.RepoIndexEntry {
+	return coreapi.RepoIndexEntry{
+		FullName:   fullName,
+		Visibility: visibility,
+		Provider:   coreapi.NewOptString(repoProviderEntire),
+		Placements: []coreapi.RepoPlacement{{ClusterSlug: slug, Status: coreapi.RepoPlacementStatusReady, Mirror: false}},
+	}
+}
+
+// onboardedMulti builds a /repos entry placed on several clusters (all ready),
+// so multi-placement grouping and the CLUSTERS cell are observable.
+func onboardedMulti(fullName, visibility string, slugs ...string) coreapi.RepoIndexEntry {
+	e := coreapi.RepoIndexEntry{FullName: fullName, Visibility: visibility, Provider: coreapi.NewOptString(repoProviderGitHub)}
+	for _, s := range slugs {
+		e.Placements = append(e.Placements, coreapi.RepoPlacement{ClusterSlug: s, Status: coreapi.RepoPlacementStatusReady, Mirror: true})
+	}
+	return e
+}
+
+// candidateEntry builds a /repos index entry for an onboardable GitHub repo.
+func candidateEntry(fullName, visibility string, access coreapi.RepoCandidateAccess, onboardable bool) coreapi.RepoIndexEntry {
+	return coreapi.RepoIndexEntry{
+		FullName:   fullName,
+		Visibility: visibility,
+		Candidate:  coreapi.NewOptRepoCandidate(coreapi.RepoCandidate{Access: access, Onboardable: onboardable}),
+	}
+}
+
+// Paths the fake control-plane servers below route on.
+const (
+	testClustersPath = "/api/v1/clusters"
+	testReposPath    = "/api/v1/repos"
+)
+
+// bulkEntries builds n onboarded /repos entries named <prefix>/repo-0000…,
+// for tests that need to cross the fetch budget.
+func bulkEntries(prefix string, n int) []coreapi.RepoIndexEntry {
+	entries := make([]coreapi.RepoIndexEntry, 0, n)
+	for i := range n {
+		entries = append(entries, onboardedEntry(fmt.Sprintf("%s/repo-%04d", prefix, i), "private", "us"))
+	}
+	return entries
+}
+
+// serveRepoList stands up a fake control-plane serving the two endpoints the
+// merged `list` calls: GET /clusters (the slug→host catalog used to synthesise
+// clone URLs) and GET /repos?scope=all (the directory). It points the
+// active-context client seam at the server for the test. Only the /repos
+// request is delivered on the returned channel — receiving it after the command
+// runs is the happens-before edge that synchronises handler-goroutine writes
+// with test-goroutine reads (HTTP completion alone is not an edge the race
+// detector recognises; see TestBearerOnlySource_NoCookieOnTheWire). Buffered so
+// the handler never blocks on the send.
+func serveRepoList(t *testing.T, repos []coreapi.RepoIndexEntry, clusters []coreapi.Cluster, truncated bool) <-chan recordedRequest {
 	t.Helper()
 	recCh := make(chan recordedRequest, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/api/v1/mirrors/available":
-			if err := printJSON(w, &coreapi.ListAvailableMirrorsOutputBody{Available: available}); err != nil {
-				t.Errorf("encode available response: %v", err)
+		case testClustersPath:
+			if err := printJSON(w, &coreapi.ListClustersOutputBody{Clusters: clusters}); err != nil {
+				t.Errorf("encode clusters response: %v", err)
 			}
-		case mirrorsAPIPath:
-			if err := printJSON(w, &coreapi.ListMirrorsOutputBody{Mirrors: mirrors}); err != nil {
-				t.Errorf("encode mirrors response: %v", err)
+		case testReposPath:
+			if err := printJSON(w, &coreapi.ListReposOutputBody{Repos: repos, Truncated: truncated}); err != nil {
+				t.Errorf("encode repos response: %v", err)
 			}
+			recCh <- recordedRequest{method: r.Method, path: r.URL.Path, query: r.URL.Query()}
 		default:
 			t.Errorf("unexpected path %q", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 		}
-		recCh <- recordedRequest{method: r.Method, path: r.URL.Path, query: r.URL.Query()}
 	}))
 	t.Cleanup(srv.Close)
 
@@ -376,6 +366,110 @@ func serveMirrorList(t *testing.T, mirrors []coreapi.Mirror, available []coreapi
 	}
 	t.Cleanup(func() { activeCoreClient = prev })
 	return recCh
+}
+
+// serveClusters stands up a fake control plane serving only GET /clusters, for
+// the paths whose whole job is turning a cluster slug into its public host. It
+// points the active-context client seam at the server for the test.
+func serveClusters(t *testing.T, clusters []coreapi.Cluster) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != testClustersPath {
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := printJSON(w, &coreapi.ListClustersOutputBody{Clusters: clusters}); err != nil {
+			t.Errorf("encode clusters response: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	prev := activeCoreClient
+	activeCoreClient = func(context.Context) (*coreapi.Client, error) {
+		return coreapi.NewWithBearer(srv.URL, "tok")
+	}
+	t.Cleanup(func() { activeCoreClient = prev })
+}
+
+// serveRepoListPaged is serveRepoList with a keyset-paginated /repos: each call
+// answers with the page addressed by the pageToken query param ("" is the first
+// page), echoing that page's NextPageToken so the client can walk the chain.
+// Every /repos request is delivered on the returned channel (buffered to the
+// page count so the handler never blocks).
+func serveRepoListPaged(t *testing.T, pages []coreapi.ListReposOutputBody, clusters []coreapi.Cluster) <-chan recordedRequest {
+	t.Helper()
+	tokenToPage := make(map[string]coreapi.ListReposOutputBody, len(pages))
+	for i, p := range pages {
+		token := ""
+		if i > 0 {
+			token = pages[i-1].NextPageToken.Or("")
+			require.NotEmpty(t, token, "every page but the last needs a NextPageToken linking to the next one")
+		}
+		tokenToPage[token] = p
+	}
+	recCh := make(chan recordedRequest, len(pages))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case testClustersPath:
+			if err := printJSON(w, &coreapi.ListClustersOutputBody{Clusters: clusters}); err != nil {
+				t.Errorf("encode clusters response: %v", err)
+			}
+		case testReposPath:
+			page, ok := tokenToPage[r.URL.Query().Get("pageToken")]
+			if !ok {
+				t.Errorf("unexpected pageToken %q", r.URL.Query().Get("pageToken"))
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if err := printJSON(w, &page); err != nil {
+				t.Errorf("encode repos response: %v", err)
+			}
+			recCh <- recordedRequest{method: r.Method, path: r.URL.Path, query: r.URL.Query()}
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	prev := activeCoreClient
+	activeCoreClient = func(context.Context) (*coreapi.Client, error) {
+		return coreapi.NewWithBearer(srv.URL, "tok")
+	}
+	t.Cleanup(func() { activeCoreClient = prev })
+	return recCh
+}
+
+// serveRepoListClustersError is serveRepoList with a failing /clusters catalog:
+// /repos answers normally but the slug→host lookup 500s, so `list` must fail
+// instead of returning mirror rows with silently empty clone URLs. Points the
+// active-context client seam at the server for the test.
+func serveRepoListClustersError(t *testing.T, repos []coreapi.RepoIndexEntry) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case testClustersPath:
+			w.WriteHeader(http.StatusInternalServerError)
+		case testReposPath:
+			w.Header().Set("Content-Type", "application/json")
+			if err := printJSON(w, &coreapi.ListReposOutputBody{Repos: repos}); err != nil {
+				t.Errorf("encode repos response: %v", err)
+			}
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	prev := activeCoreClient
+	activeCoreClient = func(context.Context) (*coreapi.Client, error) {
+		return coreapi.NewWithBearer(srv.URL, "tok")
+	}
+	t.Cleanup(func() { activeCoreClient = prev })
 }
 
 // execMirrorList runs `list` under a parent that carries the control-plane
@@ -404,89 +498,276 @@ func runMirrorList(t *testing.T, args ...string) (stdout, stderr string) {
 	return stdout, stderr
 }
 
-// TestRepoMirrorList_ShowAvailableRouting locks in the flag-driven branch of
-// `repo mirror list`: --show-available must hit the /mirrors/available endpoint
-// with the available-repo columns and its own banner, while the default lists
-// existing mirrors from /mirrors. --owner flows into the query on both paths;
-// --cluster/--provider apply only to the existing-mirror path. These are the
-// behaviors the seam was added to pin — the per-row formatting is covered by
-// TestMirrorRow / TestAvailableMirrorRow.
+// TestRepoMirrorList_Merged pins the merged `repo mirror list`: one table from a
+// single GET /repos?scope=all, with existing mirrors (one row per repo: clusters
+// + clone status) and onboardable candidates (access + availability)
+// interleaved. Per-row formatting is covered by TestRepoDirCells; this pins
+// the end-to-end routing and rendering.
 //
 // Not parallel: swaps the package-level activeCoreClient seam.
-func TestRepoMirrorList_ShowAvailableRouting(t *testing.T) {
-	t.Run("--show-available routes to /mirrors/available with available columns", func(t *testing.T) {
-		recCh := serveMirrorList(t,
-			[]coreapi.Mirror{{Owner: "acme", Repo: "web", ClusterHost: "aws-us-east-2.entire.io"}},
-			[]coreapi.AvailableMirror{{Owner: "acme", Repo: "web", Access: "write", Status: "available"}},
-		)
-		stdout, stderr := runMirrorList(t, "--show-available")
-		rec := <-recCh
+func TestRepoMirrorList_Merged(t *testing.T) {
+	clusters := []coreapi.Cluster{{Slug: "us", PublicUrl: "https://aws-us-east-2.entire.io"}}
 
-		require.Equal(t, http.MethodGet, rec.method)
-		require.Equal(t, "/api/v1/mirrors/available", rec.path)
-		require.Contains(t, stderr, "Listing repos you could mirror")
-		// Available columns, not the existing-mirror "CLONE URL" view.
-		require.Contains(t, stdout, "ACCESS")
-		require.Contains(t, stdout, "STATUS")
-		require.Contains(t, stdout, "acme/web")
-		require.Contains(t, stdout, "available")
-		require.NotContains(t, stdout, "CLONE URL")
-	})
-
-	t.Run("default lists existing mirrors from /mirrors", func(t *testing.T) {
-		recCh := serveMirrorList(t,
-			[]coreapi.Mirror{{Owner: "acme", Repo: "web", ClusterHost: "aws-us-east-2.entire.io"}},
-			nil,
-		)
+	t.Run("mirrors and candidates render in one table via scope=all", func(t *testing.T) {
+		recCh := serveRepoList(t, []coreapi.RepoIndexEntry{
+			onboardedEntry("acme/web", "private", "us"),
+			candidateEntry("acme/marketing", "public", coreapi.RepoCandidateAccessAdmin, true),
+			candidateEntry("alice/dotfiles", "private", coreapi.RepoCandidateAccessRead, false),
+		}, clusters, false)
 		stdout, stderr := runMirrorList(t)
 		rec := <-recCh
 
-		require.Equal(t, mirrorsAPIPath, rec.path)
-		require.Contains(t, stderr, "Listing mirrors on")
-		require.Contains(t, stdout, "CLONE URL")
-		require.Contains(t, stdout, "entire://aws-us-east-2.entire.io/gh/acme/web")
+		require.Equal(t, http.MethodGet, rec.method)
+		require.Equal(t, testReposPath, rec.path)
+		require.Equal(t, "all", rec.query.Get("scope"), "list must request the unified directory")
+		require.Contains(t, stderr, "Listing repos on")
+		for _, h := range []string{"NAME", "CLUSTERS", "VISIBILITY", "STATUS", "ACCESS"} {
+			require.Contains(t, stdout, h)
+		}
+		// Mirror row: cluster host + clone status, access dashed.
+		require.Regexp(t, `acme/web\s+aws-us-east-2\.entire\.io\s+Private\s+ready`, stdout)
+		// Candidate rows: availability status + access, clusters dashed.
+		require.Contains(t, stdout, "acme/marketing")
+		require.Contains(t, stdout, "available")
+		require.Contains(t, stdout, "admin")
+		require.Contains(t, stdout, "alice/dotfiles")
+		require.Contains(t, stdout, "owner-only")
+		// The NAME cell is the handle into the detail view.
+		require.Contains(t, stderr, "entire repo view /gh/<owner>/<repo>")
 	})
 
-	t.Run("--owner flows into the available query", func(t *testing.T) {
-		recCh := serveMirrorList(t, nil,
-			[]coreapi.AvailableMirror{{Owner: "acme", Repo: "web", Access: "write", Status: "available"}},
-		)
-		runMirrorList(t, "--show-available", "--owner", "acme")
-		rec := <-recCh
-
-		require.Equal(t, "/api/v1/mirrors/available", rec.path)
-		require.Equal(t, "acme", rec.query.Get("owner"))
+	t.Run("a multi-cluster repo lists once, clusters joined in one cell", func(t *testing.T) {
+		serveRepoList(t, []coreapi.RepoIndexEntry{
+			onboardedMulti("acme/web", "private", "us", "eu"),
+		}, []coreapi.Cluster{
+			{Slug: "us", PublicUrl: "https://aws-us-east-2.entire.io"},
+			{Slug: "eu", PublicUrl: "https://eu-west-1.entire.io"},
+		}, false)
+		stdout, _ := runMirrorList(t)
+		require.Equal(t, 1, strings.Count(stdout, "acme/web"), "one row per repo, not one per placement")
+		require.Regexp(t, `acme/web\s+aws-us-east-2\.entire\.io, eu-west-1\.entire\.io\s+Private\s+ready`, stdout)
 	})
 
-	t.Run("--owner flows into the existing-mirror query", func(t *testing.T) {
-		recCh := serveMirrorList(t,
-			[]coreapi.Mirror{{Owner: "acme", Repo: "web", ClusterHost: "aws-us-east-2.entire.io"}}, nil,
-		)
-		runMirrorList(t, "--owner", "acme")
-		rec := <-recCh
+	t.Run("the detail hint is withheld from empty tables and --json", func(t *testing.T) {
+		serveRepoList(t, nil, clusters, false)
+		_, stderr := runMirrorList(t)
+		require.NotContains(t, stderr, "repo view", "no rows, nothing to drill into")
 
-		require.Equal(t, mirrorsAPIPath, rec.path)
-		require.Equal(t, "acme", rec.query.Get("owner"))
+		serveRepoList(t, []coreapi.RepoIndexEntry{onboardedEntry("acme/web", "private", "us")}, clusters, false)
+		_, stderr = runMirrorList(t, "--json")
+		require.NotContains(t, stderr, "repo view", "scripts already get nested placements in the rows")
 	})
 
-	t.Run("--cluster/--provider apply to /mirrors but are ignored by --show-available", func(t *testing.T) {
-		recCh := serveMirrorList(t,
-			[]coreapi.Mirror{{Owner: "acme", Repo: "web", ClusterHost: "aws-us-east-2.entire.io"}}, nil,
-		)
-		runMirrorList(t, "--cluster", "eu-west-1.entire.io", "--provider", "github")
-		rec := <-recCh
-		require.Equal(t, mirrorsAPIPath, rec.path)
-		require.Equal(t, "eu-west-1.entire.io", rec.query.Get("cluster"))
-		require.Equal(t, "github", rec.query.Get("provider"))
+	t.Run("empty directory prints the empty sentence", func(t *testing.T) {
+		serveRepoList(t, nil, clusters, false)
+		stdout, _ := runMirrorList(t)
+		require.Contains(t, stdout, "No repos found.")
+	})
 
-		recCh = serveMirrorList(t, nil,
-			[]coreapi.AvailableMirror{{Owner: "acme", Repo: "web", Access: "write", Status: "available"}},
-		)
-		runMirrorList(t, "--show-available", "--cluster", "eu-west-1.entire.io", "--provider", "github")
-		rec = <-recCh
-		require.Equal(t, "/api/v1/mirrors/available", rec.path)
-		require.Empty(t, rec.query.Get("cluster"), "show-available is cluster-agnostic; must not send --cluster")
-		require.Empty(t, rec.query.Get("provider"), "show-available is GitHub-only; must not send --provider")
+	t.Run("the directory follows nextPageToken across every page", func(t *testing.T) {
+		recCh := serveRepoListPaged(t, []coreapi.ListReposOutputBody{
+			{
+				Repos:         []coreapi.RepoIndexEntry{onboardedEntry("acme/web", "private", "us")},
+				NextPageToken: coreapi.NewOptString("p2"),
+			},
+			{
+				Repos: []coreapi.RepoIndexEntry{candidateEntry("acme/marketing", "public", coreapi.RepoCandidateAccessAdmin, true)},
+			},
+		}, clusters)
+		stdout, stderr := runMirrorList(t)
+
+		// The command has returned, so every request it made is already
+		// buffered; a non-blocking receive distinguishes "never fetched the
+		// second page" from a hang.
+		first := <-recCh
+		require.Empty(t, first.query.Get("pageToken"), "the first request starts the chain")
+		select {
+		case second := <-recCh:
+			require.Equal(t, "p2", second.query.Get("pageToken"), "the second request passes the cursor back")
+		default:
+			t.Fatal("the directory stopped after page 1 instead of following nextPageToken")
+		}
+		require.Contains(t, stdout, "acme/web", "page-1 row renders")
+		require.Contains(t, stdout, "acme/marketing", "page-2 row renders")
+		require.NotContains(t, stderr, "truncated", "a fully-walked chain is not a truncated directory")
+	})
+
+	t.Run("--limit caps rows after the default name sort", func(t *testing.T) {
+		serveRepoList(t, []coreapi.RepoIndexEntry{
+			onboardedEntry("zeta/last", "private", "us"),
+			onboardedEntry("acme/web", "private", "us"),
+			onboardedEntry("mid/way", "private", "us"),
+		}, clusters, false)
+		stdout, _ := runMirrorList(t, "--limit", "2")
+		require.Contains(t, stdout, "acme/web")
+		require.Contains(t, stdout, "mid/way")
+		require.NotContains(t, stdout, "zeta/last", "sorted last, so --limit 2 drops it")
+	})
+
+	t.Run("--limit composes with filters before capping", func(t *testing.T) {
+		serveRepoList(t, []coreapi.RepoIndexEntry{
+			onboardedEntry("acme/web", "private", "us"),
+			candidateEntry("acme/marketing", "public", coreapi.RepoCandidateAccessAdmin, true),
+			candidateEntry("acme/site", "public", coreapi.RepoCandidateAccessAdmin, true),
+		}, clusters, false)
+		stdout, _ := runMirrorList(t, "--status", "available", "--limit", "1")
+		require.Contains(t, stdout, "acme/marketing", "first available candidate by name survives")
+		require.NotContains(t, stdout, "acme/site", "capped after the filter")
+		require.NotContains(t, stdout, "acme/web", "filtered out before the cap")
+	})
+
+	t.Run("a negative --limit fails fast", func(t *testing.T) {
+		serveRepoList(t, nil, clusters, false)
+		err := runMirrorListErr(t, "--limit", "-1")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "--limit")
+	})
+}
+
+// TestRepoMirrorList_FetchBudget pins the bounded cursor walk: by default at
+// most coreListFetchBudget entries are fetched (raised to --limit when larger),
+// a partial window is disclosed on stderr — including for --json — and --all
+// lifts the bound entirely.
+//
+// Not parallel: swaps the package-level activeCoreClient seam.
+func TestRepoMirrorList_FetchBudget(t *testing.T) {
+	clusters := []coreapi.Cluster{{Slug: "us", PublicUrl: "https://aws-us-east-2.entire.io"}}
+
+	t.Run("the default fetch budget stops the walk and discloses the partial window", func(t *testing.T) {
+		recCh := serveRepoListPaged(t, []coreapi.ListReposOutputBody{
+			{
+				Repos:         bulkEntries("bulk", 1000),
+				NextPageToken: coreapi.NewOptString("p2"),
+			},
+			{
+				Repos: []coreapi.RepoIndexEntry{onboardedEntry("tail/end", "private", "us")},
+			},
+		}, clusters)
+		stdout, stderr := runMirrorList(t)
+
+		require.NotContains(t, stdout, "tail/end", "the walk must stop at the budget, not fetch page 2")
+		<-recCh
+		select {
+		case rec := <-recCh:
+			t.Fatalf("no second page request expected, got one with pageToken=%q", rec.query.Get("pageToken"))
+		default:
+		}
+		require.Contains(t, stderr, "first 1000", "the note says how much was fetched")
+		require.Contains(t, stderr, "local", "the note says filters/sort ran locally over the window")
+		require.Contains(t, stderr, "--all", "the note points at the escape hatch")
+	})
+
+	t.Run("--all walks past the budget and prints no note", func(t *testing.T) {
+		serveRepoListPaged(t, []coreapi.ListReposOutputBody{
+			{
+				Repos:         bulkEntries("bulk", 1000),
+				NextPageToken: coreapi.NewOptString("p2"),
+			},
+			{
+				Repos: []coreapi.RepoIndexEntry{onboardedEntry("tail/end", "private", "us")},
+			},
+		}, clusters)
+		stdout, stderr := runMirrorList(t, "--all")
+		require.Contains(t, stdout, "tail/end", "--all fetches the full directory")
+		require.NotContains(t, stderr, "--all", "a complete walk needs no note")
+	})
+
+	t.Run("--limit above the budget raises the fetch budget to match", func(t *testing.T) {
+		serveRepoListPaged(t, []coreapi.ListReposOutputBody{
+			{
+				Repos:         bulkEntries("aaa", 1000),
+				NextPageToken: coreapi.NewOptString("p2"),
+			},
+			{
+				Repos:         bulkEntries("bbb", 500),
+				NextPageToken: coreapi.NewOptString("p3"),
+			},
+			{
+				Repos: []coreapi.RepoIndexEntry{onboardedEntry("tail/end", "private", "us")},
+			},
+		}, clusters)
+		stdout, stderr := runMirrorList(t, "--limit", "1200")
+		require.Contains(t, stdout, "bbb/repo-0100", "rows past the default budget are shown when --limit asks for them")
+		require.NotContains(t, stdout, "tail/end", "the walk still stops once --limit is satisfiable")
+		require.Contains(t, stderr, "first 1500", "the note reports the real fetched count")
+	})
+
+	t.Run("a capped page mid-chain does not warn once the cursor walks past it", func(t *testing.T) {
+		serveRepoListPaged(t, []coreapi.ListReposOutputBody{
+			{
+				Repos:         []coreapi.RepoIndexEntry{onboardedEntry("acme/web", "private", "us")},
+				NextPageToken: coreapi.NewOptString("p2"),
+				Truncated:     true,
+			},
+			{
+				Repos: []coreapi.RepoIndexEntry{onboardedEntry("acme/api", "private", "us")},
+			},
+		}, clusters)
+		stdout, stderr := runMirrorList(t)
+		require.Contains(t, stdout, "acme/api", "the chain was walked to the end")
+		require.NotContains(t, stderr, "truncated", "nothing was left unseen, so no warning")
+	})
+
+	t.Run("truncated result warns on stderr, not stdout", func(t *testing.T) {
+		serveRepoList(t, []coreapi.RepoIndexEntry{
+			onboardedEntry("acme/web", "private", "us"),
+		}, clusters, true)
+		stdout, stderr := runMirrorList(t)
+		require.Contains(t, stderr, "truncated")
+		require.NotContains(t, stdout, "truncated")
+	})
+
+	t.Run("truncated warning reaches --json runs on stderr", func(t *testing.T) {
+		// Same rationale as the partial-window note: a script acting on
+		// silently truncated data is the worst outcome, and stderr never
+		// corrupts the stdout JSON.
+		serveRepoList(t, []coreapi.RepoIndexEntry{
+			onboardedEntry("acme/web", "private", "us"),
+		}, clusters, true)
+		stdout, stderr := runMirrorList(t, "--json")
+		require.Contains(t, stderr, "truncated")
+		require.Contains(t, stdout, `"cloneUrl"`, "--json emits the directory rows with nested placements")
+	})
+
+	t.Run("a catalog fetch failure fails the whole command", func(t *testing.T) {
+		// The clone URL is the payload of a mirror listing and --json suppresses
+		// the banner, so a catalog error must abort rather than hand back rows
+		// with silently empty clone URLs.
+		serveRepoListClustersError(t, []coreapi.RepoIndexEntry{
+			onboardedEntry("acme/web", "private", "us"),
+		})
+		err := runMirrorListErr(t)
+		require.Error(t, err)
+	})
+
+	t.Run("a malformed catalog publicUrl lists the mirror without a clone URL, never a spoofed one", func(t *testing.T) {
+		// The `bad` cluster's publicUrl smuggles evil.com via userinfo; it must
+		// never produce a clone URL. The mirror still lists — its slug in
+		// CLUSTERS — and its --json placement carries no cloneUrl. The healthy
+		// cluster's clone URL is unaffected.
+		serve := func(t *testing.T) {
+			t.Helper()
+			serveRepoList(t, []coreapi.RepoIndexEntry{
+				onboardedEntry("acme/web", "private", "us"),
+				onboardedEntry("acme/bad", "private", "bad"),
+			}, []coreapi.Cluster{
+				{Slug: "us", PublicUrl: "https://aws-us-east-2.entire.io"},
+				{Slug: "bad", PublicUrl: "https://aws-us-east-2.entire.io@evil.com"},
+			}, false)
+		}
+		serve(t)
+		stdout, stderr, err := execMirrorList(t)
+		require.NoError(t, err)
+		require.Contains(t, stdout, "acme/bad", "the mirror is still listed")
+		require.Regexp(t, `acme/bad\s+bad\s+`, stdout, "the unresolvable cluster still names itself in CLUSTERS")
+		require.NotContains(t, stdout, "evil.com", "a spoofed host must never reach the output")
+		require.NotContains(t, stderr, "omitted", "no warning: the row is kept")
+
+		serve(t)
+		stdout, _, err = execMirrorList(t, "--json")
+		require.NoError(t, err)
+		require.Contains(t, stdout, "entire://aws-us-east-2.entire.io/gh/acme/web", "the healthy placement keeps its clone URL")
+		require.NotContains(t, stdout, "evil.com", "a spoofed host must never reach a clone URL")
 	})
 }
 
@@ -513,21 +794,26 @@ func requireOrder(t *testing.T, s string, needles ...string) {
 	}
 }
 
-// TestRepoMirrorList_FilterSort pins the client-side --name filter and --sort
-// applied to `repo mirror list` before rendering (server handles
-// owner/provider/cluster), so they shape both the table and --json output and
-// work under --show-available.
+// TestRepoMirrorList_FilterSort pins the client-side --name/--owner/--cluster
+// filters and --sort applied to the merged `repo mirror list` before rendering,
+// so they shape both the table and --json output.
 //
 // Not parallel: swaps the package-level activeCoreClient seam.
 func TestRepoMirrorList_FilterSort(t *testing.T) {
-	mirrors := []coreapi.Mirror{
-		{Owner: "acme", Repo: "web", ClusterHost: "aws-us-east-2.entire.io"},
-		{Owner: "acme", Repo: "cli", ClusterHost: "aws-us-east-2.entire.io"},
-		{Owner: "other", Repo: "api", ClusterHost: "eu-west-1.entire.io"},
+	clusters := []coreapi.Cluster{
+		{Slug: "us", PublicUrl: "https://aws-us-east-2.entire.io"},
+		{Slug: "eu", PublicUrl: "https://eu-west-1.entire.io"},
+	}
+	repos := func() []coreapi.RepoIndexEntry {
+		return []coreapi.RepoIndexEntry{
+			onboardedEntry("acme/web", "private", "us"),
+			onboardedEntry("acme/cli", "public", "us"),
+			onboardedEntry("other/api", "public", "eu"),
+		}
 	}
 
 	t.Run("--name narrows the table by owner/repo substring", func(t *testing.T) {
-		serveMirrorList(t, mirrors, nil)
+		serveRepoList(t, repos(), clusters, false)
 		stdout, _ := runMirrorList(t, "--name", "cli")
 		require.Contains(t, stdout, "acme/cli")
 		require.NotContains(t, stdout, "acme/web")
@@ -537,22 +823,155 @@ func TestRepoMirrorList_FilterSort(t *testing.T) {
 	t.Run("--name matches the owner/repo form shown in the NAME column", func(t *testing.T) {
 		// A value copied straight from the displayed NAME column must match the
 		// row it came from; filtering on the bare repo name would drop it.
-		serveMirrorList(t, mirrors, nil)
+		serveRepoList(t, repos(), clusters, false)
 		stdout, _ := runMirrorList(t, "--name", "acme/web")
 		require.Contains(t, stdout, "acme/web")
 		require.NotContains(t, stdout, "acme/cli")
 		require.NotContains(t, stdout, "other/api")
 	})
 
+	t.Run("--owner narrows to a single owner login", func(t *testing.T) {
+		serveRepoList(t, repos(), clusters, false)
+		stdout, _ := runMirrorList(t, "--owner", "acme")
+		require.Contains(t, stdout, "acme/web")
+		require.Contains(t, stdout, "acme/cli")
+		require.NotContains(t, stdout, "other/api")
+	})
+
+	t.Run("--cluster keeps only mirrors on that cluster and drops candidates", func(t *testing.T) {
+		serveRepoList(t, []coreapi.RepoIndexEntry{
+			onboardedEntry("acme/web", "private", "us"),
+			onboardedEntry("other/api", "public", "eu"),
+			candidateEntry("acme/mkt", "public", coreapi.RepoCandidateAccessAdmin, true),
+		}, clusters, false)
+		// --cluster takes the host, which is also what the CLUSTERS cell prints:
+		// the filter is client-side over these rows, so the two must agree.
+		stdout, _ := runMirrorList(t, "--cluster", "aws-us-east-2.entire.io")
+		require.Contains(t, stdout, "acme/web")
+		require.NotContains(t, stdout, "other/api", "the eu mirror must be dropped")
+		require.NotContains(t, stdout, "acme/mkt", "candidates are cluster-agnostic and dropped by --cluster")
+	})
+
+	t.Run("--status filters by exact status across both row types", func(t *testing.T) {
+		mixed := func() []coreapi.RepoIndexEntry {
+			return []coreapi.RepoIndexEntry{
+				onboardedEntry("acme/web", "private", "us"),                                  // mirror → STATUS "ready"
+				candidateEntry("acme/mkt", "public", coreapi.RepoCandidateAccessAdmin, true), // candidate → STATUS "available"
+			}
+		}
+		serveRepoList(t, mixed(), clusters, false)
+		stdout, _ := runMirrorList(t, "--status", "ready")
+		require.Contains(t, stdout, "acme/web")
+		require.NotContains(t, stdout, "acme/mkt", "available candidate dropped by --status ready")
+
+		serveRepoList(t, mixed(), clusters, false)
+		stdout, _ = runMirrorList(t, "--status", "available")
+		require.Contains(t, stdout, "acme/mkt")
+		require.NotContains(t, stdout, "acme/web", "ready mirror dropped by --status available")
+	})
+
+	t.Run("--status is case-insensitive", func(t *testing.T) {
+		serveRepoList(t, []coreapi.RepoIndexEntry{onboardedEntry("acme/web", "public", "us")}, clusters, false)
+		stdout, _ := runMirrorList(t, "--status", "READY")
+		require.Contains(t, stdout, "acme/web")
+	})
+
+	t.Run("--status matches any placement of a mixed-status repo", func(t *testing.T) {
+		// One placement failed, the other ready: the STATUS cell reads
+		// "mixed", but hunting failures with --status failed must still
+		// surface the repo — and --status mixed matches the displayed cell.
+		mixedRepo := func() []coreapi.RepoIndexEntry {
+			return []coreapi.RepoIndexEntry{
+				{FullName: "acme/web", Visibility: "private", Placements: []coreapi.RepoPlacement{
+					{ClusterSlug: "us", Status: coreapi.RepoPlacementStatusReady, Mirror: true},
+					{ClusterSlug: "eu", Status: coreapi.RepoPlacementStatusFailed, Mirror: true},
+				}},
+				onboardedEntry("acme/fine", "private", "us"),
+			}
+		}
+		serveRepoList(t, mixedRepo(), clusters, false)
+		stdout, _ := runMirrorList(t, "--status", "failed")
+		require.Contains(t, stdout, "acme/web", "a failed placement must surface the repo")
+		require.NotContains(t, stdout, "acme/fine")
+
+		serveRepoList(t, mixedRepo(), clusters, false)
+		stdout, _ = runMirrorList(t, "--status", "mixed")
+		require.Contains(t, stdout, "acme/web", "--status matches the displayed cell too")
+		require.NotContains(t, stdout, "acme/fine")
+	})
+
+	t.Run("--mirrored and --available split the two row types", func(t *testing.T) {
+		both := func() []coreapi.RepoIndexEntry {
+			return []coreapi.RepoIndexEntry{
+				onboardedEntry("acme/web", "private", "us"),
+				candidateEntry("acme/mkt", "public", coreapi.RepoCandidateAccessAdmin, true),
+				candidateEntry("alice/x", "private", coreapi.RepoCandidateAccessRead, false), // owner-only candidate
+			}
+		}
+		serveRepoList(t, both(), clusters, false)
+		stdout, _ := runMirrorList(t, "--mirrored")
+		require.Contains(t, stdout, "acme/web")
+		require.NotContains(t, stdout, "acme/mkt", "candidate dropped by --mirrored")
+		require.NotContains(t, stdout, "alice/x")
+
+		serveRepoList(t, both(), clusters, false)
+		stdout, _ = runMirrorList(t, "--available")
+		require.Contains(t, stdout, "acme/mkt")
+		require.Contains(t, stdout, "alice/x", "--available keeps every candidate, owner-only included")
+		require.NotContains(t, stdout, "acme/web", "mirror dropped by --available")
+
+		serveRepoList(t, both(), clusters, false)
+		err := runMirrorListErr(t, "--mirrored", "--available")
+		require.Error(t, err, "the two type filters are mutually exclusive")
+	})
+
+	t.Run("--access filters candidates and drops mirrors, which have no access", func(t *testing.T) {
+		serveRepoList(t, []coreapi.RepoIndexEntry{
+			onboardedEntry("acme/web", "private", "us"), // mirror → empty ACCESS
+			candidateEntry("acme/adm", "public", coreapi.RepoCandidateAccessAdmin, true),
+			candidateEntry("acme/rdo", "public", coreapi.RepoCandidateAccessRead, true),
+		}, clusters, false)
+		stdout, _ := runMirrorList(t, "--access", "admin")
+		require.Contains(t, stdout, "acme/adm")
+		require.NotContains(t, stdout, "acme/rdo", "read candidate dropped by --access admin")
+		require.NotContains(t, stdout, "acme/web", "mirror has no access dimension and is dropped by --access")
+	})
+
+	t.Run("--private is tri-state (private / public / all)", func(t *testing.T) {
+		mixed := func() []coreapi.RepoIndexEntry {
+			return []coreapi.RepoIndexEntry{
+				onboardedEntry("acme/secret", "private", "us"),
+				onboardedEntry("acme/open", "public", "us"),
+			}
+		}
+		// --private → private only.
+		serveRepoList(t, mixed(), clusters, false)
+		stdout, _ := runMirrorList(t, "--private")
+		require.Contains(t, stdout, "acme/secret")
+		require.NotContains(t, stdout, "acme/open", "public dropped by --private")
+
+		// --private=false → public only.
+		serveRepoList(t, mixed(), clusters, false)
+		stdout, _ = runMirrorList(t, "--private=false")
+		require.Contains(t, stdout, "acme/open")
+		require.NotContains(t, stdout, "acme/secret", "private dropped by --private=false")
+
+		// omitted → both (the flag is not Changed, so no filtering).
+		serveRepoList(t, mixed(), clusters, false)
+		stdout, _ = runMirrorList(t)
+		require.Contains(t, stdout, "acme/secret")
+		require.Contains(t, stdout, "acme/open")
+	})
+
 	t.Run("default output is owner/repo sorted", func(t *testing.T) {
-		serveMirrorList(t, mirrors, nil)
+		serveRepoList(t, repos(), clusters, false)
 		stdout, _ := runMirrorList(t)
 		// acme/cli < acme/web < other/api by owner/repo
 		requireOrder(t, stdout, "acme/cli", "acme/web", "other/api")
 	})
 
 	t.Run("--sort -name reverses the order", func(t *testing.T) {
-		serveMirrorList(t, mirrors, nil)
+		serveRepoList(t, repos(), clusters, false)
 		stdout, _ := runMirrorList(t, "--sort", "-name")
 		requireOrder(t, stdout, "other/api", "acme/web", "acme/cli")
 	})
@@ -560,115 +979,72 @@ func TestRepoMirrorList_FilterSort(t *testing.T) {
 	t.Run("--sort name resolves the NAME column by its key", func(t *testing.T) {
 		// The NAME header carries an inline "(owner/repo)" display hint, but the
 		// sort key is the plain "name" — --sort matches on key, not header.
-		serveMirrorList(t, mirrors, nil)
+		serveRepoList(t, repos(), clusters, false)
 		stdout, _ := runMirrorList(t, "--sort", "name")
 		requireOrder(t, stdout, "acme/cli", "acme/web", "other/api")
 	})
 
 	t.Run("--name applies to --json and keeps [] not null", func(t *testing.T) {
-		serveMirrorList(t, mirrors, nil)
-		// The JSON keys come from the raw coreapi model, unaffected by the NAME
-		// column/flag rename — the wire field stays "repo".
+		serveRepoList(t, repos(), clusters, false)
 		stdout, _ := runMirrorList(t, "--name", "cli", "--json")
-		require.Contains(t, stdout, `"repo": "cli"`)
-		require.NotContains(t, stdout, `"repo": "web"`)
+		require.Contains(t, stdout, `"repo": "/gh/acme/cli"`, "--json carries the same ref the verbs accept")
+		require.NotContains(t, stdout, `"repo": "acme/web"`)
 
-		serveMirrorList(t, mirrors, nil)
+		serveRepoList(t, repos(), clusters, false)
 		stdout, _ = runMirrorList(t, "--name", "zzz", "--json")
 		require.Contains(t, stdout, "[]")
 		require.NotContains(t, stdout, "null")
 	})
 
-	t.Run("unknown --sort column errors naming valid columns", func(t *testing.T) {
-		serveMirrorList(t, mirrors, nil)
-		err := runMirrorListErr(t, "--sort", "nope")
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "unknown sort column")
+	t.Run("--sort access resolves the ACCESS column by its key", func(t *testing.T) {
+		// A candidate-only column, so unit-level TestSortRepoDir (which uses
+		// mirror rows) can't reach it: this pins that --sort resolves the kebab
+		// key "access" end-to-end. "admin" < "read" ascending, so the admin row
+		// sorts before the read row. The sort's tiebreak/direction/whitespace/
+		// bad-column semantics are covered by TestSortRepoDir.
+		serveRepoList(t, []coreapi.RepoIndexEntry{
+			candidateEntry("acme/read-repo", "public", coreapi.RepoCandidateAccessRead, true),
+			candidateEntry("acme/admin-repo", "public", coreapi.RepoCandidateAccessAdmin, true),
+		}, clusters, false)
+		stdout, _ := runMirrorList(t, "--sort", "access")
+		requireOrder(t, stdout, "acme/admin-repo", "acme/read-repo")
 	})
+}
 
-	t.Run("default order breaks duplicate-repo ties by cluster ascending", func(t *testing.T) {
-		// Same repo on two clusters, delivered eu-first; the default sort must
-		// deterministically place aws before eu.
-		dupes := []coreapi.Mirror{
-			{Owner: "acme", Repo: "web", ClusterHost: "eu-west-1.entire.io"},
-			{Owner: "acme", Repo: "web", ClusterHost: "aws-us-east-2.entire.io"},
-		}
-		serveMirrorList(t, dupes, nil)
-		stdout, _ := runMirrorList(t)
-		requireOrder(t, stdout,
-			"entire://aws-us-east-2.entire.io/gh/acme/web",
-			"entire://eu-west-1.entire.io/gh/acme/web",
-		)
-	})
+// TestParseHostedGitHubURL pins the one distinction between the two GitHub
+// parsers: parseGitHubURL accepts an unqualified `owner/repo` (its callers took
+// a GitHub argument and nothing else), while parseHostedGitHubURL requires the
+// host to be named, because its caller must not attribute a forge-less pair to
+// GitHub — `repo clone` offers such a pair both readings instead.
+func TestParseHostedGitHubURL(t *testing.T) {
+	t.Parallel()
+	hosted := []string{
+		"https://github.com/acme/app",
+		"https://github.com/acme/app.git",
+		"git@github.com:acme/app",
+		"git@github.com:acme/app.git",
+		"github.com/acme/app",
+		"github.com/acme/app.git",
+	}
+	for _, raw := range hosted {
+		owner, repo, err := parseHostedGitHubURL(raw)
+		require.NoErrorf(t, err, "parseHostedGitHubURL(%q)", raw)
+		require.Equal(t, "acme", owner)
+		require.Equal(t, "app", repo)
+	}
 
-	t.Run("explicit --sort name keeps the cluster tiebreak (matches default)", func(t *testing.T) {
-		// A repo on two clusters plus a lexically-earlier repo. Explicit
-		// `--sort name` must order like the default: owner/repo ascending, and
-		// within the duplicate tie, cluster ascending (aws before eu). Guards
-		// against `--sort name` regressing to a plain single-key sort that would
-		// drop the tiebreak.
-		dupes := []coreapi.Mirror{
-			{Owner: "acme", Repo: "web", ClusterHost: "eu-west-1.entire.io"},
-			{Owner: "acme", Repo: "web", ClusterHost: "aws-us-east-2.entire.io"},
-			{Owner: "acme", Repo: "api", ClusterHost: "aws-us-east-2.entire.io"},
-		}
-		serveMirrorList(t, dupes, nil)
-		stdout, _ := runMirrorList(t, "--sort", "name")
-		// acme/api before acme/web, and within the acme/web tie aws before eu.
-		requireOrder(t, stdout,
-			"entire://aws-us-east-2.entire.io/gh/acme/api",
-			"entire://aws-us-east-2.entire.io/gh/acme/web",
-			"entire://eu-west-1.entire.io/gh/acme/web",
-		)
+	// An unqualified pair names no forge; parseGitHubURL still takes it.
+	_, _, err := parseHostedGitHubURL("acme/app")
+	require.Error(t, err)
+	owner, repo, err := parseGitHubURL("acme/app")
+	require.NoError(t, err)
+	require.Equal(t, "acme", owner)
+	require.Equal(t, "app", repo)
 
-		// -name reverses the whole ordering, tiebreak included.
-		serveMirrorList(t, dupes, nil)
-		stdout, _ = runMirrorList(t, "--sort", "-name")
-		requireOrder(t, stdout,
-			"entire://eu-west-1.entire.io/gh/acme/web",
-			"entire://aws-us-east-2.entire.io/gh/acme/web",
-		)
-	})
-
-	t.Run("--name/--sort apply under --show-available", func(t *testing.T) {
-		// --name cli keeps two rows (so --sort is observable) and drops the
-		// third, so the filter and the sort are both exercised: `access` orders
-		// read before write, i.e. cli-web before cli-api.
-		serveMirrorList(t, nil, []coreapi.AvailableMirror{
-			{Owner: "acme", Repo: "cli-api", Access: "write", Status: "available"},
-			{Owner: "acme", Repo: "cli-web", Access: "read", Status: "available"},
-			{Owner: "other", Repo: "srv", Access: "read", Status: "available"},
-		})
-		stdout, _ := runMirrorList(t, "--show-available", "--name", "cli", "--sort", "access")
-		require.NotContains(t, stdout, "other/srv", "--name cli must drop the non-matching row")
-		requireOrder(t, stdout, "acme/cli-web", "acme/cli-api")
-	})
-
-	t.Run("--sort private breaks ties deterministically by owner/repo then cluster", func(t *testing.T) {
-		// A non-name column sort: all rows share the same private value, so the
-		// order must fall back to the owner/repo + cluster tiebreak rather than
-		// the eu-first order the server delivered.
-		dupes := []coreapi.Mirror{
-			{Owner: "acme", Repo: "web", ClusterHost: "eu-west-1.entire.io"},
-			{Owner: "acme", Repo: "web", ClusterHost: "aws-us-east-2.entire.io"},
-			{Owner: "acme", Repo: "api", ClusterHost: "aws-us-east-2.entire.io"},
-		}
-		serveMirrorList(t, dupes, nil)
-		stdout, _ := runMirrorList(t, "--sort", "private")
-		// All rows share the private value, so acme/api sorts before acme/web,
-		// and within the acme/web tie aws before eu.
-		requireOrder(t, stdout,
-			"entire://aws-us-east-2.entire.io/gh/acme/api",
-			"entire://aws-us-east-2.entire.io/gh/acme/web",
-			"entire://eu-west-1.entire.io/gh/acme/web",
-		)
-	})
-
-	t.Run("--sort with leading whitespace parses direction like the trimmed spec", func(t *testing.T) {
-		serveMirrorList(t, mirrors, nil)
-		stdout, _ := runMirrorList(t, "--sort", " -name")
-		requireOrder(t, stdout, "other/api", "acme/web", "acme/cli")
-	})
+	// The dot-only guard applies to the host-qualified form too, so a
+	// `github.com/owner/..` ref is not attributed to GitHub either.
+	_, _, err = parseHostedGitHubURL("github.com/acme/..")
+	require.Error(t, err)
 }
 
 // TestParseGitHubURL is ported from entiredb's cmd/entire-repo/cli
@@ -732,199 +1108,253 @@ func TestParseGitHubURL(t *testing.T) {
 	}
 }
 
-func TestParseMirrorCloneURL(t *testing.T) {
+func TestParseEntireCloneURL(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name                             string
-		raw                              string
-		wantCluster, wantOwner, wantRepo string
-		wantErr                          bool
+		name                   string
+		raw                    string
+		wantCluster, wantForge string
+		wantOwner, wantRepo    string
+		wantErr                bool
 	}{
 		{name: "github clone URL", raw: "entire://aws-eu-central-1.entire.io/gh/entirehq/entire-api",
-			wantCluster: "aws-eu-central-1.entire.io", wantOwner: "entirehq", wantRepo: "entire-api"},
+			wantCluster: "aws-eu-central-1.entire.io", wantForge: mirrorCloneForge, wantOwner: "entirehq", wantRepo: "entire-api"},
+		// The form the CLONE URL column prints for a native repo, which is why
+		// it has to parse: a URL read out of the table is pasted back in.
+		{name: "native clone URL", raw: "entire://aws-us-east-2.entire.io/et/acme/web",
+			wantCluster: "aws-us-east-2.entire.io", wantForge: nativeCloneForge, wantOwner: "acme", wantRepo: "web"},
+		// A trailing .git is decoration on either forge, in any case
+		// (621ecf062a): git tooling reserves the suffix — Git LFS derives its
+		// endpoint by appending it — so a repo literally named `foo.git` is
+		// indistinguishable from `foo` to anything following that convention.
+		// Delegating to parseMirrorRepoRef is what keeps this URL following the
+		// rule without the URL parser restating it, which is how five
+		// spellings of one rule got three of them wrong.
+		{name: "native clone URL drops a trailing .git", raw: "entire://c.entire.io/et/acme/web.git",
+			wantCluster: "c.entire.io", wantForge: nativeCloneForge, wantOwner: "acme", wantRepo: "web"},
 		{name: "owner and repo lowercased", raw: "entire://c.entire.io/gh/OctoCat/Hello-World",
-			wantCluster: "c.entire.io", wantOwner: "octocat", wantRepo: "hello-world"},
+			wantCluster: "c.entire.io", wantForge: mirrorCloneForge, wantOwner: "octocat", wantRepo: "hello-world"},
 		{name: "trailing .git is trimmed", raw: "entire://c.entire.io/gh/entireio/cli.git",
-			wantCluster: "c.entire.io", wantOwner: "entireio", wantRepo: "cli"},
+			wantCluster: "c.entire.io", wantForge: mirrorCloneForge, wantOwner: "entireio", wantRepo: "cli"},
+		// The suffix is cut BEFORE the name is lowercased. Doing it the other
+		// way round — which is what shipped — left ".GIT" in place for the
+		// case-sensitive cut, then lowercased the whole thing to "cli.git": a
+		// repo spelling no stored mirror can ever match, so the lookup
+		// reported no such mirror for a clone URL git itself resolves.
+		{name: "uppercase .GIT is trimmed, not lowercased into the name", raw: "entire://c.entire.io/gh/EntireIO/CLI.GIT",
+			wantCluster: "c.entire.io", wantForge: mirrorCloneForge, wantOwner: "entireio", wantRepo: "cli"},
+		{name: "mixed-case .Git is trimmed", raw: "entire://c.entire.io/gh/entireio/cli.Git",
+			wantCluster: "c.entire.io", wantForge: mirrorCloneForge, wantOwner: "entireio", wantRepo: "cli"},
+		// The same three on the native side, because this parser serves both
+		// forges and the rule is one rule: whatever parseMirrorRepoRef decides
+		// about a suffix, a clone URL of either kind inherits.
+		{name: "uppercase .GIT is trimmed on a native URL", raw: "entire://c.entire.io/et/acme/Web.GIT",
+			wantCluster: "c.entire.io", wantForge: nativeCloneForge, wantOwner: "acme", wantRepo: "Web"},
+		{name: "a longer dotted extension is not the suffix, natively too", raw: "entire://c.entire.io/et/acme/web.gitignore",
+			wantCluster: "c.entire.io", wantForge: nativeCloneForge, wantOwner: "acme", wantRepo: "web.gitignore"},
 		{name: "interior dots in repo name are kept", raw: "entire://c.entire.io/gh/entirehq/entire-trails.el",
-			wantCluster: "c.entire.io", wantOwner: "entirehq", wantRepo: "entire-trails.el"},
+			wantCluster: "c.entire.io", wantForge: mirrorCloneForge, wantOwner: "entirehq", wantRepo: "entire-trails.el"},
+		{name: "a longer dotted extension is not the suffix", raw: "entire://c.entire.io/gh/entireio/cli.gitignore",
+			wantCluster: "c.entire.io", wantForge: mirrorCloneForge, wantOwner: "entireio", wantRepo: "cli.gitignore"},
 		{name: "wrong scheme", raw: "https://c.entire.io/gh/a/b", wantErr: true},
-		{name: "non-gh provider segment", raw: "entire://c.entire.io/git/a/b", wantErr: true},
+		{name: "unknown forge segment", raw: "entire://c.entire.io/git/a/b", wantErr: true},
 		{name: "missing repo", raw: "entire://c.entire.io/gh/a", wantErr: true},
+		{name: "native missing repo", raw: "entire://c.entire.io/et/acme", wantErr: true},
 		{name: "extra path segment", raw: "entire://c.entire.io/gh/a/b/c", wantErr: true},
 		{name: "not a URL", raw: "not-a-url", wantErr: true},
+		{name: "host with a URL metacharacter", raw: "entire://c.entire.io:8080:9090/gh/a/b", wantErr: true},
+		// url.Parse splits userinfo off before filling Host, so validating
+		// u.Host saw a clean "evil.com" and the CLI would dial it — from a URL
+		// that reads as naming the real cluster.
+		{name: "userinfo smuggling another host", raw: "entire://real-cluster.entire.io@evil.com/gh/a/b", wantErr: true},
+		{name: "userinfo on a native URL", raw: "entire://real-cluster.entire.io@evil.com/et/acme/web", wantErr: true},
+		{name: "a differently-cased scheme is still checked", raw: "ENTIRE://real-cluster.entire.io@evil.com/gh/a/b", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			cluster, provider, owner, repo, err := parseMirrorCloneURL(tt.raw)
+			cluster, ref, err := parseEntireCloneURL(tt.raw)
 			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("parseMirrorCloneURL(%q) = (%q,%q,%q,%q), want error", tt.raw, cluster, provider, owner, repo)
-				}
+				require.Error(t, err, "parseEntireCloneURL(%q) = (%q, %+v)", tt.raw, cluster, ref)
 				return
 			}
-			if err != nil {
-				t.Fatalf("parseMirrorCloneURL(%q): %v", tt.raw, err)
-			}
-			if provider != string(coreapi.CreateMirrorInputBodyProviderGithub) {
-				t.Errorf("provider = %q, want github", provider)
-			}
-			if cluster != tt.wantCluster || owner != tt.wantOwner || repo != tt.wantRepo {
-				t.Errorf("= (%q,%q,%q), want (%q,%q,%q)", cluster, owner, repo, tt.wantCluster, tt.wantOwner, tt.wantRepo)
-			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantCluster, cluster)
+			require.Equal(t, mirrorRepoRef{forge: tt.wantForge, owner: tt.wantOwner, repo: tt.wantRepo}, ref)
 		})
 	}
 }
 
-func TestResolveMirrorRef(t *testing.T) {
-	t.Parallel()
-	// 26 Crockford base32 chars (no I/L/O/U) so the ULID short-circuit fires.
-	const mirrorULID = "0123456789ABCDEFGHJKMNPQRS"
-	const otherULID = "0123456789ABCDEFGHJKMNPQRT"
-	const cloneURL = "entire://aws-eu-central-1.entire.io/gh/entirehq/entire-api"
+// viewClusterHost is the cluster a `repo view` clone URL names in these tests;
+// it is deliberately not one of detailClusters' public hosts, so a test that
+// resolves on the wrong core cannot pass by coincidence.
+const viewClusterHost = "eukanuba.partial.to"
 
-	t.Run("ULID passes through without a network call", func(t *testing.T) {
-		t.Parallel()
-		c, calls := resolveTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-			t.Error("unexpected HTTP call for a ULID ref")
-			w.WriteHeader(http.StatusInternalServerError)
-		})
-		got, err := resolveMirrorRef(context.Background(), c, mirrorULID)
-		if err != nil {
-			t.Fatalf("resolveMirrorRef: %v", err)
-		}
-		if got != mirrorULID {
-			t.Errorf("resolveMirrorRef = %q, want the ULID unchanged", got)
-		}
-		if n := calls.Load(); n != 0 {
-			t.Errorf("ULID ref made %d HTTP calls, want 0", n)
-		}
-	})
-
-	t.Run("clone URL resolves to the matching mirror's ULID", func(t *testing.T) {
-		t.Parallel()
-		var gotCluster, gotProvider, gotOwner string
-		c, _ := resolveTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-			q := r.URL.Query()
-			gotCluster, gotProvider, gotOwner = q.Get("cluster"), q.Get("provider"), q.Get("owner")
-			if err := printJSON(w, &coreapi.ListMirrorsOutputBody{Mirrors: []coreapi.Mirror{
-				{MirrorId: otherULID, Owner: "entirehq", Repo: "other", ClusterHost: "aws-eu-central-1.entire.io"},
-				{MirrorId: mirrorULID, Owner: "entirehq", Repo: "entire-api", ClusterHost: "aws-eu-central-1.entire.io"},
-			}}); err != nil {
-				t.Errorf("encode mirrors: %v", err)
-			}
-		})
-		got, err := resolveMirrorRef(context.Background(), c, cloneURL)
-		if err != nil {
-			t.Fatalf("resolveMirrorRef: %v", err)
-		}
-		if got != mirrorULID {
-			t.Errorf("resolveMirrorRef = %q, want %q", got, mirrorULID)
-		}
-		// The (cluster, provider, owner) narrowing must be server-side; only the
-		// repo is matched client-side (ListMirrors has no repo filter).
-		if gotCluster != "aws-eu-central-1.entire.io" || gotProvider != string(coreapi.CreateMirrorInputBodyProviderGithub) || gotOwner != "entirehq" {
-			t.Errorf("filters = cluster %q provider %q owner %q, want the clone URL's coords", gotCluster, gotProvider, gotOwner)
-		}
-	})
-
-	t.Run("no matching repo is a friendly error", func(t *testing.T) {
-		t.Parallel()
-		c, _ := resolveTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-			if err := printJSON(w, &coreapi.ListMirrorsOutputBody{Mirrors: []coreapi.Mirror{
-				{MirrorId: otherULID, Owner: "entirehq", Repo: "other", ClusterHost: "aws-eu-central-1.entire.io"},
-			}}); err != nil {
-				t.Errorf("encode mirrors: %v", err)
-			}
-		})
-		_, err := resolveMirrorRef(context.Background(), c, cloneURL)
-		if err == nil || !strings.Contains(err.Error(), "no mirror matching") {
-			t.Errorf("resolveMirrorRef no match: err = %v, want a \"no mirror matching\" error", err)
-		}
-	})
-
-	t.Run("unparseable ref errors before any call", func(t *testing.T) {
-		t.Parallel()
-		c, calls := resolveTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-			t.Error("unexpected HTTP call for an unparseable ref")
-			w.WriteHeader(http.StatusInternalServerError)
-		})
-		if _, err := resolveMirrorRef(context.Background(), c, "not-a-url"); err == nil {
-			t.Fatal("resolveMirrorRef unparseable: want an error")
-		}
-		if n := calls.Load(); n != 0 {
-			t.Errorf("unparseable ref made %d HTTP calls, want 0", n)
-		}
-	})
+// seamActive / seamCluster point the two core-client constructors at a test
+// server for the duration of one test. Which one a command reaches is the
+// routing question these tests ask, so they are always set as a pair: the one
+// that must not be dialed is pointed at a t.Error.
+func seamActive(t *testing.T, fn func(context.Context) (*coreapi.Client, error)) {
+	t.Helper()
+	prev := activeCoreClient
+	activeCoreClient = fn
+	t.Cleanup(func() { activeCoreClient = prev })
 }
 
-// TestRepoMirrorGet_Routing pins which core `mirror get <ref>` dials. A clone
-// URL names its cluster, so it must be resolved on the core fronting that
-// cluster (clusterCoreClient), not the active context — the original bug:
-// `mirror get entire://<cluster>/…` for a cluster in a federation other than
-// the active login failed with "no mirror matching" until the user switched
-// contexts. A ULID carries no cluster coordinate and stays on the active
-// context; an unparseable ref must error before dialing anything.
-//
-// Not parallel: swaps the package-level activeCoreClient/clusterCoreClient
-// seams.
-func TestRepoMirrorGet_Routing(t *testing.T) {
-	const mirrorULID = "0123456789ABCDEFGHJKMNPQRS"
-	const clusterHost = "eukanuba.partial.to"
+func seamCluster(t *testing.T, fn func(context.Context, string) (*coreapi.Client, error)) {
+	t.Helper()
+	prev := clusterCoreClient
+	clusterCoreClient = fn
+	t.Cleanup(func() { clusterCoreClient = prev })
+}
+
+// runRepoView runs `repo view` under the real `repo` parent, so the ref lands
+// in the routing the command itself wires rather than one the test rebuilds.
+func runRepoView(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	cmd := newRepoCmd()
+	var out, errW bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errW)
+	cmd.SetArgs(append([]string{"view"}, args...))
+	err := cmd.ExecuteContext(t.Context())
+	return out.String(), err
+}
+
+func TestRepoView_Routing(t *testing.T) {
+	const clusterHost = viewClusterHost
 	const cloneURL = "entire://" + clusterHost + "/gh/entirehq/librarian"
 
-	// mirrorServer answers both the list (clone-URL resolution) and the
-	// GetMirror-by-ULID calls for the librarian mirror.
-	mirrorServer := func(t *testing.T) *httptest.Server {
+	t.Run("a malformed clone URL errors before dialing any core", func(t *testing.T) {
+		seamActive(t, func(context.Context) (*coreapi.Client, error) {
+			t.Error("a malformed clone URL dialed the active context's core")
+			return nil, errors.New("no dial expected")
+		})
+		seamCluster(t, func(context.Context, string) (*coreapi.Client, error) {
+			t.Error("a malformed clone URL dialed a cluster core")
+			return nil, errors.New("no dial expected")
+		})
+		_, err := runRepoView(t, "entire://")
+		require.Error(t, err)
+		require.ErrorContains(t, err, `invalid clone URL "entire://"`)
+	})
+
+	// serveRepoDetail answers the two endpoints the owner/repo form uses: the
+	// exact-match /repos?filter= lookup and the cluster catalog.
+	serveRepoDetail := func(t *testing.T, repos []coreapi.RepoIndexEntry, clusters []coreapi.Cluster) *string {
 		t.Helper()
+		var gotFilter string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			switch r.URL.Path {
-			case mirrorsAPIPath:
-				assert.NoError(t, printJSON(w, &coreapi.ListMirrorsOutputBody{Mirrors: []coreapi.Mirror{
-					{MirrorId: mirrorULID, Owner: "entirehq", Repo: "librarian", ClusterHost: clusterHost},
-				}}))
-			case mirrorsAPIPath + "/" + mirrorULID:
-				assert.NoError(t, printJSON(w, &coreapi.Mirror{
-					MirrorId: mirrorULID, Owner: "entirehq", Repo: "librarian", ClusterHost: clusterHost,
-					IsPrivate: coreapi.NewOptBool(true),
-				}))
+			case testClustersPath:
+				assert.NoError(t, printJSON(w, &coreapi.ListClustersOutputBody{Clusters: clusters}))
+			case testReposPath:
+				gotFilter = r.URL.Query().Get("filter")
+				assert.NoError(t, printJSON(w, &coreapi.ListReposOutputBody{Repos: repos}))
 			default:
-				t.Errorf("unexpected request path %q", r.URL.Path)
+				t.Errorf("unexpected path %q", r.URL.Path)
 				w.WriteHeader(http.StatusNotFound)
 			}
 		}))
 		t.Cleanup(srv.Close)
-		return srv
+		seamActive(t, func(context.Context) (*coreapi.Client, error) {
+			return coreapi.NewWithBearer(srv.URL, "tok")
+		})
+		seamCluster(t, func(_ context.Context, host string) (*coreapi.Client, error) {
+			t.Errorf("owner/repo get dialed cluster core %q; it has no cluster coordinate", host)
+			return nil, errors.New("wrong core")
+		})
+		return &gotFilter
 	}
-	seamActive := func(t *testing.T, fn func(context.Context) (*coreapi.Client, error)) {
-		t.Helper()
-		prev := activeCoreClient
-		activeCoreClient = fn
-		t.Cleanup(func() { activeCoreClient = prev })
-	}
-	seamCluster := func(t *testing.T, fn func(context.Context, string) (*coreapi.Client, error)) {
-		t.Helper()
-		prev := clusterCoreClient
-		clusterCoreClient = fn
-		t.Cleanup(func() { clusterCoreClient = prev })
-	}
-	runGet := func(t *testing.T, ref string) (string, error) {
-		t.Helper()
-		cmd := newRepoCmd()
-		var out, errW bytes.Buffer
-		cmd.SetOut(&out)
-		cmd.SetErr(&errW)
-		cmd.SetArgs([]string{"mirror", "get", ref})
-		err := cmd.ExecuteContext(t.Context())
-		return out.String(), err
+	detailClusters := []coreapi.Cluster{
+		{Slug: "us", PublicUrl: "https://aws-us-east-2.entire.io"},
+		{Slug: "eu", PublicUrl: "https://eu-west-1.entire.io"},
 	}
 
-	t.Run("clone URL dials the cluster's core, not the active context", func(t *testing.T) {
-		srv := mirrorServer(t)
+	t.Run("/gh/owner/repo renders the record view with a per-cluster table", func(t *testing.T) {
+		// The drill-down from the grouped `mirror list` NAME cell: identity
+		// fields, then one row per cluster mirror with clone URL + status, in
+		// the order the CLUSTER column prints — by host, which is what the
+		// table sorts on, so the eye can follow it. The entry delivers eu first.
+		gotFilter := serveRepoDetail(t, []coreapi.RepoIndexEntry{
+			{FullName: "entirehq/entiredb", Visibility: "private", Placements: []coreapi.RepoPlacement{
+				{ClusterSlug: "eu", Status: coreapi.RepoPlacementStatusFailed, Mirror: true},
+				{ClusterSlug: "us", Status: coreapi.RepoPlacementStatusReady, Mirror: true},
+			}},
+		}, detailClusters)
+
+		out, err := runRepoView(t, "/gh/entirehq/entiredb")
+		require.NoError(t, err)
+		require.Equal(t, "entirehq/entiredb", *gotFilter, "the lookup must be the server-side exact-match filter")
+		requireOrder(t, out,
+			"Name:", "entirehq/entiredb",
+			"Visibility:", "Private",
+			"CLUSTER", "CLONE URL", "STATUS",
+			"aws-us-east-2.entire.io", "entire://aws-us-east-2.entire.io/gh/entirehq/entiredb", "ready",
+			"eu-west-1.entire.io", "entire://eu-west-1.entire.io/gh/entirehq/entiredb", "failed",
+		)
+	})
+
+	t.Run("/gh/owner/repo on a candidate shows access and availability, no table", func(t *testing.T) {
+		serveRepoDetail(t, []coreapi.RepoIndexEntry{
+			candidateEntry("entirehq/notyet", "private", coreapi.RepoCandidateAccessWrite, true),
+		}, detailClusters)
+
+		out, err := runRepoView(t, "/gh/entirehq/notyet")
+		require.NoError(t, err)
+		requireOrder(t, out,
+			"Name:", "entirehq/notyet",
+			"Visibility:", "Private",
+			"Access:", "write",
+			"Not mirrored on any cluster (available).",
+		)
+		require.NotContains(t, out, "CLONE URL", "a candidate has no placements table")
+	})
+
+	// The cluster coordinates ride on a GitHub placement exactly as they do on a
+	// native one: keying on a cluster rather than printing it is a property of a
+	// placement, not of a forge, and the two forges share this row shape.
+	t.Run("/gh/owner/repo --json emits the list's row shape, placements nested", func(t *testing.T) {
+		serveRepoDetail(t, []coreapi.RepoIndexEntry{
+			{FullName: "entirehq/entiredb", Visibility: "private", Placements: []coreapi.RepoPlacement{
+				{ClusterSlug: "us", Jurisdiction: "us", Status: coreapi.RepoPlacementStatusReady, Mirror: true},
+			}},
+		}, detailClusters)
+
+		out, err := runRepoView(t, "/gh/entirehq/entiredb", "--json")
+		require.NoError(t, err)
+		var row repoDirRow
+		require.NoError(t, json.Unmarshal([]byte(out), &row))
+		require.Equal(t, repoDirRow{Repo: "/gh/entirehq/entiredb", Private: visibilityOf("private"), Status: "ready", Placements: []repoDirPlacement{
+			{Cluster: "aws-us-east-2.entire.io", ClusterSlug: "us", Jurisdiction: "us", Status: "ready", CloneURL: "entire://aws-us-east-2.entire.io/gh/entirehq/entiredb"},
+		}}, row)
+	})
+
+	// The record view for a clone URL is resolved on the core fronting the
+	// URL's own cluster, which is the whole reason this form exists: a mirror
+	// in another federation is invisible to the active context's core.
+	t.Run("a clone URL renders the record view on its own cluster's core", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case testClustersPath:
+				assert.NoError(t, printJSON(w, &coreapi.ListClustersOutputBody{Clusters: detailClusters}))
+			case testReposPath:
+				assert.Equal(t, "entirehq/librarian", r.URL.Query().Get("filter"))
+				assert.NoError(t, printJSON(w, &coreapi.ListReposOutputBody{Repos: []coreapi.RepoIndexEntry{
+					{FullName: "entirehq/librarian", Visibility: "private", Placements: []coreapi.RepoPlacement{
+						{ClusterSlug: "us", Status: coreapi.RepoPlacementStatusReady, Mirror: true},
+					}},
+				}}))
+			default:
+				t.Errorf("unexpected path %q", r.URL.Path)
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		t.Cleanup(srv.Close)
 		seamActive(t, func(context.Context) (*coreapi.Client, error) {
-			t.Error("clone-URL get dialed the active context's core")
+			t.Error("a clone URL dialed the active context's core")
 			return nil, errors.New("wrong core")
 		})
 		var gotHost string
@@ -932,187 +1362,416 @@ func TestRepoMirrorGet_Routing(t *testing.T) {
 			gotHost = host
 			return coreapi.NewWithBearer(srv.URL, "tok")
 		})
-		out, err := runGet(t, cloneURL)
+
+		out, err := runRepoView(t, cloneURL)
 		require.NoError(t, err)
 		require.Equal(t, clusterHost, gotHost, "must resolve on the clone URL's cluster")
-		require.Contains(t, out, "entirehq/librarian")
-		require.Contains(t, out, cloneURL)
+		require.Contains(t, out, "/gh/entirehq/librarian")
+		require.Contains(t, out, "aws-us-east-2.entire.io")
 	})
 
-	t.Run("ULID dials the active context", func(t *testing.T) {
-		srv := mirrorServer(t)
-		seamActive(t, func(context.Context) (*coreapi.Client, error) {
-			return coreapi.NewWithBearer(srv.URL, "tok")
-		})
-		seamCluster(t, func(_ context.Context, host string) (*coreapi.Client, error) {
-			t.Errorf("ULID get dialed cluster core %q; a ULID has no cluster coordinate", host)
-			return nil, errors.New("wrong core")
-		})
-		out, err := runGet(t, mirrorULID)
-		require.NoError(t, err)
-		require.Contains(t, out, "entirehq/librarian")
-	})
-
-	t.Run("unparseable ref errors before dialing any core", func(t *testing.T) {
-		seamActive(t, func(context.Context) (*coreapi.Client, error) {
-			t.Error("unparseable ref dialed the active context's core")
-			return nil, errors.New("no dial expected")
-		})
-		seamCluster(t, func(context.Context, string) (*coreapi.Client, error) {
-			t.Error("unparseable ref dialed a cluster core")
-			return nil, errors.New("no dial expected")
-		})
-		_, err := runGet(t, "not-a-url")
+	t.Run("/gh/owner/repo with no matching repo is a friendly error", func(t *testing.T) {
+		serveRepoDetail(t, nil, detailClusters)
+		_, err := runRepoView(t, "/gh/entirehq/ghost")
 		require.Error(t, err)
-		require.ErrorContains(t, err, "pass a mirror ULID or a clone URL")
+		require.ErrorContains(t, err, "no repo matching")
+	})
+
+	t.Run("a mismatched lookup cannot emit another repo's coordinates", func(t *testing.T) {
+		gotFilter := serveRepoDetail(t, []coreapi.RepoIndexEntry{
+			repoIndexFixture("other/repo", "mirror-eu", placementFixture{id: "mirror-eu", slug: euClusterSlug}),
+		}, clustersWithSlugs())
+
+		out, err := runRepoView(t, "/gh/entirehq/entiredb", "--json")
+		require.ErrorContains(t, err, `control plane returned "other/repo" for entirehq/entiredb`)
+		require.Empty(t, out, "must not emit coordinates for an unrelated repository")
+		require.Equal(t, "entirehq/entiredb", *gotFilter)
 	})
 }
 
-func TestMirrorRow(t *testing.T) {
+// TestRepoView_NativeCloneURL pins the native half of the clone-URL form: it is
+// the URL the CLONE URL column prints for an /et/ repo, so a reader pasting a
+// row back has to reach the same repo — and on the cluster the row named, not
+// on the active context's core.
+//
+// Not parallel: it replaces the process-global client seams.
+func TestRepoView_NativeCloneURL(t *testing.T) {
+	const clusterHost = viewClusterHost
+	const repoID = "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		// A name pair resolves through repos/resolve, which needs repo#pull
+		// alone; the project-scoped routes would need project#inspect.
+		case r.URL.Path == "/api/v1/repos/resolve":
+			assert.NoError(t, printJSON(w, nativeResolution("acme/web", repoID)))
+		case strings.HasSuffix(r.URL.Path, "/native-mirrors"):
+			fmt.Fprint(w, `{"nativeMirrors":[]}`)
+		case r.URL.Path == testClustersPath:
+			assert.NoError(t, printJSON(w, &coreapi.ListClustersOutputBody{Clusters: []coreapi.Cluster{
+				{Slug: "us", PublicUrl: "https://" + clusterHost},
+			}}))
+		case r.URL.Path == "/api/v1/repos/"+repoID:
+			fmt.Fprintf(w, `{"id":%q,"name":"web","owningProjectId":%q,"provider":"entire","path":"/et/acme/web","clusterSlug":"us","state":"active","visibility":"private"}`, repoID, testProjectULID)
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	seamActive(t, func(context.Context) (*coreapi.Client, error) {
+		t.Error("a native clone URL dialed the active context's core")
+		return nil, errors.New("wrong core")
+	})
+	var gotHost string
+	seamCluster(t, func(_ context.Context, host string) (*coreapi.Client, error) {
+		gotHost = host
+		return coreapi.NewWithBearer(srv.URL, "tok")
+	})
+
+	out, err := runRepoView(t, "entire://"+clusterHost+"/et/acme/web")
+	require.NoError(t, err)
+	require.Equal(t, clusterHost, gotHost, "must resolve on the clone URL's cluster")
+	requireOrder(t, out,
+		"Name:", "/et/acme/web",
+		"Visibility:", "Private",
+		"CLUSTER", "ROLE", "CLONE URL", "STATUS",
+		clusterHost, "primary", "entire://"+clusterHost+"/et/acme/web", "ready",
+	)
+}
+
+// TestSharedPlacementStatus pins the fold, and above all that it does not
+// depend on the ORDER of the placements. A status the server did not state is
+// evidence neither way: folding it as agreement made a row claim ready while
+// its primary was unknown, and folding it as disagreement made an unreadable
+// state read as partial degradation. Which of the two you got was decided by
+// position, since "nothing seen yet" was spelled the same as "unknown".
+func TestSharedPlacementStatus(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		name   string
-		mirror coreapi.Mirror
-		want   []string
-	}{
-		{
-			name:   "private mirror synthesises clone URL",
-			mirror: coreapi.Mirror{Owner: "entirehq", Repo: "entire.io", ClusterHost: "aws-us-east-2.entire.io", IsPrivate: coreapi.NewOptBool(true)},
-			want:   []string{"entirehq/entire.io", "entire://aws-us-east-2.entire.io/gh/entirehq/entire.io", "yes"},
-		},
-		{
-			name:   "public mirror, unset IsPrivate defaults to no",
-			mirror: coreapi.Mirror{Owner: "octocat", Repo: "hello", ClusterHost: "eu-west-1.entire.io"},
-			want:   []string{"octocat/hello", "entire://eu-west-1.entire.io/gh/octocat/hello", "no"},
-		},
+	of := func(ss ...string) []repoDirPlacement {
+		out := make([]repoDirPlacement, len(ss))
+		for i, st := range ss {
+			out[i] = repoDirPlacement{Status: st}
+		}
+		return out
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := mirrorRow(tt.mirror)
-			if len(got) != len(tt.want) {
-				t.Fatalf("mirrorRow len = %d, want %d (%v)", len(got), len(tt.want), got)
-			}
-			for i := range tt.want {
-				if got[i] != tt.want[i] {
-					t.Errorf("mirrorRow[%d] = %q, want %q", i, got[i], tt.want[i])
-				}
-			}
-		})
+
+	require.Empty(t, sharedPlacementStatus(nil))
+	require.Equal(t, "ready", sharedPlacementStatus(of("ready", "ready")))
+	require.Equal(t, repoDirStatusMixed, sharedPlacementStatus(of("ready", "failed")))
+
+	// The pair that used to disagree with itself. The native path builds the
+	// primary first, so the left spelling is the one that occurs today.
+	require.Equal(t, "ready", sharedPlacementStatus(of("", "ready")))
+	require.Equal(t, "ready", sharedPlacementStatus(of("ready", "")))
+
+	require.Empty(t, sharedPlacementStatus(of("", "")), "nothing stated is nothing to report")
+	require.Equal(t, repoDirStatusMixed, sharedPlacementStatus(of("", "ready", "failed")),
+		"an unstated status neither creates agreement nor hides a real disagreement")
+}
+
+// TestValidateClusterFilter pins that --cluster names a cluster or fails. The
+// filter is client-side over the printed rows, so an unknown value matched
+// nothing and exited 0 with "No repos found" — indistinguishable from a repo
+// that genuinely has no mirror there.
+func TestValidateClusterFilter(t *testing.T) {
+	t.Parallel()
+	catalog := []coreapi.Cluster{
+		{Slug: "us", PublicUrl: "https://aws-us-east-2.entire.io"},
+		{Slug: "eu", PublicUrl: "https://eu-west-1.entire.io"},
+		// A publicUrl that smuggles a host via userinfo: clusterHostBySlug
+		// drops it, so this cluster has a slug and no usable host.
+		{Slug: "bad", PublicUrl: "https://aws-us-east-2.entire.io@evil.com"},
+	}
+	hosts := clusterHostBySlug(catalog)
+	require.NotContains(t, hosts, "bad", "the fixture only works if the unsafe host is dropped")
+
+	require.NoError(t, validateClusterFilter("", hosts, catalog), "no filter is not a bad filter")
+	require.NoError(t, validateClusterFilter("aws-us-east-2.entire.io", hosts, catalog))
+	require.NoError(t, validateClusterFilter("AWS-US-EAST-2.entire.io", hosts, catalog), "hosts compare case-insensitively")
+
+	// A slug is the likely mistake, because `entire cluster list` still heads
+	// its own column CLUSTER while printing slugs.
+	err := validateClusterFilter("us", hosts, catalog)
+	require.ErrorContains(t, err, "is a cluster slug")
+	require.ErrorContains(t, err, "aws-us-east-2.entire.io", "the message names the spelling that works")
+
+	// The cluster with no usable host renders under its SLUG (placementCluster's
+	// fallback), so that slug is the only value its rows ever show — refusing it
+	// refused the exact string the column prints, and sent the reader to a HOST
+	// column showing `-`.
+	require.NoError(t, validateClusterFilter("bad", hosts, catalog),
+		"a slug the catalog has but the host map cannot resolve is what the CLUSTER column prints")
+
+	require.ErrorContains(t, validateClusterFilter("nope.entire.io", hosts, catalog), "names no cluster in the catalog")
+
+	// A value that is one cluster's slug AND another's host must always be
+	// accepted: it names a cluster. Resolving it in a single pass let Go's
+	// randomised map order decide, so the same input passed or failed by run.
+	collide := []coreapi.Cluster{
+		{Slug: "aws-us-east-2.entire.io", PublicUrl: "https://eu-west-1.entire.io"},
+		{Slug: "eu", PublicUrl: "https://aws-us-east-2.entire.io"},
+	}
+	for range 50 {
+		require.NoError(t, validateClusterFilter("aws-us-east-2.entire.io", clusterHostBySlug(collide), collide))
 	}
 }
 
-func TestAvailableMirrorRow(t *testing.T) {
+// TestMirrorRefOwner pins the owner extraction the --owner filter uses, now
+// that a directory row carries the forge-qualified name.
+func TestMirrorRefOwner(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, "acme", mirrorRefOwner("/gh/acme/web"))
+	require.Equal(t, "acme", mirrorRefOwner(qualifyRepoRef(mirrorCloneForge, "acme/web")))
+	require.Empty(t, mirrorRefOwner(""))
+}
+
+func TestRepoDirCells(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name string
-		repo coreapi.AvailableMirror
+		row  repoDirRow
 		want []string
 	}{
 		{
-			name: "onboardable org repo",
-			repo: coreapi.AvailableMirror{Owner: "acme", Repo: "web", Access: "write", Status: "available"},
-			want: []string{"acme/web", "write", "available"},
+			name: "mirror row: clusters + status, access dashed",
+			row: repoDirRow{Repo: "acme/web", Private: visibilityOf("private"), Status: "ready", Placements: []repoDirPlacement{
+				{Cluster: "us", Status: "ready", CloneURL: "entire://h/gh/acme/web"},
+			}},
+			want: []string{"acme/web", "us", "Private", "ready", "-"},
 		},
 		{
-			name: "already mirrored",
-			repo: coreapi.AvailableMirror{Owner: "acme", Repo: "api", Access: "admin", Status: "mirrored"},
-			want: []string{"acme/api", "admin", "mirrored"},
+			name: "multi-cluster mirror row joins its clusters in one cell",
+			row: repoDirRow{Repo: "acme/web", Private: visibilityOf("private"), Status: "ready", Placements: []repoDirPlacement{
+				{Cluster: "us", Status: "ready"},
+				{Cluster: "eu", Status: "ready"},
+			}},
+			want: []string{"acme/web", "us, eu", "Private", "ready", "-"},
 		},
 		{
-			name: "someone else's personal repo",
-			repo: coreapi.AvailableMirror{Owner: "alice", Repo: "secret", Access: "read", Status: "owner-only"},
-			want: []string{"alice/secret", "read", "owner-only"},
+			name: "candidate row: access + availability, clusters dashed",
+			row:  repoDirRow{Repo: "acme/mkt", Private: visibilityOf("public"), Status: "available", Access: "admin"},
+			want: []string{"acme/mkt", "-", "Public", "available", "admin"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := availableMirrorRow(tt.repo)
-			if len(got) != len(tt.want) {
-				t.Fatalf("availableMirrorRow len = %d, want %d (%v)", len(got), len(tt.want), got)
-			}
-			for i := range tt.want {
-				if got[i] != tt.want[i] {
-					t.Errorf("availableMirrorRow[%d] = %q, want %q", i, got[i], tt.want[i])
-				}
-			}
+			require.Equal(t, tt.want, repoDirCells(tt.row))
 		})
 	}
 }
 
-func TestClusterArg(t *testing.T) {
+// TestRepoStatusColor pins the STATUS→color mapping shared by the list and
+// the get views: lifecycle states get a color, owner-only and unknown values
+// stay uncolored. The concrete styles come from statusStyles, tested with the
+// rest of the styling infra; here only the routing is observable.
+func TestRepoStatusColor(t *testing.T) {
 	t.Parallel()
-	if got := clusterArg([]string{"github.com/o/r", "eu-west-1.entire.io"}); got != "eu-west-1.entire.io" {
-		t.Errorf("explicit cluster = %q, want eu-west-1.entire.io", got)
+	st := newStatusStyles(io.Discard)
+	for _, status := range []string{"ready", "available", "processing", "mixed", "failed", "suspended"} {
+		if _, ok := repoStatusColor(st, status); !ok {
+			t.Errorf("repoStatusColor(%q) ok = false, want a lifecycle color", status)
+		}
 	}
-	if got := clusterArg([]string{"github.com/o/r"}); got != defaultClusterHost {
-		t.Errorf("omitted cluster = %q, want default %q", got, defaultClusterHost)
+	for _, status := range []string{"owner-only", "", "unheard-of"} {
+		if _, ok := repoStatusColor(st, status); ok {
+			t.Errorf("repoStatusColor(%q) ok = true, want uncolored", status)
+		}
 	}
 }
 
-// TestResolveOneShotClusterHost_NonInteractive locks in that a non-interactive
-// `repo mirror create <github-url>` keeps the fixed defaultClusterHost without
-// dialing the control plane — scripts must get a stable, offline default. Under
-// `go test`, CanPromptInteractively() is false, so this exercises exactly the
-// script path; no server is running, so any catalog fetch would error.
-func TestResolveOneShotClusterHost_NonInteractive(t *testing.T) {
+// TestStyledCellsDisabledGate pins that the styled cell/header wrappers are
+// exact identities when color is off (pipes, tests, NO_COLOR): agents and
+// scripts must see the bare text, byte for byte.
+func TestStyledCellsDisabledGate(t *testing.T) {
 	t.Parallel()
-	cmd := &cobra.Command{}
-	cmd.SetContext(t.Context())
-	got, err := resolveOneShotClusterHost(cmd)
-	if err != nil {
-		t.Fatalf("resolveOneShotClusterHost() error = %v", err)
-	}
-	if got != defaultClusterHost {
-		t.Errorf("resolveOneShotClusterHost() = %q, want default %q", got, defaultClusterHost)
-	}
+	st := newStatusStyles(io.Discard) // never a TTY → color disabled
+	require.False(t, st.colorEnabled)
+
+	row := repoDirRow{Repo: "acme/web", Private: visibilityOf("private"), Status: "ready", Placements: []repoDirPlacement{
+		{Cluster: "us", Status: "ready", CloneURL: "entire://h/gh/acme/web"},
+	}}
+	require.Equal(t, repoDirCells(row), repoDirCellsStyled(st)(row))
+
+	headers := columnHeaders(repoDirColumns)
+	require.Equal(t, headers, styledHeaders(st, headers))
 }
 
-func TestClusterArgAt(t *testing.T) {
+func TestClusterHostBySlug(t *testing.T) {
 	t.Parallel()
-	// clusterArgAt reads the cluster from the optional positional at an
-	// arbitrary index — here index 2, after two leading positionals.
-	if got := clusterArgAt([]string{"github.com/o/r", "github:alice", "eu-west-1.entire.io"}, 2); got != "eu-west-1.entire.io" {
-		t.Errorf("explicit cluster = %q, want eu-west-1.entire.io", got)
-	}
-	if got := clusterArgAt([]string{"github.com/o/r", "github:alice"}, 2); got != defaultClusterHost {
-		t.Errorf("omitted cluster = %q, want default %q", got, defaultClusterHost)
-	}
+	m := clusterHostBySlug([]coreapi.Cluster{
+		{Slug: "us", PublicUrl: "https://aws-us-east-2.entire.io"},
+		{Slug: "bare", PublicUrl: "eu-west-1.entire.io"}, // no scheme: normalized safely
+	})
+	require.Equal(t, "aws-us-east-2.entire.io", m["us"])
+	require.Equal(t, "eu-west-1.entire.io", m["bare"])
+
+	// A publicUrl that smuggles a host via userinfo is rejected and omitted, so
+	// its slug has no entry — a mirror there renders a dashed clone URL, never
+	// a spoofed one.
+	m = clusterHostBySlug([]coreapi.Cluster{
+		{Slug: "us", PublicUrl: "https://aws-us-east-2.entire.io@evil.com"},
+	})
+	require.Empty(t, m)
 }
 
-func TestMirrorCollaboratorRow(t *testing.T) {
+func TestBuildRepoDir(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		name string
-		in   coreapi.MirrorCollaborator
-		want []string
-	}{
-		{
-			name: "resolved handle",
-			in:   coreapi.MirrorCollaborator{AccountId: "01ACCT", Handle: coreapi.NewOptString("github:alice"), Role: "writer"},
-			want: []string{"github:alice", "writer", "01ACCT"},
-		},
-		{
-			name: "no handle falls back to dash",
-			in:   coreapi.MirrorCollaborator{AccountId: "01ACCT", Role: "reader"},
-			want: []string{"-", "reader", "01ACCT"},
-		},
+	hosts := map[string]string{"us": "aws-us-east-2.entire.io"}
+
+	t.Run("groups mirrors one row per repo and maps candidates", func(t *testing.T) {
+		t.Parallel()
+		rows := buildRepoDir([]coreapi.RepoIndexEntry{
+			onboardedEntry("acme/web", "private", "us"),
+			candidateEntry("acme/mkt", "public", coreapi.RepoCandidateAccessAdmin, true),
+			candidateEntry("alice/x", "private", coreapi.RepoCandidateAccessRead, false),
+		}, hosts, mirrorCloneForge)
+		require.Equal(t, []repoDirRow{
+			{Repo: "/gh/acme/web", Private: visibilityOf("private"), Status: "ready", Placements: []repoDirPlacement{
+				{Cluster: "aws-us-east-2.entire.io", ClusterSlug: "us", Status: "ready", CloneURL: "entire://aws-us-east-2.entire.io/gh/acme/web"},
+			}},
+			{Repo: "/gh/acme/mkt", Private: visibilityOf("public"), Status: "available", Access: "admin"},
+			{Repo: "/gh/alice/x", Private: visibilityOf("private"), Status: "owner-only", Access: "read"},
+		}, rows)
+	})
+
+	t.Run("a multi-cell mirror stays one row, its placements nested in order", func(t *testing.T) {
+		t.Parallel()
+		rows := buildRepoDir([]coreapi.RepoIndexEntry{
+			onboardedMulti("acme/web", "private", "us", "eu"),
+		}, map[string]string{"us": "aws-us-east-2.entire.io", "eu": "eu-west-1.entire.io"}, mirrorCloneForge)
+		require.Len(t, rows, 1)
+		require.Equal(t, []repoDirPlacement{
+			{Cluster: "aws-us-east-2.entire.io", ClusterSlug: "us", Status: "ready", CloneURL: "entire://aws-us-east-2.entire.io/gh/acme/web"},
+			{Cluster: "eu-west-1.entire.io", ClusterSlug: "eu", Status: "ready", CloneURL: "entire://eu-west-1.entire.io/gh/acme/web"},
+		}, rows[0].Placements)
+		require.Equal(t, "ready", rows[0].Status, "placements agree, so the row carries their shared status")
+	})
+
+	t.Run("disagreeing placement statuses roll up to mixed", func(t *testing.T) {
+		t.Parallel()
+		rows := buildRepoDir([]coreapi.RepoIndexEntry{
+			{FullName: "acme/web", Visibility: "private", Placements: []coreapi.RepoPlacement{
+				{ClusterSlug: "us", Status: coreapi.RepoPlacementStatusReady, Mirror: true},
+				{ClusterSlug: "eu", Status: coreapi.RepoPlacementStatusFailed, Mirror: true},
+			}},
+		}, hosts, mirrorCloneForge)
+		require.Len(t, rows, 1)
+		require.Equal(t, repoDirStatusMixed, rows[0].Status)
+		require.Equal(t, "failed", rows[0].Placements[1].Status, "per-placement statuses stay exact")
+	})
+
+	t.Run("unknown cluster slug keeps the placement with an empty clone URL", func(t *testing.T) {
+		t.Parallel()
+		rows := buildRepoDir([]coreapi.RepoIndexEntry{
+			onboardedEntry("a/b", "public", "ghost"),
+		}, map[string]string{}, mirrorCloneForge)
+		require.Len(t, rows, 1)
+		require.Equal(t, []repoDirPlacement{
+			{Cluster: "ghost", ClusterSlug: "ghost", Status: "ready"},
+		}, rows[0].Placements, "unresolved host → no clone URL, and the slug names the placement in the host's place")
+	})
+
+	t.Run("native (non-mirror) placements are dropped, not given fabricated clone URLs", func(t *testing.T) {
+		t.Parallel()
+		// A repo created by `entire repo create` is placed but not mirrored;
+		// it must not appear in the mirror directory with a fake gh clone URL.
+		rows := buildRepoDir([]coreapi.RepoIndexEntry{
+			nativeEntry("acme/native", "private", "us"),
+			onboardedEntry("acme/web", "public", "us"),
+		}, hosts, mirrorCloneForge)
+		require.Equal(t, []repoDirRow{
+			{Repo: "/gh/acme/web", Private: visibilityOf("public"), Status: "ready", Placements: []repoDirPlacement{
+				{Cluster: "aws-us-east-2.entire.io", ClusterSlug: "us", Status: "ready", CloneURL: "entire://aws-us-east-2.entire.io/gh/acme/web"},
+			}},
+		}, rows, "only the mirror row survives; the native repo is dropped")
+	})
+
+	t.Run("a repo with mixed placements keeps only its mirror placements", func(t *testing.T) {
+		t.Parallel()
+		rows := buildRepoDir([]coreapi.RepoIndexEntry{
+			{FullName: "acme/web", Visibility: "public", Placements: []coreapi.RepoPlacement{
+				{ClusterSlug: "us", Status: coreapi.RepoPlacementStatusReady, Mirror: false},
+				{ClusterSlug: "us", Status: coreapi.RepoPlacementStatusReady, Mirror: true},
+			}},
+		}, hosts, mirrorCloneForge)
+		require.Equal(t, []repoDirRow{
+			{Repo: "/gh/acme/web", Private: visibilityOf("public"), Status: "ready", Placements: []repoDirPlacement{
+				{Cluster: "aws-us-east-2.entire.io", ClusterSlug: "us", Status: "ready", CloneURL: "entire://aws-us-east-2.entire.io/gh/acme/web"},
+			}},
+		}, rows)
+	})
+}
+
+// TestChooseMirrorAddRegions_NonInteractive locks in which clusters a
+// non-interactive `repo mirror add <repo>` targets. GitHub keeps a fixed
+// default so scripts are stable; a native repo has none, because which clusters
+// are eligible depends on the repo's own region. A default missing from the
+// catalog is an error naming what is there, never a silent fallback to some
+// other cluster.
+//
+// Under `go test`, CanPromptInteractively() is false, so this is exactly the
+// script path.
+func TestChooseMirrorAddRegions_NonInteractive(t *testing.T) {
+	t.Parallel()
+	clusters := []coreapi.Cluster{
+		{Slug: "aws-eu-central-1", Jurisdiction: "eu", PublicUrl: "https://aws-eu-central-1.entire.io"},
+		{Slug: "aws-us-east-2", Jurisdiction: "us", PublicUrl: "https://" + defaultClusterHost},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := mirrorCollaboratorRow(tt.in)
-			if len(got) != len(tt.want) {
-				t.Fatalf("mirrorCollaboratorRow len = %d, want %d (%v)", len(got), len(tt.want), got)
-			}
-			for i := range tt.want {
-				if got[i] != tt.want[i] {
-					t.Errorf("mirrorCollaboratorRow[%d] = %q, want %q", i, got[i], tt.want[i])
-				}
-			}
-		})
-	}
+	regions := clustersToRegions(clusters)
+	ghRef := mirrorRepoRef{forge: mirrorCloneForge, owner: "acme", repo: "web"}
+	nativeRef := mirrorRepoRef{forge: nativeCloneForge, owner: "acme", repo: "web"}
+
+	t.Run("github falls back to the default cluster", func(t *testing.T) {
+		t.Parallel()
+		got, err := chooseMirrorAddRegions(&cobra.Command{}, ghRef, nil, clusters, regions, nil)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		require.Equal(t, defaultClusterHost, got[0].host)
+	})
+
+	t.Run("a default absent from the catalog errors naming the available clusters", func(t *testing.T) {
+		t.Parallel()
+		only := clusters[:1]
+		_, err := chooseMirrorAddRegions(&cobra.Command{}, ghRef, nil, only, clustersToRegions(only), nil)
+		require.ErrorContains(t, err, defaultClusterHost)
+		require.ErrorContains(t, err, "aws-eu-central-1")
+	})
+
+	t.Run("several named clusters all resolve", func(t *testing.T) {
+		t.Parallel()
+		got, err := chooseMirrorAddRegions(&cobra.Command{}, ghRef, nil, clusters, regions,
+			[]string{"aws-eu-central-1.entire.io", defaultClusterHost})
+		require.NoError(t, err)
+		require.Equal(t, []string{"aws-eu-central-1", "aws-us-east-2"}, regionSlugs(got))
+	})
+
+	// Naming a cluster twice asks for one placement, not two — the create is
+	// idempotent per (repo, cluster), so a duplicate would race itself.
+	t.Run("a repeated cluster collapses", func(t *testing.T) {
+		t.Parallel()
+		got, err := chooseMirrorAddRegions(&cobra.Command{}, ghRef, nil, clusters, regions,
+			[]string{"aws-eu-central-1.entire.io", "AWS-EU-CENTRAL-1.ENTIRE.IO"})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+	})
+
+	// A batch must not half-apply on a mistake: one bad cluster refuses the lot.
+	t.Run("an unknown cluster refuses the whole batch", func(t *testing.T) {
+		t.Parallel()
+		_, err := chooseMirrorAddRegions(&cobra.Command{}, ghRef, nil, clusters, regions,
+			[]string{"aws-eu-central-1.entire.io", "nope.entire.io"})
+		require.ErrorContains(t, err, "unknown cluster")
+	})
+
+	t.Run("a native repo has no safe default", func(t *testing.T) {
+		t.Parallel()
+		_, err := chooseMirrorAddRegions(&cobra.Command{}, nativeRef, nativeTestRepo(), clusters, regions, nil)
+		require.ErrorContains(t, err, "pass --cluster")
+		require.ErrorContains(t, err, "aws-eu-central-1", "it names the regions that ARE eligible")
+		require.NotContains(t, err.Error(), defaultClusterHost, "the repo's own region is not one of them")
+	})
 }
 
 func TestValidateClusterHost(t *testing.T) {
@@ -1122,7 +1781,7 @@ func TestValidateClusterHost(t *testing.T) {
 		host    string
 		wantErr bool
 	}{
-		{name: "default cluster", host: defaultClusterHost},
+		{name: "default cluster", host: "aws-us-east-2.entire.io"},
 		{name: "other region", host: "eu-west-1.entire.io"},
 		{name: "single label", host: "localhost"},
 		{name: "host with port", host: "localhost:8080"},
@@ -1158,12 +1817,16 @@ func TestValidateClusterHost(t *testing.T) {
 	}
 }
 
-// TestRemoveMirror covers `repo mirror remove`'s DeleteMirror call:
-// removeMirror dials via runCoreForCluster, which the activeCoreClient test
-// seam does not intercept, so this drives the helper directly against an
-// httptest server the way the createAndAwaitMirror tests do.
-func TestRemoveMirror(t *testing.T) {
+// TestRemoveOneMirror covers one placement's teardown, the unit the parallel
+// remover fans out over. It drives the helper directly against an httptest
+// server because removeMirrors dials per target, which the activeCoreClient
+// seam does not intercept.
+func TestRemoveOneMirror(t *testing.T) {
 	t.Parallel()
+	target := mirrorTarget{
+		forge: mirrorCloneForge, owner: "octocat", repo: "hello-world",
+		region: regionChoice{slug: "aws-us-east-2", host: "aws-us-east-2.entire.io"},
+	}
 
 	t.Run("success", func(t *testing.T) {
 		t.Parallel()
@@ -1175,30 +1838,15 @@ func TestRemoveMirror(t *testing.T) {
 		c, err := coreapi.NewWithBearer(srv.URL, "tok")
 		require.NoError(t, err)
 
-		var out bytes.Buffer
-		err = removeMirror(t.Context(), &out, c, "octocat", "hello-world", "aws-us-east-2.entire.io")
-		require.NoError(t, err)
-		require.Contains(t, out.String(), "✓ Removed mirror github.com/octocat/hello-world from aws-us-east-2.entire.io")
+		got := removeOneMirror(t.Context(), target, c, nil, time.Minute, nil)
+		require.NoError(t, got.err)
+		require.Equal(t, mirrorStatusRemoved, got.status)
+		require.Equal(t, "/gh/octocat/hello-world", got.ref())
 	})
 
-	t.Run("decoded 404 appends server detail", func(t *testing.T) {
-		t.Parallel()
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			writeNotFoundProblem(t, w)
-		}))
-		t.Cleanup(srv.Close)
-		c, err := coreapi.NewWithBearer(srv.URL, "tok")
-		require.NoError(t, err)
-
-		var out bytes.Buffer
-		err = removeMirror(t.Context(), &out, c, "octocat", "hello-world", "aws-us-east-2.entire.io")
-		require.Error(t, err)
-		require.ErrorContains(t, err, "may be on a different cluster")
-		require.ErrorContains(t, err, "(server: not found)")
-		require.Empty(t, out.String())
-	})
-
-	t.Run("non-404 server error passes through the problem detail", func(t *testing.T) {
+	// A failure folds into the result rather than returning: one placement must
+	// not sink a batch of them.
+	t.Run("a server error becomes a failed row, not a returned error", func(t *testing.T) {
 		t.Parallel()
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/problem+json")
@@ -1211,134 +1859,480 @@ func TestRemoveMirror(t *testing.T) {
 		c, err := coreapi.NewWithBearer(srv.URL, "tok")
 		require.NoError(t, err)
 
-		var out bytes.Buffer
-		err = removeMirror(t.Context(), &out, c, "octocat", "hello-world", "aws-us-east-2.entire.io")
-		require.Error(t, err)
-		require.Equal(t, "boom", coreapi.APIError(err))
-		require.Empty(t, out.String())
+		got := removeOneMirror(t.Context(), target, c, nil, time.Minute, nil)
+		require.Error(t, got.err)
+		require.Equal(t, mirrorStatusError, got.status)
+		// Rendered for display, like createOneMirror's failures: the row carries
+		// the server's own detail rather than ogen's decoded struct.
+		require.ErrorContains(t, got.err, "boom")
+	})
+
+	t.Run("a client that could not be built fails only its own row", func(t *testing.T) {
+		t.Parallel()
+		got := removeOneMirror(t.Context(), target, nil, errors.New("no login for that cluster"), time.Minute, nil)
+		require.ErrorContains(t, got.err, "no login for that cluster")
+		require.Equal(t, mirrorStatusError, got.status)
 	})
 }
 
-// mirrorRepoHosts renders each mirror as "owner/repo@clusterHost" so a sorted
-// slice's order (including the cluster tiebreak) is asserted in one line.
-func mirrorRepoHosts(mirrors []coreapi.Mirror) []string {
-	out := make([]string, len(mirrors))
-	for i, m := range mirrors {
-		out[i] = m.Owner + "/" + m.Repo + "@" + m.ClusterHost
+// repoDirKeys renders each row as "repo@clusters" so a sorted slice's order
+// (including the CLUSTERS-cell tiebreak) is asserted in one line.
+func repoDirKeys(rows []repoDirRow) []string {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i] = r.Repo + "@" + repoDirClusters(r)
 	}
 	return out
 }
 
-func TestSortMirrors(t *testing.T) {
+// placedOn builds the nested placements for a sort fixture row, one ready
+// placement per slug.
+func placedOn(slugs ...string) []repoDirPlacement {
+	out := make([]repoDirPlacement, len(slugs))
+	for i, s := range slugs {
+		out[i] = repoDirPlacement{Cluster: s, Status: "ready"}
+	}
+	return out
+}
+
+func TestSortRepoDir(t *testing.T) {
 	t.Parallel()
 
-	// One repo mirrored on two clusters (delivered eu-first) plus a
-	// lexically-earlier repo, so both the primary key and the cluster tiebreak
+	// Two same-owner repos plus a row colliding with one of them on every
+	// non-name column, so both the primary key and the name/clusters tiebreak
 	// are observable.
-	base := func() []coreapi.Mirror {
-		return []coreapi.Mirror{
-			{Owner: "acme", Repo: "web", ClusterHost: "eu-west-1.entire.io", IsPrivate: coreapi.NewOptBool(true)},
-			{Owner: "acme", Repo: "web", ClusterHost: "aws-us-east-2.entire.io", IsPrivate: coreapi.NewOptBool(false)},
-			{Owner: "acme", Repo: "api", ClusterHost: "aws-us-east-2.entire.io", IsPrivate: coreapi.NewOptBool(false)},
+	base := func() []repoDirRow {
+		return []repoDirRow{
+			{Repo: "acme/web", Private: visibilityOf("private"), Status: "ready", Placements: placedOn("us", "eu")},
+			{Repo: "beta/api", Private: visibilityOf("public"), Status: "ready", Placements: placedOn("eu")},
+			{Repo: "acme/api", Private: visibilityOf("public"), Status: "ready", Placements: placedOn("us")},
 		}
 	}
 
-	t.Run("default sorts owner/repo then cluster ascending", func(t *testing.T) {
+	t.Run("default sorts by repo name ascending", func(t *testing.T) {
 		t.Parallel()
-		m := base()
-		require.NoError(t, sortMirrors(m, ""))
+		r := base()
+		require.NoError(t, sortRepoDir(r, ""))
 		require.Equal(t, []string{
-			"acme/api@aws-us-east-2.entire.io",
-			"acme/web@aws-us-east-2.entire.io",
-			"acme/web@eu-west-1.entire.io",
-		}, mirrorRepoHosts(m))
+			"acme/api@us",
+			"acme/web@us, eu",
+			"beta/api@eu",
+		}, repoDirKeys(r))
 	})
 
-	t.Run("-name reverses the whole ordering, tiebreak included", func(t *testing.T) {
+	t.Run("-name reverses the ordering", func(t *testing.T) {
 		t.Parallel()
-		m := base()
-		require.NoError(t, sortMirrors(m, "-name"))
+		r := base()
+		require.NoError(t, sortRepoDir(r, "-name"))
 		require.Equal(t, []string{
-			"acme/web@eu-west-1.entire.io",
-			"acme/web@aws-us-east-2.entire.io",
-			"acme/api@aws-us-east-2.entire.io",
-		}, mirrorRepoHosts(m))
+			"beta/api@eu",
+			"acme/web@us, eu",
+			"acme/api@us",
+		}, repoDirKeys(r))
 	})
 
-	t.Run("non-name column sorts keep the owner/repo+cluster tiebreak", func(t *testing.T) {
+	t.Run("non-name column sort falls back to the name tiebreak", func(t *testing.T) {
 		t.Parallel()
-		// All three sort keys collide on "private" once acme/api and the aws web
-		// mirror are both public; the deterministic order must fall back to
-		// owner/repo then cluster, not arbitrary input order.
-		m := base()
-		require.NoError(t, sortMirrors(m, "private"))
+		// beta/api and acme/api collide on "ready"+Public; within the tie the
+		// order must fall back to repo name, not the input order.
+		r := base()
+		require.NoError(t, sortRepoDir(r, "visibility"))
 		require.Equal(t, []string{
-			// "no" (public) group first, ordered by owner/repo then cluster.
-			"acme/api@aws-us-east-2.entire.io",
-			"acme/web@aws-us-east-2.entire.io",
-			// "yes" (private) group last.
-			"acme/web@eu-west-1.entire.io",
-		}, mirrorRepoHosts(m))
+			// "private" sorts before "public"; the Private row leads, the
+			// Public group follows ordered by repo name.
+			"acme/web@us, eu",
+			"acme/api@us",
+			"beta/api@eu",
+		}, repoDirKeys(r))
+	})
+
+	t.Run("clusters sorts by the joined CLUSTERS cell", func(t *testing.T) {
+		t.Parallel()
+		r := base()
+		require.NoError(t, sortRepoDir(r, "clusters"))
+		require.Equal(t, []string{
+			// "eu" < "us" < "us, eu"; the eu-only row leads.
+			"beta/api@eu",
+			"acme/api@us",
+			"acme/web@us, eu",
+		}, repoDirKeys(r))
 	})
 
 	t.Run("whitespace spec parses direction from the trimmed spec", func(t *testing.T) {
 		t.Parallel()
-		m := base()
-		require.NoError(t, sortMirrors(m, " -name"))
+		r := base()
+		require.NoError(t, sortRepoDir(r, " -name"))
 		require.Equal(t, []string{
-			"acme/web@eu-west-1.entire.io",
-			"acme/web@aws-us-east-2.entire.io",
-			"acme/api@aws-us-east-2.entire.io",
-		}, mirrorRepoHosts(m))
+			"beta/api@eu",
+			"acme/web@us, eu",
+			"acme/api@us",
+		}, repoDirKeys(r))
 	})
 
 	t.Run("unknown column errors naming valid columns", func(t *testing.T) {
 		t.Parallel()
-		err := sortMirrors(base(), "nope")
+		err := sortRepoDir(base(), "nope")
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "unknown sort column")
 		require.Contains(t, err.Error(), "name")
 	})
 }
 
-func TestSortAvailable(t *testing.T) {
-	t.Parallel()
+// TestRepoMirrorList_PageMode pins single-page cursor passthrough on the
+// merged directory: one /repos request per call, an --json envelope carrying
+// nextPageToken, a table resume hint on stderr, and the (experimental)
+// client-side filters/sort applying to just that page.
+//
+// Not parallel: swaps the package-level activeCoreClient seam.
+func TestRepoMirrorList_PageMode(t *testing.T) {
+	clusters := []coreapi.Cluster{{Slug: "us", PublicUrl: "https://aws-us-east-2.entire.io"}}
 
-	base := func() []coreapi.AvailableMirror {
-		return []coreapi.AvailableMirror{
-			{Owner: "acme", Repo: "web", Access: "write", Status: "available"},
-			{Owner: "acme", Repo: "api", Access: "read", Status: "available"},
-			{Owner: "acme", Repo: "cli", Access: "read", Status: "available"},
+	t.Run("--page-size makes one request and hints the resume token", func(t *testing.T) {
+		recCh := serveRepoListPaged(t, []coreapi.ListReposOutputBody{
+			{
+				Repos:         []coreapi.RepoIndexEntry{onboardedEntry("acme/web", "private", "us")},
+				NextPageToken: coreapi.NewOptString("p2"),
+			},
+			{
+				Repos: []coreapi.RepoIndexEntry{onboardedEntry("tail/end", "private", "us")},
+			},
+		}, clusters)
+		stdout, stderr := runMirrorList(t, "--page-size", "1")
+		rec := <-recCh
+		require.Equal(t, "1", rec.query.Get("pageSize"))
+		select {
+		case rec := <-recCh:
+			t.Fatalf("page mode must make exactly one request, got a second with pageToken=%q", rec.query.Get("pageToken"))
+		default:
 		}
-	}
-	repos := func(avail []coreapi.AvailableMirror) []string {
-		out := make([]string, len(avail))
-		for i, m := range avail {
-			out[i] = m.Owner + "/" + m.Repo
-		}
-		return out
-	}
-
-	t.Run("sorts by access with an owner/repo tiebreak on equal keys", func(t *testing.T) {
-		t.Parallel()
-		a := base()
-		require.NoError(t, sortAvailable(a, "access"))
-		// "read" < "write"; within read, acme/api < acme/cli by owner/repo.
-		require.Equal(t, []string{"acme/api", "acme/cli", "acme/web"}, repos(a))
+		require.Contains(t, stdout, "acme/web")
+		require.NotContains(t, stdout, "tail/end")
+		require.Contains(t, stderr, "--page-token p2")
 	})
 
-	t.Run("whitespace spec parses direction from the trimmed spec", func(t *testing.T) {
-		t.Parallel()
-		a := base()
-		require.NoError(t, sortAvailable(a, " -name"))
-		require.Equal(t, []string{"acme/web", "acme/cli", "acme/api"}, repos(a))
+	t.Run("--json page mode emits the envelope and filters apply to the page", func(t *testing.T) {
+		serveRepoListPaged(t, []coreapi.ListReposOutputBody{
+			{
+				Repos: []coreapi.RepoIndexEntry{
+					onboardedEntry("acme/web", "private", "us"),
+					candidateEntry("acme/marketing", "public", coreapi.RepoCandidateAccessAdmin, true),
+				},
+				NextPageToken: coreapi.NewOptString("p2"),
+			},
+			{
+				Repos: []coreapi.RepoIndexEntry{onboardedEntry("tail/end", "private", "us")},
+			},
+		}, clusters)
+		stdout, _ := runMirrorList(t, "--json", "--page-size", "2", "--status", "available")
+		var envelope struct {
+			Items         []repoDirRow `json:"items"`
+			NextPageToken string       `json:"nextPageToken"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(stdout), &envelope))
+		require.Len(t, envelope.Items, 1, "the client-side --status filter applies to the fetched page")
+		require.Equal(t, "/gh/acme/marketing", envelope.Items[0].Repo)
+		require.Equal(t, "p2", envelope.NextPageToken, "the cursor survives local filtering")
 	})
 
-	t.Run("unknown column errors naming valid columns", func(t *testing.T) {
-		t.Parallel()
-		err := sortAvailable(base(), "nope")
+	t.Run("an explicitly empty --page-token still selects page mode", func(t *testing.T) {
+		// A script's resume loop naturally starts with an empty cursor; the
+		// output shape must not flip to the multi-page walk on the token's
+		// value — page mode is opted into by setting the flag.
+		recCh := serveRepoListPaged(t, []coreapi.ListReposOutputBody{
+			{
+				Repos:         []coreapi.RepoIndexEntry{onboardedEntry("acme/web", "private", "us")},
+				NextPageToken: coreapi.NewOptString("p2"),
+			},
+			{
+				Repos: []coreapi.RepoIndexEntry{onboardedEntry("tail/end", "private", "us")},
+			},
+		}, clusters)
+		stdout, stderr := runMirrorList(t, "--page-token", "")
+		rec := <-recCh
+		require.Empty(t, rec.query.Get("pageToken"), "an empty cursor addresses the first page")
+		select {
+		case rec := <-recCh:
+			t.Fatalf("page mode must make exactly one request, got a second with pageToken=%q", rec.query.Get("pageToken"))
+		default:
+		}
+		require.Contains(t, stdout, "acme/web")
+		require.NotContains(t, stdout, "tail/end")
+		require.Contains(t, stderr, "--page-token p2")
+	})
+
+	t.Run("a truncated page with no cursor warns on stderr, --json included", func(t *testing.T) {
+		// The server said the directory was cut short and offered no cursor to
+		// continue from: the page must not read as complete, in either output
+		// mode — a script acting on silently truncated data is the worst
+		// outcome, and stderr never corrupts the stdout JSON.
+		entries := []coreapi.RepoIndexEntry{onboardedEntry("acme/web", "private", "us")}
+		serveRepoList(t, entries, clusters, true)
+		_, stderr := runMirrorList(t, "--page-size", "5")
+		require.Contains(t, stderr, "truncated")
+
+		serveRepoList(t, entries, clusters, true)
+		stdout, stderr := runMirrorList(t, "--json", "--page-size", "5")
+		require.Contains(t, stderr, "truncated")
+		require.Contains(t, stdout, `"items"`, "the envelope still renders")
+	})
+
+	t.Run("a truncated page with a cursor to continue from does not warn", func(t *testing.T) {
+		// A capped page the cursor can walk past leaves nothing unreachable;
+		// the resume hint already tells the caller how to continue.
+		serveRepoListPaged(t, []coreapi.ListReposOutputBody{
+			{
+				Repos:         []coreapi.RepoIndexEntry{onboardedEntry("acme/web", "private", "us")},
+				NextPageToken: coreapi.NewOptString("p2"),
+				Truncated:     true,
+			},
+			{
+				Repos: []coreapi.RepoIndexEntry{onboardedEntry("tail/end", "private", "us")},
+			},
+		}, clusters)
+		_, stderr := runMirrorList(t, "--page-size", "1")
+		require.NotContains(t, stderr, "truncated")
+		require.Contains(t, stderr, "--page-token p2")
+	})
+
+	t.Run("page mode excludes the walk flags", func(t *testing.T) {
+		serveRepoListPaged(t, nil, clusters)
+		for _, combo := range [][]string{
+			{"--page-size", "5", "--all"},
+			{"--page-token", "p2", "--limit", "3"},
+		} {
+			err := runMirrorListErr(t, combo...)
+			require.Error(t, err, "combo %v must be rejected", combo)
+		}
+	})
+}
+
+// TestRepoMirrorList_FilterGroupNote pins the fetched-window caveat: stated
+// once, at the Filtering & Sorting group level (between the section header
+// and its first flag), telling the user what the flags apply to and how to
+// widen it. Every flag in the group runs on the client today (/repos offers
+// the server no filter or sort params); a flag that gains a server-side
+// implementation must leave the group.
+func TestRepoMirrorList_FilterGroupNote(t *testing.T) {
+	stdout, _, err := execMirrorList(t, "--help")
+	require.NoError(t, err)
+	const note = "Applied only to the fetched rows; combine with --all to filter/sort the complete mirror list."
+	require.Equal(t, 1, strings.Count(stdout, note), "the window note appears exactly once, at group level")
+	idx := strings.Index(stdout, "Filtering & Sorting Flags:")
+	require.GreaterOrEqual(t, idx, 0, "expected a Filtering & Sorting Flags section")
+	requireOrder(t, stdout[idx:],
+		"Filtering & Sorting Flags:", note, "--access",
+	)
+}
+
+// TestRepoMirrorList_GroupedFlagHelp pins the grouped help layout: flags are
+// presented by usage — navigation (how much is fetched / which page),
+// filtering & sorting (client-side, window-scoped), formatting — so the
+// window semantics are legible at a glance.
+func TestRepoMirrorList_GroupedFlagHelp(t *testing.T) {
+	stdout, _, err := execMirrorList(t, "--help")
+	require.NoError(t, err)
+	// Anchor past the Long text (which mentions flags by name) so the order
+	// assertions see only the flag sections.
+	idx := strings.Index(stdout, "Navigation Flags:")
+	require.GreaterOrEqual(t, idx, 0, "expected a Navigation Flags section")
+	requireOrder(t, stdout[idx:],
+		"Navigation Flags:", "--all", "--limit", "--page-size", "--page-token",
+		"Filtering & Sorting Flags:", "--access", "--available", "--cluster", "--mirrored", "--name", "--owner", "--private", "--sort", "--status",
+		"Formatting Flags:", "--json", "--no-pager",
+	)
+}
+
+// seamClusterCoreClient routes every cluster-addressed core call at client for
+// the test's duration.
+func seamClusterCoreClient(t *testing.T, client *coreapi.Client) {
+	t.Helper()
+	prev := clusterCoreClient
+	clusterCoreClient = func(context.Context, string) (*coreapi.Client, error) { return client, nil }
+	t.Cleanup(func() { clusterCoreClient = prev })
+}
+
+// testClusterCatalog is the catalog the cluster-flag tests resolve --cluster
+// against: one slug whose host is obviously not derivable from it, plus the
+// default, so a test that passed a host through unchanged would fail.
+var testClusterCatalog = []coreapi.Cluster{
+	{Slug: "eu", PublicUrl: "https://eu.example"},
+	{Slug: "aws-us-east-2", PublicUrl: "https://" + defaultClusterHost},
+}
+
+// serveRemovePlacements stands up the active-context half of `mirror remove`:
+// the cluster catalog, and the pull-gated placement list that says where the
+// repo actually is. The delete itself goes to the cluster's own core, which
+// seamClusterCoreClient intercepts separately.
+func serveRemovePlacements(t *testing.T, hosts ...string) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == testClustersPath:
+			assert.NoError(t, printJSON(w, &coreapi.ListClustersOutputBody{Clusters: testClusterCatalog}))
+		case strings.HasSuffix(r.URL.Path, "/mirrors/placements"):
+			placements := make([]coreapi.ResolvedPlacement, 0, len(hosts))
+			for _, h := range hosts {
+				placements = append(placements, coreapi.ResolvedPlacement{ClusterHost: h})
+			}
+			assert.NoError(t, printJSON(w, &coreapi.ResolvePlacementsOutputBody{Placements: placements}))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	prev := activeCoreClient
+	activeCoreClient = func(context.Context) (*coreapi.Client, error) {
+		return coreapi.NewWithBearer(srv.URL, "tok")
+	}
+	t.Cleanup(func() { activeCoreClient = prev })
+}
+
+// TestRepoMirrorRemove_ClusterFlag pins how `mirror remove` chooses what to
+// remove: --cluster takes catalog SLUGS and several at once, the command
+// resolves each to the host it dials, and there is NO default — removing is
+// destructive and which clusters a repo is on is a property of the repo, so a
+// non-interactive run with no --cluster refuses rather than guessing.
+//
+// Not parallel: swaps the package-level activeCoreClient and clusterCoreClient
+// seams.
+func TestRepoMirrorRemove_ClusterFlag(t *testing.T) {
+	var deleted []string
+	var mu sync.Mutex
+	client := newMirrorRequestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		mu.Lock()
+		deleted = append(deleted, r.URL.Query().Get("clusterHost"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	// The resolver lists only eu. aws-us-east-2 is in the catalog but NOT in the
+	// listing — the shape a failed or unpullable placement takes, which must
+	// still be removable when named.
+	serveRemovePlacements(t, "eu.example")
+	seamClusterCoreClient(t, client)
+	run := func(args ...string) (stdout string, err error) {
+		mu.Lock()
+		deleted = nil
+		mu.Unlock()
+		cmd := newRepoMirrorRemoveCmd()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs(args)
+		err = cmd.ExecuteContext(t.Context())
+		return out.String(), err
+	}
+
+	t.Run("--cluster names the cluster by host", func(t *testing.T) {
+		stdout, err := run("/gh/o/r", "--cluster", "eu.example")
+		require.NoError(t, err)
+		require.Equal(t, []string{"eu.example"}, deleted)
+		require.Contains(t, stdout, "/gh/o/r")
+		require.Contains(t, stdout, mirrorStatusRemoved)
+	})
+
+	// The whole point of accepting several: one invocation, one summary. The
+	// second cluster is also the unlisted one, so this pins that a cluster the
+	// caller named explicitly reaches the server even when the pull-gated
+	// resolver did not report it — otherwise the placement most worth tearing
+	// down (failed, suspended, unpullable) would be unreachable.
+	t.Run("several clusters are removed in one run, listed or not", func(t *testing.T) {
+		_, err := run("/gh/o/r", "--cluster", "eu.example,"+defaultClusterHost)
+		require.NoError(t, err)
+		require.ElementsMatch(t, []string{"eu.example", "aws-us-east-2.entire.io"}, deleted)
+	})
+
+	// No default: guessing a cluster would delete a copy the caller never named.
+	t.Run("omitting --cluster refuses and names where the repo is", func(t *testing.T) {
+		_, err := run("/gh/o/r")
+		require.ErrorContains(t, err, "pass --cluster")
+		require.ErrorContains(t, err, "eu.example")
+		require.Empty(t, deleted)
+	})
+
+	// A cluster in neither the listing nor the catalog is a typo, and the
+	// answer names where the repo actually is.
+	t.Run("a cluster that exists nowhere names where the repo is", func(t *testing.T) {
+		_, err := run("/gh/o/r", "--cluster", "nope.example")
+		require.ErrorContains(t, err, "unknown cluster")
+		require.ErrorContains(t, err, "eu.example")
+		require.Empty(t, deleted)
+	})
+
+	t.Run("a second positional is refused before any request", func(t *testing.T) {
+		_, err := run("/gh/o/r", "eu.example")
+		require.ErrorContains(t, err, "accepts 1 arg(s)")
+		require.Empty(t, deleted)
+	})
+}
+
+// TestRepoView_NamesARepoOneWay pins the grammar of `repo view`: a repo is
+// named with its forge, so a bare pair is REFUSED — and because the verb
+// serves both forges, the refusal suggests both spellings rather than the one
+// the resolver happens to reach first.
+//
+// Not parallel: swaps the package-level activeCoreClient seam.
+func TestRepoView_NamesARepoOneWay(t *testing.T) {
+	var filters []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		filters = append(filters, r.URL.Query().Get("filter"))
+		writeJSONResponse(t, w, http.StatusOK, &coreapi.ListReposOutputBody{})
+	}))
+	t.Cleanup(srv.Close)
+	prev := activeCoreClient
+	activeCoreClient = func(context.Context) (*coreapi.Client, error) {
+		return coreapi.NewWithBearer(srv.URL, "tok")
+	}
+	t.Cleanup(func() { activeCoreClient = prev })
+
+	run := func(ref string) error {
+		filters = nil
+		cmd := newRepoViewCmd()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&out)
+		cmd.SetArgs([]string{ref})
+		return cmd.ExecuteContext(t.Context())
+	}
+
+	t.Run("the qualified form reaches the by-name lookup", func(t *testing.T) {
+		err := run("/gh/octocat/hello-world")
+		require.ErrorContains(t, err, "no repo matching", "the fake server holds nothing")
+		// The server filter is the bare pair; the forge is the CLI's grammar.
+		require.Equal(t, []string{"octocat/hello-world"}, filters)
+	})
+
+	t.Run("a bare pair is refused and offered both forges", func(t *testing.T) {
+		err := run("octocat/hello-world")
+		require.ErrorContains(t, err, "must name its forge")
+		require.ErrorContains(t, err, "/gh/octocat/hello-world")
+		require.ErrorContains(t, err, "/et/octocat/hello-world")
+		require.Empty(t, filters, "it must not reach the control plane")
+	})
+
+	// A native ref is served now, so it leaves the GitHub directory filter
+	// alone: a native repo is found through its project, and its placements come
+	// from the repo itself plus its native-mirror list. (The fake server answers
+	// every path, so the project lookup below fails on an empty response rather
+	// than on the grammar.)
+	t.Run("a native ref takes the native lookup, not the repos filter", func(t *testing.T) {
+		err := run("/et/my-project/my-repo")
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "unknown sort column")
-		require.Contains(t, err.Error(), "access")
+		require.NotContains(t, err.Error(), "does not support")
+		require.NotContains(t, filters, "my-project/my-repo",
+			"the GitHub directory filter is not how a native repo is found")
 	})
+}
+
+func regionSlugs(regions []regionChoice) []string {
+	out := make([]string, 0, len(regions))
+	for _, r := range regions {
+		out = append(out, r.slug)
+	}
+	slices.Sort(out)
+	return out
 }

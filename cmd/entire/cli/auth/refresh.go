@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,7 +15,9 @@ import (
 	authtokenstore "github.com/entireio/auth-go/tokenstore"
 
 	"github.com/entireio/cli/internal/entireclient/contexts"
+	"github.com/entireio/cli/internal/entireclient/netcause"
 	"github.com/entireio/cli/internal/entireclient/tokenstore"
+	"github.com/entireio/cli/internal/entireclient/userdirs"
 )
 
 // defaultSavedTokenTTL is the encoded keychain expiry used when a refreshed
@@ -104,12 +108,12 @@ func (s contextTokenStore) DeleteTokens(string) error {
 	return nil
 }
 
-// newContextTokenManager builds the per-context auth-go tokenmanager that both
-// NewRefreshingLoginProvider and NewRefreshingResourceProvider sit on. Keying
-// Issuer on c.CoreURL is the whole point: store reads, the refresh grant, and
-// the STS exchange all target that context's core, so a multi-core user's
-// credentials never travel to (or get keyed under) a host the context
-// doesn't belong to.
+// newContextTokenManager builds the per-context auth-go tokenmanager that
+// NewRefreshingLoginProvider sits on. Keying Issuer on c.CoreURL is the whole
+// point: store reads and the refresh grant target that context's core, so a
+// multi-core user's credentials never travel to (or get keyed under) a host
+// the context doesn't belong to. It only refreshes: data-plane bearers are
+// the login JWT itself (ResolveDataAPIToken).
 //
 // transport carries the caller's TLS configuration; allowInsecureHTTP permits
 // an http:// core/resource for loopback/dev.
@@ -120,20 +124,38 @@ func newContextTokenManager(c *contexts.Context, transport http.RoundTripper, al
 	if c.KeychainService == "" || c.Handle == "" {
 		return nil, fmt.Errorf("context %q has no keychain slot", c.Name)
 	}
+	lockDir, err := tokenManagerLockDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve auth lock directory for context %q: %w", c.Name, err)
+	}
 	mgr, err := tokenmanager.New(tokenmanager.Config{
 		Issuer:            strings.TrimRight(c.CoreURL, "/"),
 		ClientID:          oauthClientID,
-		STSPath:           oauthSTSPath,
 		RefreshPath:       oauthTokenPath,
 		Store:             contextTokenStore{service: c.KeychainService, handle: c.Handle},
 		Transport:         transport,
 		AllowInsecureHTTP: allowInsecureHTTP,
 		UserAgent:         oauthClientID,
+		LockDir:           lockDir,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("init token manager for context %q: %w", c.Name, err)
 	}
 	return mgr, nil
+}
+
+// tokenManagerLockDir puts auth-go's cross-process refresh lock in Entire's
+// per-user cache instead of auth-go's default, os.UserCacheDir()/auth-go.
+// That default ignores XDG_CACHE_HOME on macOS, so spawned test binaries,
+// which the testdirs fallback cannot reach, locked in the developer's real
+// ~/Library/Caches. The lock only serializes refreshes of the rotating refresh
+// token between processes that resolve the same directory.
+func tokenManagerLockDir() (string, error) {
+	cache, err := userdirs.CacheDirChecked()
+	if err != nil {
+		return "", err //nolint:wrapcheck // the caller wraps it with the context name
+	}
+	return filepath.Join(cache, "auth-locks"), nil
 }
 
 // reauthError carries a friendly, context-named re-login message while still
@@ -149,16 +171,22 @@ type reauthError struct {
 func (e *reauthError) Error() string { return e.msg }
 func (e *reauthError) Unwrap() error { return e.sentinel }
 
-// contextReauthError maps the two re-auth sentinels a per-context manager can
-// return into a friendly message that names the context and its core (so a
-// multi-core user logs back into the right one — matching the
-// "no auth context, run `entire login`" hint style used by clusterdiscovery),
-// preserving the sentinel for errors.Is. Returns nil when err is neither
-// sentinel, leaving the caller to wrap the residual error in its own terms
-// (refresh vs exchange).
-func contextReauthError(c *contexts.Context, err error) error {
+// contextAuthError maps the per-context auth failures worth rewording into
+// messages that name the context and its core (so a multi-core user logs back
+// into the right one — matching the "no auth context, run `entire login`" hint
+// style used by clusterdiscovery): the two re-auth sentinels a per-context
+// manager can return, preserving the sentinel for errors.Is, and a core we
+// could not reach. Returns nil for everything else, leaving the caller to wrap
+// the residual error in its own terms (refresh vs exchange).
+func contextAuthError(c *contexts.Context, err error) error {
 	coreURL := strings.TrimRight(c.CoreURL, "/")
 	switch {
+	case errors.Is(err, tokenstore.ErrKeyringUnavailable):
+		// The login exists; it just can't be read from here. Name the login
+		// and keep the keyring's explanation, not the store-read chain. First,
+		// because a keyring that could not be read makes any "expired" or
+		// "not logged in" conclusion in the same chain unreliable.
+		return fmt.Errorf("cannot read the saved login for %q (%s): %w", c.Name, coreURL, tokenstore.ErrKeyringUnavailable)
 	case errors.Is(err, tokenmanager.ErrReauthRequired):
 		return &reauthError{
 			msg:      fmt.Sprintf("login session for %q (%s) expired; run `entire login` to re-authenticate", c.Name, coreURL),
@@ -170,12 +198,114 @@ func contextReauthError(c *contexts.Context, err error) error {
 			sentinel: tokenmanager.ErrNotLoggedIn,
 		}
 	}
-	return nil
+	return contextUnreachableError(c, coreURL, err)
+}
+
+// contextUnreachableError maps a transport-level failure talking to a context's
+// core (connection refused, DNS miss, TLS failure, timeout) into a message that
+// names the context and the host it chose, and offers the two ways out:
+// re-login, or switch to another saved login.
+//
+// This is the stale-context case, and it is the one an unadorned error serves
+// worst: a context left pointing at a local dev core that is no longer
+// listening surfaces as a bare `dial tcp [::1]:8180: connect: connection
+// refused`, naming neither the context that chose that host nor a command that
+// fixes it.
+//
+// Scope: the paths that MINT a token (this refresh, and the STS exchange). A
+// command holding a locally-valid access token makes no call here, so the same
+// dead core surfaces from the request instead — with the host but no context
+// name or hint (see internal/coreapi's transport). Covering that too means
+// carrying the context name on auth.ControlPlaneTarget so the coreapi client
+// can reword its own transport failures next to CoreOrigin().
+//
+// Gated on *url.Error, which the http client returns only for transport-level
+// failures — a 4xx/5xx from the token endpoint is a credential problem, not a
+// reachability one, and keeps its own text. Cancellation and deadline are
+// excluded for the same reason (the user hit Ctrl-C, or an enclosing timeout
+// fired; neither says anything about the core). DNS misses need no separate
+// tier here (cf. isRecapNetworkError in the cli package): reaching the core
+// always goes through http.Client, which wraps a *net.DNSError in a *url.Error
+// too.
+//
+// urlErr.Err is wrapped rather than urlErr itself so the message doesn't repeat
+// the core URL we already name; errors.Is against the syscall/net cause still
+// matches. http.Client always sets it.
+//
+// When the cause can be named (netcause.Hint) it leads the advice. A connection
+// the operating system refused (a sandbox or firewall) never reached the core,
+// so the re-login and switch hints are dropped: they cannot fix it.
+func contextUnreachableError(c *contexts.Context, coreURL string, err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil
+	}
+	const switchHint = "run `entire login` to sign in again, or `entire auth switch <context>` to switch to another login"
+	// Denied is decided apart from Hint: Hint is empty when the transport
+	// already explained the cause, and a denial must still drop switchHint.
+	hint := netcause.Hint(err)
+	var advice string
+	switch {
+	case netcause.Denied(err):
+		advice = hint
+	case hint != "":
+		advice = hint + "; if this login server no longer exists, " + switchHint
+	default:
+		advice = switchHint
+	}
+	if advice == "" {
+		return fmt.Errorf("cannot reach the login server for %q (%s): %w", c.Name, coreURL, urlErr.Err)
+	}
+	return fmt.Errorf("cannot reach the login server for %q (%s): %w; %s", c.Name, coreURL, urlErr.Err, advice)
+}
+
+// RefreshingLoginCredential resolves a context's login JWT and can force a
+// refresh after a server rejects a still-locally-valid token.
+type RefreshingLoginCredential struct {
+	context *contexts.Context
+	manager *tokenmanager.Manager
+}
+
+// NewRefreshingLoginCredential returns a refreshable login credential for
+// context c.
+func NewRefreshingLoginCredential(c *contexts.Context, transport http.RoundTripper, allowInsecureHTTP bool) (*RefreshingLoginCredential, error) {
+	mgr, err := newContextTokenManager(c, transport, allowInsecureHTTP)
+	if err != nil {
+		return nil, err
+	}
+	return &RefreshingLoginCredential{context: c, manager: mgr}, nil
+}
+
+// Token returns a locally fresh login JWT, refreshing it when needed.
+func (c *RefreshingLoginCredential) Token(ctx context.Context) (string, error) {
+	tok, err := c.manager.Refresh(ctx)
+	return c.result(tok, err)
+}
+
+// ForceRefresh re-mints the login JWT after staleToken was rejected by the
+// server despite still appearing locally valid.
+func (c *RefreshingLoginCredential) ForceRefresh(ctx context.Context, staleToken string) (string, error) {
+	tok, err := c.manager.ForceRefresh(ctx, staleToken)
+	return c.result(tok, err)
+}
+
+func (c *RefreshingLoginCredential) result(tok string, err error) (string, error) {
+	if mapped := contextAuthError(c.context, err); mapped != nil {
+		return "", mapped
+	}
+	if err != nil {
+		return "", fmt.Errorf("refresh login token: %w", err)
+	}
+	return tok, nil
 }
 
 // NewRefreshingLoginProvider returns a login-JWT provider (the shape
-// repocreds wants) for context c that transparently re-mints an expired
-// login JWT from the stored refresh token.
+// repocreds wants) for context c that transparently re-mints an expired login
+// JWT from the stored refresh token. Call NewRefreshingLoginCredential when a
+// reactive 401 path also needs to force-refresh a rejected token.
 //
 // It is backed by auth-go's tokenmanager, which is what makes this safe
 // against the server's single-use refresh-token rotation: refreshes are
@@ -193,20 +323,11 @@ func contextReauthError(c *contexts.Context, err error) error {
 // transport carries the caller's TLS configuration; allowInsecureHTTP
 // permits an http:// core for loopback/dev.
 func NewRefreshingLoginProvider(c *contexts.Context, transport http.RoundTripper, allowInsecureHTTP bool) (func(context.Context) (string, error), error) {
-	mgr, err := newContextTokenManager(c, transport, allowInsecureHTTP)
+	credential, err := NewRefreshingLoginCredential(c, transport, allowInsecureHTTP)
 	if err != nil {
 		return nil, err
 	}
-	return func(ctx context.Context) (string, error) {
-		tok, err := mgr.Refresh(ctx)
-		if mapped := contextReauthError(c, err); mapped != nil {
-			return "", mapped
-		}
-		if err != nil {
-			return "", fmt.Errorf("refresh login token: %w", err)
-		}
-		return tok, nil
-	}, nil
+	return credential.Token, nil
 }
 
 // RefreshedLoginToken returns context c's login JWT, transparently re-minting
@@ -229,38 +350,4 @@ func RefreshedLoginToken(ctx context.Context, c *contexts.Context) (string, erro
 		return "", err
 	}
 	return provider(ctx)
-}
-
-// NewRefreshingResourceProvider returns a provider that mints a bearer valid
-// for resourceOrigin, by exchanging context c's login JWT at c's own core (RFC
-// 8693). It is NewRefreshingLoginProvider's sibling for resource servers: where
-// that returns the bare login JWT (the control plane / cluster cases, where the
-// host is the core), this performs the token exchange the data API requires.
-//
-// Both the silent login-JWT re-mint and the exchange run through the shared
-// per-context tokenmanager (newContextTokenManager). resourceOrigin must
-// already be origin-only (no path). No audience is passed: the token manager
-// defaults the RFC 8693 audience to the resource origin, which is exactly what
-// the data API requires (aud == its base URI), so the audience is derived from
-// the host being dialed rather than read from discovery. Exchanged tokens are
-// cached in-process by the tokenmanager for the life of this process.
-//
-// transport carries the caller's TLS configuration; allowInsecureHTTP permits
-// an http:// core/resource for loopback/dev.
-func NewRefreshingResourceProvider(c *contexts.Context, resourceOrigin string, transport http.RoundTripper, allowInsecureHTTP bool) (func(context.Context) (string, error), error) {
-	mgr, err := newContextTokenManager(c, transport, allowInsecureHTTP)
-	if err != nil {
-		return nil, err
-	}
-	req := tokenmanager.TokenRequest{Resource: resourceOrigin}
-	return func(ctx context.Context) (string, error) {
-		tok, err := mgr.Token(ctx, req)
-		if mapped := contextReauthError(c, err); mapped != nil {
-			return "", mapped
-		}
-		if err != nil {
-			return "", fmt.Errorf("exchange token for %s: %w", resourceOrigin, err)
-		}
-		return tok, nil
-	}, nil
 }

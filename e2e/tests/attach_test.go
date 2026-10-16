@@ -19,7 +19,7 @@ import (
 func TestAttachSessionCreatesCheckpoint(t *testing.T) {
 	testutil.ForEachNamedAgent(t, 2*time.Minute, []string{"vogon"}, func(t *testing.T, s *testutil.RepoState, ctx context.Context) {
 		homeDir := t.TempDir()
-		extraEnv := []string{"HOME=" + homeDir}
+		extraEnv := agents.HomeEnv(homeDir)
 		vogon := requireVogonAgent(t, s)
 
 		mainBranch := testutil.GitOutput(t, s.Dir, "branch", "--show-current")
@@ -46,7 +46,7 @@ func TestAttachSessionCreatesCheckpoint(t *testing.T) {
 		assert.Contains(t, resumeOut, sessionID, "resume output should reference the attached session")
 		assert.Contains(t, resumeOut, "To continue", "resume output should show follow-up instructions")
 		_, statErr := os.Stat(transcriptPath)
-		assert.NoError(t, statErr, "resume should restore the transcript into the isolated vogon HOME")
+		require.NoError(t, statErr, "resume should restore the transcript into the isolated vogon HOME")
 
 		s.Git(t, "checkout", mainBranch)
 		explainOut := entire.Explain(t, s.Dir, checkpointID)
@@ -57,7 +57,7 @@ func TestAttachSessionCreatesCheckpoint(t *testing.T) {
 func TestAttachSessionAddsToExistingCheckpoint(t *testing.T) {
 	testutil.ForEachNamedAgent(t, 3*time.Minute, []string{"vogon"}, func(t *testing.T, s *testutil.RepoState, ctx context.Context) {
 		homeDir := t.TempDir()
-		extraEnv := []string{"HOME=" + homeDir}
+		extraEnv := agents.HomeEnv(homeDir)
 		vogon := requireVogonAgent(t, s)
 
 		s.Git(t, "add", ".")

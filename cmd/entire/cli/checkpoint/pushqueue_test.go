@@ -167,3 +167,69 @@ func TestPushQueue_RemoveEmptyIsNoop(t *testing.T) {
 	q := NewPushQueue(t.TempDir())
 	require.NoError(t, q.Remove(nil))
 }
+
+func TestPushQueue_PeekIsReadOnly(t *testing.T) {
+	t.Parallel()
+	q := NewPushQueue(t.TempDir())
+	a := mustRefName(t, "a1b2c3d4e5f6")
+	b := mustRefName(t, "b2c3d4e5f6a1")
+
+	// Empty queue peeks to nothing.
+	refs, err := q.Peek()
+	require.NoError(t, err)
+	assert.Empty(t, refs)
+
+	require.NoError(t, q.Enqueue(a))
+	require.NoError(t, q.Enqueue(a)) // duplicate on disk
+	require.NoError(t, q.Enqueue(b))
+	require.Equal(t, 3, nonEmptyLineCount(t, q))
+
+	refs, err = q.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, []plumbing.ReferenceName{a, b}, refs, "peek de-duplicates in first-seen order")
+
+	// Unlike Drain, Peek never rewrites the file — the redundant line survives.
+	assert.Equal(t, 3, nonEmptyLineCount(t, q), "Peek must not compact the queue file")
+
+	// A second Peek sees the same refs.
+	refs, err = q.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, []plumbing.ReferenceName{a, b}, refs)
+}
+
+func TestPushQueue_RotateMovesRefsToBack(t *testing.T) {
+	t.Parallel()
+	q := NewPushQueue(t.TempDir())
+
+	a := mustRefName(t, "a1b2c3d4e5f6")
+	b := mustRefName(t, "b2c3d4e5f6a1")
+	c := mustRefName(t, "c3d4e5f6a1b2")
+	for _, ref := range []plumbing.ReferenceName{a, b, c} {
+		require.NoError(t, q.Enqueue(ref))
+	}
+
+	require.NoError(t, q.Rotate([]plumbing.ReferenceName{a, b}))
+	refs, err := q.Drain()
+	require.NoError(t, err)
+	assert.Equal(t, []plumbing.ReferenceName{c, a, b}, refs,
+		"rotated refs go to the back, both groups keeping their relative order")
+
+	// A ref that is not queued is ignored rather than added.
+	require.NoError(t, q.Rotate([]plumbing.ReferenceName{mustRefName(t, "ffffffffffff")}))
+	refs, err = q.Drain()
+	require.NoError(t, err)
+	assert.Equal(t, []plumbing.ReferenceName{c, a, b}, refs, "an absent ref must not join the queue")
+
+	// Rotating everything is a no-op on order, and never drops a ref.
+	require.NoError(t, q.Rotate([]plumbing.ReferenceName{c, a, b}))
+	refs, err = q.Drain()
+	require.NoError(t, err)
+	assert.Equal(t, []plumbing.ReferenceName{c, a, b}, refs)
+
+	require.NoError(t, q.Rotate(nil))
+	refs, err = q.Drain()
+	require.NoError(t, err)
+	assert.Len(t, refs, 3, "rotation only reorders; it never removes")
+}
+
+func (q *PushQueue) queuePath() string { return filepath.Join(q.dir, pushQueueFileName) }

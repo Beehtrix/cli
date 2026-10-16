@@ -15,12 +15,45 @@ type TokenUsage struct {
 	APICallCount int `json:"api_call_count"`
 	// SubagentTokens contains token usage from spawned subagents (if any)
 	SubagentTokens *TokenUsage `json:"subagent_tokens,omitempty"`
+	// SubagentTokensComplete says whether the outer result has exact child coverage.
+	SubagentTokensComplete *bool `json:"subagent_tokens_complete,omitempty"`
 }
+
+// WithClearedSubagentTokens returns an independent usage result with child
+// totals removed and an explicit coverage marker. A nil usage becomes a
+// marker-only result so unavailable coverage persists.
+func WithClearedSubagentTokens(usage *TokenUsage, complete bool) *TokenUsage {
+	if usage == nil {
+		usage = &TokenUsage{}
+	}
+	cleared := *usage
+	cleared.SubagentTokens = nil
+	cleared.SubagentTokensComplete = &complete
+	return &cleared
+}
+
+// MaxSubagentDepth caps how deep a SubagentTokens chain is walked. Real chains
+// are depth 1 — an agent reports one aggregate for all its subagents — so this is
+// insurance against a malformed or hostile chain, not a real limit.
+//
+// It matters because token usage is read back from per-session metadata.json blobs
+// on the shared checkpoint branch, which anyone with push access can author. The
+// depth is not a stack-overflow risk (encoding/json caps nesting at 10000), but an
+// unbounded chain reaching the root CheckpointSummary is a write amplification
+// vector: the summary is re-marshalled with indentation, which is O(depth²) in
+// output size, so a ~10k-deep chain in a 200KB session blob expands to a ~700MB
+// root blob that then gets written and pushed.
+const MaxSubagentDepth = 16
 
 // AddTokenUsage returns the sum of a and b, recursing into subagent usage.
 // Either operand may be nil (treated as zero); the result is nil only when both
-// are. Neither input is mutated.
+// are. Neither input is mutated. Subagent chains deeper than MaxSubagentDepth are
+// truncated.
 func AddTokenUsage(a, b *TokenUsage) *TokenUsage {
+	return addTokenUsageAtDepth(a, b, 0)
+}
+
+func addTokenUsageAtDepth(a, b *TokenUsage, depth int) *TokenUsage {
 	if a == nil && b == nil {
 		return nil
 	}
@@ -42,8 +75,44 @@ func AddTokenUsage(a, b *TokenUsage) *TokenUsage {
 		sum.APICallCount += b.APICallCount
 		bSub = b.SubagentTokens
 	}
-	sum.SubagentTokens = AddTokenUsage(aSub, bSub)
+	if depth >= MaxSubagentDepth {
+		if depth == 0 {
+			sum.SubagentTokensComplete = tokenCompleteness(a, b)
+		}
+		return sum
+	}
+	sum.SubagentTokens = addTokenUsageAtDepth(aSub, bSub, depth+1)
+	if depth == 0 {
+		sum.SubagentTokensComplete = tokenCompleteness(a, b)
+	}
 	return sum
+}
+
+func tokenCompleteness(a, b *TokenUsage) *bool {
+	seenComplete := false
+	seenUnknown := false
+	for _, usage := range []*TokenUsage{a, b} {
+		if usage == nil {
+			continue
+		}
+		if usage.SubagentTokensComplete == nil {
+			seenUnknown = true
+			continue
+		}
+		if !*usage.SubagentTokensComplete {
+			incomplete := false
+			return &incomplete
+		}
+		seenComplete = true
+	}
+	if seenUnknown {
+		return nil
+	}
+	if seenComplete {
+		complete := true
+		return &complete
+	}
+	return nil
 }
 
 // SubtractTokenUsage returns a-b, recursing into subagent usage and clamping
@@ -52,6 +121,10 @@ func AddTokenUsage(a, b *TokenUsage) *TokenUsage {
 // subagent token usage, which is always re-read from the start of each
 // subagent transcript) down to a delta since a previously captured baseline.
 func SubtractTokenUsage(a, b *TokenUsage) *TokenUsage {
+	return subtractTokenUsageAtDepth(a, b, 0)
+}
+
+func subtractTokenUsageAtDepth(a, b *TokenUsage, depth int) *TokenUsage {
 	if a == nil {
 		return nil
 	}
@@ -65,7 +138,11 @@ func SubtractTokenUsage(a, b *TokenUsage) *TokenUsage {
 		OutputTokens:        clampSubtract(a.OutputTokens, b.OutputTokens),
 		APICallCount:        clampSubtract(a.APICallCount, b.APICallCount),
 	}
-	diff.SubagentTokens = SubtractTokenUsage(a.SubagentTokens, b.SubagentTokens)
+	diff.SubagentTokens = subtractTokenUsageAtDepth(a.SubagentTokens, b.SubagentTokens, depth+1)
+	if depth == 0 && a.SubagentTokensComplete != nil {
+		complete := *a.SubagentTokensComplete
+		diff.SubagentTokensComplete = &complete
+	}
 	return diff
 }
 

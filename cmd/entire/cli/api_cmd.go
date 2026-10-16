@@ -48,13 +48,25 @@ func newAPICmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "api <path>",
 		Short: "Make an authenticated request to an Entire API and print the response",
+		// Human-facing help stays a reference, not a lecture: someone who typed
+		// this command chose it deliberately. The one caveat kept here is a real
+		// compatibility fact rather than advice — raw endpoints are internal. The
+		// "prefer a first-class command" steer is agent-facing guidance and lives
+		// in agentHelpGuidance, which only agent-help renders.
 		Long: "Make an authenticated HTTP request to an Entire API and print the JSON response.\n\n" +
+			"These endpoints are internal and can change shape without notice; where a\n" +
+			"purpose-built command exists, its output is the stable interface.\n\n" +
 			"The CLI attaches the right bearer token and dials the right host for the\n" +
 			"chosen backend, so you don't have to plumb auth yourself:\n\n" +
 			"  --to core   the control plane (default): orgs, repos, mirrors, clusters, /me\n" +
 			"  --to cell   your home entire-api cell: /me/* activity, repo aggregates\n\n" +
 			"Use --jurisdiction <slug> (e.g. us, eu) to reach a specific jurisdiction's\n" +
 			"entire-api cell instead of your home one; it implies --to cell.\n\n" +
+			"Both backends act as ENTIRE_TOKEN when set, else the selected login\n" +
+			"(--context, else $ENTIRE_CONTEXT, else the active context), so a staging\n" +
+			"login reaches staging's control plane and cells. The cell host comes from\n" +
+			"environment's cluster listing; an explicit ENTIRE_API_BASE_URL names the\n" +
+			"data host directly instead.\n\n" +
 			"<path> is the full path on that host, e.g. /api/v1/clusters. These\n" +
 			"placeholders are filled from the current repo's origin remote:\n" +
 			"  {owner} {repo}   the GitHub owner / repo\n" +
@@ -169,6 +181,8 @@ func resolveAPIClient(ctx context.Context, to, jurisdiction string, insecure boo
 				return nil, fmt.Errorf("control-plane URL check: %w", err)
 			}
 		}
+		// Stderr, so the response body on stdout stays clean.
+		auth.AnnounceContext(target.totalContexts, target.activeContext)
 		return api.NewClientWithBaseURL(target.token, target.coreURL), nil
 	case apiTargetCell:
 		var target *auth.CellTarget

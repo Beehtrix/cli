@@ -1,12 +1,52 @@
 package id
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
+	"time"
+
+	ulid "github.com/oklog/ulid/v2"
 )
 
 // A representative ULID (Crockford base32, 26 chars) used across tests.
 const sampleULID = "01KVBJCWYA4YW6J5M9GP655HZN"
+
+func TestCheckpointID_Time(t *testing.T) {
+	t.Parallel()
+
+	// A ULID minted from a known instant recovers that instant (millisecond
+	// precision), so remote-ref discovery can sort/display a checkpoint by its
+	// real creation time from the ref name alone — no store read.
+	want := time.UnixMilli(1700000000000).UTC()
+	// Deterministic entropy (zeros); Time() only reads the timestamp prefix.
+	minted := ulid.MustNew(ulid.Timestamp(want), bytes.NewReader(make([]byte, 16)))
+	got, ok := CheckpointID(minted.String()).Time()
+	if !ok {
+		t.Fatalf("Time() ok = false for a valid ULID %q", minted)
+	}
+	if !got.Equal(want) {
+		t.Errorf("Time() = %v, want %v", got, want)
+	}
+
+	// The canonical sample ULID also yields a non-zero time.
+	if ts, ok := CheckpointID(sampleULID).Time(); !ok || ts.IsZero() {
+		t.Errorf("Time() for sample ULID = (%v, %v), want a non-zero time", ts, ok)
+	}
+
+	// A legacy hex ID carries no timestamp.
+	if _, ok := CheckpointID("a1b2c3d4e5f6").Time(); ok {
+		t.Errorf("Time() ok = true for a legacy hex ID; want false")
+	}
+
+	// Non-ID / empty strings report no time.
+	if _, ok := CheckpointID("").Time(); ok {
+		t.Errorf("Time() ok = true for empty ID; want false")
+	}
+	if _, ok := CheckpointID("not-an-id").Time(); ok {
+		t.Errorf("Time() ok = true for a non-ID string; want false")
+	}
+}
 
 func TestGenerateULID(t *testing.T) {
 	t.Parallel()
@@ -29,6 +69,48 @@ func TestGenerateULID(t *testing.T) {
 	}
 	if a == b {
 		t.Errorf("two GenerateULID() calls returned the same id %q", a)
+	}
+}
+
+func TestDeriveULID(t *testing.T) {
+	t.Parallel()
+	at := time.Date(2026, 6, 20, 10, 30, 0, 123_000_000, time.UTC)
+
+	a, err := DeriveULID(at, []byte("sess/turn-1"))
+	if err != nil {
+		t.Fatalf("DeriveULID() error = %v", err)
+	}
+	if a.Kind() != KindULID {
+		t.Errorf("Kind() = %v, want KindULID for %q", a.Kind(), a)
+	}
+	if got, ok := a.Time(); !ok || !got.Equal(at) {
+		t.Errorf("Time() = %v, %v; want %v, true", got, ok, at)
+	}
+
+	again, err := DeriveULID(at, []byte("sess/turn-1"))
+	if err != nil {
+		t.Fatalf("DeriveULID() error = %v", err)
+	}
+	if again != a {
+		t.Errorf("not deterministic: %q != %q", again, a)
+	}
+
+	other, err := DeriveULID(at, []byte("sess/turn-2"))
+	if err != nil {
+		t.Fatalf("DeriveULID() error = %v", err)
+	}
+	if other == a {
+		t.Errorf("distinct seeds derived the same id %q", a)
+	}
+
+	for _, pre := range []time.Time{{}, time.Date(1960, 1, 1, 0, 0, 0, 0, time.UTC)} {
+		cid, err := DeriveULID(pre, []byte("sess/turn-1"))
+		if err != nil {
+			t.Fatalf("DeriveULID(%v) error = %v", pre, err)
+		}
+		if got, ok := cid.Time(); !ok || got.UnixMilli() != 0 {
+			t.Errorf("DeriveULID(%v).Time() = %v, %v; want the epoch, true", pre, got, ok)
+		}
 	}
 }
 

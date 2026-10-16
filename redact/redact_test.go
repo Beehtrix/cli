@@ -2,7 +2,9 @@ package redact
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -236,8 +238,10 @@ func TestShouldSkipJSONLField(t *testing.T) {
 		{"google_adsense_account", false},
 		{"aws_account", false},
 		{"service_account", false},
-		// Exact match "signature" should be skipped.
+		// Signature fields should be skipped (any key ending in "signature").
 		{"signature", true},
+		{"thinkingSignature", true},
+		{"thinking_signature", true},
 		// Path-related fields should be skipped.
 		{"filePath", true},
 		{"file_path", true},
@@ -257,7 +261,7 @@ func TestShouldSkipJSONLField(t *testing.T) {
 		{"args", false},
 		{"video", false},      // ends in "o", not "id"
 		{"identify", false},   // ends in "ify", not "id"
-		{"signatures", false}, // not exact match "signature"
+		{"signatures", false}, // does not end in "signature"
 		{"signal_data", false},
 		{"consideration", false}, // contains "id" but doesn't end with it
 	}
@@ -330,6 +334,22 @@ func TestJSONLContent_CredentialIdentifierKeysStayScanned(t *testing.T) {
 	}
 }
 
+func TestJSONLContent_PreservesThinkingSignature(t *testing.T) {
+	t.Parallel()
+	// Oh My Pi stores extended-thinking signatures under "thinkingSignature".
+	// Their base64 value is high-entropy; redacting it corrupts the signature and
+	// breaks replay with "Invalid `signature` in `thinking` block".
+	input := `{"type":"thinking","thinking":"plan","thinkingSignature":"` + highEntropySecret + `"}`
+
+	result, err := JSONLContent(input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result, `"thinkingSignature":"`+highEntropySecret+`"`) {
+		t.Fatalf("expected thinkingSignature to be preserved verbatim, got: %s", result)
+	}
+}
+
 func TestString_PatternDetection(t *testing.T) {
 	// These secrets have entropy below 4.5 so entropy-only detection misses them.
 	// Betterleaks pattern matching should catch them.
@@ -340,17 +360,17 @@ func TestString_PatternDetection(t *testing.T) {
 	}{
 		{
 			name:  "AWS access key (entropy ~3.9, below 4.5 threshold)",
-			input: "key=AKIAYRWQG5EJLPZLBYNP",
+			input: "key=" + awsKeyFixture,
 			want:  "key=REDACTED",
 		},
 		{
 			name:  "two AWS keys separated by space produce two REDACTED tokens",
-			input: "key=AKIAYRWQG5EJLPZLBYNP AKIAYRWQG5EJLPZLBYNP",
+			input: "key=" + awsKeyFixture + " " + awsKeyFixture,
 			want:  "key=REDACTED REDACTED",
 		},
 		{
 			name:  "adjacent AWS keys without separator merge into single REDACTED",
-			input: "key=AKIAYRWQG5EJLPZLBYNPAKIAYRWQG5EJLPZLBYNP",
+			input: "key=" + awsKeyFixture + awsKeyFixture,
 			want:  "key=REDACTED",
 		},
 	}
@@ -378,6 +398,17 @@ func TestString_PatternDetection(t *testing.T) {
 // and keeps secret scanners (including GitHub push protection) from flagging
 // synthetic test fixtures; the assembled runtime values exercise the redactor
 // exactly as a real token would.
+
+// awsKeyFixture is an AWS-Access-Key-ID-shaped value, assembled for the same
+// reason as the prefixes above and openSSHPrivateKeyMarker. It matters more
+// here than for those: GitHub push protection rejects this pattern outright,
+// and because this repo stores its own agent transcripts as checkpoints, a
+// literal reaches a transcript whenever someone edits redaction code and wedges
+// that checkpoint's push queue permanently. The bytes are unchanged, so the
+// AWS rule stays genuinely exercised — the "key=REDACTED" cases below fail if
+// it ever stops matching. Do not re-inline it.
+const awsKeyFixture = "AKIAYRWQG5" + "EJLPZLBYNP"
+
 func supabaseSecretPrefix() string      { return "sb" + "_secret_" }
 func supabasePersonalPrefix() string    { return "sb" + "p_" }
 func supabasePublishablePrefix() string { return "sb" + "_publishable_" }
@@ -671,6 +702,140 @@ func TestJSONLContent_SupabaseSecretMalformedLineFallback(t *testing.T) {
 	}
 }
 
+func bareSKPrefix() string { return "s" + "k-" }
+
+// TestString_BareSKKeys covers issue #2728: an "sk-" key with a short body
+// (LiteLLM proxy virtual keys are sk- + 22 chars) written as a bare value in
+// prose was missed by every layer. The entropy layer structurally cannot catch
+// it (see providers.go), so the provider layer must, wherever it appears.
+func TestString_BareSKKeys(t *testing.T) {
+	t.Parallel()
+
+	issueKey := bareSKPrefix() + "Qm4Wn8Rt_bVcXzLkJhGfDs" // issue #2728 fake value
+	lowerDigitKey := bareSKPrefix() + "a1b2c3d4e5f6g7h8i9j0k1"
+	hyphenKey := bareSKPrefix() + "Qm4Wn8Rt-bVcXzLkJhGfDs"
+	body20 := bareSKPrefix() + "Qm4Wn8RtbVcXzLkJhGfD"
+	body19 := bareSKPrefix() + "Qm4Wn8RtbVcXzLkJhGf"
+	for _, low := range []string{issueKey, lowerDigitKey, body19} {
+		if e := shannonEntropy(low); e > entropyThreshold {
+			t.Fatalf("value %q has entropy %.3f > %.1f; not an entropy-miss regression case", low, e, entropyThreshold)
+		}
+	}
+
+	assertStringRedactionCases(t, []stringRedactionCase{
+		{
+			name:  "issue #2728 repro: bare key in prose",
+			input: "the first is " + issueKey + " the second",
+			want:  "the first is REDACTED the second",
+		},
+		{
+			name:  "lowercase body with digits",
+			input: "key " + lowerDigitKey + " here",
+			want:  "key REDACTED here",
+		},
+		{
+			name:  "body with a hyphen is redacted whole",
+			input: "key " + hyphenKey + " here",
+			want:  "key REDACTED here",
+		},
+		{
+			name:  "quoted value",
+			input: `"api_key": "` + issueKey + `"`,
+			want:  `"api_key": "REDACTED"`,
+		},
+		{
+			name:  "bearer header",
+			input: "Authorization: Bearer " + issueKey,
+			want:  "Authorization: Bearer REDACTED",
+		},
+		{
+			name:  "exactly 20-char body redacts",
+			input: body20,
+			want:  "REDACTED",
+		},
+		{
+			name:  "exactly 19-char body is preserved",
+			input: body19,
+			want:  body19,
+		},
+		{
+			// Raw-text fall-back shape: "\n" is a literal backslash-n, so the
+			// byte before the prefix is the word char 'n'.
+			name:  "preceded by a literal JSON escape letter",
+			input: `first line\n` + issueKey,
+			want:  `first line\nREDACTED`,
+		},
+	})
+}
+
+// TestDetectProviderTokens_BareSKKeyBoundaries pins the underscore and escape
+// boundaries on the provider layer alone: through String, the entropy layer can
+// swallow the preceding name or escape digits together with the key and mask a
+// missing boundary.
+func TestDetectProviderTokens_BareSKKeyBoundaries(t *testing.T) {
+	t.Parallel()
+
+	key := bareSKPrefix() + "Qm4Wn8Rt_bVcXzLkJhGfDs"
+	for _, prefix := range []string{`API_KEY_`, `first line\n`, `quote\u0022`} {
+		input := prefix + key
+		regions := detectProviderTokens(input)
+		if len(regions) != 1 || input[regions[0].start:regions[0].end] != key {
+			t.Errorf("detectProviderTokens(%q) = %v, want exactly the key", input, regions)
+		}
+	}
+}
+
+// TestString_BareSKKeyOverRedactionGuards pins the two guards that keep the
+// bare sk- rule off ordinary text: the prefix must not sit inside a word, and
+// an all-lowercase digit-free body is a kebab-case name, not a key.
+func TestString_BareSKKeyOverRedactionGuards(t *testing.T) {
+	t.Parallel()
+
+	inWord := "risk-assessment-2026-q4-planning-doc"
+	kebab := bareSKPrefix() + "learn-model-selection-guide"
+	for _, low := range []string{inWord, kebab} {
+		if e := shannonEntropy(low); e > entropyThreshold {
+			t.Fatalf("value %q has entropy %.3f > %.1f; entropy layer would mask the guard", low, e, entropyThreshold)
+		}
+	}
+
+	assertStringRedactionCases(t, []stringRedactionCase{
+		{
+			name:  "sk- inside a hyphenated word is preserved",
+			input: "see " + inWord + " for details",
+			want:  "see " + inWord + " for details",
+		},
+		{
+			name:  "all-lowercase digit-free body is preserved",
+			input: "read " + kebab,
+			want:  "read " + kebab,
+		},
+		{
+			name:  "bare prefix in prose is preserved",
+			input: "OpenAI keys start with " + bareSKPrefix(),
+			want:  "OpenAI keys start with " + bareSKPrefix(),
+		},
+	})
+}
+
+// TestJSONLContent_BareSKKeyRedacted drives the issue #2728 value through the
+// field-aware JSONL path used for transcript.jsonl and full.jsonl.
+func TestJSONLContent_BareSKKeyRedacted(t *testing.T) {
+	t.Parallel()
+	key := bareSKPrefix() + "Qm4Wn8Rt_bVcXzLkJhGfDs"
+	line := `{"type":"user","message":{"role":"user","content":"the first is ` + key + ` the second"}}`
+	got, err := JSONLContent(line)
+	if err != nil {
+		t.Fatalf("JSONLContent error: %v", err)
+	}
+	if strings.Contains(got, key) {
+		t.Fatalf("key survived JSONL redaction: %q", got)
+	}
+	if !strings.Contains(got, "REDACTED") {
+		t.Fatalf("expected REDACTED placeholder in %q", got)
+	}
+}
+
 func TestString_CredentialedURIs(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -938,9 +1103,10 @@ func TestString_BoundedCredentialValueOverRedactionGuards(t *testing.T) {
 			want:  "PWD=/workspace/project",
 		},
 		{
-			name:  "standalone password assignment is preserved",
+			// betterleaks >= 1.8.0 detects generic password assignments.
+			name:  "standalone password assignment is redacted by betterleaks",
 			input: "password=not-a-secret-setting",
-			want:  "password=not-a-secret-setting",
+			want:  "password=REDACTED",
 		},
 		{
 			name:  "password reset query parameter is preserved",
@@ -948,9 +1114,10 @@ func TestString_BoundedCredentialValueOverRedactionGuards(t *testing.T) {
 			want:  "https://example.com/?password_reset=true",
 		},
 		{
-			name:  "generic https password query is preserved",
+			// The greedy match consumes the trailing query param too.
+			name:  "generic https password query is redacted by betterleaks",
 			input: "https://example.com/callback?user=svc&password=not-a-db-credential&debug=true",
-			want:  "https://example.com/callback?user=svc&password=not-a-db-credential&debug=true",
+			want:  "https://example.com/callback?user=svc&password=REDACTED",
 		},
 		{
 			name:  "db password hash field is preserved",
@@ -991,6 +1158,41 @@ func TestString_BoundedCredentialValueOverRedactionGuards(t *testing.T) {
 			name:  "secret_here placeholder is preserved",
 			input: "DB_PASSWORD=secret_here",
 			want:  "DB_PASSWORD=secret_here",
+		},
+		{
+			// Exact placeholder match suppresses the betterleaks finding.
+			name:  "bare placeholder password assignment is preserved",
+			input: "password=changeme",
+			want:  "password=changeme",
+		},
+		{
+			// Semicolon DSNs terminate the unquoted capture, so the finding
+			// is exactly the placeholder.
+			name:  "dsn placeholder password is preserved",
+			input: "Server=db.internal;Database=prod;User Id=app;Password=changeme;TrustCert=true",
+			want:  "Server=db.internal;Database=prod;User Id=app;Password=changeme;TrustCert=true",
+		},
+		{
+			// Greedy findings are redacted whole, never split at a
+			// placeholder head — the tail can hold a real secret.
+			name:  "placeholder head with real secret in greedy tail is redacted",
+			input: "password=changeme&db_pass=hunter2hunter2",
+			want:  "password=REDACTED",
+		},
+		{
+			name:  "quoted secret with placeholder first token is redacted",
+			input: `password="changeme;realSecret42"`,
+			want:  `password="REDACTED"`,
+		},
+		{
+			name:  "placeholder with trailing query params over-redacts",
+			input: "password=changeme&sslmode=require",
+			want:  "password=REDACTED",
+		},
+		{
+			name:  "real value with trailing query params is still redacted",
+			input: "password=hunter2secret&sslmode=require",
+			want:  "password=REDACTED",
 		},
 		{
 			name:  "placeholder literal is preserved",
@@ -1426,7 +1628,7 @@ func TestString_RealSecretsStillCaught(t *testing.T) {
 		},
 		{
 			name:  "AWS access key (pattern-based)",
-			input: "key=AKIAYRWQG5EJLPZLBYNP",
+			input: "key=" + awsKeyFixture,
 		},
 		{
 			name:  "GitHub personal access token",
@@ -2101,5 +2303,135 @@ func TestJSONLContent_CompoundNonSecretTokenKeys(t *testing.T) {
 		if !strings.Contains(out, RedactedPlaceholder) {
 			t.Errorf("token key with non-allowlisted segment must redact, got: %s", out)
 		}
+	}
+}
+
+func TestConfigureScanners_GoredactLayer(t *testing.T) {
+	t.Cleanup(func() {
+		if err := ConfigureScanners(ScannersConfig{Betterleaks: true}); err != nil {
+			t.Fatalf("restore default scanners: %v", err)
+		}
+	})
+
+	// Baseline: both scanners off (legal at the package level; the settings
+	// layer forbids this combination in production). This LOW-entropy,
+	// shape-valid PAT (entropy ≈3.22 full token, ≈2.99 over the suffix — below
+	// layer 1's 4.5 threshold) survives
+	// unchanged, proving no non-scanner layer catches it — every redaction
+	// asserted below is scanner-attributable — and pinning the betterleaks
+	// gate-off direction (betterleaks-only DOES redact this PAT).
+	if err := ConfigureScanners(ScannersConfig{}); err != nil {
+		t.Fatalf("ConfigureScanners(none): %v", err)
+	}
+	in := "auth with token ghp_a1b2c1d2e1f2g1h2a1b2c1d2e1f2g1h2a1b2"
+	if got := String(in); got != in {
+		t.Errorf("no-scanners String() = %q, want input preserved", got)
+	}
+
+	// goredact-only: with betterleaks gated off, a redaction of the PAT can
+	// only come from goredact's shape-only GitHubPAT validator. This is the
+	// non-vacuous wiring proof for the OnFinding collector and offset
+	// conversion.
+	if err := ConfigureScanners(ScannersConfig{Goredact: true}); err != nil {
+		t.Fatalf("ConfigureScanners: %v", err)
+	}
+	if got := String(in); strings.Contains(got, "ghp_a1b2c1d2e1f2g1h2a1b2c1d2e1f2g1h2a1b2") {
+		t.Errorf("goredact-only String() left a GitHub PAT unredacted: %q", got)
+	}
+
+	// Regression pin: placeholders stay preserved under goredact-only.
+	// goredact's own validators reject placeholder shapes; the filter loop
+	// in detectGoredact is defensive belt-and-braces on top of that.
+	if got := String("password=changeme"); got != "password=changeme" {
+		t.Errorf("goredact-only String(changeme) = %q, want preserved", got)
+	}
+
+	// Non-scanner layers stay on under every configuration: layer 8
+	// (bounded credential key/values) is scanner-independent.
+	if got := String("database_password=secret123"); got != "database_password=REDACTED" {
+		t.Errorf("goredact-only String(db kv) = %q, want layer-8 redaction", got)
+	}
+
+	// Gate-off pin: a betterleaks-1.8.0-exclusive detection (the
+	// generic-password rule; goredact rejects the low-entropy value and no
+	// other layer matches) must NOT fire under goredact-only.
+	if got := String("password=not-a-secret-setting"); got != "password=not-a-secret-setting" {
+		t.Errorf("goredact-only String() = %q, want unchanged (betterleaks gated off)", got)
+	}
+
+	// Both engines: goredact remains active alongside betterleaks.
+	if err := ConfigureScanners(ScannersConfig{Betterleaks: true, Goredact: true}); err != nil {
+		t.Fatalf("ConfigureScanners(both): %v", err)
+	}
+	if got := String(in); strings.Contains(got, "ghp_a1b2c1d2e1f2g1h2a1b2c1d2e1f2g1h2a1b2") {
+		t.Errorf("both-scanners String() left the PAT unredacted: %q", got)
+	}
+	// ...and betterleaks remains active too (same 1.8.0-exclusive detection).
+	if got := String("password=not-a-secret-setting"); got != "password=REDACTED" {
+		t.Errorf("both-scanners String() = %q, want betterleaks generic-password detection", got)
+	}
+}
+
+func TestConfigureScanners_DefaultConfig(t *testing.T) {
+	// Explicit default config = betterleaks-only, identical to the
+	// pre-feature pipeline; the existing betterleaks-layer tests in this
+	// file remain the pin for the unconfigured state.
+	if err := ConfigureScanners(ScannersConfig{Betterleaks: true}); err != nil {
+		t.Fatalf("ConfigureScanners: %v", err)
+	}
+	// The low-entropy PAT is invisible to every non-scanner layer (pinned by
+	// the all-off baseline in TestConfigureScanners_GoredactLayer), so this
+	// redaction is attributable to betterleaks running under the default
+	// config.
+	if got := String("auth with token ghp_a1b2c1d2e1f2g1h2a1b2c1d2e1f2g1h2a1b2"); strings.Contains(got, "ghp_a1b2c1d2e1f2g1h2a1b2c1d2e1f2g1h2a1b2") {
+		t.Errorf("betterleaks-only String() left the PAT unredacted: %q", got)
+	}
+}
+
+func TestJSONLBytes_ScannerDegradedSentinel(t *testing.T) {
+	t.Cleanup(func() {
+		SetScannerDegradedForTest(false)
+		if err := ConfigureScanners(ScannersConfig{Betterleaks: true}); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+	})
+	if err := ConfigureScanners(ScannersConfig{Goredact: true}); err != nil {
+		t.Fatalf("ConfigureScanners: %v", err)
+	}
+	SetScannerDegradedForTest(true)
+
+	// Secret-free input: redaction leaves it byte-identical, so this pins
+	// the degradation check running before the `redacted == s` short-circuit
+	// rather than depending on a redaction actually happening.
+	if _, err := JSONLBytes([]byte(`{"message":"hello"}`)); !errors.Is(err, ErrScannerDegraded) {
+		t.Fatalf("JSONLBytes error = %v, want ErrScannerDegraded", err)
+	}
+
+	// Degradation with betterleaks also enabled is logged-only: no error.
+	if err := ConfigureScanners(ScannersConfig{Betterleaks: true, Goredact: true}); err != nil {
+		t.Fatalf("ConfigureScanners(both): %v", err)
+	}
+	SetScannerDegradedForTest(true)
+	if _, err := JSONLBytes([]byte(`{"message":"hello"}`)); err != nil {
+		t.Fatalf("JSONLBytes with betterleaks covering = %v, want nil", err)
+	}
+}
+
+func TestJSONLBytesWithPrivacyFilter_ScannerDegradedSentinel(t *testing.T) {
+	t.Cleanup(func() {
+		SetScannerDegradedForTest(false)
+		if err := ConfigureScanners(ScannersConfig{Betterleaks: true}); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+	})
+	if err := ConfigureScanners(ScannersConfig{Goredact: true}); err != nil {
+		t.Fatalf("ConfigureScanners: %v", err)
+	}
+	SetScannerDegradedForTest(true)
+
+	// OPF is unconfigured, so this falls back to the plain JSONLContent flow;
+	// the sentinel must still surface from that path.
+	if _, err := JSONLBytesWithPrivacyFilter(context.Background(), []byte(`{"message":"hello"}`)); !errors.Is(err, ErrScannerDegraded) {
+		t.Fatalf("JSONLBytesWithPrivacyFilter error = %v, want ErrScannerDegraded", err)
 	}
 }

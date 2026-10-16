@@ -9,6 +9,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/spf13/cobra"
 )
 
@@ -50,7 +51,7 @@ const tokensProfileUsageScopeCheckpointObserved = "checkpoint_observed"
 
 func newTokensGroupCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:    "tokens",
+		Use:    cmdTokens,
 		Short:  "Analyze token usage across sessions and checkpoints",
 		Hidden: true,
 		Long: `Analyze token usage across sessions and checkpoints.
@@ -112,7 +113,7 @@ func runTokensProfile(ctx context.Context, cmd *cobra.Command, jsonOutput bool, 
 	}
 	defer repo.Close()
 
-	stores, err := checkpoint.Open(ctx, repo, checkpoint.OpenOptions{BlobFetcher: FetchBlobsByHash, RefFetcher: FetchCheckpointRef})
+	stores, err := checkpoint.Open(ctx, repo, checkpoint.OpenOptions{BlobFetcher: FetchBlobsByHash, RefFetcher: FetchCheckpointRef, ReadRemotes: strategy.CheckpointReadRemotes(ctx)})
 	if err != nil {
 		return fmt.Errorf("failed to open checkpoint stores: %w", err)
 	}
@@ -275,7 +276,7 @@ func tokensProfileRecommendations(report tokensProfileReport) []sessionTokensRec
 	if report.CheckpointsAnalyzed == 0 {
 		return []sessionTokensRecommendation{{
 			ID:       "no-checkpoints",
-			Severity: "low",
+			Severity: tokensSeverityLow,
 			Message:  "Create checkpoints first; token profiling needs committed checkpoint metadata to identify patterns.",
 			Signals:  []string{"empty_checkpoint_history"},
 		}}
@@ -285,48 +286,48 @@ func tokensProfileRecommendations(report tokensProfileReport) []sessionTokensRec
 		tokensProfileSignalCount(report.Signals, "api-call-amplification") > 0 {
 		recs = append(recs, sessionTokensRecommendation{
 			ID:       "search-before-reinvestigation",
-			Severity: "high",
+			Severity: tokensSeverityHigh,
 			Message:  "Use `entire search` for prior decisions/checkpoints before broad re-investigation.",
-			Signals:  []string{"cache_read_tokens", "api_call_count"},
+			Signals:  []string{tokensSignalCacheReadTokens, tokensSignalAPICallCount},
 		})
 	}
 	if tokensProfileSignalCount(report.Signals, "api-call-amplification") > 0 {
 		recs = append(recs, sessionTokensRecommendation{
 			ID:       "batch-diagnostics",
-			Severity: "medium",
+			Severity: tokensSeverityMedium,
 			Message:  "Batch diagnostic reads around one narrowed hypothesis when API call amplification repeats.",
-			Signals:  []string{"api_call_count"},
+			Signals:  []string{tokensSignalAPICallCount},
 		})
 	}
 	if tokensProfileSignalCount(report.Signals, "context-replay-hotspot") > 0 {
 		recs = append(recs, sessionTokensRecommendation{
 			ID:       "preserve-then-compact",
-			Severity: "medium",
+			Severity: tokensSeverityMedium,
 			Message:  "Summarize useful findings before continuing large-context work; compact or restart only after preserving relevant context.",
-			Signals:  []string{"cache_read_tokens"},
+			Signals:  []string{tokensSignalCacheReadTokens},
 		})
 	}
 	if tokensProfileSignalCount(report.Signals, "subagent-heavy") > 0 {
 		recs = append(recs, sessionTokensRecommendation{
 			ID:       "scope-subagents",
-			Severity: "medium",
+			Severity: tokensSeverityMedium,
 			Message:  "Scope subagent tasks tightly with a narrow objective and expected output.",
-			Signals:  []string{"subagent_tokens"},
+			Signals:  []string{tokensSignalSubagentTokens},
 		})
 	}
 	if report.MissingTokenData > 0 {
 		recs = append(recs, sessionTokensRecommendation{
 			ID:       "improve-token-coverage",
-			Severity: "low",
+			Severity: tokensSeverityLow,
 			Message:  "Increase token coverage by using agents and checkpoints that report token usage.",
-			Signals:  []string{"missing_token_usage"},
+			Signals:  []string{tokensSignalMissingUsage},
 		})
 	}
 
 	if len(recs) == 0 {
 		recs = append(recs, sessionTokensRecommendation{
 			ID:       "no-repeated-hotspots",
-			Severity: "low",
+			Severity: tokensSeverityLow,
 			Message:  "No repeated token hotspots were visible in committed checkpoint metadata.",
 			Signals:  []string{"checkpoint_token_metadata"},
 		})
