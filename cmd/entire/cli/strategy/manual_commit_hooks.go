@@ -3134,8 +3134,9 @@ var errPartialState = errors.New("partial session state")
 // at commit time). HandleTurnEnd replaces that with the complete session transcript
 // (from prompt to stop event), ensuring every checkpoint has the full context.
 //
-
-func (s *ManualCommitStrategy) HandleTurnEnd(ctx context.Context, state *SessionState) error { //nolint:unparam // error return is part of the hook contract; callers check it
+// finalizeDeadline bounds that rewrite's network phase so the hook finishes
+// before its host kills it; the zero time means no deadline.
+func (s *ManualCommitStrategy) HandleTurnEnd(ctx context.Context, state *SessionState, finalizeDeadline time.Time) error { //nolint:unparam // error return is part of the hook contract; callers check it
 	hadMidTurnCommits := len(state.TurnCheckpointIDs) > 0
 
 	// Finalize all checkpoints from this turn with the full transcript.
@@ -3144,7 +3145,7 @@ func (s *ManualCommitStrategy) HandleTurnEnd(ctx context.Context, state *Session
 	// Failing here would prevent session cleanup and could leave state inconsistent.
 	// The provisional transcript from PostCommit is already persisted, so the
 	// checkpoint isn't lost - it just won't have the complete transcript.
-	errCount := s.finalizeAllTurnCheckpoints(ctx, state)
+	errCount := s.finalizeAllTurnCheckpoints(ctx, state, finalizeDeadline)
 	if errCount > 0 {
 		logCtx := logging.WithComponent(ctx, "checkpoint")
 		logging.Warn(logCtx, "HandleTurnEnd completed with errors (best-effort)",
@@ -3254,8 +3255,8 @@ func precomputeTranscriptBlobsForFinalize(ctx context.Context, repo *git.Reposit
 // impossible rather than merely unlikely.
 //
 // ok=false means abandon this finalize pass, and is returned only for a degraded
-// scanner -- the caller must keep TurnCheckpointIDs so the next hook process
-// retries, since the degradation flag is per-process. Any other redaction failure
+// scanner -- the caller keeps TurnCheckpointIDs so a repeated Stop process can
+// retry, since the degradation flag is per-process. Any other redaction failure
 // drops the transcript and returns ok=true, preserving the rest of the checkpoint
 // metadata: hooks have no retry path, and partial metadata beats none.
 func redactFinalizedTranscript(
@@ -3284,6 +3285,10 @@ func redactFinalizedTranscript(
 	return redact.RedactedBytes{}, true
 }
 
+// errTurnEndDeadline is the cause recorded when the turn-end budget, rather
+// than the host cancelling the hook, ends finalize.
+var errTurnEndDeadline = errors.New("turn-end finalize deadline exceeded")
+
 // finalizeAllTurnCheckpoints replaces the provisional transcript in each checkpoint
 // created during this turn with the full session transcript.
 //
@@ -3291,8 +3296,14 @@ func redactFinalizedTranscript(
 // transcript was available at commit time. Now we have the complete transcript and
 // replace it so every checkpoint has the full prompt-to-stop context.
 //
+// deadline bounds the store open and the checkpoint writes, the steps that
+// can wait on a slow remote, and finalize does not start once it has passed;
+// the zero time means no deadline.
+//
 // Returns the number of errors encountered (best-effort: continues processing on error).
-func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, state *SessionState) int {
+// Checkpoints the deadline or a cancellation cut off are not counted: the
+// interruption is logged and recorded as capture degradation instead.
+func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, state *SessionState, deadline time.Time) int {
 	if len(state.TurnCheckpointIDs) == 0 {
 		return 0 // No mid-turn commits to finalize
 	}
@@ -3304,7 +3315,19 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 		slog.Int("checkpoint_count", len(state.TurnCheckpointIDs)),
 	)
 
-	errCount := 0
+	// budgetCtx ends at the deadline or with ctx. Only the entry check and the
+	// network phase observe it: local preparation is never cut part-way, but
+	// once the budget is spent, nothing it prepares could be written, and its
+	// time is the headroom the hook needs to save state before the host kills it.
+	budgetCtx := ctx
+	if !deadline.IsZero() {
+		var cancel context.CancelFunc
+		budgetCtx, cancel = context.WithDeadlineCause(ctx, deadline, errTurnEndDeadline)
+		defer cancel()
+	}
+	if abandonIfInterrupted(budgetCtx, logCtx, state) {
+		return 0
+	}
 
 	// Read full transcript from live transcript file, re-resolving the path if the
 	// agent relocated it mid-session (e.g., Cursor CLI flat → nested layout change).
@@ -3362,6 +3385,9 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 	// Open repository (needed for the checkpoint store)
 	repo, err := OpenRepository(ctx)
 	if err != nil {
+		if abandonIfInterrupted(ctx, logCtx, state) {
+			return 0
+		}
 		logging.Warn(logCtx, "finalize: failed to open repository",
 			slog.String("error", err.Error()),
 		)
@@ -3448,57 +3474,48 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 	// multi-machine sessions). This loops over every checkpoint of the turn
 	// against one store, so both fetch paths need their own memo or a dead
 	// network costs the budget N times: gitRefsStore.fetchFailure covers refs,
-	// and hookBlobFetcher memoizes an exhausted blob fetch. Nothing else bounds
-	// the total — newGitHookContext adds no deadline.
-	stores, err := checkpoint.Open(ctx, repo, s.hookCheckpointStoreOptions(ctx))
+	// and hookBlobFetcher memoizes an exhausted blob fetch. Neither memo detects
+	// a slow remote whose fetches succeed just under budget, so the turn-end
+	// deadline (budgetCtx) bounds this network phase as a whole. The preparation
+	// above ran under ctx: it is local work, and the deadline exists to stop
+	// slow fetches.
+	if abandonIfInterrupted(budgetCtx, logCtx, state) {
+		return 0
+	}
+	stores, err := checkpoint.Open(budgetCtx, repo, s.hookCheckpointStoreOptions(budgetCtx))
 	if err != nil {
+		if abandonIfInterrupted(budgetCtx, logCtx, state) {
+			return 0
+		}
 		logging.Warn(logCtx, "finalize: failed to open checkpoint store",
 			slog.String("error", err.Error()),
 		)
 		return 1 // Count as error - all checkpoints will be skipped
 	}
+	// The deadline can pass while Open runs; precompute would then hash the
+	// whole transcript for writes that never start.
+	if abandonIfInterrupted(budgetCtx, logCtx, state) {
+		return 0
+	}
 	store := stores.Persistent
 
 	precomputed := precomputeTranscriptBlobsForFinalize(logCtx, repo, redactedTranscript, state)
 
-	// Update each checkpoint with the full transcript
-	for _, cpIDStr := range state.TurnCheckpointIDs {
-		cpID, parseErr := id.NewCheckpointID(cpIDStr)
-		if parseErr != nil {
-			logging.Warn(logCtx, "finalize: invalid checkpoint ID, skipping",
-				slog.String("checkpoint_id", cpIDStr),
-				slog.String("error", parseErr.Error()),
-			)
-			errCount++
-			continue
-		}
-
-		updateOpts := checkpoint.UpdateOptions{
-			CheckpointID:            cpID,
-			SessionID:               state.SessionID,
-			Transcript:              redactedTranscript,
-			Assets:                  finalizeAssets,
-			PreserveAssetsWhenEmpty: sidecarCapable || !externalizationRan,
-			Prompts:                 prompts,
-			Agent:                   state.AgentType,
-			SkillEvents:             skillEvents,
-			PrecomputedBlobs:        precomputed,
-		}
-
-		updateErr := store.Write(ctx, checkpoint.SessionTranscript(updateOpts))
-		if updateErr != nil {
-			logging.Warn(logCtx, "finalize: failed to update checkpoint",
-				slog.String("checkpoint_id", cpIDStr),
-				slog.String("error", updateErr.Error()),
-			)
-			errCount++
-			continue
-		}
-
-		logging.Info(logCtx, "finalize: checkpoint updated with full transcript",
-			slog.String("checkpoint_id", cpIDStr),
-			slog.String("session_id", state.SessionID),
-		)
+	updateOpts := checkpoint.UpdateOptions{
+		SessionID:               state.SessionID,
+		Transcript:              redactedTranscript,
+		Assets:                  finalizeAssets,
+		PreserveAssetsWhenEmpty: sidecarCapable || !externalizationRan,
+		Prompts:                 prompts,
+		Agent:                   state.AgentType,
+		SkillEvents:             skillEvents,
+		PrecomputedBlobs:        precomputed,
+	}
+	errCount, unfinalized := finalizeTurnCheckpointWrites(budgetCtx, logCtx, store, state, updateOpts)
+	if unfinalized > 0 {
+		state.TurnCheckpointIDs = state.TurnCheckpointIDs[len(state.TurnCheckpointIDs)-unfinalized:]
+		recordFinalizeInterruption(budgetCtx, logCtx, state)
+		return errCount
 	}
 
 	// Clear turn checkpoint IDs. Do NOT update CheckpointTranscriptStart here — it was
@@ -3509,6 +3526,86 @@ func (s *ManualCommitStrategy) finalizeAllTurnCheckpoints(ctx context.Context, s
 	state.TurnCheckpointIDs = nil
 
 	return errCount
+}
+
+// finalizeTurnCheckpointWrites writes the finalized transcript to each
+// checkpoint in state.TurnCheckpointIDs, in order. errCount counts checkpoints
+// that failed for reasons other than ctx ending; processing continues past
+// them. If ctx ends, the loop stops and unfinalized is the length of the
+// unprocessed suffix of state.TurnCheckpointIDs, which the caller keeps for a
+// retry; it is zero whenever ctx did not end.
+func finalizeTurnCheckpointWrites(
+	ctx context.Context,
+	logCtx context.Context,
+	store checkpoint.PersistentStore,
+	state *SessionState,
+	updateOpts checkpoint.UpdateOptions,
+) (errCount, unfinalized int) {
+	for checkpointIndex, cpIDStr := range state.TurnCheckpointIDs {
+		if ctx.Err() != nil {
+			return errCount, len(state.TurnCheckpointIDs) - checkpointIndex
+		}
+
+		cpID, err := id.NewCheckpointID(cpIDStr)
+		if err != nil {
+			logging.Warn(logCtx, "finalize: invalid checkpoint ID, skipping",
+				slog.String("checkpoint_id", cpIDStr),
+				slog.String("error", err.Error()),
+			)
+			errCount++
+			continue
+		}
+
+		updateOpts.CheckpointID = cpID
+		if err := store.Write(ctx, checkpoint.SessionTranscript(updateOpts)); err != nil {
+			if ctx.Err() != nil {
+				// Counted as an interruption, but the write may have failed for
+				// another reason as the deadline passed; keep that error visible.
+				logging.Warn(logCtx, "finalize: checkpoint write failed as the context ended",
+					slog.String("checkpoint_id", cpIDStr),
+					slog.String("error", err.Error()),
+				)
+				return errCount, len(state.TurnCheckpointIDs) - checkpointIndex
+			}
+			logging.Warn(logCtx, "finalize: failed to update checkpoint",
+				slog.String("checkpoint_id", cpIDStr),
+				slog.String("error", err.Error()),
+			)
+			errCount++
+			continue
+		}
+
+		logging.Info(logCtx, "finalize: checkpoint updated with full transcript",
+			slog.String("checkpoint_id", cpIDStr),
+			slog.String("session_id", state.SessionID),
+		)
+	}
+	return errCount, 0
+}
+
+// abandonIfInterrupted reports whether ctx has ended, from the turn-end
+// deadline or the host cancelling the hook (SIGTERM ends the root context),
+// and if so records the interruption with recordFinalizeInterruption.
+func abandonIfInterrupted(ctx, logCtx context.Context, state *SessionState) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	recordFinalizeInterruption(ctx, logCtx, state)
+	return true
+}
+
+// recordFinalizeInterruption marks the turn's capture as degraded and logs why
+// ctx ended. The caller keeps the unfinalized TurnCheckpointIDs, so a repeated
+// Stop in the same turn can retry them; turn start clears them otherwise,
+// leaving their provisional transcripts for good.
+func recordFinalizeInterruption(ctx, logCtx context.Context, state *SessionState) {
+	now := time.Now().UTC()
+	state.CaptureDegradedAt = &now
+	logging.Warn(logCtx, "finalize: interrupted; checkpoints left with provisional transcripts",
+		slog.String("session_id", state.SessionID),
+		slog.Int("unfinalized_count", len(state.TurnCheckpointIDs)),
+		slog.Any("cause", context.Cause(ctx)),
+	)
 }
 
 // filesChangedInCommit returns the set of files changed in a commit using git diff-tree.

@@ -1084,7 +1084,7 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 		// The tokens are applied by the turn-end transition itself, so a
 		// repeated or concurrent Stop for the same turn adds nothing.
 		turnUsage := resolveTurnTokenUsage(ctx, ag, event, sessionID, preState, transcriptData, subagentsDir, codexInventoryUsage)
-		transitionSessionTurnEnd(ctx, sessionID, event, &checkpointlessTurnUsage{usage: turnUsage, ledgerVersion: codexLedgerVersion})
+		transitionSessionTurnEnd(ctx, sessionID, ag.Type(), event, &checkpointlessTurnUsage{usage: turnUsage, ledgerVersion: codexLedgerVersion})
 		if cleanupErr := CleanupPrePromptState(ctx, sessionID); cleanupErr != nil {
 			logging.Warn(logCtx, "failed to cleanup pre-prompt state",
 				slog.String("error", cleanupErr.Error()))
@@ -1154,7 +1154,7 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 		}
 	}
 	recordCaptureDegraded(ctx, sessionID, captureDegraded)
-	transitionSessionTurnEnd(ctx, sessionID, event, nil)
+	transitionSessionTurnEnd(ctx, sessionID, agentType, event, nil)
 	if cleanupErr := CleanupPrePromptState(ctx, sessionID); cleanupErr != nil {
 		logging.Warn(logCtx, "failed to cleanup pre-prompt state",
 			slog.String("error", cleanupErr.Error()))
@@ -1501,6 +1501,29 @@ func sessionEndCondenseDeadline(ag agent.Agent) time.Time {
 		return time.Time{}
 	}
 	return processStart.Add(budget)
+}
+
+// defaultTurnEndHookTimeout is the turn-end hook timeout assumed for agents
+// that do not declare agent.TurnEndHookTimeouter, or declare a non-positive
+// one. Cursor documents only a "platform default", OpenCode applies none (its
+// plugin blocks on the hook), and external agents expose none, so it borrows
+// the limit Codex and Copilot CLI enforce (their defaultHookTimeoutSec and
+// hostDefaultHookTimeoutSec).
+const defaultTurnEndHookTimeout = 30 * time.Second
+
+// turnEndFinalizeDeadline returns when turn-end checkpoint finalization must
+// stop waiting on the network so the hook finishes inside its host's timeout,
+// measured from process start like the host's own clock.
+func turnEndFinalizeDeadline(agentType types.AgentType) time.Time {
+	hookTimeout := defaultTurnEndHookTimeout
+	if ag, err := agent.GetByAgentType(agentType); err == nil {
+		if timeouter, ok := agent.AsTurnEndHookTimeouter(ag); ok {
+			if declared := timeouter.TurnEndHookTimeout(); declared > 0 {
+				hookTimeout = declared
+			}
+		}
+	}
+	return processStart.Add(agent.TurnEndBudgetWithin(hookTimeout))
 }
 
 // endSessionNow runs the canonical "this session is over" sequence: it marks the
@@ -2455,7 +2478,7 @@ func saveSubagentSessionTaskStep(ctx context.Context, step subagentSessionStep) 
 	// Ending it first is what claims the turn's usage: a repeated Stop finds
 	// the Worker already IDLE and adds none.
 	var turnUsage *agent.TokenUsage
-	if transitionSessionTurnEnd(ctx, step.sessionID, step.event, nil) {
+	if transitionSessionTurnEnd(ctx, step.sessionID, step.ag.Type(), step.event, nil) {
 		turnUsage = step.turnUsage
 	}
 
@@ -2546,7 +2569,9 @@ func recordCaptureDegraded(ctx context.Context, sessionID string, degraded bool)
 }
 
 // transitionSessionTurnEnd transitions the session phase to IDLE and dispatches turn-end actions.
-func transitionSessionTurnEnd(ctx context.Context, sessionID string, event *agent.Event, turnUsage *checkpointlessTurnUsage) (endedActiveTurn bool) {
+// agentType is the agent running this hook: its host's timeout bounds the
+// finalize, while state.AgentType can be empty.
+func transitionSessionTurnEnd(ctx context.Context, sessionID string, agentType types.AgentType, event *agent.Event, turnUsage *checkpointlessTurnUsage) (endedActiveTurn bool) {
 	logCtx := logging.WithComponent(ctx, "lifecycle")
 	var appendedSkillEvents []agent.SkillEvent
 	wasActive := false
@@ -2573,7 +2598,7 @@ func transitionSessionTurnEnd(ctx context.Context, sessionID string, event *agen
 		// and appends the new ones to state.SkillEvents — snapshot its growth
 		// so those events reach telemetry alongside the hook-provided ones.
 		skillEventsBefore := len(state.SkillEvents)
-		if err := strat.HandleTurnEnd(ctx, state); err != nil {
+		if err := strat.HandleTurnEnd(ctx, state, turnEndFinalizeDeadline(agentType)); err != nil {
 			logging.Warn(logCtx, "turn-end action dispatch failed",
 				slog.String("error", err.Error()))
 		}
