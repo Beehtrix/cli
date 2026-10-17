@@ -1713,11 +1713,12 @@ func TestPrintTrailDetailsRendersURLAndDescription(t *testing.T) {
 	}
 
 	// A Change prints its parent's page, the link agents otherwise guess.
+	// Both links are server text, so control characters never reach the terminal.
 	out.Reset()
-	m.ProjectTrailURL = "https://entire.io/gh/acme/-/trails/42"
-	printTrailDetails(&out, m, "", nil, "")
-	if text := out.String(); !strings.Contains(text, "Project: https://entire.io/gh/acme/-/trails/42\n") {
-		t.Fatalf("expected the parent's page, got:\n%s", text)
+	m.ProjectTrailURL = "https://entire.io/gh/acme/-/trails/42\x1b[31m"
+	printTrailDetails(&out, m, "https://entire.io/gh/acme/repo/trails/5\x1b[0m", nil, "")
+	if text := out.String(); !strings.Contains(text, "Project: https://entire.io/gh/acme/-/trails/42") || strings.Contains(text, "\x1b") {
+		t.Fatalf("expected sanitized links, got:\n%q", text)
 	}
 }
 
