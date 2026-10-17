@@ -17,23 +17,9 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/testutil/gitenv"
 )
 
-// Force-with-lease coverage for pushes through the helper. Git only
-// forwards a lease to a remote helper as `option cas <ref>:<oid>`
-// before the push batch; the helper must turn that into
-// `send-pack --force-with-lease=<ref>:<oid>` or the rewritten branch is
-// rejected client-side as non-fast-forward, exactly as if no force flag
-// had been given. These tests pin that against the installed git and a
-// real receive-pack, at two layers:
-//
-//   - handlePush with the real send-pack (TestHandlePush_ForceWithLease)
-//   - `git push --force-with-lease` driving the real protocol loop as a
-//     helper subprocess (TestGitPush_ForceWithLease)
+// Git sends leases to helpers as `option cas`.
 
-// gitBackendServer serves a bare repository at /et/owner/repo over
-// smart HTTP via `git http-backend`, so pushes hit a real receive-pack
-// (lease checks included) rather than a scripted reply. Isolates git
-// config first so the bare repo setup and the CGI process never read
-// the developer's own config; that mutates process-global state.
+// IsolateRepository first: http-backend inherits developer config.
 func gitBackendServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	gitenv.IsolateRepository(t)
@@ -53,7 +39,7 @@ func gitBackendServer(t *testing.T) (*httptest.Server, string) {
 		"GIT_PROJECT_ROOT=" + root,
 		"GIT_HTTP_EXPORT_ALL=1",
 	}
-	// Carry the test's git config isolation into the CGI process.
+	// cgi.Handler drops GIT_CONFIG_* unless copied.
 	for _, e := range os.Environ() {
 		if strings.HasPrefix(e, "GIT_CONFIG_") {
 			env = append(env, e)
@@ -68,7 +54,6 @@ func gitBackendServer(t *testing.T) (*httptest.Server, string) {
 	return server, bare
 }
 
-// runGit runs git in the process cwd and fails the test on error.
 func runGit(t *testing.T, args ...string) string {
 	t.Helper()
 	out, err := exec.CommandContext(context.Background(), "git", args...).CombinedOutput()
@@ -78,9 +63,6 @@ func runGit(t *testing.T, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// seedDivergedBranch seeds the bare repo's main with one commit from
-// the client repo, then amends that commit locally so the client's main
-// is a non-fast-forward rewrite. Returns the served tip and the rewrite.
 func seedDivergedBranch(t *testing.T, bare string, run func(args ...string) string) (served, rewritten string) {
 	t.Helper()
 	run("commit", "-q", "--allow-empty", "-m", "one")
@@ -99,12 +81,8 @@ func bareTip(t *testing.T, bare string) string {
 	return runGit(t, "-C", bare, "rev-parse", testRefMain)
 }
 
-// TestHandlePush_ForceWithLease drives handlePush with the real
-// send-pack against a real receive-pack: a non-fast-forward rewrite is
-// rejected without a lease, refused as stale when the lease names the
-// wrong tip, and lands with an exact lease.
 func TestHandlePush_ForceWithLease(t *testing.T) {
-	// No t.Parallel(): t.Chdir, because send-pack runs in the process cwd.
+	// No t.Parallel(): t.Chdir for send-pack cwd.
 	server, bare := gitBackendServer(t)
 	dir, run := newRealGitRepo(t)
 	served, rewritten := seedDivergedBranch(t, bare, run)
@@ -159,9 +137,7 @@ func TestHandlePush_ForceWithLease(t *testing.T) {
 	})
 }
 
-// helperStub puts a `git-remote-<scheme>` script on a fresh PATH entry
-// that re-executes this test binary as the helper (see TestMain) against
-// serverURL with the given protocol version, and returns that PATH.
+// Re-executes this test binary as the helper.
 func helperStub(t *testing.T, scheme, serverURL string, protocolVersion int) string {
 	t.Helper()
 	exe, err := os.Executable()
@@ -179,14 +155,9 @@ func helperStub(t *testing.T, scheme, serverURL string, protocolVersion int) str
 	return stubDir + string(os.PathListSeparator) + os.Getenv("PATH")
 }
 
-// TestGitPush_ForceWithLease is the user's command end to end: `git
-// push --force-with-lease` to a helper-scheme remote, with the real
-// git driving the real protocol loop over both capability sets (v2
-// `push`, v0 `connect`). A rewritten branch must be rejected without a
-// lease or with a stale one, and must land with an exact lease and
-// with a lease taken from the remote-tracking ref.
+// v2 uses helper push; v0 uses connect.
 func TestGitPush_ForceWithLease(t *testing.T) {
-	// No t.Parallel(): newRealGitRepo mutates process-global git env.
+	// No t.Parallel(): newRealGitRepo sets process env.
 	if runtime.GOOS == goosWindows {
 		t.Skip("shell-script helper stub is POSIX-only")
 	}
@@ -198,7 +169,7 @@ func TestGitPush_ForceWithLease(t *testing.T) {
 			const scheme = "entiretest"
 			path := helperStub(t, scheme, server.URL, protocolVersion)
 			run("remote", "add", "origin", scheme+"://host/et/owner/repo")
-			// Remote-tracking ref for the bare --force-with-lease form.
+			// Bare --force-with-lease reads this tracking ref.
 			run("update-ref", "refs/remotes/origin/main", served)
 
 			gitPush := func(t *testing.T, args ...string) (string, error) {
@@ -245,7 +216,7 @@ func TestGitPush_ForceWithLease(t *testing.T) {
 				if got := bareTip(t, bare); got != rewritten {
 					t.Errorf("served tip = %s, want rewrite %s\n%s", got, rewritten, out)
 				}
-				// Rewind server and tracking ref for the next subtest.
+				// Push moved the tracking ref too; rewind.
 				runGit(t, "-C", bare, "update-ref", testRefMain, served)
 				run("update-ref", "refs/remotes/origin/main", served)
 			})

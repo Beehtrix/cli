@@ -8,18 +8,13 @@ import (
 	"testing"
 )
 
-// Environment handed to the test binary when a git subprocess runs it
-// as a remote helper (see helperStub in force_with_lease_test.go).
+// Set by helperStub; read by TestMain.
 const (
 	helperServerEnv   = "GITHELPER_TEST_HELPER_SERVER"
 	helperProtocolEnv = "GITHELPER_TEST_HELPER_PROTOCOL"
 )
 
-// TestMain lets the test binary double as a git remote helper: when
-// git spawns it with helperServerEnv set, it runs the real protocol
-// loop against that server instead of the test suite. Exiting here,
-// not from a test, keeps the testing package's "PASS" line off the
-// helper's stdout, which git reads as protocol.
+// os.Exit here keeps PASS off helper stdout.
 func TestMain(m *testing.M) {
 	serverURL := os.Getenv(helperServerEnv)
 	if serverURL == "" {
