@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/entireio/cli/cmd/entire/cli/testutil/gitenv"
 )
 
 // Force-with-lease coverage for pushes through the helper. Git only
@@ -29,9 +31,12 @@ import (
 
 // gitBackendServer serves a bare repository at /et/owner/repo over
 // smart HTTP via `git http-backend`, so pushes hit a real receive-pack
-// (lease checks included) rather than a scripted reply.
+// (lease checks included) rather than a scripted reply. Isolates git
+// config first so the bare repo setup and the CGI process never read
+// the developer's own config; that mutates process-global state.
 func gitBackendServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
+	gitenv.IsolateRepository(t)
 	gitPath, err := exec.LookPath("git")
 	if err != nil {
 		t.Skip("git not on PATH")
