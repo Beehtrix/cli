@@ -20,10 +20,10 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/gitremote"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/trail"
+	"github.com/entireio/cli/cmd/entire/cli/tuiutil"
 
 	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/entireio/cli/cmd/entire/cli/tuiutil"
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/spf13/cobra"
@@ -380,7 +380,7 @@ func printTrailDetails(w io.Writer, m *trail.Metadata, webURL string, mergeabili
 		fmt.Fprintf(w, "  %s%s\n", label("URL:     "), tuiutil.SanitizeTerminalText(webURL))
 	}
 	if m.ProjectTrailURL != "" {
-		fmt.Fprintf(w, "  %s%s\n", label("Project: "), tuiutil.SanitizeTerminalText(m.ProjectTrailURL))
+		fmt.Fprintf(w, "  %s%s\n", label("Project trail: "), tuiutil.SanitizeTerminalText(m.ProjectTrailURL))
 	}
 	if len(m.Labels) > 0 {
 		fmt.Fprintf(w, "  %s%s\n", label("Labels:  "), strings.Join(m.Labels, ", "))

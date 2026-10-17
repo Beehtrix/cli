@@ -160,8 +160,7 @@ func TestProjectTrailShowPrintsServerURL(t *testing.T) {
 	})
 	out, _, err := executeProjectTrailTest(t, "show", "42", "--project", "gh/acme")
 	require.NoError(t, err)
-	require.Contains(t, out, "Trail #42: Project intent\n")
-	require.Contains(t, out, "URL: https://entire.io/gh/acme/-/trails/42\n")
+	require.Contains(t, out, "Trail #42: Project intent\nURL: https://entire.io/gh/acme/-/trails/42\nID: ")
 }
 
 func TestProjectTrailShowOmitsURLWithoutOne(t *testing.T) {
