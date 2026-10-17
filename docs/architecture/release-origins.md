@@ -122,11 +122,14 @@ release can enqueue a second run and cancel a queued hotfix by itself. Dropping
 a release outright is worse than the race, and the conditional write already
 closes that race for workflow runs and manual ones alike.
 
-The channel a tag belongs to is decided the same way in all three places: a
-`nightly` prerelease goes to nightly, no prerelease to stable, and any other
-prerelease is **refused at publish time**. Readers identify nightly by that
-prerelease segment, so an rc tag routed to nightly would publish a pointer both
-readers reject, leaving the channel silently stuck. Both readers also prefer
+The channel a tag belongs to is decided the same way everywhere: the literal
+`-nightly.` prerelease segment goes to nightly, no prerelease to stable, and any
+other prerelease is **refused at publish time**. Four places answer this
+question — the publisher, `install.sh`, `isNightly`, and the GitHub release scan
+— and they have to use the same test. A looser one in any of them routes a tag
+like `v0.5.4-nightly` or `v0.5.4-prenightly` to the channel, where the readers
+disagree about it: the CLI announces an update that `install.sh` then refuses to
+install, which is worse than either accepting or rejecting it consistently. Both readers also prefer
 `tag` over `version` and check the manifest's declared `channel`.
 
 **Publishing inverts rule 1 on purpose.** `publish-channel-manifest.sh` fails

@@ -389,9 +389,16 @@ func semverTag(version string) string {
 	return version
 }
 
-// isNightly returns true if the version string is a nightly build.
+// isNightly reports whether a version is a nightly build, identified by the
+// literal "-nightly." prerelease segment that create-nightly-tag.sh produces.
+//
+// A substring test for "nightly" is too loose, and the looseness is not
+// harmless: it accepts v0.5.4-nightly and v0.5.4-prenightly, which install.sh's
+// version_valid_for_channel and the GitHub release scan below both reject. The
+// CLI would then announce an update the installer refuses to install. All four
+// places that answer this question test the same segment.
 func isNightly(version string) bool {
-	return strings.Contains(semver.Prerelease(semverTag(version)), "nightly")
+	return strings.HasPrefix(semver.Prerelease(semverTag(version)), "-nightly.")
 }
 
 // fetchLatestNightlyVersion fetches the latest nightly version tag from the GitHub releases list.

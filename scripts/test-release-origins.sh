@@ -460,6 +460,21 @@ out="$(publish --tag v1.2.3-rc.1 --bucket b; printf 'rc=%s' "$?")"
 expect "refuses a prerelease no channel claims" contains "$out" "rc=1"
 expect "the refusal says no channel claims it" contains "$out" "no channel claims it"
 
+# The publisher's nightly test must be the readers' test, not a looser one. A
+# prerelease merely containing "nightly" would be routed to the channel, where
+# the CLI accepts it and install.sh does not.
+for t in v0.5.4-nightly v0.5.4-prenightly v0.5.4-rc.nightly.1; do
+    fresh "nearmiss-$t"
+    out="$(publish --tag "$t" --bucket b; printf 'rc=%s' "$?")"
+    expect "refuses $t, which only looks like a nightly" contains "$out" "rc=1"
+    refute "$t never reaches the nightly pointer" test -f "$AWS_STUB_ROOT/b/channels/nightly.json"
+done
+
+fresh realnightly
+out="$(publish --tag v0.5.4-nightly.202604061200.abc1234 --bucket b; printf 'rc=%s' "$?")"
+expect "a real nightly tag still publishes" contains "$out" "rc=0"
+expect "it lands on the nightly channel" eq "$(pointer nightly)" "0.5.4-nightly.202604061200.abc1234"
+
 expect "requires --tag" eq "$rc" 1
 
 # The monotonic guard must fail closed: a pointer it could not read cannot be

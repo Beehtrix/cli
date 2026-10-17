@@ -84,10 +84,17 @@ VERSION="${TAG#v}"
 
 # A nightly prerelease belongs to nightly, no prerelease to stable. Any other
 # prerelease is refused rather than routed: readers identify the nightly channel
-# by the "nightly" prerelease segment, so an rc tag sent to nightly would publish
-# a pointer they reject, leaving nightly silently stuck on the previous version.
-# Refusing here makes that a loud failure at publish time instead.
-if [[ "$VERSION" == *-*nightly* ]]; then
+# by the "-nightly." prerelease segment, so an rc tag sent to nightly would
+# publish a pointer they reject, leaving nightly silently stuck on the previous
+# version. Refusing here makes that a loud failure at publish time instead.
+#
+# The test is the literal "-nightly." segment, matching install.sh's
+# version_valid_for_channel, versioncheck's isNightly and its GitHub release
+# scan. A looser test here (any prerelease merely containing "nightly") routes
+# v0.5.4-nightly or v0.5.4-prenightly to the channel, where the CLI accepts
+# them and install.sh does not -- the CLI then announces an update that the
+# installer refuses to install.
+if [[ "$VERSION" == *-nightly.* ]]; then
     CHANNEL="nightly"
 elif [[ "$VERSION" == *-* ]]; then
     die "tag '${TAG}' carries a prerelease segment that is not a nightly; no channel claims it"

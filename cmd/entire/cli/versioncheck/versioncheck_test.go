@@ -73,6 +73,12 @@ func TestIsNightly(t *testing.T) {
 		{"1.0.0-rc1", false},
 		{"1.0.0-dev-xxx", false},
 		{"dev", false},
+		// Near misses the old substring test accepted. install.sh and the
+		// GitHub release scan reject all three, so accepting them here made
+		// the CLI announce updates the installer would not install.
+		{"0.5.3-nightly", false},
+		{"0.5.3-prenightly", false},
+		{"0.5.3-rc.nightly.1", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.version, func(t *testing.T) {
