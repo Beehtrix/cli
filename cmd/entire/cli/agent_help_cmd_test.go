@@ -953,7 +953,7 @@ func TestAgentHelpGuidance_NeverLeaksIntoCobraHelp(t *testing.T) {
 func TestAgentHelpProjectTrailGuidance_OnlyInProjectTree(t *testing.T) {
 	t.Parallel()
 
-	const urlLine = "Users paste entire.io trail URLs."
+	const urlLine = "Users paste Entire trail URLs."
 	project := projectTrailsHelpTestRoot()
 	for path, guidance := range agentHelpProjectTrailGuidance {
 		cmd := project

@@ -256,7 +256,7 @@ var agentHelpProjectTrailGuidance = map[string]string{
 	// No command parses web URLs, and the project and change URLs put
 	// "-" where a repository name would be, so an agent passing one through
 	// gets a misleading repository-mismatch error.
-	"trail show": "Users paste entire.io trail URLs. Do not pass a URL to any command; map\n" +
+	"trail show": "Users paste Entire trail URLs. Do not pass a URL to any command; map\n" +
 		"the path after the host to a selector:\n" +
 		"  <forge>/<project>/-/trails/<P>/changes/<repo>/<n>  change <repo>/<n>\n" +
 		"  <forge>/<project>/<repo>/-/trails/<P>/changes/<n>  change <repo>/<n>\n" +
