@@ -59,8 +59,8 @@ func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail) error {
 	fmt.Fprintf(w, "Trail #%d: %s\nID: %s\nProject: %s\nStatus: %s\nType: %s\nPriority: %s\nAssignees: %s\n",
 		item.Number, tuiutil.SanitizeTerminalLabel(item.Title), tuiutil.SanitizeTerminalLabel(item.ID), tuiutil.SanitizeTerminalLabel(item.ProjectID), tuiutil.SanitizeTerminalLabel(item.Status),
 		tuiutil.SanitizeTerminalLabel(item.Type), tuiutil.SanitizeTerminalLabel(item.Priority), tuiutil.SanitizeTerminalLabel(strings.Join(item.Assignees, ", ")))
-	if item.URL != "" {
-		fmt.Fprintf(w, "URL: %s\n", tuiutil.SanitizeTerminalText(item.URL))
+	if url := strings.TrimSpace(item.URL); url != "" {
+		fmt.Fprintf(w, "URL: %s\n", tuiutil.SanitizeTerminalText(url))
 	}
 	if item.Body != "" {
 		fmt.Fprintf(w, "\n%s\n", tuiutil.SanitizeTerminalText(item.Body))

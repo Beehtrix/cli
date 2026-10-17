@@ -164,6 +164,21 @@ func TestProjectTrailShowPrintsServerURL(t *testing.T) {
 	require.Contains(t, out, "URL: https://entire.io/gh/acme/-/trails/42\n")
 }
 
+func TestProjectTrailShowOmitsURLWithoutOne(t *testing.T) {
+	for name, url := range map[string]string{"absent": "", "whitespace": "  "} {
+		t.Run(name, func(t *testing.T) {
+			setupProjectTrailTest(t, func(w http.ResponseWriter, _ *http.Request) {
+				item := projectTrailTestResource()
+				item.URL = url
+				assert.NoError(t, json.NewEncoder(w).Encode(item))
+			})
+			out, _, err := executeProjectTrailTest(t, "show", "42", "--project", "gh/acme")
+			require.NoError(t, err)
+			require.NotContains(t, out, "URL:")
+		})
+	}
+}
+
 func TestProjectTrailUpdateAtomicConditionalPatch(t *testing.T) {
 	var methods []string
 	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {

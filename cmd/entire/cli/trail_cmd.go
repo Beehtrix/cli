@@ -378,6 +378,9 @@ func printTrailDetails(w io.Writer, m *trail.Metadata, webURL string, mergeabili
 	if webURL != "" {
 		fmt.Fprintf(w, "  %s%s\n", label("URL:     "), webURL)
 	}
+	if m.ProjectTrailURL != "" {
+		fmt.Fprintf(w, "  %s%s\n", label("Project: "), m.ProjectTrailURL)
+	}
 	if len(m.Labels) > 0 {
 		fmt.Fprintf(w, "  %s%s\n", label("Labels:  "), strings.Join(m.Labels, ", "))
 	}
