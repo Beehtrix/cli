@@ -921,6 +921,21 @@ func TestString_KeywordGatedProviderTokens(t *testing.T) {
 	})
 }
 
+// TestDetectProviderTokens_JoinedSalesforceTokens covers tokens joined by a
+// body character: a greedy body would run into the second token's org ID, stop
+// at its "!", and leave the second body unredacted.
+func TestDetectProviderTokens_JoinedSalesforceTokens(t *testing.T) {
+	t.Parallel()
+
+	for _, sep := range []string{"_", ".", "-"} {
+		input := salesforceTokenFixture + sep + salesforceTokenFixture
+		want := "REDACTED" + sep + "REDACTED"
+		if got := applyRegions(input, detectProviderTokens(input)); got != want {
+			t.Errorf("provider layer on tokens joined by %q = %q, want %q", sep, got, want)
+		}
+	}
+}
+
 // TestDetectProviderTokens_KeywordGatedBoundaries pins boundaries and filters
 // of the Salesforce and Tableau rules on the provider layer alone.
 func TestDetectProviderTokens_KeywordGatedBoundaries(t *testing.T) {
@@ -938,6 +953,7 @@ func TestDetectProviderTokens_KeywordGatedBoundaries(t *testing.T) {
 	for _, input := range []string{
 		"x" + salesforceTokenFixture,
 		"00" + strings.Repeat("X", 13) + "!" + strings.Repeat("x", 80),
+		salesforceTokenFixture[:len(salesforceTokenFixture)-19],
 		tableauPATFixture + "Z",
 		strings.Repeat("A", 22) + "==:" + strings.Repeat("a", 32),
 		"x" + tableauPATFixture,

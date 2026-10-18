@@ -107,16 +107,6 @@ var boundedTokenRules = []boundedTokenRule{
 			return endsAtBoundary(s, end) && !strings.HasSuffix(id, "EXAMPLE") && shannonEntropy(id) > 3.0
 		},
 	},
-	// Salesforce access tokens (org ID, "!", session body). betterleaks only
-	// scans for them when "salesforce.com" appears in the same text, and "!"
-	// and "." split them into chunks the entropy layer misses. The open-ended
-	// body consumes every trailing body char, so no trailing check is needed.
-	{
-		pattern: regexp.MustCompile(tokenBoundary + `(00[A-Za-z0-9]{13}![A-Za-z0-9._-]{80,})`),
-		keep: func(s string, start, end int) bool {
-			return shannonEntropy(s[start:end]) >= 3.3
-		},
-	},
 	// Tableau personal access tokens ("<22 base64>==:<32 alnum>"). betterleaks
 	// only scans for them when "tableau" appears in the same text, and "/",
 	// "+" and ":" split them for the entropy layer.
@@ -139,6 +129,7 @@ func detectProviderTokens(s string) []taggedRegion {
 			regions = append(regions, taggedRegion{region: region{loc[0], loc[1]}})
 		}
 	}
+	regions = append(regions, detectSalesforceTokens(s)...)
 	for _, rule := range boundedTokenRules {
 		for _, loc := range rule.pattern.FindAllStringSubmatchIndex(s, -1) {
 			start, end := loc[2], loc[3]
@@ -148,6 +139,43 @@ func detectProviderTokens(s string) []taggedRegion {
 		}
 	}
 	return regions
+}
+
+// salesforceHeadPattern matches the head of a Salesforce access token: the
+// 15-char org ID and the "!" before the session body.
+var salesforceHeadPattern = regexp.MustCompile(tokenBoundary + `(00[A-Za-z0-9]{13}!)`)
+
+// detectSalesforceTokens catches Salesforce access tokens (org ID, "!", session
+// body of 80+ chars). betterleaks only scans for them when "salesforce.com"
+// appears in the same text, and "!" and "." split them into chunks the entropy
+// layer misses.
+//
+// The body charset includes "_", "." and "-", so a single greedy regex would
+// run a body into the org ID of a token joined to it ("<token>_<token>") and,
+// stopping at that token's "!", skip it. Heads cannot overlap, so they are
+// matched first and each body is extended by hand up to the next head.
+func detectSalesforceTokens(s string) []taggedRegion {
+	heads := salesforceHeadPattern.FindAllStringSubmatchIndex(s, -1)
+	var regions []taggedRegion
+	for i, head := range heads {
+		start, bodyStart := head[2], head[3]
+		limit := len(s)
+		if i+1 < len(heads) {
+			limit = heads[i+1][0]
+		}
+		end := bodyStart
+		for end < limit && isSalesforceBodyChar(s[end]) {
+			end++
+		}
+		if end-bodyStart >= 80 && shannonEntropy(s[start:end]) >= 3.3 {
+			regions = append(regions, taggedRegion{region: region{start, end}})
+		}
+	}
+	return regions
+}
+
+func isSalesforceBodyChar(b byte) bool {
+	return isASCIIAlnum(b) || b == '.' || b == '_' || b == '-'
 }
 
 // endsAtBoundary reports whether the match ending at end is not followed by an
