@@ -73,12 +73,60 @@ var providerTokenPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`sbp_[a-z0-9_-]{20,}`),
 }
 
-// bareSKKeyPattern catches short sk- keys (e.g. LiteLLM virtual keys, sk- + 22
-// chars) that are too short for the entropy layer (#2728). The prefix must
-// follow a non-alphanumeric char ("_" included) or a literal JSON escape, so
-// "risk-" doesn't match; detectProviderTokens also requires a digit or
-// uppercase letter in the body.
-var bareSKKeyPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9]|\\[bfnrt]|\\u[0-9A-Fa-f]{4})(sk-[A-Za-z0-9_-]{20,})`)
+// tokenBoundary is the leading boundary for the bounded token rules below: the
+// token must follow a non-alphanumeric char ("_" included) or a literal JSON
+// escape, whose trailing letter or hex digit would otherwise read as part of a
+// word ("\nsk-…", ""AKIA…"). Each rule captures the token in group 1.
+const tokenBoundary = `(?:^|[^A-Za-z0-9]|\\[bfnrt]|\\u[0-9A-Fa-f]{4})` //nolint:gosec // regex literal, not a credential
+
+// boundedTokenRule is a token shape with a leading boundary and a check that
+// filters a match by the surrounding input and the token itself.
+type boundedTokenRule struct {
+	pattern *regexp.Regexp
+	keep    func(s string, start, end int) bool
+}
+
+var boundedTokenRules = []boundedTokenRule{
+	// Short sk- keys (e.g. LiteLLM virtual keys, sk- + 22 chars) that are too
+	// short for the entropy layer (#2728). The boundary keeps "risk-" out, and
+	// a digit or uppercase letter in the body keeps kebab-case names out.
+	{
+		pattern: regexp.MustCompile(tokenBoundary + `(sk-[A-Za-z0-9_-]{20,})`),
+		keep: func(s string, start, end int) bool {
+			return strings.ContainsFunc(s[start+len("sk-"):end], isDigitOrUpper)
+		},
+	},
+	// AWS access key IDs on their own (#2808). betterleaks' aws-access-token
+	// rule fired only beside a secret access key, and a 20-char ID can never
+	// clear the entropy threshold. The body is betterleaks' own regex; the
+	// filters are its documentation EXAMPLE keys and low-entropy placeholders.
+	{
+		pattern: regexp.MustCompile(tokenBoundary + `((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16})`),
+		keep: func(s string, start, end int) bool {
+			id := s[start:end]
+			return endsAtBoundary(s, end) && !strings.HasSuffix(id, "EXAMPLE") && shannonEntropy(id) > 3.0
+		},
+	},
+	// Salesforce access tokens (org ID, "!", session body). betterleaks only
+	// scans for them when "salesforce.com" appears in the same text, and "!"
+	// and "." split them into chunks the entropy layer misses. The open-ended
+	// body consumes every trailing body char, so no trailing check is needed.
+	{
+		pattern: regexp.MustCompile(tokenBoundary + `(00[A-Za-z0-9]{13}![A-Za-z0-9._-]{80,})`),
+		keep: func(s string, start, end int) bool {
+			return shannonEntropy(s[start:end]) >= 3.3
+		},
+	},
+	// Tableau personal access tokens ("<22 base64>==:<32 alnum>"). betterleaks
+	// only scans for them when "tableau" appears in the same text, and "/",
+	// "+" and ":" split them for the entropy layer.
+	{
+		pattern: regexp.MustCompile(tokenBoundary + `([A-Za-z0-9+/]{22}==:[A-Za-z0-9]{32})`),
+		keep: func(s string, start, end int) bool {
+			return endsAtBoundary(s, end) && shannonEntropy(s[start:end]) >= 3.5
+		},
+	},
+}
 
 // detectProviderTokens returns tagged regions for every occurrence of a
 // known provider secret-token prefix in s. Regions use the empty label so
@@ -91,13 +139,25 @@ func detectProviderTokens(s string) []taggedRegion {
 			regions = append(regions, taggedRegion{region: region{loc[0], loc[1]}})
 		}
 	}
-	for _, loc := range bareSKKeyPattern.FindAllStringSubmatchIndex(s, -1) {
-		start, end := loc[2], loc[3]
-		if strings.ContainsFunc(s[start+len("sk-"):end], isDigitOrUpper) {
-			regions = append(regions, taggedRegion{region: region{start, end}})
+	for _, rule := range boundedTokenRules {
+		for _, loc := range rule.pattern.FindAllStringSubmatchIndex(s, -1) {
+			start, end := loc[2], loc[3]
+			if rule.keep(s, start, end) {
+				regions = append(regions, taggedRegion{region: region{start, end}})
+			}
 		}
 	}
 	return regions
+}
+
+// endsAtBoundary reports whether the match ending at end is not followed by an
+// alphanumeric char. RE2 has no lookahead, so fixed-length rules check it here.
+func endsAtBoundary(s string, end int) bool {
+	return end == len(s) || !isASCIIAlnum(s[end])
+}
+
+func isASCIIAlnum(b byte) bool {
+	return ('0' <= b && b <= '9') || ('A' <= b && b <= 'Z') || ('a' <= b && b <= 'z')
 }
 
 func isDigitOrUpper(r rune) bool {
