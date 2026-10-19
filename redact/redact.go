@@ -31,7 +31,8 @@ var secretPattern = regexp.MustCompile(`[A-Za-z0-9+_=-]{10,}`)
 // credentialedURIPattern matches URLs that embed userinfo with a password, such
 // as postgres://user:pass@host/db or redis://:pass@host/0. These often have
 // moderate entropy and are not reliably covered by vendor-specific scanners.
-var credentialedURIPattern = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]{1,31}://[^\s/?#@"'` + "`" + `<>:]*:[^\s/?#@"'` + "`" + `<>]+@[^\s"'` + "`" + `<>]+`)
+// Group 1 is the password.
+var credentialedURIPattern = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]{1,31}://[^\s/?#@"'` + "`" + `<>:]*:([^\s/?#@"'` + "`" + `<>]+)@[^\s"'` + "`" + `<>]+`)
 
 // dbPasswordKeyShape matches a DB-prefixed credential key (vendor prefix +
 // optional `_word`/`-word` segments + `password`/`passwd`/`pwd`). Used to
@@ -46,14 +47,15 @@ var (
 	semicolonConnPattern = regexp.MustCompile(`(?i)\b[a-z][a-z0-9 _-]*=(?:\{[^}]*\}|"[^"]*"|'[^']*'|[^=;"'\s]+)(?:;[a-z][a-z0-9 _-]*=(?:\{[^}]*\}|"[^"]*"|'[^']*'|[^=;"'\s]+)){2,}`)
 	// credentialValuePattern requires the prefix to start at a non-alphanumeric
 	// boundary, so APP_DB_PASSWORD matches via the leading `_` but mydbpassword
-	// does not.
-	credentialValuePattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(` + dbPasswordKeyShape + `)\s*=\s*("[^"]*"|'[^']*'|[^\s,;&]+)`)
+	// does not. Only spaces and tabs may surround `=`, so a blank value never
+	// takes the next line as its value.
+	credentialValuePattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(` + dbPasswordKeyShape + `)[ \t]*=[ \t]*("[^"]*"|'[^']*'|[^\s,;&]+)`)
 
 	keywordHostPattern      = regexp.MustCompile(`(?i)(?:^|\s)host=`)
 	keywordUserPattern      = regexp.MustCompile(`(?i)(?:^|\s)user=`)
 	semicolonServerPattern  = regexp.MustCompile(`(?i)(?:^|;)\s*(?:server|data source|datasource|addr|address|network address)\s*=`)
 	semicolonUserPattern    = regexp.MustCompile(`(?i)(?:^|;)\s*(?:user id|userid|user|uid)\s*=`)
-	passwordAssignmentRegex = regexp.MustCompile(`(?i)(?:^|[?&;\s])(?:password|pwd)=("[^"]*"|'[^']*'|[^&;\s"']+)`)
+	passwordAssignmentRegex = regexp.MustCompile(`(?i)(?:^|[?&;\s])(password|pwd)=("[^"]*"|'[^']*'|[^&;\s"']+)`)
 	// credentialJSONKeyRegex operates on output of normalizeCredentialJSONKey
 	// (already lowercased, `-`/` `/`.` → `_`), so the `(?i)` flag is unnecessary.
 	credentialJSONKeyRegex  = regexp.MustCompile(`^` + dbPasswordKeyShape + `$`)
@@ -84,6 +86,53 @@ func isClaudeToolUseID(match string) bool {
 	return len(match) == 30 && claudeToolUseIDPattern.MatchString(match)
 }
 
+// contentDigestPattern matches a base64 content digest at its exact encoded
+// length: a go.sum h1: hash (SHA-256), or a Subresource Integrity, npm
+// lockfile, or CSP hash source (sha1-, sha256-, sha384-, sha512-). They hash
+// public content but score above entropyThreshold.
+var contentDigestPattern = regexp.MustCompile(`\b(?:h1:[A-Za-z0-9+/]{43}=|sha1-[A-Za-z0-9+/]{27}=|sha256-[A-Za-z0-9+/]{43}=|sha384-[A-Za-z0-9+/]{64}|sha512-[A-Za-z0-9+/]{86}==)`)
+
+// contentDigestSpans returns the byte ranges of content digests in s, in
+// order. An entropy-layer match lying entirely inside one is exempt from that
+// layer only; a secret glued onto a digest makes the match longer than the
+// digest, so it is still checked.
+func contentDigestSpans(s string) [][]int {
+	if !strings.Contains(s, "h1:") && !strings.Contains(s, "sha") {
+		return nil
+	}
+	spans := contentDigestPattern.FindAllStringIndex(s, -1)
+	digests := spans[:0]
+	for _, span := range spans {
+		// More base64 after the span means a longer value whose prefix only
+		// has a digest's length. A '/' inside it would split the entropy match,
+		// so its high-entropy head would otherwise look exempt.
+		if span[1] < len(s) && isBase64OrTokenByte(s[span[1]]) {
+			continue
+		}
+		digests = append(digests, span)
+	}
+	return digests
+}
+
+func isBase64OrTokenByte(c byte) bool {
+	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.IndexByte("+/=_-", c) >= 0
+}
+
+// digestCursor answers whether entropy matches lie inside a content digest.
+// Matches arrive in increasing order, so it walks the spans forward and passes
+// over each one once.
+type digestCursor struct {
+	spans [][]int
+	next  int
+}
+
+func (c *digestCursor) contains(start, end int) bool {
+	for c.next < len(c.spans) && c.spans[c.next][1] <= start {
+		c.next++
+	}
+	return c.next < len(c.spans) && c.spans[c.next][0] <= start && end <= c.spans[c.next][1]
+}
+
 // RedactedPlaceholder is the replacement text used for redacted secrets.
 const RedactedPlaceholder = "REDACTED"
 
@@ -91,7 +140,8 @@ const RedactedPlaceholder = "REDACTED"
 // non-secrets when they appear as a credential value: prior redactions
 // (REDACTED / [REDACTED] / <REDACTED>), common documentation placeholders,
 // and obviously-non-real defaults. Values matched by shape (mask runs,
-// `<…>` brackets, `${…}` shell expansion) are handled separately.
+// `<…>` brackets, `${…}` shell expansion, template expressions like `%s`)
+// are handled separately.
 var placeholderSecretValues = func() map[string]struct{} {
 	lower := strings.ToLower(RedactedPlaceholder)
 	values := []string{
@@ -207,6 +257,7 @@ func detectAllLayers(s string) []taggedRegion {
 	var regions []taggedRegion
 
 	// 1. Entropy-based detection (secrets — always on).
+	digests := digestCursor{spans: contentDigestSpans(s)}
 	for _, loc := range secretPattern.FindAllStringIndex(s, -1) {
 		start, end := loc[0], loc[1]
 
@@ -226,7 +277,7 @@ func detectAllLayers(s string) []taggedRegion {
 			}
 		}
 
-		if isClaudeToolUseID(s[start:end]) {
+		if isClaudeToolUseID(s[start:end]) || digests.contains(start, end) {
 			continue
 		}
 		if shannonEntropy(s[start:end]) > entropyThreshold {
@@ -276,8 +327,13 @@ func detectAllLayers(s string) []taggedRegion {
 	// the entropy and betterleaks layers miss when captured in isolation.
 	regions = append(regions, detectProviderTokens(s)...)
 
-	// 4. Credentialed URIs (secrets — always on).
-	for _, loc := range credentialedURIPattern.FindAllStringIndex(s, -1) {
+	// 4. Credentialed URIs (secrets — always on). A URI whose password is a
+	// placeholder stays intact, like the connection strings in layer 5, unless
+	// its query carries a real password.
+	for _, loc := range credentialedURIPattern.FindAllStringSubmatchIndex(s, -1) {
+		if isPlaceholderSecretValue(s[loc[2]:loc[3]]) && !uriQueryHasPassword(s[loc[0]:loc[1]]) {
+			continue
+		}
 		regions = append(regions, taggedRegion{region: region{loc[0], loc[1]}})
 	}
 
@@ -298,7 +354,11 @@ func detectAllLayers(s string) []taggedRegion {
 
 // applyRegions sorts, merges, and replaces the given regions in s, returning
 // the redacted string. Returns s unchanged when regions is empty.
+//
+// Zero-length regions are dropped: replacing nothing would insert a token
+// into text that no layer flagged.
 func applyRegions(s string, regions []taggedRegion) string {
+	regions = slices.DeleteFunc(regions, func(r taggedRegion) bool { return r.end <= r.start })
 	if len(regions) == 0 {
 		return s
 	}
@@ -377,7 +437,7 @@ func hasJDBCPassword(candidate string) bool {
 	if !strings.HasPrefix(strings.ToLower(candidate), "jdbc:") {
 		return false
 	}
-	return hasNonPlaceholderPasswordAssignment(candidate)
+	return hasNonPlaceholderPasswordAssignment(candidate, nil)
 }
 
 func hasDatabaseURLSecret(candidate string) bool {
@@ -385,11 +445,30 @@ func hasDatabaseURLSecret(candidate string) bool {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return false
 	}
-	for key, values := range u.Query() {
+	return hasQueryPasswordSecret(u.Query())
+}
+
+// uriQueryHasPassword reports whether a URI's query assigns a real password.
+// It parses the query on its own, so a host url.Parse rejects (a templated
+// ${DB_HOST}) cannot hide it.
+func uriQueryHasPassword(uri string) bool {
+	_, query, ok := strings.Cut(uri, "?")
+	if !ok {
+		return false
+	}
+	query, _, _ = strings.Cut(query, "#")
+	// ParseQuery keeps every pair it can decode even when it reports an
+	// error for another.
+	values, _ := url.ParseQuery(query) //nolint:errcheck // partial values are what we want
+	return hasQueryPasswordSecret(values)
+}
+
+func hasQueryPasswordSecret(values url.Values) bool {
+	for key, vals := range values {
 		if !isPasswordQueryKey(key) {
 			continue
 		}
-		for _, value := range values {
+		for _, value := range vals {
 			if hasNonPlaceholderPasswordValue(value) {
 				return true
 			}
@@ -405,13 +484,20 @@ func isPasswordQueryKey(key string) bool {
 func hasKeywordDSNPassword(candidate string) bool {
 	return keywordHostPattern.MatchString(candidate) &&
 		keywordUserPattern.MatchString(candidate) &&
-		hasNonPlaceholderPasswordAssignment(candidate)
+		hasNonPlaceholderPasswordAssignment(candidate, isShellWorkingDirectory)
+}
+
+// isShellWorkingDirectory reports whether a keyword-DSN assignment is the
+// shell's PWD variable, which env output prints uppercase with an absolute
+// path. A lowercase pwd= is always a password.
+func isShellWorkingDirectory(key, value string) bool {
+	return key == "PWD" && (strings.HasPrefix(value, "/") || strings.HasPrefix(value, "~/"))
 }
 
 func hasSemicolonConnectionPassword(candidate string) bool {
 	return semicolonServerPattern.MatchString(candidate) &&
 		semicolonUserPattern.MatchString(candidate) &&
-		hasNonPlaceholderPasswordAssignment(candidate)
+		hasNonPlaceholderPasswordAssignment(candidate, nil)
 }
 
 func detectCredentialValues(s string) []taggedRegion {
@@ -439,13 +525,21 @@ func unquoteRange(s string, start, end int) (int, int) {
 	return start, end
 }
 
-func hasNonPlaceholderPasswordAssignment(candidate string) bool {
+// hasNonPlaceholderPasswordAssignment reports whether candidate assigns a
+// password that is not a placeholder. notPassword, when non-nil, excludes
+// assignments that only look like one.
+func hasNonPlaceholderPasswordAssignment(candidate string, notPassword func(key, value string) bool) bool {
 	for _, loc := range passwordAssignmentRegex.FindAllStringSubmatchIndex(candidate, -1) {
-		if len(loc) >= 4 && loc[2] >= 0 && loc[3] >= 0 {
-			start, end := unquoteRange(candidate, loc[2], loc[3])
-			if hasNonPlaceholderPasswordValue(candidate[start:end]) {
-				return true
-			}
+		if len(loc) < 6 || loc[4] < 0 || loc[5] < 0 {
+			continue
+		}
+		start, end := unquoteRange(candidate, loc[4], loc[5])
+		value := candidate[start:end]
+		if notPassword != nil && notPassword(candidate[loc[2]:loc[3]], value) {
+			continue
+		}
+		if hasNonPlaceholderPasswordValue(value) {
+			return true
 		}
 	}
 	return false
@@ -463,15 +557,70 @@ func isPlaceholderSecretValue(value string) bool {
 	if isBracketedPlaceholder(trimmed) {
 		return true
 	}
-	normalized := strings.ToLower(trimmed)
-	if strings.HasPrefix(normalized, "${") && strings.HasSuffix(normalized, "}") {
+	if strings.HasPrefix(trimmed, "${") && strings.HasSuffix(trimmed, "}") {
+		return isPlaceholderShellExpansion(trimmed)
+	}
+	if templatePlaceholderRE.MatchString(trimmed) {
 		return true
 	}
+	normalized := strings.ToLower(trimmed)
 	if _, ok := placeholderSecretValues[normalized]; ok {
 		return true
 	}
 	return isRepeatedCharPlaceholder(normalized)
 }
+
+// shellExpansionWordRE matches ${NAME<op>word}, whose word becomes the value
+// when NAME is unset (-, =) or set (+); with a colon, an empty NAME counts as
+// unset. ${NAME:?word} is left out: its word is an error message, never a
+// value.
+var shellExpansionWordRE = regexp.MustCompile(`^\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=+](.*)\}$`)
+
+// isPlaceholderShellExpansion reports whether a ${…} value is a placeholder:
+// one complete expression that is a plain reference, or one whose word is
+// itself empty or a placeholder, so ${DB_PASSWORD:-hunter2} and
+// ${A}hunter2${B} still count as secrets.
+func isPlaceholderShellExpansion(s string) bool {
+	if !isSingleBraceExpression(s) {
+		return false
+	}
+	if m := shellExpansionWordRE.FindStringSubmatch(s); m != nil {
+		return isPlaceholderSecretValue(m[1])
+	}
+	return !shellTextOperatorRE.MatchString(s)
+}
+
+// shellTextOperatorRE matches ${NAME<op>...} for shell operators whose text can
+// carry a literal value: pattern substitution and removal (/ # %), case
+// changes (^ ,), and substrings (:offset). Non-shell forms such as ${var.x},
+// ${env:X} and ${{secrets.X}} do not match.
+var shellTextOperatorRE = regexp.MustCompile(`^\$\{[A-Za-z_][A-Za-z0-9_]*(?:[/#%^,]|:[-0-9 ])`)
+
+// isSingleBraceExpression reports whether the brace opened by the leading "${"
+// of s is closed by its final "}".
+func isSingleBraceExpression(s string) bool {
+	depth := 0
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i == len(s)-1
+			}
+		}
+	}
+	return false
+}
+
+// templatePlaceholderRE matches a value that is one interpolation expression:
+// a printf verb (%s, %v, %q), a Python %-format name (%(password)s), a format
+// field ({} or {password}), or an uppercase shell variable ($DB_PASSWORD).
+// Format-field names allow only lowercase letters, `_` and `.`, and shell
+// variables only uppercase, so values like {hunter2} or $hunter2 are still
+// redacted.
+var templatePlaceholderRE = regexp.MustCompile(`^(?:%[svq]|%\([A-Za-z_][A-Za-z0-9_]*\)s|\{\}|\{[a-z_][a-z_.]*\}|\$[A-Z_][A-Z0-9_]*)$`)
 
 // bracketedPlaceholderInteriorRE matches the inside of a "<…>" placeholder
 // shape: lowercase letters joined by `-` or `_`. Digits, mixed case, and
