@@ -314,7 +314,12 @@ func detectAllLayers(s string) []taggedRegion {
 			regions = append(regions, taggedRegion{region: region{start, end}})
 		}
 	}
-	regions = append(regions, detectSlashedBase64(s)...)
+	slashedDigests := digestCursor{spans: digests.spans}
+	for _, r := range detectSlashedBase64(s) {
+		if !slashedDigests.contains(r.start, r.end) {
+			regions = append(regions, r)
+		}
+	}
 
 	// 2. Pattern-based detection via scanner engines (secrets — selected
 	// via ConfigureScanners; betterleaks-only when unconfigured).

@@ -147,6 +147,7 @@ func TestString_Base64WithSlashPathsPreserved(t *testing.T) {
 		"go/pkg/mod/github.com/foo/bar@v1.2.10+incompatible/CMake/DESCRIPTION",
 		"node_modules/@types/node/index.d.ts",
 		"https://github.com/entireio/cli/pull/2798",
+		"github.com/foo/bar v1.2.3 h1:wdMgn+sje1KNXdwFizIWjbf328fIUBxqEmJ/vYPo8yc=",
 		"commit a334cb6988d1e2f3a4b5c6d7e8f90a1b2c3d4e5f",
 		"session 3c1a8bcc-6af5-4ff5-a750-7fdfd71cd61d",
 	}
