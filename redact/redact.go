@@ -760,7 +760,7 @@ func hasNonPlaceholderSemicolonPassword(candidate string) bool {
 }
 
 func detectShellStdinSecrets(s string) []taggedRegion {
-	if !strings.ContainsRune(s, '|') {
+	if !strings.ContainsRune(s, '|') || !containsFoldASCII(s, "printf") || !containsFoldASCII(s, "secret") {
 		return nil
 	}
 	return detectCredentialKeyCaptures(s, shellStdinSecretPattern, true, nil)
@@ -779,7 +779,13 @@ func detectCredentialValues(s string) []taggedRegion {
 		if start == loc[4] {
 			end = extendPastValueSeparators(s, end)
 		}
-		if hasNonPlaceholderQuotedPasswordValue(s[start:end], singleQuoted) {
+		// Main's shared placeholder rules, except that a single-quoted value
+		// is a shell literal and only the literal placeholder words apply.
+		isReal := hasNonPlaceholderPasswordValue(s[start:end])
+		if singleQuoted {
+			isReal = hasNonPlaceholderQuotedPasswordValue(s[start:end], true)
+		}
+		if isReal {
 			regions = append(regions, taggedRegion{region: region{start, end}})
 		}
 	}
@@ -924,12 +930,12 @@ func hasNonPlaceholderPasswordAssignment(candidate string, notPassword func(key,
 		if len(loc) < 6 || loc[4] < 0 || loc[5] < 0 {
 			continue
 		}
-		start, end, singleQuoted := unquoteRangeQuoted(candidate, loc[4], loc[5])
+		start, end, _ := unquoteRangeQuoted(candidate, loc[4], loc[5])
 		value := candidate[start:end]
 		if notPassword != nil && notPassword(candidate[loc[2]:loc[3]], value) {
 			continue
 		}
-		if hasNonPlaceholderQuotedPasswordValue(value, singleQuoted) {
+		if hasNonPlaceholderPasswordValue(value) {
 			return true
 		}
 	}
@@ -937,7 +943,7 @@ func hasNonPlaceholderPasswordAssignment(candidate string, notPassword func(key,
 }
 
 func hasNonPlaceholderPasswordValue(value string) bool {
-	return hasNonPlaceholderQuotedPasswordValue(value, false)
+	return value != "" && !isPlaceholderSecretValue(value)
 }
 
 // hasNonPlaceholderQuotedPasswordValue is the quote-aware variant:
@@ -1028,7 +1034,7 @@ func isPlaceholderSecretValueQuoted(value string, singleQuoted bool) bool {
 		}
 		return isRepeatedCharPlaceholder(normalized)
 	}
-	if isPlaceholderSecretValue(trimmed) {
+	if isPlaceholderSecretValue(trimmed) || upperBracketedPlaceholderRE.MatchString(trimmed) {
 		return true
 	}
 	// Documentation fill-ins: `your_api_key_here`, `your-token`, `paste_key_here`.
@@ -1036,12 +1042,11 @@ func isPlaceholderSecretValueQuoted(value string, singleQuoted bool) bool {
 		return true
 	}
 	// Command substitutions (`TOKEN="$(cat token)"`) are how docs and scripts
-	// reference a secret without containing it — the value is the recipe. One
-	// that echoes or quotes text can carry the secret itself, so it does not
-	// count.
+	// reference a secret without containing it — the value is the recipe. Only
+	// a known secret-fetching command with no quotes or redirection counts:
+	// `$(echo x)`, `$(/bin/echo x)` and `$(cat <<< x)` carry the secret itself.
 	if inner, ok := strings.CutPrefix(trimmed, "$("); ok && strings.HasSuffix(inner, ")") {
-		cmd := strings.TrimSpace(strings.TrimSuffix(inner, ")"))
-		if !strings.ContainsAny(cmd, `"'`) && !commandSubstitutionTextRE.MatchString(cmd) {
+		if isSecretRecipeCommand(strings.TrimSuffix(inner, ")")) {
 			return true
 		}
 	}
@@ -1061,9 +1066,40 @@ func isPlaceholderSecretValueQuoted(value string, singleQuoted bool) bool {
 // (`your_api_key_here`, `api-token-here`).
 var docFillInPlaceholderRE = regexp.MustCompile(`^(?:your[_-][a-z_-]+|[a-z_-]*(?:key|token|secret|password)[_-]here)$`)
 
-// commandSubstitutionTextRE matches a $(...) command that prints its own
-// arguments, whose text is therefore the value rather than a recipe for it.
-var commandSubstitutionTextRE = regexp.MustCompile(`^(?:echo|printf)\b`)
+// secretRecipeCommands are commands that fetch a secret from somewhere else,
+// so `$(cmd ...)` names where the value lives rather than containing it.
+var secretRecipeCommands = map[string]struct{}{
+	"cat": {}, "printenv": {}, "gh": {}, "op": {}, "vault": {}, "aws": {},
+	"gcloud": {}, "az": {}, "security": {}, "pass": {}, "doppler": {},
+	"bw": {}, "lpass": {}, "secret-tool": {}, "kubectl": {}, "infisical": {},
+}
+
+// isSecretRecipeCommand reports whether a $(...) body runs an allowlisted
+// secret-fetching command. Quotes and redirection (`<<<`, `<`) can carry a
+// literal, so any body containing them is treated as text.
+func isSecretRecipeCommand(cmd string) bool {
+	if strings.ContainsAny(cmd, "\"'<`$|;&") {
+		return false
+	}
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return false
+	}
+	_, ok := secretRecipeCommands[fields[0]]
+	return ok
+}
+
+// containsFoldASCII reports whether s contains substr, ignoring ASCII case,
+// without allocating a lowered copy of s.
+func containsFoldASCII(s, substr string) bool {
+	n := len(substr)
+	for i := 0; i+n <= len(s); i++ {
+		if strings.EqualFold(s[i:i+n], substr) {
+			return true
+		}
+	}
+	return false
+}
 
 // shellExpansionWordRE matches ${NAME<op>word}, whose word becomes the value
 // when NAME is unset (-, =) or set (+); with a colon, an empty NAME counts as
@@ -1122,7 +1158,12 @@ var templatePlaceholderRE = regexp.MustCompile(`^(?:%[svq]|%\([A-Za-z_][A-Za-z0-
 // (`<your-token>`, `<ENTIRE_TOKEN>`). Digits, mixed case, and special chars
 // are rejected so values like `<hunter2>` or `<RealPassword>` still fall
 // through to redaction.
-var bracketedPlaceholderInteriorRE = regexp.MustCompile(`^(?:[a-z][a-z_-]*|[A-Z][A-Z_-]*)$`)
+var bracketedPlaceholderInteriorRE = regexp.MustCompile(`^[a-z][a-z_-]*$`)
+
+// upperBracketedPlaceholderRE matches an all-uppercase "<NAME>" placeholder
+// (`<ENTIRE_TOKEN>`). Key/value captures only: the shared rule stays
+// lowercase, so `<HUNTER>` from a scanner or connection string still redacts.
+var upperBracketedPlaceholderRE = regexp.MustCompile(`^<[A-Z][A-Z_-]{2,}>$`)
 
 // isBracketedPlaceholder reports whether s is a "<name>" doc placeholder
 // (e.g. "<password>", "<your-db-password>"). The minimum total length of 5
@@ -1944,7 +1985,8 @@ func redactLeafValue(key string, credentialContext bool, val string, redactor fu
 		return RedactedPlaceholder
 	}
 	redacted := redactor(val)
-	if redacted == val && isCredentialJSONSecretKey(key, credentialContext) && hasNonPlaceholderPasswordValue(val) {
+	if redacted == val && isCredentialJSONSecretKey(key, credentialContext) &&
+		hasNonPlaceholderQuotedPasswordValue(val, false) && !isNonPasswordCodeLiteral(key, val) {
 		redacted = RedactedPlaceholder
 	}
 	return redacted

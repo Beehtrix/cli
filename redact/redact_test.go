@@ -2999,3 +2999,51 @@ func TestString_CredentialCodeCallWithLiteralRedacts(t *testing.T) {
 		}
 	}
 }
+
+// Merge-review regression: a $(...) value is a placeholder only when it runs an
+// allowlisted secret-fetching command; paths, wrappers and here-strings can
+// carry the literal and must redact as they do on main.
+func TestString_CommandSubstitutionCarryingTextRedacts(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{
+		`DB_PASSWORD="$(/bin/echo hunter2)"`,
+		`DB_PASSWORD="$(command echo hunter2)"`,
+		`DB_PASSWORD="$(cat <<< hunter2)"`,
+		`DB_PASSWORD=$(cat<<<hunter2)`,
+		`AUTH_TOKEN="$(echo hunter2)"`,
+	} {
+		if out := String(in); strings.Contains(out, "hunter2") {
+			t.Errorf("String(%q) = %q, want the literal redacted", in, out)
+		}
+	}
+	for _, in := range []string{`{"DB_PASSWORD":"$(/bin/echo hunter2)"}`, `{"password":"$(cat <<< hunter2)","host":"h","user":"u"}`} {
+		if out := mustJSONLContent(t, in); strings.Contains(out, "hunter2") {
+			t.Errorf("JSONLContent(%s) = %s, want the literal redacted", in, out)
+		}
+	}
+	if got := String(`AUTH_TOKEN="$(gh auth token)"`); got != `AUTH_TOKEN="$(gh auth token)"` {
+		t.Errorf("secret-fetching recipe must stay a placeholder, got %q", got)
+	}
+}
+
+// Merge-review regression: the key/value placeholder shapes must not reach
+// main's connection-string layers, which redact a string with a real password
+// as a unit.
+func TestString_KeyValuePlaceholdersStayOutOfConnectionStrings(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[string]string{
+		`Server=db.example.com;Database=app;User Id=u;Password=your-pw-value;`: `REDACTED;`,
+		`host=db.example.com dbname=app user=u password=your-pw-value`:         `REDACTED`,
+		`DB_PASSWORD=<HUNTER>`: `DB_PASSWORD=REDACTED`,
+	} {
+		if got := String(in); got != want {
+			t.Errorf("String(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := String(`subject_token = <ENTIRE_TOKEN>`); got != `subject_token = <ENTIRE_TOKEN>` {
+		t.Errorf("uppercase bracketed key/value placeholder redacted: %q", got)
+	}
+	if out := mustJSONLContent(t, `{"api_key":"hidden"}`); out != `{"api_key":"hidden"}` {
+		t.Errorf("JSON mask under a non-password key redacted: %s", out)
+	}
+}
