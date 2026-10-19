@@ -46,9 +46,9 @@ var credentialedURIPattern = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]{1,31}://
 var databaseURIPasswordPattern = regexp.MustCompile(`(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?)://[^\s/?#@"'` + "`" + `<>:]*:([^\s?#@"` + "`" + `<>]+)@[^\s"'` + "`" + `<>]+`)
 
 // uriPortPrefixPattern matches a databaseURIPasswordPattern "password" that is
-// really a port followed by a path or a closing quote, as in
+// really a port followed by a closing quote, as in
 // ['postgres://localhost:5432','admin@example.com'].
-var uriPortPrefixPattern = regexp.MustCompile(`^[0-9]+[/']`)
+var uriPortPrefixPattern = regexp.MustCompile(`^[0-9]+'`)
 
 // oracleJDBCPattern and sqlplusLoginPattern match Oracle's user/password@connect
 // syntax, which has no password= key. oracleJDBCPattern captures the password;

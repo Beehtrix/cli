@@ -306,6 +306,11 @@ func TestString_DatabaseURIPasswordCharacters(t *testing.T) {
 			input: "DATABASE_URL=mysql://root:pa/ss'word9@localhost:3306/app",
 			want:  "DATABASE_URL=REDACTED",
 		},
+		{
+			name:  "digits then slash in password",
+			input: "postgres://app:2024/" + shapeSecret + "@db/app",
+			want:  "REDACTED",
+		},
 		{name: "no userinfo", input: "postgres://localhost:5432/app", want: "postgres://localhost:5432/app"},
 		{name: "at-sign in query", input: "postgres://localhost:5432/db?user=bob@corp", want: "postgres://localhost:5432/db?user=bob@corp"},
 		{
