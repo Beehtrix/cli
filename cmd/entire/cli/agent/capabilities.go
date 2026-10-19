@@ -31,6 +31,7 @@ type CapabilityDeclarer interface {
 //   - HomeScopedInventoryExtractor
 //   - HookConfigLocator
 //   - HookFreshness
+//   - HookTimeoutRepairer
 //   - InventoryAwareExtractor
 //   - LateTranscriptWriter (refuses CapabilityDeclarer agents)
 //   - ModelExtractor
@@ -47,10 +48,12 @@ type CapabilityDeclarer interface {
 //   - SkillEventExtractor
 //   - StaleHookReporter
 //   - SubagentSessionResolver
+//   - SubagentTranscriptFetcher
 //   - TaskTranscriptMatcher
 //   - ToolInvocationScanner
 //   - TranscriptFetcher
 //   - TranscriptSanitizer
+//   - TurnEndHookTimeouter
 //
 // Their As* helpers resolve through builtinCapability, or through
 // nonDeclarerCapability for the entries marked as refusing CapabilityDeclarer
@@ -129,6 +132,12 @@ func AsHookFreshness(ag Agent) (HookFreshness, bool) {
 // stale Entire hooks its next install will remove.
 func AsStaleHookReporter(ag Agent) (StaleHookReporter, bool) {
 	return builtinCapability[StaleHookReporter](ag)
+}
+
+// AsHookTimeoutRepairer returns the agent as HookTimeoutRepairer if it can
+// add the hook timeouts an older CLI wrote its config without.
+func AsHookTimeoutRepairer(ag Agent) (HookTimeoutRepairer, bool) {
+	return builtinCapability[HookTimeoutRepairer](ag)
 }
 
 // AsEffectiveHookDiagnostics returns the agent as EffectiveHookDiagnostics if
@@ -215,6 +224,12 @@ func SanitizeTranscriptForStorage(ag Agent, data []byte) []byte {
 // assertion alone with no DeclaredCaps gate.
 func AsTranscriptFetcher(ag Agent) (TranscriptFetcher, bool) {
 	return builtinCapability[TranscriptFetcher](ag)
+}
+
+// AsSubagentTranscriptFetcher returns the agent as SubagentTranscriptFetcher if
+// it implements the interface. Built-in only, like TranscriptFetcher.
+func AsSubagentTranscriptFetcher(ag Agent) (SubagentTranscriptFetcher, bool) {
+	return builtinCapability[SubagentTranscriptFetcher](ag)
 }
 
 // AsTokenCalculator returns the agent as TokenCalculator if it both
@@ -348,4 +363,11 @@ func AsToolInvocationScanner(ag Agent) (ToolInvocationScanner, bool) {
 // field when an external agent has a host that clamps its session-end hook.
 func AsSessionEndBudgeter(ag Agent) (SessionEndBudgeter, bool) {
 	return builtinCapability[SessionEndBudgeter](ag)
+}
+
+// AsTurnEndHookTimeouter returns the agent as TurnEndHookTimeouter if it
+// implements the interface. Built-in only: the bounded work runs in the entire
+// process, and the external-agent protocol carries no host hook timeout.
+func AsTurnEndHookTimeouter(ag Agent) (TurnEndHookTimeouter, bool) {
+	return builtinCapability[TurnEndHookTimeouter](ag)
 }

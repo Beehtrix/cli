@@ -141,7 +141,7 @@ const (
 	HooksCurrent
 	// HooksOutdated means Entire hooks are installed but stale — an older CLI
 	// wrote a config that no longer matches the current one. Fix:
-	// `entire enable --force`.
+	// `entire agent add <agent>`; add --force if that does not fix it.
 	HooksOutdated
 )
 
@@ -167,16 +167,30 @@ type HookFreshness interface {
 }
 
 // StaleHookReporter is implemented by hook-supporting agents whose install
-// also prunes Entire hooks that older CLIs wrote and this one no longer does
-// (for Claude Code, the retired post-todo hook). `entire enable` asks before
-// installing, so it can say it removed them instead of reporting the hooks as
+// also rewrites Entire hooks that older CLIs wrote: pruning ones this CLI no
+// longer writes (for Claude Code, the retired post-todo hook) or updating ones
+// whose shape changed (Claude Code's hook timeouts). `entire enable` asks before
+// installing, so it can say it updated them instead of reporting the hooks as
 // already installed. Implementations must be read-only.
 type StaleHookReporter interface {
 	Agent
 
 	// HasStaleManagedHooks reports whether the agent's hook config holds
-	// Entire hooks the next install will remove.
+	// Entire hooks the next install will remove or update.
 	HasStaleManagedHooks(ctx context.Context) bool
+}
+
+// HookTimeoutRepairer is implemented by agents whose Entire hooks carry
+// timeouts that configs written by older CLIs lack. `entire doctor` runs the
+// repair without asking, because a user who already enabled Entire has no
+// reason to run enable again. The repair must only give Entire's own hooks a
+// missing timeout and leave everything the user chose as it is.
+type HookTimeoutRepairer interface {
+	Agent
+
+	// RepairHookTimeouts adds the missing timeouts and reports whether it
+	// rewrote the hook config. An absent config is not an error.
+	RepairHookTimeouts(ctx context.Context) (bool, error)
 }
 
 // EffectiveHookDiagnostics marks agents whose effective hook state is reported
@@ -311,6 +325,25 @@ type TranscriptFetcher interface {
 	// location and returns its path. Errors may be shown to users after other
 	// transcript sources fail, so they must be concise and safe to display.
 	FetchTranscript(ctx context.Context, sessionID string) (string, error)
+}
+
+// SubagentTranscriptFetcher is implemented by agents whose subagents are
+// sessions the agent can still export after the fact, keyed by the task
+// record's AgentID (OpenCode: the child session ID). Condensation calls it for
+// a completed task record whose transcript was never declared or can no
+// longer be read (a subagent-stop whose export failed), so a transcript that
+// still exists in the agent's store is not recorded as unavailable. Callers go
+// through FetchSubagentTranscript, which honours WithSubagentFetchBudget. Agents whose AgentID is not a fetchable session
+// (Claude Code's agent IDs) must not implement it.
+type SubagentTranscriptFetcher interface {
+	Agent
+
+	// FetchSubagentTranscript writes the transcript of the task call
+	// toolUseID, run by subagent agentID between startedAt and completedAt
+	// (either zero when unknown or still running), to the agent's cache
+	// location and returns its path. The window matters when one subagent
+	// backs several calls: a re-export after a later call must not carry it.
+	FetchSubagentTranscript(ctx context.Context, agentID, toolUseID string, startedAt, completedAt time.Time) (string, error)
 }
 
 // SidecarImageProvider is implemented by agents that keep images OUTSIDE the
@@ -563,6 +596,30 @@ type SessionEndBudgeter interface {
 	// hook invocation, measured from process start. A non-positive value means
 	// no budget applies.
 	SessionEndBudget() time.Duration
+}
+
+// TurnEndHookTimeouter is implemented by agents whose host bounds the hook that
+// ends a turn. Entire derives a finalize budget from the timeout with
+// TurnEndBudgetWithin and bounds the network-bound part of turn-end checkpoint
+// finalization by it, so a slow remote makes Entire give up on the remaining
+// checkpoints instead of the host killing the hook before the session state is
+// saved. Agents that do not implement it get a conservative default.
+type TurnEndHookTimeouter interface {
+	Agent
+
+	// TurnEndHookTimeout returns how long the host lets the turn-end hook run
+	// before killing it: the host's own limit, not a budget. A non-positive
+	// value is treated as unknown, and the default applies.
+	TurnEndHookTimeout() time.Duration
+}
+
+// TurnEndBudgetWithin returns the turn-end budget for a host hook timeout. It
+// keeps a fifth of the timeout, between 2s and 10s, for what the hook does
+// after finalization (saving session state) and for the shell wrapper and
+// binary load that run before Entire's clock starts.
+func TurnEndBudgetWithin(hookTimeout time.Duration) time.Duration {
+	headroom := min(max(hookTimeout/5, 2*time.Second), 10*time.Second)
+	return max(hookTimeout-headroom, 0)
 }
 
 // RestoredSessionPathResolver is implemented by agents that need a

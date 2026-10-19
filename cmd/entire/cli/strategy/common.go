@@ -571,7 +571,8 @@ func EnsureRedactionConfigured(ctx context.Context) error {
 				slog.Int("pack_rules", packRules),
 				slog.Int("inline_patterns", len(inline)),
 				// Configured counts above, compiled below: a gap between
-				// them means a rule failed to compile (warned separately).
+				// them means a rule was rejected: it failed to compile or can
+				// match the empty string (warned separately).
 				slog.Int("active_rules", redact.ActiveCustomRules()),
 				slog.Bool("pii", piiEnabled),
 				slog.Bool("opf", redact.OPFEnabled()),
