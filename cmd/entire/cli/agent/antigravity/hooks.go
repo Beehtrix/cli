@@ -337,10 +337,12 @@ func (a *AntigravityAgent) RepairHookTimeouts(ctx context.Context) (bool, error)
 	return true, nil
 }
 
-// CheckHookConfig implements agent.HookFreshness. It reports outdated only when
-// RepairHookTimeouts has a Stop timeout to add, because `entire status` sends
-// the user to `entire doctor` for an outdated config; flagging anything doctor
-// does not repair would leave a warning the user cannot clear.
+// CheckHookConfig implements agent.HookFreshness. It reports outdated when
+// RepairHookTimeouts has a Stop timeout to add, or when Entire's entry has no
+// SessionStart hook (installs from before it was added), which leaves every
+// session idle until it is purged. `entire status` sends the user to `entire
+// doctor`, which repairs the timeout itself and for the missing hook tells the
+// user to run `entire agent add antigravity`; a user-disabled entry is current.
 func (a *AntigravityAgent) CheckHookConfig(ctx context.Context) agent.HookConfigState {
 	if installed, err := a.AreHooksInstalled(ctx); err != nil || !installed {
 		return agent.HooksAbsent
@@ -356,7 +358,27 @@ func (a *AntigravityAgent) CheckHookConfig(ctx context.Context) agent.HookConfig
 	if _, changed, err := withMissingStopTimeouts(data); err == nil && changed {
 		return agent.HooksOutdated
 	}
+	if missingSessionStart(data) {
+		return agent.HooksOutdated
+	}
 	return agent.HooksCurrent
+}
+
+// missingSessionStart reports whether Entire's enabled entry in hooks.json has
+// no SessionStart hook of Entire's.
+func missingSessionStart(data []byte) bool {
+	var rawFile map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawFile); err != nil {
+		return false
+	}
+	var entry HookConfig
+	if err := json.Unmarshal(rawFile["entire"], &entry); err != nil {
+		return false
+	}
+	if entry.Enabled != nil && !*entry.Enabled {
+		return false
+	}
+	return !hasEntireHookInSimpleHandlers(entry.SessionStart)
 }
 
 // withMissingStopTimeouts returns hooks.json with stopHookTimeoutSeconds added

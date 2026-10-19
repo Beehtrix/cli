@@ -2145,3 +2145,18 @@ func TestCheckAntigravityHooksLoaded_UnparseableVersionSkipsProbeWithoutUpgradeA
 	require.NotContains(t, stdout.String(), "agy update")
 	require.NotContains(t, stdout.String(), "LOADED by agy")
 }
+
+// An agy entry from before the SessionStart hook leaves sessions idle until
+// they are purged; doctor reports it and names the reinstall that fixes it.
+func TestCheckHookDrift_AntigravityWarnsWithoutSessionStart(t *testing.T) {
+	dir := setupGitRepoForPhaseTest(t)
+	t.Chdir(dir)
+	writeAntigravityPreInvocationEntryForDoctor(t, dir, agent.HookHostIsWindows())
+
+	cmd, stdout := newTestCmd(t)
+	checkHookDrift(cmd)
+
+	out := stdout.String()
+	require.Contains(t, out, "hooks: OUT OF DATE")
+	require.Contains(t, out, "Run `entire agent add antigravity` to update it.")
+}
