@@ -22,7 +22,8 @@ import (
 // mode "fail" exits non-zero, "assets" adds an asset, "secret" embeds a credential,
 // "empty" returns an empty transcript, "prefixfail" fails on inputs under 4 lines,
 // "merge" folds the whole input into one line (like merging streaming fragments),
-// "leak" fails with a credential and prompt text on stderr, "slow" hangs.
+// "leak" fails with a credential and prompt text on stderr, "slow" hangs,
+// "pause" sleeps 500ms on every run.
 func installCompactingExternalAgent(t *testing.T, name, agentType, mode string) {
 	t.Helper()
 	if _, err := exec.LookPath("sh"); err != nil {
@@ -47,6 +48,7 @@ case "$1" in
     [ "` + mode + `" = "fail" ] && { echo "compactor exploded" >&2; exit 1; }
     [ "` + mode + `" = "empty" ] && { echo '{"transcript":""}'; exit 0; }
     [ "` + mode + `" = "slow" ] && exec sleep 30
+    [ "` + mode + `" = "pause" ] && sleep 0.5
     [ "` + mode + `" = "leak" ] && { echo "boom sk-ant-api03-xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA hello one" >&2; exit 1; }
     n=$(grep -c '' "$3")
     if [ "` + mode + `" = "merge" ]; then
@@ -288,5 +290,21 @@ func TestWriteCommitted_ExternalCompactorTimeoutFallsBack(t *testing.T) {
 	compact, ok := readBranchFile(t, store, sessionPath+paths.CompactTranscriptFileName)
 	if !ok || !strings.Contains(compact, "reply two") {
 		t.Fatalf("expected the built-in compact transcript after the agent compactor timed out, got (present=%v):\n%s", ok, compact)
+	}
+}
+
+// Each compactor run gets its own timeout, so a full run that uses most of the
+// budget doesn't starve the prefix run and silently reset the marker to 0.
+func TestWriteCommitted_ExternalCompactorRunsHaveSeparateTimeouts(t *testing.T) {
+	// Cannot use t.Parallel: mutates $PATH, the agent registry and agentCompactTimeout.
+	installCompactingExternalAgent(t, "compactpause", "Compact Pause", "pause")
+	orig := agentCompactTimeout
+	agentCompactTimeout = 800 * time.Millisecond
+	t.Cleanup(func() { agentCompactTimeout = orig })
+
+	store, _ := writeExternalAgentCheckpoint(t, "Compact Pause", "f6a1b2c3d4ec", 2)
+	meta := readSessionMetadata(t, store.repo, id.MustCheckpointID("f6a1b2c3d4ec"))
+	if marker, _ := meta.GetCompactTranscriptStart(); marker != 2 {
+		t.Fatalf("compact_transcript_start = %d, want 2: the prefix run must get its own timeout", marker)
 	}
 }

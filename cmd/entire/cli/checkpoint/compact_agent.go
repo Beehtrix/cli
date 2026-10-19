@@ -21,7 +21,7 @@ import (
 // leading lines compacting the raw lines before startLine shares with the full
 // output (0 if that fails), so a line the plugin merges across startLine stays
 // in this checkpoint.
-// agentCompactTimeout bounds both compactor runs: they happen inside the
+// agentCompactTimeout bounds each compactor run: they happen inside the
 // checkpoint ref lock, so a slow plugin would stall every other checkpoint write.
 var agentCompactTimeout = 5 * time.Second //nolint:gochecknoglobals // overridable for testing
 
@@ -34,9 +34,6 @@ func compactWithAgent(ctx context.Context, agentType types.AgentType, startLine 
 	if !ok {
 		return nil, 0, false
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, agentCompactTimeout)
-	defer cancel()
 
 	full, err := runAgentCompactor(ctx, compactor, transcriptBytes)
 	if err != nil {
@@ -51,6 +48,10 @@ func compactWithAgent(ctx context.Context, agentType types.AgentType, startLine 
 	if prefix := leadingLines(transcriptBytes, startLine); len(prefix) > 0 {
 		if compactedPrefix, err := runAgentCompactor(ctx, compactor, prefix); err == nil {
 			boundary = sharedLeadingLines(compactedPrefix, full)
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			logging.Warn(ctx, "agent compact transcript prefix timed out, scoping from line 0",
+				slog.String("agent", string(agentType)),
+			)
 		} else {
 			logging.Debug(ctx, "agent compact transcript prefix not compactable, scoping from line 0",
 				slog.String("agent", string(agentType)),
@@ -85,10 +86,12 @@ func runAgentCompactor(ctx context.Context, compactor agent.TranscriptCompactor,
 		return nil, fmt.Errorf("close temp transcript: %w", err)
 	}
 
-	compacted, err := compactor.CompactTranscript(ctx, tmpPath)
+	runCtx, cancel := context.WithTimeout(ctx, agentCompactTimeout)
+	defer cancel()
+	compacted, err := compactor.CompactTranscript(runCtx, tmpPath)
 	if err != nil {
 		// The plugin's stderr is in err and may hold transcript text; keep it out of logs.
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := runCtx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("agent compact-transcript: %w", ctxErr)
 		}
 		return nil, errors.New("agent compact-transcript failed")
