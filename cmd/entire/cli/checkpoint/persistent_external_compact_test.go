@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/external"
@@ -19,7 +20,9 @@ import (
 // installCompactingExternalAgent registers a mock external agent whose
 // compact-transcript emits one line per input line ("agent-compacted N").
 // mode "fail" exits non-zero, "assets" adds an asset, "secret" embeds a credential,
-// "empty" returns an empty transcript, "prefixfail" fails on inputs under 4 lines.
+// "empty" returns an empty transcript, "prefixfail" fails on inputs under 4 lines,
+// "merge" folds the whole input into one line (like merging streaming fragments),
+// "leak" fails with a credential and prompt text on stderr, "slow" hangs.
 func installCompactingExternalAgent(t *testing.T, name, agentType, mode string) {
 	t.Helper()
 	if _, err := exec.LookPath("sh"); err != nil {
@@ -43,7 +46,14 @@ case "$1" in
   compact-transcript)
     [ "` + mode + `" = "fail" ] && { echo "compactor exploded" >&2; exit 1; }
     [ "` + mode + `" = "empty" ] && { echo '{"transcript":""}'; exit 0; }
+    [ "` + mode + `" = "slow" ] && exec sleep 30
+    [ "` + mode + `" = "leak" ] && { echo "boom sk-ant-api03-xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA hello one" >&2; exit 1; }
     n=$(grep -c '' "$3")
+    if [ "` + mode + `" = "merge" ]; then
+      out="{\"v\":1,\"agent\":\"` + name + `\",\"type\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"merged $n\"}]}"
+      printf '{"transcript":"%s"}' "$(printf '%s\n' "$out" | base64 | tr -d '\n')"
+      exit 0
+    fi
     [ "` + mode + `" = "prefixfail" ] && [ "$n" -lt 4 ] && { echo "prefix exploded" >&2; exit 1; }
     i=1
     out=""
@@ -202,20 +212,81 @@ func TestLeadingLines(t *testing.T) {
 	}
 }
 
-func TestCountLines(t *testing.T) {
+func TestSharedLeadingLines(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		in   string
-		want int
+		prefix, full string
+		want         int
 	}{
-		{"", 0},
-		{"a", 1},
-		{"a\n", 1},
-		{"a\n\n  \nb\n", 2},
+		{"", "a\nb\n", 0},
+		{"a\n", "a\nb\n", 1},
+		{"a\nb\n", "a\nb\n", 2},
+		{"a\nx\n", "a\nb\n", 1},
+		{"a\n\n b\n", "a\n b\n", 2},
+		{"a\nb\nc\n", "a\nb\n", 2},
 	}
 	for _, tt := range tests {
-		if got := countLines([]byte(tt.in)); got != tt.want {
-			t.Errorf("countLines(%q) = %d, want %d", tt.in, got, tt.want)
+		if got := sharedLeadingLines([]byte(tt.prefix), []byte(tt.full)); got != tt.want {
+			t.Errorf("sharedLeadingLines(%q, %q) = %d, want %d", tt.prefix, tt.full, got, tt.want)
 		}
+	}
+}
+
+// A plugin that merges lines across the checkpoint boundary must not push the
+// marker past this checkpoint's first line: the merged line stays in scope.
+func TestWriteCommitted_ExternalCompactorMergedBoundaryStaysInScope(t *testing.T) {
+	// Cannot use t.Parallel: mutates $PATH and the agent registry.
+	installCompactingExternalAgent(t, "compactmerge", "Compact Merge", "merge")
+	store, sessionPath := writeExternalAgentCheckpoint(t, "Compact Merge", "d4e5f6a1b2ca", 2)
+
+	compact, ok := readBranchFile(t, store, sessionPath+paths.CompactTranscriptFileName)
+	if !ok || !strings.Contains(compact, "merged 4") {
+		t.Fatalf("expected the agent's merged transcript, got (present=%v):\n%s", ok, compact)
+	}
+	meta := readSessionMetadata(t, store.repo, id.MustCheckpointID("d4e5f6a1b2ca"))
+	if marker, _ := meta.GetCompactTranscriptStart(); marker != 0 {
+		t.Fatalf("compact_transcript_start = %d, want 0 so the merged line stays in this checkpoint", marker)
+	}
+}
+
+// A plugin's stderr may carry transcript text or credentials; it must not reach
+// the CLI's logs.
+func TestCompactWithAgent_FailureDoesNotLogPluginStderr(t *testing.T) {
+	// Cannot use t.Parallel: mutates $PATH and the agent registry.
+	installCompactingExternalAgent(t, "compactleak", "Compact Leak", "leak")
+	ag, err := agent.GetByAgentType("Compact Leak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compactor, ok := agent.AsTranscriptCompactor(ag)
+	if !ok {
+		t.Fatal("mock agent is not a transcript compactor")
+	}
+	_, err = runAgentCompactor(context.Background(), compactor, claudeStyleTranscript())
+	if err == nil {
+		t.Fatal("expected the failing compactor to return an error")
+	}
+	if strings.Contains(err.Error(), "sk-ant-api03") || strings.Contains(err.Error(), "hello one") {
+		t.Fatalf("compactor error carries plugin stderr: %v", err)
+	}
+}
+
+// The agent compactor runs inside the checkpoint ref lock, so a hung plugin
+// must give up quickly and fall back rather than hold the lock.
+func TestWriteCommitted_ExternalCompactorTimeoutFallsBack(t *testing.T) {
+	// Cannot use t.Parallel: mutates $PATH, the agent registry and agentCompactTimeout.
+	installCompactingExternalAgent(t, "compactslow", "Compact Slow", "slow")
+	orig := agentCompactTimeout
+	agentCompactTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { agentCompactTimeout = orig })
+
+	start := time.Now()
+	store, sessionPath := writeExternalAgentCheckpoint(t, "Compact Slow", "e5f6a1b2c3db", 2)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("checkpoint write took %v; the compactor timeout was not applied", elapsed)
+	}
+	compact, ok := readBranchFile(t, store, sessionPath+paths.CompactTranscriptFileName)
+	if !ok || !strings.Contains(compact, "reply two") {
+		t.Fatalf("expected the built-in compact transcript after the agent compactor timed out, got (present=%v):\n%s", ok, compact)
 	}
 }
