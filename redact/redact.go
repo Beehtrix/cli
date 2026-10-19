@@ -25,13 +25,44 @@ import (
 
 // secretPattern matches high-entropy strings that may be secrets.
 // Note: / is excluded to prevent matching entire file paths as single tokens.
-// Base64 and JWT tokens are still caught via high-entropy segments between slashes.
+// Base64 values containing / are scored whole by detectSlashedBase64 instead.
 var secretPattern = regexp.MustCompile(`[A-Za-z0-9+_=-]{10,}`)
+
+// pathSegmentPattern matches a path component that random base64 almost never
+// produces: a word ("refs", "Library") or a long lowercase hex name, as in
+// content-addressed caches.
+var pathSegmentPattern = regexp.MustCompile(`^(?:[A-Z]?[a-z]{3,}|[0-9a-f]{16,})$`)
 
 // credentialedURIPattern matches URLs that embed userinfo with a password, such
 // as postgres://user:pass@host/db or redis://:pass@host/0. These often have
 // moderate entropy and are not reliably covered by vendor-specific scanners.
 var credentialedURIPattern = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]{1,31}://[^\s/?#@"'` + "`" + `<>:]*:[^\s/?#@"'` + "`" + `<>]+@[^\s"'` + "`" + `<>]+`)
+
+// databaseURIPasswordPattern is credentialedURIPattern for database schemes,
+// with the password (group 1) also allowed to contain a slash or an
+// apostrophe. A slash is invalid unencoded in userinfo, but a hand-written DSN
+// still carries the secret. Other schemes keep the strict pattern because
+// host:port/path@… is common there (http://localhost:5173/@vite/client).
+var databaseURIPasswordPattern = regexp.MustCompile(`(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?)://[^\s/?#@"'` + "`" + `<>:]*:([^\s?#@"` + "`" + `<>]+)@[^\s"'` + "`" + `<>]+`)
+
+// uriPortPrefixPattern matches a databaseURIPasswordPattern "password" that is
+// really a port followed by a path or a closing quote, as in
+// ['postgres://localhost:5432','admin@example.com'].
+var uriPortPrefixPattern = regexp.MustCompile(`^[0-9]+[/']`)
+
+// oracleJDBCPattern and sqlplusLoginPattern match Oracle's user/password@connect
+// syntax, which has no password= key. oracleJDBCPattern captures the password;
+// sqlplusLoginPattern captures the user/password@connect token and the password.
+var (
+	oracleJDBCPattern   = regexp.MustCompile(`(?i)\bjdbc:oracle:[a-z0-9]+:[^\s/@"'<>` + "`" + `]+/([^\s@"'<>` + "`" + `]+)@[^\s"'<>` + "`" + `]*`)
+	sqlplusLoginPattern = regexp.MustCompile(`(?i)\bsqlplus(?:\s+-[a-z]+)*\s+([^\s/@"']+/([^\s@"']+)@[^\s"']+)`)
+)
+
+// sasSignaturePattern captures the value of a sig query parameter, the HMAC
+// that authorizes an Azure SAS URL or token. It is URL-encoded base64, so the
+// entropy layer only ever sees fragments of it. SAS parameter names are
+// lowercase.
+var sasSignaturePattern = regexp.MustCompile(`[?&]sig=([A-Za-z0-9%+/=]{20,})`)
 
 // dbPasswordKeyShape matches a DB-prefixed credential key (vendor prefix +
 // optional `_word`/`-word` segments + `password`/`passwd`/`pwd`). Used to
@@ -39,21 +70,29 @@ var credentialedURIPattern = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]{1,31}://
 // vendor list stays in one place.
 const dbPasswordKeyShape = `(?:db|database|pg|postgres|postgresql|mysql|mariadb|redis|mongo|mongodb|sqlserver|mssql|jdbc)(?:[_-]+[a-z0-9]+)*[_-]*(?:password|passwd|pwd)` //nolint:gosec // regex literal, not a credential
 
+// semicolonConnValue is one value of an ODBC or ADO.NET connection string.
+// Unquoted values run to the next ';' and may contain spaces, but never a
+// newline or a leading or trailing blank.
+const semicolonConnValue = `(?:\{[^}]*\}|"[^"]*"|'[^']*'|[^=;"'\s](?:[^=;"'\r\n]*[^=;"'\s])?)`
+
 var (
 	jdbcPattern          = regexp.MustCompile(`(?i)\bjdbc:[^\s"'<>` + "`" + `]+`)
 	databaseURLPattern   = regexp.MustCompile(`(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis)://[^\s"'<>` + "`" + `]+`)
 	keywordDSNPattern    = regexp.MustCompile(`(?i)\b[a-z_][a-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s"']+)(?:\s+[a-z_][a-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s"']+)){2,}`)
-	semicolonConnPattern = regexp.MustCompile(`(?i)\b[a-z][a-z0-9 _-]*=(?:\{[^}]*\}|"[^"]*"|'[^']*'|[^=;"'\s]+)(?:;[a-z][a-z0-9 _-]*=(?:\{[^}]*\}|"[^"]*"|'[^']*'|[^=;"'\s]+)){2,}`)
+	semicolonConnPattern = regexp.MustCompile(`(?i)\b[a-z][a-z0-9 _-]*=[ \t]*` + semicolonConnValue + `(?:;[ \t]*[a-z][a-z0-9 _-]*=[ \t]*` + semicolonConnValue + `){2,}`)
 	// credentialValuePattern requires the prefix to start at a non-alphanumeric
 	// boundary, so APP_DB_PASSWORD matches via the leading `_` but mydbpassword
 	// does not.
 	credentialValuePattern = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])(` + dbPasswordKeyShape + `)\s*=\s*("[^"]*"|'[^']*'|[^\s,;&]+)`)
 
-	keywordHostPattern      = regexp.MustCompile(`(?i)(?:^|\s)host=`)
-	keywordUserPattern      = regexp.MustCompile(`(?i)(?:^|\s)user=`)
-	semicolonServerPattern  = regexp.MustCompile(`(?i)(?:^|;)\s*(?:server|data source|datasource|addr|address|network address)\s*=`)
-	semicolonUserPattern    = regexp.MustCompile(`(?i)(?:^|;)\s*(?:user id|userid|user|uid)\s*=`)
-	passwordAssignmentRegex = regexp.MustCompile(`(?i)(?:^|[?&;\s])(?:password|pwd)=("[^"]*"|'[^']*'|[^&;\s"']+)`)
+	// keywordTargetPattern requires a host or a database name; a Unix-socket
+	// DSN such as `user=app password=... dbname=app` has no host.
+	keywordTargetPattern     = regexp.MustCompile(`(?i)(?:^|\s)(?:host|hostaddr|dbname)=`)
+	keywordUserPattern       = regexp.MustCompile(`(?i)(?:^|\s)user=`)
+	semicolonServerPattern   = regexp.MustCompile(`(?i)(?:^|;)\s*(?:server|data source|datasource|addr|address|network address)\s*=`)
+	semicolonUserPattern     = regexp.MustCompile(`(?i)(?:^|;)\s*(?:user id|userid|user|uid)\s*=`)
+	semicolonPasswordPattern = regexp.MustCompile(`(?i)(?:^|;)[ \t]*(?:password|pwd)[ \t]*=[ \t]*(\{[^}]*\}|"[^"]*"|'[^']*'|[^;]*)`)
+	passwordAssignmentRegex  = regexp.MustCompile(`(?i)(?:^|[?&;\s])(?:password|pwd)=("[^"]*"|'[^']*'|[^&;\s"']+)`)
 	// credentialJSONKeyRegex operates on output of normalizeCredentialJSONKey
 	// (already lowercased, `-`/` `/`.` → `_`), so the `(?i)` flag is unnecessary.
 	credentialJSONKeyRegex  = regexp.MustCompile(`^` + dbPasswordKeyShape + `$`)
@@ -188,9 +227,10 @@ var connectionStringRules = []connectionStringRule{
 //  3. Provider token prefixes: deterministic prefix rules for credential
 //     formats betterleaks misses in isolation (e.g. Supabase sb_secret_)
 //  4. Credentialed URIs: URLs containing userinfo passwords
-//  5. Database connection strings: JDBC, keyword DSNs, and semicolon strings
+//  5. Database connection strings: JDBC, keyword DSNs, semicolon strings, and
+//     Oracle user/password@ logins
 //  6. User-defined custom rules: configured via ConfigureCustomRules
-//  7. Bounded credential key/value pairs: DB_PASSWORD=...
+//  7. Bounded credential key/value pairs: DB_PASSWORD=..., Azure SAS sig=...
 //  8. PII detection: email, phone, address patterns (only when configured via ConfigurePII)
 //
 // A string is redacted if ANY method flags it.
@@ -208,22 +248,9 @@ func detectAllLayers(s string) []taggedRegion {
 
 	// 1. Entropy-based detection (secrets — always on).
 	for _, loc := range secretPattern.FindAllStringIndex(s, -1) {
-		start, end := loc[0], loc[1]
-
-		// Don't consume characters that are part of JSON/string escape sequences.
-		// Example: in "controller.go\nmodel.go", the regex could match "nmodel"
-		// (consuming the 'n' from '\n'), and after replacement the '\' would be
-		// followed by 'R' from "REDACTED", creating invalid escape '\R'.
-		// Only skip for known JSON escape letters to avoid trimming real secrets
-		// that happen to follow a literal backslash in decoded content.
-		if start > 0 && s[start-1] == '\\' {
-			switch s[start] {
-			case 'n', 't', 'r', 'b', 'f', 'u', '"', '\\', '/':
-				start++
-				if end-start < 10 {
-					continue
-				}
-			}
+		start, end := skipJSONEscapeLetter(s, loc[0]), loc[1]
+		if end-start < 10 {
+			continue
 		}
 
 		if isClaudeToolUseID(s[start:end]) {
@@ -233,6 +260,7 @@ func detectAllLayers(s string) []taggedRegion {
 			regions = append(regions, taggedRegion{region: region{start, end}})
 		}
 	}
+	regions = append(regions, detectSlashedBase64(s)...)
 
 	// 2. Pattern-based detection via scanner engines (secrets — selected
 	// via ConfigureScanners; betterleaks-only when unconfigured).
@@ -278,6 +306,7 @@ func detectAllLayers(s string) []taggedRegion {
 	for _, loc := range credentialedURIPattern.FindAllStringIndex(s, -1) {
 		regions = append(regions, taggedRegion{region: region{loc[0], loc[1]}})
 	}
+	regions = append(regions, detectDatabaseURIPasswords(s)...)
 
 	// 5. Database and connection-string detection (secrets — always on).
 	regions = append(regions, detectConnectionStrings(s)...)
@@ -334,11 +363,121 @@ func applyRegions(s string, regions []taggedRegion) string {
 	return b.String()
 }
 
-func detectConnectionStrings(s string) []taggedRegion {
-	if !strings.ContainsRune(s, '=') {
+// skipJSONEscapeLetter returns start moved past the letter of a JSON escape
+// sequence the match begins with. Example: in "controller.go\nmodel.go" an
+// entropy pattern could match "nmodel", and after replacement the '\' would be
+// followed by 'R' from "REDACTED", creating the invalid escape '\R'. Only known
+// JSON escape letters are skipped, to avoid trimming real secrets that happen
+// to follow a literal backslash in decoded content.
+func skipJSONEscapeLetter(s string, start int) int {
+	if start > 0 && s[start-1] == '\\' {
+		switch s[start] {
+		case 'n', 't', 'r', 'b', 'f', 'u', '"', '\\', '/':
+			return start + 1
+		}
+	}
+	return start
+}
+
+// detectSlashedBase64 scores standard-alphabet base64 runs that contain '/' as
+// a whole. secretPattern splits such a secret at each '/', and the pieces often
+// fall short of entropyThreshold: an n-character string has at most log2(n)
+// bits of entropy, so a piece shorter than 23 characters never exceeds it. Runs
+// are found by expanding around each '/' because a regex pass over every string
+// cost more than secretPattern's own pass.
+func detectSlashedBase64(s string) []taggedRegion {
+	var regions []taggedRegion
+	for i := 0; i < len(s); {
+		slash := strings.IndexByte(s[i:], '/')
+		if slash < 0 {
+			break
+		}
+		start, end := i+slash, i+slash+1
+		for start > 0 && isBase64Byte(s[start-1]) {
+			start--
+		}
+		for end < len(s) && isBase64Byte(s[end]) {
+			end++
+		}
+		for pad := 0; pad < 2 && end < len(s) && s[end] == '='; pad++ {
+			end++
+		}
+		i = end
+		start = skipJSONEscapeLetter(s, start)
+		if end-start >= 20 && isSlashedBase64Secret(s, start, end) {
+			regions = append(regions, taggedRegion{region: region{start, end}})
+		}
+	}
+	return regions
+}
+
+func isBase64Byte(c byte) bool {
+	return 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '+' || c == '/'
+}
+
+// isSlashedBase64Secret reports whether s[start:end], a base64 run, is a
+// high-entropy value rather than a path. A run glued to a preceding '.', '-',
+// '_', '~' or '@' continues a dotted name, an identifier, a home path or a
+// package scope.
+func isSlashedBase64Secret(s string, start, end int) bool {
+	run := s[start:end]
+	if !strings.Contains(run, "/") {
+		return false
+	}
+	if start > 0 && strings.IndexByte(".-_~@", s[start-1]) >= 0 {
+		return false
+	}
+	for segment := range strings.SplitSeq(run, "/") {
+		if pathSegmentPattern.MatchString(segment) {
+			return false
+		}
+	}
+	return shannonEntropy(run) > entropyThreshold
+}
+
+// detectDatabaseURIPasswords covers database URIs whose password contains a
+// character credentialedURIPattern stops at. Placeholder passwords stay
+// visible, as in every other credential layer.
+func detectDatabaseURIPasswords(s string) []taggedRegion {
+	if !strings.Contains(s, "@") || !strings.Contains(s, "://") {
 		return nil
 	}
 	var regions []taggedRegion
+	for _, loc := range databaseURIPasswordPattern.FindAllStringSubmatchIndex(s, -1) {
+		password := s[loc[2]:loc[3]]
+		if uriPortPrefixPattern.MatchString(password) || !hasNonPlaceholderPasswordValue(password) {
+			continue
+		}
+		regions = append(regions, taggedRegion{region: region{loc[0], loc[1]}})
+	}
+	return regions
+}
+
+// detectOracleCredentials redacts a JDBC Oracle URL as a unit, like the other
+// JDBC strings, and a sqlplus login as its user/password@connect token.
+func detectOracleCredentials(s string) []taggedRegion {
+	if !strings.Contains(s, "@") {
+		return nil
+	}
+	var regions []taggedRegion
+	for _, loc := range oracleJDBCPattern.FindAllStringSubmatchIndex(s, -1) {
+		if hasNonPlaceholderPasswordValue(s[loc[2]:loc[3]]) {
+			regions = append(regions, taggedRegion{region: region{loc[0], trimConnectionStringEnd(s, loc[0], loc[1])}})
+		}
+	}
+	for _, loc := range sqlplusLoginPattern.FindAllStringSubmatchIndex(s, -1) {
+		if hasNonPlaceholderPasswordValue(s[loc[4]:loc[5]]) {
+			regions = append(regions, taggedRegion{region: region{loc[2], trimConnectionStringEnd(s, loc[2], loc[3])}})
+		}
+	}
+	return regions
+}
+
+func detectConnectionStrings(s string) []taggedRegion {
+	regions := detectOracleCredentials(s)
+	if !strings.ContainsRune(s, '=') {
+		return regions
+	}
 	for _, rule := range connectionStringRules {
 		regions = append(regions, detectConnectionStringRule(s, rule)...)
 	}
@@ -401,7 +540,7 @@ func isPasswordQueryKey(key string) bool {
 }
 
 func hasKeywordDSNPassword(candidate string) bool {
-	return keywordHostPattern.MatchString(candidate) &&
+	return keywordTargetPattern.MatchString(candidate) &&
 		keywordUserPattern.MatchString(candidate) &&
 		hasNonPlaceholderPasswordAssignment(candidate)
 }
@@ -409,7 +548,18 @@ func hasKeywordDSNPassword(candidate string) bool {
 func hasSemicolonConnectionPassword(candidate string) bool {
 	return semicolonServerPattern.MatchString(candidate) &&
 		semicolonUserPattern.MatchString(candidate) &&
-		hasNonPlaceholderPasswordAssignment(candidate)
+		hasNonPlaceholderSemicolonPassword(candidate)
+}
+
+// hasNonPlaceholderSemicolonPassword reads each Password/Pwd value up to the
+// next ';', since ODBC and ADO.NET values may contain spaces.
+func hasNonPlaceholderSemicolonPassword(candidate string) bool {
+	for _, m := range semicolonPasswordPattern.FindAllStringSubmatch(candidate, -1) {
+		if hasNonPlaceholderPasswordValue(strings.TrimRight(m[1], " \t")) {
+			return true
+		}
+	}
+	return false
 }
 
 func detectCredentialValues(s string) []taggedRegion {
@@ -419,11 +569,39 @@ func detectCredentialValues(s string) []taggedRegion {
 			continue
 		}
 		start, end := unquoteRange(s, loc[4], loc[5])
+		if start == loc[4] {
+			end = extendPastValueSeparators(s, end)
+		}
 		if hasNonPlaceholderPasswordValue(s[start:end]) {
 			regions = append(regions, taggedRegion{region: region{start, end}})
 		}
 	}
+	if strings.Contains(s, "sig=") {
+		for _, loc := range sasSignaturePattern.FindAllStringSubmatchIndex(s, -1) {
+			regions = append(regions, taggedRegion{region: region{loc[2], loc[3]}})
+		}
+	}
 	return regions
+}
+
+// extendPastValueSeparators continues an unquoted credential value across ',',
+// ';' and '&' while the text after the separator is not another key=value
+// pair, so "ab;cd" is redacted whole while "x;DB_USER=bob" and
+// "x&sslmode=require" still stop at the separator. Like the value itself, it
+// never crosses whitespace.
+func extendPastValueSeparators(s string, end int) int {
+	for end < len(s) && strings.IndexByte(",;&", s[end]) >= 0 {
+		rest := s[end+1:]
+		n := strings.IndexAny(rest, " \t\n\f\r,;&")
+		if n < 0 {
+			n = len(rest)
+		}
+		if n == 0 || strings.Contains(rest[:n], "=") {
+			break
+		}
+		end += 1 + n
+	}
+	return end
 }
 
 func unquoteRange(s string, start, end int) (int, int) {
