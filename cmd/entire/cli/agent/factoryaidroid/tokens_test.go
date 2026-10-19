@@ -140,6 +140,47 @@ func TestCalculateTokenUsageSince_TotalsGoingBackwardsAreARestart(t *testing.T) 
 	require.Equal(t, &agent.TokenUsage{InputTokens: 400, OutputTokens: 20, APICallCount: 1}, usage)
 }
 
+// A compaction rewrites the transcript shorter without restarting the totals:
+// the surviving messages are earlier turns' calls, so none are recounted.
+func TestCalculateTokenUsageSince_CompactionDoesNotRecountHistory(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ag := &FactoryAIDroidAgent{}
+	dir := t.TempDir()
+
+	ref := writeDroidSession(t, dir, &droidTokenUsage{InputTokens: 9000, OutputTokens: 300},
+		userLine, assistantLine1, userLine, assistantLine2)
+	baseline, err := ag.SnapshotTokenBaseline(ctx, "s", ref)
+	require.NoError(t, err)
+
+	writeDroidSession(t, dir, &droidTokenUsage{InputTokens: 9500, OutputTokens: 340}, assistantLine2, assistantLine3)
+	usage, err := ag.CalculateTokenUsageSince(ctx, "s", ref, baseline)
+	require.NoError(t, err)
+	require.Equal(t, &agent.TokenUsage{InputTokens: 500, OutputTokens: 40}, usage)
+}
+
+// A settings file that exists but cannot be read at turn start is an unknown
+// position, not a fresh session: reading it fine at Stop must not count the
+// whole running total, which includes earlier turns.
+func TestCalculateTokenUsageSince_UnreadableSettingsAtTurnStartIsNil(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ag := &FactoryAIDroidAgent{}
+	dir := t.TempDir()
+
+	ref := writeDroidSession(t, dir, nil, userLine, assistantLine1)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "session.settings.json"), []byte(`{"tokenUsage":`), 0o600))
+	baseline, err := ag.SnapshotTokenBaseline(ctx, "s", ref)
+	require.NoError(t, err)
+	require.Empty(t, baseline)
+
+	writeDroidSession(t, dir, &droidTokenUsage{InputTokens: 30149, OutputTokens: 725, CacheReadTokens: 60603},
+		userLine, assistantLine1, userLine, assistantLine2)
+	usage, err := ag.CalculateTokenUsageSince(ctx, "s", ref, baseline)
+	require.NoError(t, err)
+	require.Nil(t, usage)
+}
+
 func TestCalculateTokenUsageSince_MissingSettingsIsNil(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -164,8 +205,8 @@ func TestAssistantMessagesSince_CountsEachMessageOnce(t *testing.T) {
 	ref := writeDroidSession(t, t.TempDir(), nil,
 		assistantLine1, userLine, assistantLine2, assistantLine2, assistantLine3)
 
-	require.Equal(t, 3, assistantMessagesSince(ref, 0), "a message written twice is one call")
-	require.Equal(t, 2, assistantMessagesSince(ref, 2))
+	require.Equal(t, 3, assistantMessagesSince(ref, 0, false), "a message written twice is one call")
+	require.Equal(t, 2, assistantMessagesSince(ref, 2, false))
 }
 
 func TestExtractModelFromTranscript_StillReadsTheModel(t *testing.T) {

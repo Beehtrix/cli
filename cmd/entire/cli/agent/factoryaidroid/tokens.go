@@ -3,6 +3,8 @@ package factoryaidroid
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"log/slog"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
@@ -33,9 +35,10 @@ type droidTokenUsage struct {
 }
 
 // droidTokenBaseline is the turn-start position, stored opaquely in the
-// pre-prompt state. It is written even when the settings file has no token
-// block yet (Tokens nil, meaning a fresh session), so an absent baseline at
-// turn end always means "position unknown" and never "count from zero".
+// pre-prompt state. It is written even when the settings file or its token
+// block does not exist yet (Tokens nil, meaning a fresh session), so an absent
+// baseline at turn end always means "position unknown" and never "count from
+// zero". A settings file that exists but cannot be read writes no baseline.
 type droidTokenBaseline struct {
 	Tokens          *droidTokenUsage `json:"tokens"`
 	TranscriptLines int              `json:"transcript_lines"`
@@ -48,8 +51,14 @@ func (f *FactoryAIDroidAgent) SnapshotTokenBaseline(ctx context.Context, _, sess
 		return nil, nil // no transcript path, no position
 	}
 	base := droidTokenBaseline{TranscriptLines: transcriptLineCount(sessionRef)}
-	if settings, ok := readSessionSettings(ctx, sessionRef); ok {
+	settings, err := readSessionSettings(ctx, sessionRef)
+	switch {
+	case err == nil:
 		base.Tokens = settings.TokenUsage
+	case !errors.Is(err, fs.ErrNotExist):
+		// Unreadable is not "fresh": a zero start would re-add earlier turns
+		// if the file reads fine at Stop.
+		return nil, nil // position unknown, no token counts for the turn
 	}
 	raw, err := json.Marshal(base)
 	if err != nil {
@@ -75,9 +84,9 @@ func (f *FactoryAIDroidAgent) CalculateTokenUsageSince(ctx context.Context, sess
 			slog.String("session_id", sessionID))
 		return nil, nil //nolint:nilerr,nilnil // an unreadable baseline degrades to no token counts
 	}
-	settings, ok := readSessionSettings(ctx, sessionRef)
-	if !ok || settings.TokenUsage == nil {
-		return nil, nil //nolint:nilnil // no token data written yet
+	settings, err := readSessionSettings(ctx, sessionRef)
+	if err != nil || settings.TokenUsage == nil {
+		return nil, nil //nolint:nilnil,nilerr // no readable token data, no token counts for the turn
 	}
 
 	cur := *settings.TokenUsage
@@ -87,8 +96,9 @@ func (f *FactoryAIDroidAgent) CalculateTokenUsageSince(ctx context.Context, sess
 	}
 	// A total below its turn-start value means Droid restarted the count, so
 	// everything in the current total was used after the baseline.
-	if cur.InputTokens < start.InputTokens || cur.OutputTokens < start.OutputTokens ||
-		cur.CacheCreationTokens < start.CacheCreationTokens || cur.CacheReadTokens < start.CacheReadTokens {
+	restarted := cur.InputTokens < start.InputTokens || cur.OutputTokens < start.OutputTokens ||
+		cur.CacheCreationTokens < start.CacheCreationTokens || cur.CacheReadTokens < start.CacheReadTokens
+	if restarted {
 		start = droidTokenUsage{}
 	}
 
@@ -97,7 +107,7 @@ func (f *FactoryAIDroidAgent) CalculateTokenUsageSince(ctx context.Context, sess
 		CacheCreationTokens: cur.CacheCreationTokens - start.CacheCreationTokens,
 		CacheReadTokens:     cur.CacheReadTokens - start.CacheReadTokens,
 		OutputTokens:        cur.OutputTokens - start.OutputTokens,
-		APICallCount:        assistantMessagesSince(sessionRef, base.TranscriptLines),
+		APICallCount:        assistantMessagesSince(sessionRef, base.TranscriptLines, restarted),
 	}
 	if usage.InputTokens == 0 && usage.CacheCreationTokens == 0 && usage.CacheReadTokens == 0 && usage.OutputTokens == 0 {
 		return nil, nil //nolint:nilnil // nothing used since the baseline
@@ -116,13 +126,18 @@ func transcriptLineCount(sessionRef string) int {
 }
 
 // assistantMessagesSince counts distinct assistant messages after startLine.
-// A transcript shorter than startLine was rewritten, so every message counts.
-func assistantMessagesSince(sessionRef string, startLine int) int {
+// A transcript shorter than startLine was rewritten: after a restart every
+// message is new, but after a compaction the survivors are earlier turns' calls
+// and which messages are new is unknown, so the count is 0.
+func assistantMessagesSince(sessionRef string, startLine int, restarted bool) int {
 	lines, total, err := ParseDroidTranscript(sessionRef, startLine)
 	if err != nil {
 		return 0
 	}
 	if total < startLine {
+		if !restarted {
+			return 0
+		}
 		if lines, _, err = ParseDroidTranscript(sessionRef, 0); err != nil {
 			return 0
 		}
