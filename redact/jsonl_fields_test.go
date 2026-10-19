@@ -75,11 +75,32 @@ func TestJSONLContent_ScansValueWithItsKey(t *testing.T) {
 			want: `{"input":{"username":"svc","password":"REDACTED"}}`,
 		},
 		{
-			name: "only the flagged part of a longer value",
+			name: "a finding only the key reveals replaces the whole value",
 			line: `{"api_key_note":"` + lowEntropyAPIKey + ` is the staging key"}`,
-			want: `{"api_key_note":"REDACTED is the staging key"}`,
+			want: `{"api_key_note":"REDACTED"}`,
+		},
+		{
+			name: "a finding the value reveals on its own keeps the rest",
+			line: `{"token":"` + githubPATFixture + ` and a note"}`,
+			want: `{"token":"REDACTED and a note"}`,
 		},
 	})
+}
+
+// Key context must only add to what the value alone redacts. Rewriting the
+// value before the other layers scan it would stop a rule that needs the
+// unchanged value from matching.
+func TestJSONLContent_KeyContextKeepsValueAloneMatches(t *testing.T) {
+	// Not parallel: custom rules are process-global.
+	resetCustomRulesForTest(t)
+	ConfigureCustomRules(CustomRulesConfig{Inline: map[string]string{
+		"prefix":   `ACME-[a-z]+`,
+		"anchored": `^ACME-[a-z]+ [0-9]{4}$`,
+	}})
+
+	got, err := JSONLContent(`{"author":"ACME-aaaaaa 1234"}`)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"author":"REDACTED"}`, got)
 }
 
 func TestJSONLContent_KeyContextKeepsNonSecrets(t *testing.T) {

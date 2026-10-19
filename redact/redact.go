@@ -1121,11 +1121,18 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 }
 
 // redactLeafValue is the per-leaf redaction rule shared by the splice
-// collection pass and the structural re-encode fallback: findings that need
-// the leaf's key first, then the redactor, then the credential-key
-// placeholder for values neither changed.
+// collection pass and the structural re-encode fallback: the placeholder for
+// a value whose key reveals a secret the value alone does not, otherwise the
+// redactor, then the credential-key placeholder for values it left alone.
+//
+// The redactor always sees the unchanged value. Rewriting part of it first
+// would stop a rule that needs the whole value, such as an anchored custom
+// rule, from matching, and expose text it used to redact.
 func redactLeafValue(key string, credentialContext bool, val string, redactor func(string) string) string {
-	redacted := redactor(redactKeyContext(key, val))
+	if keyContextFindsMore(key, val) {
+		return RedactedPlaceholder
+	}
+	redacted := redactor(val)
 	if redacted == val && isCredentialJSONSecretKey(key, credentialContext) && hasNonPlaceholderPasswordValue(val) {
 		redacted = RedactedPlaceholder
 	}
@@ -1137,27 +1144,38 @@ func redactLeafValue(key string, credentialContext bool, val string, redactor fu
 // containing one of them precedes it, as in api_key=<value>.
 var credentialKeyWords = []string{"access", "api", "auth", "cred", "key", "secret", "token", "passw", "psw", "pw"}
 
-// redactKeyContext redacts what detection flags in val when val is scanned as
-// the "key":"val" text it came from. A leaf scanned on its own has lost its
-// key, so without this {"api_key":"<hex>"} would pass where api_key=<hex> in
-// prose is redacted. Findings inside the key itself are dropped; only the
-// value is rewritten.
+// keyContextFindsMore reports whether scanning val as the "key":"val" text it
+// came from flags any part of val that scanning val alone leaves. A leaf
+// scanned on its own has lost its key, so without this {"api_key":"<hex>"}
+// would pass where api_key=<hex> in prose is redacted. Findings inside the key
+// itself do not count.
 //
-// Only keys containing a credentialKeyWords stem pay for the second scan.
-func redactKeyContext(key, val string) string {
+// Only keys containing a credentialKeyWords stem pay for the extra scans.
+func keyContextFindsMore(key, val string) bool {
 	if val == "" || !containsCredentialKeyWord(key) {
-		return val
+		return false
 	}
 	prefix := `"` + key + `":"`
 	start, end := len(prefix), len(prefix)+len(val)
-	var regions []taggedRegion
+	var coveredAlone []bool
 	for _, r := range detectAllLayers(prefix + val + `"`) {
-		r.start, r.end = max(r.start, start)-start, min(r.end, end)-start
-		if r.start < r.end {
-			regions = append(regions, r)
+		s, e := max(r.start, start)-start, min(r.end, end)-start
+		if s >= e {
+			continue
+		}
+		if coveredAlone == nil {
+			coveredAlone = make([]bool, len(val))
+			for _, a := range detectAllLayers(val) {
+				for i := a.start; i < a.end; i++ {
+					coveredAlone[i] = true
+				}
+			}
+		}
+		if slices.Contains(coveredAlone[s:e], false) {
+			return true
 		}
 	}
-	return applyRegions(val, regions)
+	return false
 }
 
 func containsCredentialKeyWord(key string) bool {
