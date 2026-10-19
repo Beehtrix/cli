@@ -264,3 +264,23 @@ func TestLiveSubagentModifiedFiles_WritesNothingACaptureReads(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, entries, "the probe must leave nothing under .entire/tmp")
 }
+
+func TestCompletedToolParts_DropsUnfinishedEdits(t *testing.T) {
+	t.Parallel()
+	write := func(status, file string) Part {
+		return Part{Type: "tool", Tool: "write", State: &ToolState{Status: status, Input: map[string]any{"filePath": file}}}
+	}
+	msgs := []ExportMessage{{
+		Info: MessageInfo{ID: "m1", Role: roleAssistant},
+		Parts: []Part{
+			{Type: "text", Text: "editing"},
+			write("pending", "/repo/pending.md"),
+			write("running", "/repo/running.md"),
+			write("error", "/repo/error.md"),
+			write("completed", "/repo/done.md"),
+		},
+	}}
+
+	assert.Equal(t, []string{"/repo/done.md"}, modifiedFilesFromMessages(completedToolParts(msgs), 0))
+	assert.Len(t, msgs[0].Parts, 5, "the caller's messages are left as they were")
+}

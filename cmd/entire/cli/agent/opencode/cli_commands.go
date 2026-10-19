@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/redact"
 
@@ -62,6 +63,10 @@ func runOpenCodeExportToFile(ctx context.Context, root *os.Root, sessionID, outp
 	}()
 
 	cmd := exec.CommandContext(ctx, "opencode", "export", sessionID)
+	// The npm launcher runs the real binary as a child that inherits stderr;
+	// killing only the launcher would leave Run waiting on that pipe past the
+	// deadline, and a commit's fetch budget depends on this cut-off.
+	execx.TerminateOnCancel(cmd)
 	// Exports run inside git hooks (condensation in post-commit),
 	// whose GIT_DIR / GIT_INDEX_FILE would otherwise reach OpenCode's own git
 	// calls (project detection) and point them at the hook's state.

@@ -197,7 +197,24 @@ func (a *OpenCodeAgent) LiveSubagentModifiedFiles(ctx context.Context, childID, 
 	if err != nil || session == nil {
 		return nil, err
 	}
-	return modifiedFilesFromMessages(session.Messages, 0), nil
+	return modifiedFilesFromMessages(completedToolParts(session.Messages), 0), nil
+}
+
+// completedToolParts returns msgs with only finished tool parts. A live
+// export carries pending, running and failed edits too, and none of those is
+// evidence the subagent changed a file.
+func completedToolParts(msgs []ExportMessage) []ExportMessage {
+	kept := make([]ExportMessage, len(msgs))
+	for i, msg := range msgs {
+		kept[i] = ExportMessage{Info: msg.Info}
+		for _, part := range msg.Parts {
+			if part.Type == "tool" && (part.State == nil || part.State.Status != "completed") {
+				continue
+			}
+			kept[i].Parts = append(kept[i].Parts, part)
+		}
+	}
+	return kept
 }
 
 // exportToPrivateFile runs `opencode export` for sessionID into a staging file

@@ -564,7 +564,9 @@ the committed files and the IDLE session has none of its own, it condenses
 only if a live record modified a committed file (`liveTaskFilesInCommit`):
 per the transcript on disk, or, for an agent with none yet, its own report
 (`agent.LiveSubagentFileReporter`) within a 10s share of the commit's
-subagent fetch budget.
+subagent fetch budget. The check reads the whole running call, so while it
+runs, a later commit of the same file by another session credits the session
+again even when the subagent added nothing since.
 Ordinary idle commits with no task records are unaffected — they stay exactly
 as before.
 
