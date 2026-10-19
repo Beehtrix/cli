@@ -9,76 +9,69 @@ import (
 	"github.com/betterleaks/betterleaks/report"
 )
 
-// betterleaksNonSecretComponents lists the component-only rules that match
-// identifiers, hosts, URLs, and names rather than credentials. Together with
-// betterleaksSecretComponents it must cover every SkipReport rule.
-var betterleaksNonSecretComponents = []string{
-	"aikido-client-id",
-	"algolia-application-id",
-	"artifactory-jfrog-url",
-	"auth0-client-id.1",
-	"auth0-domain.1",
-	"azure-client-id",
-	"azure-storage-account-name",
-	"azure-tenant-id",
-	"browserstack-username.1",
-	"canva-client-id",
-	"clickhouse-cloud-key-id",
-	"cloudinary-api-key",
-	"cloudinary-cloud-name",
-	"ebay-client-id",
-	"generic-username",
-	"langfuse-public-key.1",
-	"lark-app-id",
-	"miro-client-id",
-	"mongodb-atlas-service-account-id",
-	"mux-access-token-id.1",
-	"ovh-application-key",
-	"paypal-client-id.1",
-	"planetscale-id",
-	"plivo-auth-id",
-	"polymarket-address",
-	"ramp-client-id",
-	"razorpay-key-id.1",
-	"salesforce-instance-url.1",
-	"snowflake-account-host.1",
-	"supabase-project-url",
-	"tableau-personal-access-token-name.1",
-	"tableau-server-host.1",
-	"upstash-redis-rest-url.1",
-	"wiz-client-id.1",
-	"zoho-client-id.1",
-}
-
-// TestBetterleaksComponentRulesClassified fails when a betterleaks upgrade adds,
-// renames, or un-skips a component-only rule, so each one is classified as a
-// credential (redacted) or an identifier (left visible) on purpose.
-func TestBetterleaksComponentRulesClassified(t *testing.T) {
+// TestBetterleaksCredentialComponents pins which rules attached as components,
+// or marked SkipReport, are treated as credentials. Anything not listed in
+// betterleaksIdentifierComponents lands here, so a betterleaks upgrade that
+// adds or renames such a rule fails this test and is classified on purpose.
+func TestBetterleaksCredentialComponents(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := config.Default()
 	if err != nil {
 		t.Fatalf("load betterleaks default config: %v", err)
 	}
+	componentLike := make(map[string]bool)
 	for id, rule := range cfg.Rules {
-		if !rule.SkipReport {
-			continue
+		if rule.SkipReport {
+			componentLike[id] = true
 		}
-		secret := betterleaksSecretComponents[id]
-		nonSecret := slices.Contains(betterleaksNonSecretComponents, id)
-		if secret == nonSecret {
-			t.Errorf("component-only rule %q must be in exactly one of betterleaksSecretComponents and betterleaksNonSecretComponents", id)
+		for _, component := range rule.Components {
+			componentLike[component.RuleID] = true
 		}
 	}
-	for id := range betterleaksSecretComponents {
-		if rule, ok := cfg.Rules[id]; !ok || !rule.SkipReport {
-			t.Errorf("betterleaksSecretComponents lists %q, which is no longer a component-only rule", id)
+	for id := range betterleaksIdentifierComponents {
+		if !componentLike[id] {
+			t.Errorf("betterleaksIdentifierComponents lists %q, which is no longer a component or SkipReport rule", id)
 		}
 	}
-	for _, id := range betterleaksNonSecretComponents {
-		if rule, ok := cfg.Rules[id]; !ok || !rule.SkipReport {
-			t.Errorf("betterleaksNonSecretComponents lists %q, which is no longer a component-only rule", id)
+	var credentials []string
+	for id := range componentLike {
+		if !betterleaksIdentifierComponents[id] {
+			credentials = append(credentials, id)
 		}
+	}
+	slices.Sort(credentials)
+	want := []string{
+		"alibaba-access-key-id",
+		"alibaba-sts-access-key-id",
+		"alibaba-sts-security-token",
+		"aws-secret-access-key",
+		"exoscale-api-secret",
+		"ovh-consumer-key",
+		"polymarket-api-secret",
+		"polymarket-passphrase",
+	}
+	if !slices.Equal(credentials, want) {
+		t.Errorf("credential component rules = %v, want %v; classify new rules in betterleaksIdentifierComponents or add them here", credentials, want)
+	}
+}
+
+// TestBetterleaksFindingSecrets_UnlistedComponentRedacted pins the fail-safe
+// default: a component rule missing from the identifier list is redacted, since
+// betterleaks suppresses that rule's own finding once it is attached.
+func TestBetterleaksFindingSecrets_UnlistedComponentRedacted(t *testing.T) {
+	t.Parallel()
+
+	f := report.Finding{
+		Secret: "primary",
+		ComponentSets: []report.ComponentSet{{Components: []*report.ComponentFinding{
+			{RuleID: "some-future-credential", Secret: "credential"},
+			{RuleID: "azure-tenant-id", Secret: "tenant"},
+		}}},
+	}
+	got := betterleaksFindingSecrets(f)
+	if want := []string{"primary", "credential"}; !slices.Equal(got, want) {
+		t.Errorf("betterleaksFindingSecrets = %v, want %v", got, want)
 	}
 }
 

@@ -31,7 +31,7 @@ Entire automatically scans transcript and metadata content before writing it to 
 
 1. **Entropy scoring** — Identifies high-entropy strings (Shannon entropy > 4.5) that look like randomly generated secrets, even if they don't match a known pattern. One exact shape is exempt from this layer only: a string that is, in its entirety, a Claude Code tool-use id (`toolu_01` plus 22 letters or digits). The other layers still scan it, and a secret attached to an id forms a longer string that is not exempt.
 2. **Pattern matching** — Runs one or both configurable scanner engines against known secret formats: [Betterleaks](https://github.com/betterleaks/betterleaks) (default on) and/or [goredact](https://github.com/lastpersonlabs/goredact) (default off). See [Choosing secret-scanner engines](#choosing-secret-scanner-engines) below. Betterleaks multi-part rules (such as an AWS key ID with its secret access key) are adjusted for redaction: each credential part is redacted on its own, whether or not its partner appears nearby.
-3. **Provider token prefixes** — Deterministically redacts known secret-key prefixes (e.g. Supabase `sb_secret_`, `sbp_`, AWS access key IDs, Salesforce access tokens, Tableau personal access tokens) regardless of entropy or surrounding context.
+3. **Provider token shapes** — Deterministically redacts known secret-key prefixes (Supabase `sb_secret_`, `sbp_`) regardless of entropy or surrounding context, plus bounded token shapes with boundary checks and false-positive filters: short `sk-` keys, AWS access key IDs (documentation `EXAMPLE` keys stay visible), Salesforce access tokens, and Tableau personal access tokens. These shapes are caught without a vendor keyword nearby.
 4. **Credentialed URI detection** — Redacts URLs with embedded passwords, such as `scheme://user:password@host`.
 5. **Database connection-string detection** — Redacts JDBC, Postgres keyword DSN, SQL Server, and ODBC-style connection strings containing passwords.
 6. **Bounded credential value detection** — Redacts password-like config values such as `DB_PASSWORD=...` and `PGPASSWORD=...` while preserving the surrounding key.
@@ -78,7 +78,7 @@ Configure them under `redaction.betterleaks` / `redaction.goredact` in `.entire/
 }
 ```
 
-Omitting either key, or the key's `enabled` field, keeps that engine at its default. All other redaction layers — entropy scoring, provider token prefixes, credentialed URI detection, connection-string detection, custom rules, bounded credential key/value detection, and PII — are unaffected by these two toggles; they keep running exactly as described elsewhere in this document regardless of which scanner engine(s) are selected.
+Omitting either key, or the key's `enabled` field, keeps that engine at its default. All other redaction layers — entropy scoring, provider token shapes, credentialed URI detection, connection-string detection, custom rules, bounded credential key/value detection, and PII — are unaffected by these two toggles; they keep running exactly as described elsewhere in this document regardless of which scanner engine(s) are selected.
 
 **Fail-closed rules:**
 
@@ -289,6 +289,7 @@ File an issue when the rule would benefit every Entire user (e.g., a major SaaS 
 
 - **Best-effort.** Novel or low-entropy secrets (short passwords, predictable tokens) may not be caught.
 - **Filenames and binary data.** Secrets in filenames, binary files, or deeply nested structures may not be detected.
+- **Base64 secrets containing `/` without a keyword.** Entropy scoring splits values on `/` so it does not redact whole file paths. A base64 secret that contains `/` and appears without a recognizable key name or vendor shape nearby (for example an AWS secret access key or Azure storage key pasted into prose) can leave fragments visible.
 - **JSONL skip rules.** Entire skips scanning fields whose name *ends in* `signature` (so `thinkingSignature` too), fields ending in `id`/`ids`, and structural-path fields (`filepath`, `file_path`, `cwd`, `root`, `directory`, `dir`, `path`) to avoid false positives. Objects whose `type` starts with `image` or equals `base64` are also skipped — and that skip is what leaves a pasted image unredacted rather than merely unflagged. It matches some agents' image shapes and not others, which is why the outcome differs per agent: see [What Entire does NOT understand: pasted images and screenshots](#what-entire-does-not-understand-pasted-images-and-screenshots) above.
 - **Built-in PII patterns are US-centric.** `phone` matches North American (NANP) formats only — international formats, including E.164 numbers outside `+1`, are not detected. `address` matches the street line only; city, state, and ZIP/postcode are preserved. If you handle personal data from other regions, add `custom_patterns` for your locale rather than relying on the built-in categories alone.
 - **Custom PII patterns are user-authored.** Teams own the correctness of their `custom_patterns`. An invalid regex is logged and skipped, not enforced.
