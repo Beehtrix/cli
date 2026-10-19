@@ -298,14 +298,22 @@ keeps its default, so experimental commands are visible.
   at `install.entire.com/installers/…` only after a release has actually uploaded
   those keys. Repointing first would turn every install into a 404 with no
   fallback.
-- **Repoint the cask and Scoop download URLs** at `install.entire.com`
-  (`homebrew_casks[].url.template` with `verified:`, and `scoops[].url_template`).
-  Deliberately not done here: a published manifest must never name a host that
-  isn't serving yet. Once the origin is live this is the highest-value follow-up
-  — it moves roughly the other half of all download bytes off GitHub with **no**
-  loss of integrity, because the sha256 stays pinned in the manifest, which still
-  comes from the tap. Metadata refresh (`brew update`, bucket clone) still needs
-  GitHub, so those channels remain outage-affected for *discovering* a release.
+- **Repointing the cask and bucket download URLs is not an outage fix**, and is
+  deliberately not done. Both manifests live in GitHub git repos
+  (`entireio/homebrew-tap`, `entireio/scoop-bucket`), so `brew update` and a
+  bucket refresh need GitHub whatever the artifact URL says. Changing
+  `homebrew_casks[].url.template` or `scoops[].url_template` would only help
+  someone who refreshed metadata *before* the outage and has not installed yet —
+  a narrow window. It would move download bytes off GitHub, which is a bandwidth
+  and partial-outage argument rather than an availability one, and it would put
+  every cask and bucket install behind a single origin with no fallback of its
+  own.
+
+  The complete path is the one `scoop/entire.json` takes: mirror a manifest whose
+  URLs name this origin, so metadata *and* bytes come from us. Scoop supports
+  that directly (`scoop install <url>`, no bucket, no git). Homebrew has no clean
+  equivalent, so the cask stays outage-affected; `install.sh` is the GitHub-free
+  path on macOS.
 - **Decide on signing.** Nothing is signed today beyond macOS notarization — no
   cosign, no SBOM, no attestations. A second origin doubles the number of hosts
   that can serve a bad binary. Two options: sign `checksums.txt` with a key
