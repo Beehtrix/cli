@@ -92,24 +92,45 @@ func isClaudeToolUseID(match string) bool {
 // public content but score above entropyThreshold.
 var contentDigestPattern = regexp.MustCompile(`\b(?:h1:[A-Za-z0-9+/]{43}=|sha1-[A-Za-z0-9+/]{27}=|sha256-[A-Za-z0-9+/]{43}=|sha384-[A-Za-z0-9+/]{64}|sha512-[A-Za-z0-9+/]{86}==)`)
 
-// contentDigestSpans returns the byte ranges of content digests in s. An
-// entropy-layer match lying entirely inside one is exempt from that layer
-// only; a secret glued onto a digest makes the match longer than the digest,
-// so it is still checked.
+// contentDigestSpans returns the byte ranges of content digests in s, in
+// order. An entropy-layer match lying entirely inside one is exempt from that
+// layer only; a secret glued onto a digest makes the match longer than the
+// digest, so it is still checked.
 func contentDigestSpans(s string) [][]int {
 	if !strings.Contains(s, "h1:") && !strings.Contains(s, "sha") {
 		return nil
 	}
-	return contentDigestPattern.FindAllStringIndex(s, -1)
+	spans := contentDigestPattern.FindAllStringIndex(s, -1)
+	digests := spans[:0]
+	for _, span := range spans {
+		// More base64 after the span means a longer value whose prefix only
+		// has a digest's length. A '/' inside it would split the entropy match,
+		// so its high-entropy head would otherwise look exempt.
+		if span[1] < len(s) && isBase64OrTokenByte(s[span[1]]) {
+			continue
+		}
+		digests = append(digests, span)
+	}
+	return digests
 }
 
-func insideSpan(spans [][]int, start, end int) bool {
-	for _, span := range spans {
-		if start >= span[0] && end <= span[1] {
-			return true
-		}
+func isBase64OrTokenByte(c byte) bool {
+	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.IndexByte("+/=_-", c) >= 0
+}
+
+// digestCursor answers whether entropy matches lie inside a content digest.
+// Matches arrive in increasing order, so it walks the spans forward and passes
+// over each one once.
+type digestCursor struct {
+	spans [][]int
+	next  int
+}
+
+func (c *digestCursor) contains(start, end int) bool {
+	for c.next < len(c.spans) && c.spans[c.next][1] <= start {
+		c.next++
 	}
-	return false
+	return c.next < len(c.spans) && c.spans[c.next][0] <= start && end <= c.spans[c.next][1]
 }
 
 // RedactedPlaceholder is the replacement text used for redacted secrets.
@@ -236,7 +257,7 @@ func detectAllLayers(s string) []taggedRegion {
 	var regions []taggedRegion
 
 	// 1. Entropy-based detection (secrets — always on).
-	digests := contentDigestSpans(s)
+	digests := digestCursor{spans: contentDigestSpans(s)}
 	for _, loc := range secretPattern.FindAllStringIndex(s, -1) {
 		start, end := loc[0], loc[1]
 
@@ -256,7 +277,7 @@ func detectAllLayers(s string) []taggedRegion {
 			}
 		}
 
-		if isClaudeToolUseID(s[start:end]) || insideSpan(digests, start, end) {
+		if isClaudeToolUseID(s[start:end]) || digests.contains(start, end) {
 			continue
 		}
 		if shannonEntropy(s[start:end]) > entropyThreshold {
@@ -305,9 +326,10 @@ func detectAllLayers(s string) []taggedRegion {
 	regions = append(regions, detectProviderTokens(s)...)
 
 	// 4. Credentialed URIs (secrets — always on). A URI whose password is a
-	// placeholder stays intact, like the connection strings in layer 5.
+	// placeholder stays intact, like the connection strings in layer 5, unless
+	// its query carries a real password.
 	for _, loc := range credentialedURIPattern.FindAllStringSubmatchIndex(s, -1) {
-		if isPlaceholderSecretValue(s[loc[2]:loc[3]]) {
+		if isPlaceholderSecretValue(s[loc[2]:loc[3]]) && !uriQueryHasPassword(s[loc[0]:loc[1]]) {
 			continue
 		}
 		regions = append(regions, taggedRegion{region: region{loc[0], loc[1]}})
@@ -421,11 +443,30 @@ func hasDatabaseURLSecret(candidate string) bool {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return false
 	}
-	for key, values := range u.Query() {
+	return hasQueryPasswordSecret(u.Query())
+}
+
+// uriQueryHasPassword reports whether a URI's query assigns a real password.
+// It parses the query on its own, so a host url.Parse rejects (a templated
+// ${DB_HOST}) cannot hide it.
+func uriQueryHasPassword(uri string) bool {
+	_, query, ok := strings.Cut(uri, "?")
+	if !ok {
+		return false
+	}
+	query, _, _ = strings.Cut(query, "#")
+	// ParseQuery keeps every pair it can decode even when it reports an
+	// error for another.
+	values, _ := url.ParseQuery(query) //nolint:errcheck // partial values are what we want
+	return hasQueryPasswordSecret(values)
+}
+
+func hasQueryPasswordSecret(values url.Values) bool {
+	for key, vals := range values {
 		if !isPasswordQueryKey(key) {
 			continue
 		}
-		for _, value := range values {
+		for _, value := range vals {
 			if hasNonPlaceholderPasswordValue(value) {
 				return true
 			}
@@ -447,7 +488,7 @@ func hasKeywordDSNPassword(candidate string) bool {
 // isShellWorkingDirectory reports whether a keyword-DSN assignment is the
 // shell's PWD variable, which env output prints as an absolute path.
 func isShellWorkingDirectory(key, value string) bool {
-	return strings.EqualFold(key, "pwd") && (strings.HasPrefix(value, "/") || strings.HasPrefix(value, "~"))
+	return strings.EqualFold(key, "pwd") && (strings.HasPrefix(value, "/") || strings.HasPrefix(value, "~/"))
 }
 
 func hasSemicolonConnectionPassword(candidate string) bool {
@@ -533,14 +574,36 @@ func isPlaceholderSecretValue(value string) bool {
 var shellExpansionWordRE = regexp.MustCompile(`^\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=+](.*)\}$`)
 
 // isPlaceholderShellExpansion reports whether a ${…} value is a placeholder:
-// a plain reference, or one whose word is itself empty or a placeholder, so
-// ${DB_PASSWORD:-hunter2} still counts as a secret.
+// one complete expression that is a plain reference, or one whose word is
+// itself empty or a placeholder, so ${DB_PASSWORD:-hunter2} and
+// ${A}hunter2${B} still count as secrets.
 func isPlaceholderShellExpansion(s string) bool {
+	if !isSingleBraceExpression(s) {
+		return false
+	}
 	m := shellExpansionWordRE.FindStringSubmatch(s)
 	if m == nil {
 		return true
 	}
 	return isPlaceholderSecretValue(m[1])
+}
+
+// isSingleBraceExpression reports whether the brace opened by the leading "${"
+// of s is closed by its final "}".
+func isSingleBraceExpression(s string) bool {
+	depth := 0
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i == len(s)-1
+			}
+		}
+	}
+	return false
 }
 
 // templatePlaceholderRE matches a value that is one interpolation expression:

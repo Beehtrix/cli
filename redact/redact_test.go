@@ -927,6 +927,16 @@ func TestString_CredentialedURIs(t *testing.T) {
 			want:  "postgres://app:****@db:5432/app",
 		},
 		{
+			name:  "placeholder userinfo with a query but no password is preserved",
+			input: "postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}/app?sslmode=require",
+			want:  "postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}/app?sslmode=require",
+		},
+		{
+			name:  "placeholder userinfo with a placeholder query password is preserved",
+			input: "postgres://app:changeme@db/app?password=${DB_PASSWORD}",
+			want:  "postgres://app:changeme@db/app?password=${DB_PASSWORD}",
+		},
+		{
 			name:  "placeholder head with real tail is redacted",
 			input: "postgres://postgres:changeme123@localhost:5432/app",
 			want:  "REDACTED",
@@ -1014,6 +1024,36 @@ func TestString_ConnectionSecretsCaughtWithoutScanners(t *testing.T) {
 			want:  "REDACTED",
 		},
 		{
+			name:  "keyword DSN with a pwd password starting with a tilde",
+			input: "host=db user=svc pwd=~hunter2",
+			want:  "REDACTED",
+		},
+		{
+			name:  "placeholder userinfo with a real query password",
+			input: "https://app:changeme@example.com/app?password=hunter2",
+			want:  "REDACTED",
+		},
+		{
+			name:  "templated host with a real query password",
+			input: "postgres://app:changeme@${DB_HOST}/app?password=hunter2",
+			want:  "REDACTED",
+		},
+		{
+			name:  "credentialed URI with a literal between expansions",
+			input: "amqp://app:${P}hunter2${Q}@host/vhost",
+			want:  "REDACTED",
+		},
+		{
+			name:  "credentialed URI with a literal inside a nested default",
+			input: "amqp://app:${P:-${Q}hunter2${R}}@host/vhost",
+			want:  "REDACTED",
+		},
+		{
+			name:  "credential value with a literal between expansions",
+			input: "DB_PASSWORD=${P}hunter2${Q}",
+			want:  "DB_PASSWORD=REDACTED",
+		},
+		{
 			name:  "env block with a bare password",
 			input: "HOST=db\nUSER=app\nPASSWORD=postgres\n",
 			want:  "REDACTED\n",
@@ -1093,6 +1133,18 @@ func TestString_ContentDigestsPreserved(t *testing.T) {
 			name:  "digest prefix with the wrong length is redacted",
 			input: `"integrity": "sha256-V+Cu1AWSsxpqjQMOTazGG8sOGKWCyRowpjMMscqVu8Sz"`,
 			want:  `"integrity": "REDACTED"`,
+		},
+		{
+			// The first 64 characters have a sha384 digest's length, and the
+			// slash splits the entropy match inside them.
+			name:  "overlong digest is redacted",
+			input: `integrity="sha384-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/A"`,
+			want:  `integrity="REDACTED/A"`,
+		},
+		{
+			name:  "secret between two digests is redacted",
+			input: "github.com/a/b v1.0.0 h1:kcj+ClqXiFC1clI9bJ9DPCmcSF0OopwqDYOTocnBi0U=\nnote aB3dE5fG7hJ9kL2mN4pQ6rS8tU1vW0xY\ngithub.com/c/d v1.0.0 h1:OP+PZHBRu1YXkVur4Jzyvl73RrGGmWvsWAbEWCFKYGg=",
+			want:  "github.com/a/b v1.0.0 h1:kcj+ClqXiFC1clI9bJ9DPCmcSF0OopwqDYOTocnBi0U=\nnote REDACTED\ngithub.com/c/d v1.0.0 h1:OP+PZHBRu1YXkVur4Jzyvl73RrGGmWvsWAbEWCFKYGg=",
 		},
 	})
 }
