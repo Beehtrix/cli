@@ -1425,7 +1425,7 @@ func pickerPrefill(ctx context.Context, profileName string) (map[string]settings
 		return map[string]settings.ReviewConfig{}, "", nil
 	}
 	if profileHasUnverifiedFields(s, profileName, profile) {
-		return nil, "", fmt.Errorf("review profile %q is in .entire/settings.local.json, which could not be verified as untracked, so its prompts and reviewer configs aren't loaded and saving would erase them; untrack it (git rm --cached .entire/settings.local.json) and run --edit again", profileName)
+		return nil, "", errUnverifiedLocalProfile(profileName, "--edit")
 	}
 	judge := ""
 	if j, jok := profileJudge(profile); jok {

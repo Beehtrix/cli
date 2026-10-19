@@ -422,15 +422,27 @@ func runReviewConfigure(ctx context.Context, cmd *cobra.Command, profileOverride
 		return configureAgentConfigs(ctx, cmd, profileName, opts.Configs, silentErr)
 	}
 	if opts.scripted() {
+		fail := func(err error) error {
+			cmd.SilenceUsage = true
+			fmt.Fprintln(cmd.ErrOrStderr(), err.Error())
+			return silentErr(err)
+		}
+		if profileHasUnverifiedFields(s, profileName, s.ReviewProfiles[profileName]) {
+			return fail(errUnverifiedLocalProfile(profileName, "--configure"))
+		}
 		profile, buildErr := buildConfiguredProfile(ctx, profileName, opts, s, deps)
 		if buildErr != nil {
-			cmd.SilenceUsage = true
-			fmt.Fprintln(cmd.ErrOrStderr(), buildErr.Error())
-			return silentErr(buildErr)
+			return fail(buildErr)
 		}
 		scope := reviewScopeProject
 		if opts.Local {
 			scope = reviewScopeLocal
+			// The loaded view carries configs from clone-local preferences, and
+			// --set-agents rebuilds reviewers without theirs: keep exactly the
+			// configs the local file already stores for the reviewers kept.
+			if err := keepStoredLocalConfigs(ctx, profileName, &profile); err != nil {
+				return fail(err)
+			}
 		}
 		if err := saveReviewProfile(ctx, profileName, profile, false, scope); err != nil {
 			return err
@@ -1022,6 +1034,32 @@ func printBlockedTools(w io.Writer, profileName string, summary reviewtypes.RunS
 		fmt.Fprintf(w, "%s: its permission settings blocked %s.\n", run.Name, strings.Join(names, ", "))
 		fmt.Fprintf(w, "  To allow them, %s; update the profile config with entire review --configure %s --set-config <reviewer>=<file>.\n", allow, profileName)
 	}
+}
+
+// errUnverifiedLocalProfile refuses to save profileName from a view that is
+// missing what Load dropped from an unverified local file.
+func errUnverifiedLocalProfile(profileName, flag string) error {
+	return fmt.Errorf("review profile %q is in .entire/settings.local.json, which could not be verified as untracked, so its prompts and reviewer configs aren't loaded and saving would erase them; untrack it (git rm --cached .entire/settings.local.json) and run %s again", profileName, flag)
+}
+
+// keepStoredLocalConfigs sets each reviewer's config in profile to the one the
+// local settings file stores for it, if any.
+func keepStoredLocalConfigs(ctx context.Context, profileName string, profile *settings.ReviewProfileConfig) error {
+	_, raw, err := loadReviewSettingsRaw(ctx, reviewScopeLocal)
+	if err != nil {
+		return err
+	}
+	stored, err := decodeRawReviewProfiles(raw)
+	if err != nil {
+		return err
+	}
+	agents := make(map[string]settings.ReviewConfig, len(profile.Agents))
+	for worker, cfg := range profile.Agents {
+		cfg.Config = stored[profileName].Agents[worker].Config
+		agents[worker] = cfg
+	}
+	profile.Agents = agents
+	return nil
 }
 
 // profileHasUnverifiedFields reports whether Load dropped any of profileName's

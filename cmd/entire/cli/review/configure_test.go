@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -957,5 +958,91 @@ func TestSaveReviewAgentConfigsKeepsUnverifiedLocalFields(t *testing.T) {
 	installed := func(context.Context) []agenttypes.AgentName { return []agenttypes.AgentName{tAgentClaude, tAgentCodex} }
 	if err := RunReviewProfileConfigPicker(ctx, io.Discard, installed, "mine"); err == nil || !strings.Contains(err.Error(), "git rm --cached") {
 		t.Fatalf("--edit on an unverified local profile: err = %v", err)
+	}
+}
+
+// A scripted --configure --local saves the reviewers' configs as the local file
+// stores them: a kept reviewer keeps its config through --set-agents, and a
+// config overlaid from clone-local preferences is not copied into the file.
+func TestRunReviewConfigureScriptedLocalKeepsStoredConfigs(t *testing.T) {
+	tmp := t.TempDir()
+	testutil.InitRepo(t, tmp)
+	t.Chdir(tmp)
+	ctx := context.Background()
+
+	profile := settings.ReviewProfileConfig{Agents: map[string]settings.ReviewConfig{
+		tAgentClaude: {Agent: tAgentClaude, Config: &settings.ReviewAgentConfig{Extensions: []string{"/opt/local.ts"}}},
+		tAgentCodex:  {Agent: tAgentCodex},
+	}}
+	if err := saveReviewProfile(ctx, "mine", profile, true, reviewScopeLocal); err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.ModifyClonePreferences(ctx, func(p *settings.ClonePreferences) error {
+		p.ReviewAgentConfigs = map[string]map[string]*settings.ReviewAgentConfig{"mine": {tAgentCodex: {Extensions: []string{"/opt/prefs.ts"}}}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	opts := reviewConfigureOptions{Agents: []string{tAgentClaude, tAgentCodex}, Local: true}
+	if err := runReviewConfigure(ctx, cmd, "mine", opts, configureTestDeps(tAgentClaude, tAgentCodex)); err != nil {
+		t.Fatalf("runReviewConfigure: %v", err)
+	}
+	_, raw, err := loadReviewSettingsRaw(ctx, reviewScopeLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := decodeRawReviewProfiles(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg := stored["mine"].Agents[tAgentClaude].Config; cfg == nil || !slices.Contains(cfg.Extensions, "/opt/local.ts") {
+		t.Errorf("claude-code lost its stored config: %+v", cfg)
+	}
+	if cfg := stored["mine"].Agents[tAgentCodex].Config; cfg != nil {
+		t.Errorf("clone-local config copied into the local file: %+v", cfg)
+	}
+}
+
+// A scripted --configure refuses a profile whose local file could not be
+// verified: saving the loaded view would erase what Load dropped.
+func TestRunReviewConfigureScriptedRefusesUnverifiedLocalProfile(t *testing.T) {
+	tmp := t.TempDir()
+	testutil.InitRepo(t, tmp)
+	t.Chdir(tmp)
+	ctx := context.Background()
+
+	profile := settings.ReviewProfileConfig{Agents: map[string]settings.ReviewConfig{
+		tAgentClaude: {Agent: tAgentClaude, Prompt: "Focus on auth.", Config: &settings.ReviewAgentConfig{Extensions: []string{"/opt/x.ts"}}},
+	}}
+	if err := saveReviewProfile(ctx, "mine", profile, true, reviewScopeLocal); err != nil {
+		t.Fatal(err)
+	}
+	testutil.RunGit(t, tmp, "add", "-f", ".entire/settings.local.json")
+	testutil.RunGit(t, tmp, "commit", "-q", "-m", "local settings")
+	testutil.RunGit(t, tmp, "rm", "-q", "--cached", ".entire/settings.local.json")
+	settings.ClearVersionedPathCache()
+	t.Cleanup(settings.ClearVersionedPathCache)
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	opts := reviewConfigureOptions{Models: []string{tAgentClaude + "=opus"}, Local: true}
+	if err := runReviewConfigure(ctx, cmd, "mine", opts, configureTestDeps(tAgentClaude, tAgentCodex)); err == nil {
+		t.Fatal("saved a profile from an unverified local file")
+	}
+	_, raw, err := loadReviewSettingsRaw(ctx, reviewScopeLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := decodeRawReviewProfiles(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored["mine"].Agents[tAgentClaude]; got.Prompt != "Focus on auth." || got.Config == nil {
+		t.Errorf("stored fields erased: %+v", got)
 	}
 }
