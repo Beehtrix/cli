@@ -18,15 +18,18 @@ var _ agent.OutOfBandTokenSource = (*FactoryAIDroidAgent)(nil)
 // parent's "inclusiveTokenUsage" (deliberately not read) adds the Workers in.
 //
 // inputTokens excludes cached input, the same convention as agent.TokenUsage.
-// thinkingTokens is reported separately from outputTokens; it is only as
-// complete as Droid's provider adapter makes it (the generic Chat Completions
-// adapter records none, even for a model that reasons).
+// outputTokens already includes reasoning: Droid's Anthropic, OpenAI
+// Responses, native Gemini, and Bedrock adapters all store the provider's
+// output total, reasoning included. Its "thinkingTokens" is a breakdown of
+// that figure (often estimated from text length), so it is not read: adding
+// it would count reasoning twice. The generic Chat Completions adapter stores
+// completion_tokens, which for some providers (Gemini) excludes reasoning;
+// those tokens never reach the file.
 type droidTokenUsage struct {
 	InputTokens         int `json:"inputTokens"`
 	OutputTokens        int `json:"outputTokens"`
 	CacheCreationTokens int `json:"cacheCreationTokens"`
 	CacheReadTokens     int `json:"cacheReadTokens"`
-	ThinkingTokens      int `json:"thinkingTokens"`
 }
 
 // droidTokenBaseline is the turn-start position, stored opaquely in the
@@ -56,7 +59,7 @@ func (f *FactoryAIDroidAgent) SnapshotTokenBaseline(ctx context.Context, _, sess
 }
 
 // CalculateTokenUsageSince returns the tokens used since the baseline: the
-// running total minus the turn-start total, with reasoning counted as output.
+// running total minus the turn-start total.
 // The settings file has no call count, so APICallCount is the number of
 // distinct assistant messages written since the baseline, one per model call.
 //
@@ -85,8 +88,7 @@ func (f *FactoryAIDroidAgent) CalculateTokenUsageSince(ctx context.Context, sess
 	// A total below its turn-start value means Droid restarted the count, so
 	// everything in the current total was used after the baseline.
 	if cur.InputTokens < start.InputTokens || cur.OutputTokens < start.OutputTokens ||
-		cur.CacheCreationTokens < start.CacheCreationTokens || cur.CacheReadTokens < start.CacheReadTokens ||
-		cur.ThinkingTokens < start.ThinkingTokens {
+		cur.CacheCreationTokens < start.CacheCreationTokens || cur.CacheReadTokens < start.CacheReadTokens {
 		start = droidTokenUsage{}
 	}
 
@@ -94,7 +96,7 @@ func (f *FactoryAIDroidAgent) CalculateTokenUsageSince(ctx context.Context, sess
 		InputTokens:         cur.InputTokens - start.InputTokens,
 		CacheCreationTokens: cur.CacheCreationTokens - start.CacheCreationTokens,
 		CacheReadTokens:     cur.CacheReadTokens - start.CacheReadTokens,
-		OutputTokens:        (cur.OutputTokens - start.OutputTokens) + (cur.ThinkingTokens - start.ThinkingTokens),
+		OutputTokens:        cur.OutputTokens - start.OutputTokens,
 		APICallCount:        assistantMessagesSince(sessionRef, base.TranscriptLines),
 	}
 	if usage.InputTokens == 0 && usage.CacheCreationTokens == 0 && usage.CacheReadTokens == 0 && usage.OutputTokens == 0 {

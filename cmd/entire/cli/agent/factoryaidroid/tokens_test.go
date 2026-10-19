@@ -76,21 +76,28 @@ func TestCalculateTokenUsageSince_ResumedSessionCountsOnlyThisTurn(t *testing.T)
 	require.Equal(t, &agent.TokenUsage{InputTokens: 22114, OutputTokens: 550, CacheReadTokens: 40508, APICallCount: 2}, usage)
 }
 
-func TestCalculateTokenUsageSince_CountsReasoningAsOutput(t *testing.T) {
+// Droid's outputTokens already includes reasoning; thinkingTokens is a
+// breakdown of it, so counting both would double count.
+func TestCalculateTokenUsageSince_DoesNotAddThinkingTokens(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	ag := &FactoryAIDroidAgent{}
 	dir := t.TempDir()
 
-	ref := writeDroidSession(t, dir, &droidTokenUsage{InputTokens: 100, OutputTokens: 10, ThinkingTokens: 5})
+	ref := writeDroidSession(t, dir, &droidTokenUsage{InputTokens: 100, OutputTokens: 10})
 	baseline, err := ag.SnapshotTokenBaseline(ctx, "s", ref)
 	require.NoError(t, err)
 
-	writeDroidSession(t, dir, &droidTokenUsage{InputTokens: 300, OutputTokens: 40, ThinkingTokens: 65, CacheCreationTokens: 12},
-		assistantLine1)
+	writeDroidSettingsJSON(t, dir, `{"tokenUsage":{"inputTokens":300,"outputTokens":40,"cacheCreationTokens":12,"cacheReadTokens":0,"thinkingTokens":25}}`)
+	require.NoError(t, os.WriteFile(ref, []byte(assistantLine1+"\n"), 0o600))
 	usage, err := ag.CalculateTokenUsageSince(ctx, "s", ref, baseline)
 	require.NoError(t, err)
-	require.Equal(t, &agent.TokenUsage{InputTokens: 200, OutputTokens: 30 + 60, CacheCreationTokens: 12, APICallCount: 1}, usage)
+	require.Equal(t, &agent.TokenUsage{InputTokens: 200, OutputTokens: 30, CacheCreationTokens: 12, APICallCount: 1}, usage)
+}
+
+func writeDroidSettingsJSON(t *testing.T, dir, raw string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "session.settings.json"), []byte(raw), 0o600))
 }
 
 func TestCalculateTokenUsageSince_NoBaselineIsNotTheSessionTotal(t *testing.T) {
