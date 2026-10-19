@@ -165,3 +165,35 @@ func TestForeignCommit_RunningSubagentEditLinksForeignParent(t *testing.T) {
 		makeOwnerForeign(t, env, parentID)
 	})
 }
+
+func TestForeignCommit_RunningSubagentEditStampsForeignParentsTrailer(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	const subagentFile = "docs/solo.md"
+	// No other session claims the commit, so the parent's trailer is the only
+	// link: its running subagent's edit is the staged-file overlap.
+	parent := idleParentWithRunningSubagent(t, env, "toolu_01SoloCommit", "f5555666677778888", subagentFile, "# Solo\n\nWritten by a running subagent.\n")
+	makeOwnerForeign(t, env, parent.ID)
+
+	env.GitCommitWithHooks("commit the subagent's doc", subagentFile)
+
+	cpID := headCheckpointID(t, env)
+	require.NotEmpty(t, cpID, "a commit of the running subagent's file links its parent")
+	summaryContent, found := env.ReadFileFromBranch(paths.MetadataBranchName, CheckpointSummaryPath(cpID))
+	require.True(t, found, "checkpoint summary must exist")
+	var summary checkpoint.CheckpointSummary
+	require.NoError(t, json.Unmarshal([]byte(summaryContent), &summary))
+	env.AssertCheckpointContainsSession(t, summary, parent.ID)
+}
+
+func TestForeignCommit_RunningSubagentDoesNotLinkUnrelatedFile(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	parent := idleParentWithRunningSubagent(t, env, "toolu_01SoloOther", "f6666777788889999", "docs/solo.md", "# Solo\n")
+	makeOwnerForeign(t, env, parent.ID)
+
+	env.WriteFile("other_file.txt", "typed by a person")
+	env.GitCommitWithHooks("terminal commit", "other_file.txt")
+
+	require.Empty(t, headCheckpointID(t, env), "a running subagent is no evidence for a file it did not write")
+}

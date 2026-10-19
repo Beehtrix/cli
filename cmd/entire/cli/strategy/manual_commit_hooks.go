@@ -2062,7 +2062,7 @@ func truncateHash(h string) string {
 //
 // A session in provenance's foreign set must show staged-file overlap: its
 // task records and transcript growth are not evidence about a commit its
-// agent did not make.
+// agent did not make, though a running subagent that wrote a staged file is.
 func (s *ManualCommitStrategy) filterSessionsWithNewContent(ctx context.Context, repo *git.Repository, sessions []*SessionState, redone redo, provenance commitProvenance) []*SessionState {
 	logCtx := logging.WithComponent(ctx, "manual-commit")
 	var result []*SessionState
@@ -2096,6 +2096,12 @@ func (s *ManualCommitStrategy) filterSessionsWithNewContent(ctx context.Context,
 		checked := state
 		if provenance.isForeign(state.SessionID) {
 			if len(stagedFiles) == 0 {
+				continue
+			}
+			// A running subagent's edit is staged-file overlap, as in
+			// post-commit's shouldCondenseWithOverlapCheck.
+			if idleWithLiveTaskRecord(state, time.Now()) && s.liveTaskFilesInCommit(ctx, state, fileSet(stagedFiles)) {
+				result = append(result, state)
 				continue
 			}
 			withoutRecords := *state

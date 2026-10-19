@@ -448,38 +448,7 @@ func jointCommitWithRunningSubagent(t *testing.T, env *TestEnv, beforeCommit fun
 		codingBody    = "package main\n\nfunc Feature() {}\n"
 	)
 
-	parent := env.NewSession()
-	parent.CreateTranscript("delegate a background task", nil)
-	if err := env.SimulateUserPromptSubmitWithTranscriptPath(parent.ID, parent.TranscriptPath); err != nil {
-		t.Fatalf("parent user-prompt-submit failed: %v", err)
-	}
-	if err := env.SimulatePreTask(parent.ID, parent.TranscriptPath, taskToolUseID); err != nil {
-		t.Fatalf("parent pre-task failed: %v", err)
-	}
-	if err := env.SimulatePostTask(PostTaskInput{
-		SessionID:      parent.ID,
-		TranscriptPath: parent.TranscriptPath,
-		ToolUseID:      taskToolUseID,
-		AgentID:        subagentID,
-		Background:     true,
-	}); err != nil {
-		t.Fatalf("parent post-task (background stub) failed: %v", err)
-	}
-	if err := env.SimulateStop(parent.ID, parent.TranscriptPath); err != nil {
-		t.Fatalf("parent stop failed: %v", err)
-	}
-	// The subagent writes its file and keeps running: no SubagentStop.
-	parent.CreateSubagentTranscript(subagentID, []FileChange{{Path: subagentFile, Content: subagentBody}})
-	env.WriteFile(subagentFile, subagentBody)
-
-	parentState, err := env.GetSessionState(parent.ID)
-	if err != nil || parentState == nil {
-		t.Fatalf("GetSessionState for parent failed: %v (state=%v)", err, parentState)
-	}
-	if parentState.Phase != session.PhaseIdle || len(parentState.FilesTouched) != 0 || !hasLiveTaskRecord(parentState, taskToolUseID) {
-		t.Fatalf("precondition: want IDLE parent with a live record and empty FilesTouched, got phase=%s files=%v records=%+v",
-			parentState.Phase, parentState.FilesTouched, parentState.TaskRecords)
-	}
+	parent := idleParentWithRunningSubagent(t, env, taskToolUseID, subagentID, subagentFile, subagentBody)
 
 	coding := env.NewSession()
 	if err := env.SimulateUserPromptSubmitWithTranscriptPath(coding.ID, coding.TranscriptPath); err != nil {
@@ -516,4 +485,44 @@ func jointCommitWithRunningSubagent(t *testing.T, env *TestEnv, beforeCommit fun
 	if !strings.Contains(storedTranscript, subagentFile) {
 		t.Errorf("materialized subagent transcript does not reference %q", subagentFile)
 	}
+}
+
+// idleParentWithRunningSubagent starts a session that delegated a background
+// task and went IDLE; the subagent wrote file and is still running, so the
+// file is not yet in the parent's FilesTouched.
+func idleParentWithRunningSubagent(t *testing.T, env *TestEnv, taskToolUseID, subagentID, subagentFile, subagentBody string) *Session {
+	t.Helper()
+	parent := env.NewSession()
+	parent.CreateTranscript("delegate a background task", nil)
+	if err := env.SimulateUserPromptSubmitWithTranscriptPath(parent.ID, parent.TranscriptPath); err != nil {
+		t.Fatalf("parent user-prompt-submit failed: %v", err)
+	}
+	if err := env.SimulatePreTask(parent.ID, parent.TranscriptPath, taskToolUseID); err != nil {
+		t.Fatalf("parent pre-task failed: %v", err)
+	}
+	if err := env.SimulatePostTask(PostTaskInput{
+		SessionID:      parent.ID,
+		TranscriptPath: parent.TranscriptPath,
+		ToolUseID:      taskToolUseID,
+		AgentID:        subagentID,
+		Background:     true,
+	}); err != nil {
+		t.Fatalf("parent post-task (background stub) failed: %v", err)
+	}
+	if err := env.SimulateStop(parent.ID, parent.TranscriptPath); err != nil {
+		t.Fatalf("parent stop failed: %v", err)
+	}
+	// The subagent writes its file and keeps running: no SubagentStop.
+	parent.CreateSubagentTranscript(subagentID, []FileChange{{Path: subagentFile, Content: subagentBody}})
+	env.WriteFile(subagentFile, subagentBody)
+
+	parentState, err := env.GetSessionState(parent.ID)
+	if err != nil || parentState == nil {
+		t.Fatalf("GetSessionState for parent failed: %v (state=%v)", err, parentState)
+	}
+	if parentState.Phase != session.PhaseIdle || len(parentState.FilesTouched) != 0 || !hasLiveTaskRecord(parentState, taskToolUseID) {
+		t.Fatalf("precondition: want IDLE parent with a live record and empty FilesTouched, got phase=%s files=%v records=%+v",
+			parentState.Phase, parentState.FilesTouched, parentState.TaskRecords)
+	}
+	return parent
 }
