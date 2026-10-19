@@ -332,9 +332,9 @@ func TestPiReviewer_ParseErrorWithoutMessage(t *testing.T) {
 	}
 }
 
-// Some Pi versions end the stream after the final turn without agent_end; a
-// turn that was not waiting on tool results still finishes the review, while a stream cut
-// after a tool-use turn does not.
+// Some Pi versions end the stream after the final turn without agent_end. A
+// turn that was not waiting on tool results still finishes the review; a
+// stream cut after a tool-use turn does not.
 func TestPiReviewer_ParseEndsWithoutAgentEnd(t *testing.T) {
 	t.Parallel()
 	finished := func(input string) (bool, bool) {
@@ -385,6 +385,27 @@ func TestPiReviewer_ParseLengthStopFails(t *testing.T) {
 		}
 		if success || len(errs) != 1 || !strings.Contains(errs[0], "output token limit") {
 			t.Errorf("success=%v errs=%q, want a token-limit failure", success, errs)
+		}
+	}
+}
+
+// Pi recovers from a tool call cut off at the token limit by asking the model
+// to re-issue it; a run that then finishes normally succeeds.
+func TestPiReviewer_ParseRecoveredLengthStopSucceeds(t *testing.T) {
+	t.Parallel()
+	recovered := `{"type":"turn_end","message":{"role":"assistant","stopReason":"length"}}` + "\n" +
+		`{"type":"turn_start"}` + "\n" +
+		`{"type":"turn_end","message":{"role":"assistant","stopReason":"stop"}}` + "\n"
+	for _, input := range []string{recovered, recovered + `{"type":"agent_end"}` + "\n"} {
+		for _, ev := range collectPiReviewEvents(input) {
+			switch e := ev.(type) {
+			case reviewtypes.RunError:
+				t.Errorf("unexpected error %v", e.Err)
+			case reviewtypes.Finished:
+				if !e.Success {
+					t.Error("recovered length stop failed the review")
+				}
+			}
 		}
 	}
 }

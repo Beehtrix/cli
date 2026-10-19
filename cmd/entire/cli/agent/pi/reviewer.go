@@ -72,6 +72,10 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 		// lastTurnStop is the stopReason of the latest turn_end. Some Pi
 		// versions end the stream after a final turn without agent_end.
 		lastTurnStop := ""
+		// lengthErr explains a turn cut off at the output token limit. It
+		// fails the review only when that turn ends the run: Pi recovers from
+		// a cut-off tool call by asking the model to re-issue it.
+		lengthErr := ""
 
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -111,7 +115,7 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 				inTextBlock = false
 				messageHadDelta = false
 				if env.Message.Role == "assistant" {
-					if piReviewStoppedShort(env.Message.StopReason) {
+					if piReviewFailed(env.Message.StopReason) {
 						success = false
 						pendingErr = piReviewFailureReason(env.Message)
 					}
@@ -132,9 +136,12 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 				// success/failure.
 			case "turn_end":
 				lastTurnStop = env.Message.StopReason
-				if piReviewStoppedShort(env.Message.StopReason) {
+				if piReviewFailed(env.Message.StopReason) {
 					success = false
 					pendingErr = piReviewFailureReason(env.Message)
+				}
+				if env.Message.StopReason == piStopLength {
+					lengthErr = piReviewFailureReason(env.Message)
 				}
 				if env.Message.Usage != nil {
 					emitPiReviewTokens(out, env, &tokens, messageIDsWithUsage, messageUsageByTurn, turnNumber)
@@ -145,6 +152,10 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 					continue
 				}
 				finished = true
+				if lastTurnStop == piStopLength {
+					success = false
+					pendingErr = lengthErr
+				}
 				if !success && pendingErr != "" {
 					out <- reviewtypes.RunError{Err: errors.New(pendingErr)}
 				}
@@ -167,6 +178,9 @@ func parsePiReviewOutput(r io.Reader) <-chan reviewtypes.Event {
 			if lastTurnStop == "stop" && success {
 				out <- reviewtypes.Finished{Success: true}
 				return
+			}
+			if lastTurnStop == piStopLength {
+				pendingErr = lengthErr
 			}
 			if pendingErr != "" {
 				out <- reviewtypes.RunError{Err: errors.New(pendingErr)}
@@ -208,19 +222,23 @@ type piReviewMessage struct {
 	ErrorMessage string `json:"errorMessage"`
 }
 
-// piReviewFailureReason explains a failed message: Pi's errorMessage, or the
-// stop reason when Pi gave none.
-// piReviewStoppedShort reports a stop that didn't finish the review: an
-// error, an abort, or the output token limit, which truncates the review.
-func piReviewStoppedShort(stopReason string) bool {
-	return stopReason == "error" || stopReason == "aborted" || stopReason == "length"
+// piStopLength is the stop reason for a message cut off at the output token
+// limit.
+const piStopLength = "length"
+
+// piReviewFailed reports a stop that fails the review whatever follows: an
+// error or an abort. A "length" stop is judged on the run's last turn.
+func piReviewFailed(stopReason string) bool {
+	return stopReason == "error" || stopReason == "aborted"
 }
 
+// piReviewFailureReason explains a failed message: Pi's errorMessage, or the
+// stop reason when Pi gave none.
 func piReviewFailureReason(msg piReviewMessage) string {
 	if reason := strings.TrimSpace(msg.ErrorMessage); reason != "" {
 		return "pi: " + reason
 	}
-	if msg.StopReason == "length" {
+	if msg.StopReason == piStopLength {
 		return "pi: stopped at the output token limit, so the review is incomplete"
 	}
 	return "pi: stopped with " + msg.StopReason
