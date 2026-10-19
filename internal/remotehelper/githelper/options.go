@@ -1,6 +1,9 @@
 package githelper
 
-import "strings"
+import (
+	"errors"
+	"strings"
+)
 
 // Options accumulates `option <name> <value>` commands from git and
 // translates the ones we can act on into `git send-pack` flags. The
@@ -16,6 +19,7 @@ type Options struct {
 	forceIfIncludes bool
 	pushOptions     []string
 	cas             []string // --force-with-lease=<spec>
+	invalidCAS      bool
 }
 
 // Set applies one option and returns the helper-protocol reply line.
@@ -25,7 +29,9 @@ type Options struct {
 // core.quotePath) non-ASCII bytes arrives C-quoted. send-pack parses
 // its flags literally, so cas and push-option are unquoted here the
 // same way remote-curl.c:set_option does. A malformed quoted value is
-// answered with "error invalid value" rather than forwarded.
+// answered with "error invalid value". transport-helper ignores that
+// reply for cas and still sends the forced refspec, so a rejected cas
+// also makes PushError refuse the push.
 func (o *Options) Set(name, value string) string {
 	switch name {
 	case "dry-run":
@@ -45,6 +51,7 @@ func (o *Options) Set(name, value string) string {
 	case "cas":
 		v, ok := unquoteOptionValue(value)
 		if !ok {
+			o.invalidCAS = true
 			return optionReplyInvalid
 		}
 		o.cas = append(o.cas, v)
@@ -56,6 +63,18 @@ func (o *Options) Set(name, value string) string {
 		return "unsupported"
 	}
 	return "ok"
+}
+
+// errInvalidCAS refuses a push whose lease could not be parsed. Pushing
+// without it would turn a --force-with-lease push into a plain force push.
+var errInvalidCAS = errors.New("refusing to push: invalid force-with-lease value")
+
+// PushError reports whether the accumulated options must stop a push.
+func (o *Options) PushError() error {
+	if o.invalidCAS {
+		return errInvalidCAS
+	}
+	return nil
 }
 
 // SendPackArgs returns the `git send-pack` flag set corresponding to

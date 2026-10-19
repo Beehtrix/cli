@@ -210,3 +210,34 @@ func TestHandlePush_QuotedLease(t *testing.T) {
 		})
 	}
 }
+
+// transport-helper ignores the reply to `option cas` and still sends the
+// forced refspec, so a rejected lease must stop the push in the helper.
+func TestHandlePush_MalformedLeaseRefusesPush(t *testing.T) {
+	// No t.Parallel(): t.Chdir for send-pack cwd.
+	server, bare := gitBackendServer(t)
+	dir, run := newRealGitRepo(t)
+	t.Chdir(dir)
+
+	const ref = "refs/heads/leased"
+	run("commit", "-q", "--allow-empty", "-m", "served")
+	served := run("rev-parse", "HEAD")
+	run("push", "-q", bare, served+":"+ref)
+	run("commit", "-q", "--amend", "--allow-empty", "-m", "rewritten")
+	rewritten := run("rev-parse", "HEAD")
+
+	opts := &Options{}
+	if reply := opts.Set("cas", `"`+ref+`:`+served); reply != optionReplyInvalid {
+		t.Fatalf("Set(cas) = %q, want %q", reply, optionReplyInvalid)
+	}
+	var stdout bytes.Buffer
+	err := handlePush(t.Context(), testTransport(server), &refAdvCache{},
+		"push +"+rewritten+":"+ref, opts,
+		bufio.NewReader(strings.NewReader("\n")), &stdout)
+	if err == nil {
+		t.Fatalf("push with rejected lease succeeded: %q", stdout.String())
+	}
+	if got := runGit(t, "-C", bare, "rev-parse", ref); got != served {
+		t.Fatalf("served tip moved to %s, want %s", got, served)
+	}
+}
