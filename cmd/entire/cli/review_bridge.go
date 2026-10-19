@@ -8,13 +8,16 @@ package cli
 //   review → claudecode/codex/pi → review
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
@@ -59,7 +62,7 @@ func postReviewToTrail(ctx context.Context, out io.Writer, profileName string, r
 	if len(report.Comments) == 0 && strings.TrimSpace(report.Prose) == "" {
 		return errors.New("no review output to post")
 	}
-	inputs := reviewTrailFindingInputs(profileName, report)
+	inputs, leftOut, shortened := capReviewTrailFindingInputs(reviewTrailFindingInputs(profileName, report))
 	return runAuthenticatedTrailAPI(ctx, out, false, "", func(ctx context.Context, client *api.Client, repoID string) error {
 		target, err := resolveTrailReviewTarget(ctx, client, repoID, "", "", "")
 		if err != nil {
@@ -77,11 +80,91 @@ func postReviewToTrail(ctx context.Context, out io.Writer, profileName string, r
 		} else {
 			fmt.Fprintf(out, "Posted the review verdict to the trail as %d %s.\n", len(inputs), findingWord)
 		}
+		if leftOut > 0 {
+			fmt.Fprintf(out, "Left out %d of %d findings: a review posts at most %d, most severe first.\n", leftOut, len(inputs)+leftOut, maxPostedReviewFindings)
+		}
+		if shortened > 0 {
+			fmt.Fprintf(out, "Shortened %s longer than %d characters.\n", pluralCount(shortened, "finding", "findings"), maxPostedReviewFindingRunes)
+		}
 		if link := trailReviewWebURL(target); link != "" {
 			fmt.Fprintf(out, "View the trail: %s\n", link)
 		}
 		return nil
 	})
+}
+
+const (
+	// maxPostedReviewFindings bounds how many findings one review posts. It
+	// stays under the server's per-batch limit, so a capped review posts in
+	// one request.
+	maxPostedReviewFindings = 50
+	// maxPostedReviewFindingRunes bounds a posted finding body, counted in
+	// runes as the server counts them. It stays under the server's body
+	// limit, which rejects the whole batch when one body exceeds it.
+	maxPostedReviewFindingRunes = 16384
+)
+
+// capReviewTrailFindingInputs keeps at most maxPostedReviewFindings findings,
+// most severe first, in their original order, and shortens bodies longer than
+// maxPostedReviewFindingRunes. It returns how many findings it left out and
+// how many bodies it shortened.
+func capReviewTrailFindingInputs(inputs []api.TrailReviewCommentInput) (capped []api.TrailReviewCommentInput, leftOut, shortened int) {
+	keep := make([]int, len(inputs))
+	for i := range keep {
+		keep[i] = i
+	}
+	if len(keep) > maxPostedReviewFindings {
+		slices.SortStableFunc(keep, func(a, b int) int {
+			return cmp.Compare(reviewTrailSeverityRank(inputs[a].Severity), reviewTrailSeverityRank(inputs[b].Severity))
+		})
+		keep = keep[:maxPostedReviewFindings]
+		slices.Sort(keep)
+	}
+	capped = make([]api.TrailReviewCommentInput, 0, len(keep))
+	for _, i := range keep {
+		input := inputs[i]
+		if input.Body != nil {
+			if body, ok := shortenReviewTrailFindingBody(*input.Body); ok {
+				input.Body = &body
+				shortened++
+			}
+		}
+		capped = append(capped, input)
+	}
+	return capped, len(inputs) - len(capped), shortened
+}
+
+// reviewTrailSeverityRank orders findings for capping: high, medium, low,
+// then unrated.
+func reviewTrailSeverityRank(severity *string) int {
+	if severity == nil {
+		return 3
+	}
+	switch *severity {
+	case trailReviewSeverityHigh:
+		return 0
+	case trailReviewSeverityMedium:
+		return 1
+	case trailReviewSeverityLow:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// shortenReviewTrailFindingBody cuts an over-long body on a rune boundary so
+// that, with a note saying so, it fits maxPostedReviewFindingRunes.
+func shortenReviewTrailFindingBody(body string) (string, bool) {
+	if utf8.RuneCountInString(body) <= maxPostedReviewFindingRunes {
+		return body, false
+	}
+	note := fmt.Sprintf("\n\n[Shortened: this finding was longer than %d characters.]", maxPostedReviewFindingRunes)
+	cut := 0
+	for range maxPostedReviewFindingRunes - utf8.RuneCountInString(note) {
+		_, size := utf8.DecodeRuneInString(body[cut:])
+		cut += size
+	}
+	return body[:cut] + note, true
 }
 
 // reviewTrailFindingInputs turns a trail report into trail findings.
