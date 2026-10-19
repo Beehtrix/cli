@@ -45,6 +45,7 @@ Every agent must implement all 19 methods on the `Agent` interface:
 | Interface | Methods | When to implement |
 |-----------|---------|-------------------|
 | `HookSupport` | `InstallHooks`, `UninstallHooks`, `AreHooksInstalled` | Agent uses a config file for hook registration (e.g., `settings.json`) |
+| `HookFreshness` | `CheckHookConfig` | Agent can tell whether its installed hook config still matches what this CLI writes (read-only). `entire status` points drift at `entire doctor`, which names the fix: `entire agent add <agent>`, then `--force` if that does not fix it. Claude Code also warns in its SessionStart banner, but only when a hook this CLI requires is missing (`claudecode.MissingRequiredHooks`); stale commands, missing timeouts and every other agent's check (Codex, OpenCode, Pi, Copilot) stay out of the banner because they also fire when a teammate's newer CLI wrote the config. |
 | `HookHandler` | `GetHookNames` | **Required for CLI hook registration** — `entire hooks <agent> <verb>` subcommands are only created for agents implementing this interface. Typically delegates to `HookNames()`. |
 | `TranscriptAnalyzer` | `GetTranscriptPosition`, `ExtractModifiedFilesFromOffset` | You want richer checkpoints with transcript-derived file lists |
 | `TranscriptPreparer` | `PrepareTranscript` | Agent writes transcripts asynchronously and needs a flush/sync step |
@@ -62,7 +63,8 @@ Every agent must implement all 19 methods on the `Agent` interface:
 
 Not an interface — a field. On `SubagentEnd`, set `Event.SubagentTranscriptPath` when
 the agent's hook payload names the subagent's own transcript (Codex and Cursor both
-send `agent_transcript_path`). Leave it empty and the framework probes the layout
+send `agent_transcript_path`; for OpenCode the framework's capture runs `opencode export` for the child and declares
+that file). Leave it empty and the framework probes the layout
 Claude Code and Factory AI Droid share, which finds nothing for any other agent and
 fails silently — the task checkpoint simply stores no subagent transcript. See the
 field's doc comment in `cmd/entire/cli/agent/event.go`.
@@ -492,8 +494,8 @@ The framework dispatcher (`DispatchLifecycleEvent` in `lifecycle.go`) handles ea
 | `TurnEnd` | Validates transcript, extracts metadata (prompts, summary, files), detects file changes via git status, saves step + checkpoint, transitions phase to IDLE | `stop`, `stop-failure` | `stop` | `turn-end` | `stop` | `agent-stop` |
 | `Compaction` | Fires compaction transition (stays ACTIVE), resets transcript offset | *(not used)* | `pre-compact` | `compaction` | `pre-compact` | *(not used)* |
 | `SessionEnd` | Marks session as ENDED in state machine | `session-end` | `session-end` | `session-end` | `session-end` | `session-end` |
-| `SubagentStart` | Captures pre-task state (git status snapshot) | `pre-task` (PreToolUse[Task]) | `subagent-start` | *(not used)* | `pre-tool-use` (config-level `matcher: Task`) | `subagent-start` (observed pass-through; no child identity) |
-| `SubagentEnd` | Extracts subagent modified files and completes the task record (see the "Task Records (Subagent Work)" section of [Sessions and Checkpoints](sessions-and-checkpoints.md) for the launch-stub vs. `Final` split) | `post-task` (PostToolUse[Agent] and PostToolUse[Skill] for a `context: fork` skill's agent, `Final: false`) + `subagent-start` (SubagentStart, matcher `workflow-subagent`: a Workflow agent's background launch, keyed by its agent ID, `Final: false`) + `subagent-stop` (SubagentStop, `Final: true`) | `subagent-stop` | *(not used)* | `post-tool-use` (config-level `matcher: Task`) | `subagent-stop` (`agentId` joined to parent `subagent.started.toolCallId`) |
+| `SubagentStart` | Captures pre-task state (git status snapshot) — or, for a `DeferredCompletion` start (OpenCode), records an in-flight task record and skips the snapshot | `pre-task` (PreToolUse[Task]) | `subagent-start` | `subagent-start` (plugin: parent task part `running` with `metadata.sessionId`; `DeferredCompletion`) | `pre-tool-use` (config-level `matcher: Task`) | `subagent-start` (observed pass-through; no child identity) |
+| `SubagentEnd` | Extracts subagent modified files and completes the task record (see the "Task Records (Subagent Work)" section of [Sessions and Checkpoints](sessions-and-checkpoints.md) for the launch-stub vs. `Final` split) | `post-task` (PostToolUse[Agent] and PostToolUse[Skill] for a `context: fork` skill's agent, `Final: false`) + `subagent-start` (SubagentStart, matcher `workflow-subagent`: a Workflow agent's background launch, keyed by its agent ID, `Final: false`) + `subagent-stop` (SubagentStop, `Final: true`) | `subagent-stop` | `subagent-stop` (plugin: `tool.execute.after` for `task`, or the child's own idle for a background task; `Final` + `CompletionWithoutLaunch`, child exported and declared) | `post-tool-use` (config-level `matcher: Task`) | `subagent-stop` (`agentId` joined to parent `subagent.started.toolCallId`) |
 
 ### Event Field Requirements
 

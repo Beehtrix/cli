@@ -63,7 +63,8 @@ Checks performed:
   4. Hook config: warn when the installed hooks no longer match what this
      CLI writes (e.g. an older release wrote Claude Code tool matchers that
      no longer fire, or a committed Pi/OpenCode extension has gone stale).
-     Fix by re-running 'entire enable --force'.
+     Fix by running 'entire agent add <agent>' (add --force if that does
+     not fix it).
 
   5. Retired Gemini CLI hooks: remove Entire hook entries left in
      .gemini/settings.json. Gemini CLI support was removed; the entries now do
@@ -191,7 +192,7 @@ func runSessionsFix(cmd *cobra.Command, force bool) error {
 	// reporting: it only fills in a timeout on a hook Entire wrote. Runs before
 	// the drift check, which counts a missing timeout as drift, so that check
 	// reports on the repaired config instead of telling the user to run
-	// `entire enable --force` for something doctor just fixed.
+	// `entire agent add` for something doctor just fixed.
 	checkHookTimeouts(cmd)
 
 	// Agent-specific: Claude Code hook config drift.
@@ -345,7 +346,7 @@ func classifySession(state *strategy.SessionState, now time.Time) *stuckSession 
 			State:             state,
 			Reason:            reason,
 			CheckpointCount:   state.StepCount + len(state.TaskRecords),
-			FilesTouchedCount: len(state.FilesTouched),
+			FilesTouchedCount: state.PendingFileCount(),
 		}
 	}
 
@@ -1412,11 +1413,12 @@ func checkRetiredDenyRule(cmd *cobra.Command) {
 }
 
 // checkHookTimeouts gives Entire's hooks the timeouts a config written by an
-// older CLI lacks, so a stalled `entire` launch cannot block the agent until
-// its own default timeout. It repairs without asking for the reason
-// checkRetiredDenyRule does: it only sets a timeout on a hook Entire wrote that
-// has none, so nothing the user chose is touched. As there, a repair error is
-// logged rather than printed.
+// older CLI lacks, so the agent's own default does not apply instead: a longer
+// one lets a stalled `entire` launch block the agent, and a shorter one (agy's
+// on Stop) kills a turn-end hook before it saves session state. It repairs
+// without asking for the reason checkRetiredDenyRule does: it only sets a
+// timeout on a hook Entire wrote that has none, so nothing the user chose is
+// touched. As there, a repair error is logged rather than printed.
 func checkHookTimeouts(cmd *cobra.Command) {
 	repairInstalledAgents(cmd, "could not add missing hook timeouts",
 		func(ctx context.Context, ag agent.Agent) (bool, error) {
@@ -1428,8 +1430,8 @@ func checkHookTimeouts(cmd *cobra.Command) {
 		},
 		func(w io.Writer, ag agent.Agent) {
 			fmt.Fprintf(w, "%s hooks: MISSING TIMEOUTS\n", ag.Type())
-			fmt.Fprintln(w, "  Some Entire hooks had no timeout, so a stalled `entire` launch could block")
-			fmt.Fprintln(w, "  the agent until its own default timeout.")
+			fmt.Fprintln(w, "  Some Entire hooks had no timeout, so the agent applied its own default,")
+			fmt.Fprintln(w, "  which can block the agent too long or stop a hook before it finishes.")
 			fmt.Fprintln(w, "  ✓ Fixed: timeouts added (your own hooks and timeouts are untouched).")
 		})
 }
@@ -1663,7 +1665,8 @@ func checkCodexHookTrust(cmd *cobra.Command) {
 		if diagnostics.PathsDiffer() {
 			writeCodexPrimaryCheckoutRemedy(w)
 		} else {
-			fmt.Fprintln(w, "  Run `entire enable --force` from this worktree to refresh it.")
+			fmt.Fprintln(w, "  Run `entire agent add codex` from this worktree to refresh it.")
+			fmt.Fprintln(w, "  If that does not fix it, add --force.")
 		}
 	case codexHookStateTrustReview:
 		writeCodexInstalledAndTrust(w, diagnostics)
@@ -1825,7 +1828,7 @@ func writeCodexWorktreeInspectionWarning(w io.Writer, worktreePath string, state
 		fmt.Fprintf(w, "  Current-worktree hooks: %s\n", worktreePath)
 	}
 	fmt.Fprintf(w, "  Error: %v\n", err)
-	fmt.Fprintln(w, "  Fix the current-worktree .codex path or hooks.json file, then run `entire enable --force`.")
+	fmt.Fprintln(w, "  Fix the current-worktree .codex path or hooks.json file, then run `entire agent add codex`.")
 	fmt.Fprintln(w, "  This may not be the file Codex reads. If Codex discovers another project root, apply/merge the generated .codex/hooks.json change there too.")
 	fmt.Fprintln(w, "  .codex/hooks.json is tracked — commit it and make sure the discovered project root has it too.")
 }
@@ -1847,7 +1850,7 @@ func writeCodexMissingProjectLayerWarning(w io.Writer, projectLayerPath, discove
 	fmt.Fprintf(w, "  Current-worktree project layer: %s (missing)\n", projectLayerPath)
 	fmt.Fprintf(w, "  Codex-discovered hooks: %s\n", discoveredPath)
 	fmt.Fprintln(w, "  Current Codex needs the local .codex project layer before it loads the discovered file.")
-	fmt.Fprintln(w, "  Run `entire enable` from this worktree to create the local layer.")
+	fmt.Fprintln(w, "  Run `entire agent add codex` from this worktree to create the local layer.")
 	writeCodexTrackedHooksRemedy(w)
 }
 
