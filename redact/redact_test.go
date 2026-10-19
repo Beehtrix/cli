@@ -983,14 +983,14 @@ func TestString_KeywordDSNOverRedactionGuards(t *testing.T) {
 			want:  "env HOST=0.0.0.0 USER=node PWD=/app node server.js",
 		},
 		{
-			name:  "pwd holding an absolute path is not a keyword DSN password",
-			input: "host=0.0.0.0 user=node pwd=/app",
-			want:  "host=0.0.0.0 user=node pwd=/app",
+			name:  "uppercase PWD holding an absolute path is not a keyword DSN password",
+			input: "host=0.0.0.0 user=node PWD=/app",
+			want:  "host=0.0.0.0 user=node PWD=/app",
 		},
 		{
-			name:  "pwd holding a home path is not a keyword DSN password",
-			input: "host=0.0.0.0 user=node pwd=~/app",
-			want:  "host=0.0.0.0 user=node pwd=~/app",
+			name:  "uppercase PWD holding a home path is not a keyword DSN password",
+			input: "host=0.0.0.0 user=node PWD=~/app",
+			want:  "host=0.0.0.0 user=node PWD=~/app",
 		},
 		{
 			name:  "env output without HOST is preserved",
@@ -1026,6 +1026,21 @@ func TestString_ConnectionSecretsCaughtWithoutScanners(t *testing.T) {
 		{
 			name:  "keyword DSN with a pwd password starting with a tilde",
 			input: "host=db user=svc pwd=~hunter2",
+			want:  "REDACTED",
+		},
+		{
+			name:  "keyword DSN with a lowercase pwd password starting with a slash",
+			input: "host=db user=app pwd=/s3cretPass",
+			want:  "REDACTED",
+		},
+		{
+			name:  "keyword DSN with a lowercase pwd password shaped like a home path",
+			input: "host=db user=app pwd=~/s3cretPass",
+			want:  "REDACTED",
+		},
+		{
+			name:  "keyword DSN with an uppercase PWD password that is not a path",
+			input: "host=db user=svc PWD=Xk9vq2Lm",
 			want:  "REDACTED",
 		},
 		{

@@ -486,9 +486,10 @@ func hasKeywordDSNPassword(candidate string) bool {
 }
 
 // isShellWorkingDirectory reports whether a keyword-DSN assignment is the
-// shell's PWD variable, which env output prints as an absolute path.
+// shell's PWD variable, which env output prints uppercase with an absolute
+// path. A lowercase pwd= is always a password.
 func isShellWorkingDirectory(key, value string) bool {
-	return strings.EqualFold(key, "pwd") && (strings.HasPrefix(value, "/") || strings.HasPrefix(value, "~/"))
+	return key == "PWD" && (strings.HasPrefix(value, "/") || strings.HasPrefix(value, "~/"))
 }
 
 func hasSemicolonConnectionPassword(candidate string) bool {
