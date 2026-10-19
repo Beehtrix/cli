@@ -248,7 +248,7 @@ func geminiToolResultCompact(tc geminiToolCall) json.RawMessage {
 		output = tc.Result[0].FunctionResponse.Response.Output
 	}
 
-	r := toolResultJSON{
+	r := ToolResult{
 		Output: output,
 		Status: ToolStatusSuccess,
 	}

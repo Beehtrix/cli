@@ -44,7 +44,7 @@ type wireBlock struct {
 	Text   *string         `json:"text"`
 	Name   string          `json:"name"`
 	Input  json.RawMessage `json:"input"`
-	Result *toolResultJSON `json:"result"`
+	Result *ToolResult     `json:"result"`
 }
 
 // Decode reads Entire Transcript Format bytes into typed lines.
@@ -175,16 +175,7 @@ func decodeBlock(raw json.RawMessage) Block {
 			b.Type = BlockText
 		}
 	}
-	if w.Result != nil {
-		b.Result = &ToolResult{
-			Output:     w.Result.Output,
-			Status:     w.Result.Status,
-			MatchCount: w.Result.MatchCount,
-		}
-		if f := w.Result.File; f != nil {
-			b.Result.File = &ToolResultFile{FilePath: f.FilePath, NumLines: f.NumLines}
-		}
-	}
+	b.Result = w.Result
 	return b
 }
 
