@@ -68,19 +68,23 @@ func checkPiReviewVersion(ctx context.Context, version func(context.Context) (st
 	if err != nil {
 		return nil //nolint:nilerr // best-effort probe; a missing pi fails at Start with its own error
 	}
-	// Pi 0.70 prints just the version; take the first token that parses so a
-	// prefix ("pi 0.64.0") or trailing notice can't hide an old release.
+	// Pi 0.70 prints just the version; take the first full x.y.z token so a
+	// prefix ("pi 0.64.0"), a trailing notice, or a bare number in a settings
+	// warning printed first ("...position 25...") can't hide an old release.
+	// semver alone would accept shorthand such as v25.
 	have := ""
 	for _, field := range strings.Fields(raw) {
-		if v := strings.TrimPrefix(field, "v"); semver.IsValid("v" + v) {
-			have = v
+		v := "v" + strings.TrimPrefix(field, "v")
+		if semver.Canonical(v) == v {
+			have = v[1:]
 			break
 		}
 	}
 	if have == "" || semver.Compare("v"+have, "v"+MinPiStdinJSONVersion) >= 0 {
 		return nil
 	}
-	return fmt.Errorf("pi %s is too old for review: it needs pi >= %s to keep JSON output for a prompt piped on stdin; upgrade pi and retry", have, MinPiStdinJSONVersion)
+	// Start prefixes the agent name.
+	return fmt.Errorf("version %s is too old for review: it needs pi >= %s to keep JSON output for a prompt piped on stdin; upgrade pi and retry", have, MinPiStdinJSONVersion)
 }
 
 func buildPiReviewCmd(ctx context.Context, cfg reviewtypes.RunConfig) *exec.Cmd {
