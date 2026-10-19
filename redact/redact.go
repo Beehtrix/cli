@@ -46,23 +46,26 @@ var credentialedURIPattern = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]{1,31}://
 var databaseURIPasswordPattern = regexp.MustCompile(`(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?)://[^\s/?#@"'` + "`" + `<>:]*:([^\s?#@"` + "`" + `<>]+)@[^\s"'` + "`" + `<>]+`)
 
 // uriPortPrefixPattern matches a databaseURIPasswordPattern "password" that is
-// really a port followed by a closing quote, as in
+// really a port followed by the end of a quoted list item, as in
 // ['postgres://localhost:5432','admin@example.com'].
-var uriPortPrefixPattern = regexp.MustCompile(`^[0-9]+'`)
+var uriPortPrefixPattern = regexp.MustCompile(`^[0-9]+',`)
 
 // oracleJDBCPattern and sqlplusLoginPattern match Oracle's user/password@connect
-// syntax, which has no password= key. oracleJDBCPattern captures the password;
-// sqlplusLoginPattern captures the user/password@connect token and the password.
+// syntax, which has no password= key. oracleJDBCPattern captures the password,
+// which Oracle lets a JDBC URL quote; sqlplusLoginPattern captures the
+// user/password@connect token, without the quotes scripts usually put around
+// it, and the password.
 var (
-	oracleJDBCPattern   = regexp.MustCompile(`(?i)\bjdbc:oracle:[a-z0-9]+:[^\s/@"'<>` + "`" + `]+/([^\s@"'<>` + "`" + `]+)@[^\s"'<>` + "`" + `]*`)
-	sqlplusLoginPattern = regexp.MustCompile(`(?i)\bsqlplus(?:\s+-[a-z]+)*\s+([^\s/@"']+/([^\s@"']+)@[^\s"']+)`)
+	oracleJDBCPattern   = regexp.MustCompile(`(?i)\bjdbc:oracle:[a-z0-9]+:[^\s/@"'<>` + "`" + `]+/("[^"]*"|[^\s@"'<>` + "`" + `]+)@[^\s"'<>` + "`" + `]*`)
+	sqlplusLoginPattern = regexp.MustCompile(`(?i)\bsqlplus(?:\s+-[a-z]+)*\s+["']?([^\s/@"']+/([^\s@"']+)@[^\s"']+)`)
 )
 
-// sasSignaturePattern captures the value of a sig query parameter, the HMAC
-// that authorizes an Azure SAS URL or token. It is URL-encoded base64, so the
-// entropy layer only ever sees fragments of it. SAS parameter names are
-// lowercase.
-var sasSignaturePattern = regexp.MustCompile(`[?&]sig=([A-Za-z0-9%+/=]{20,})`)
+// sasSignaturePattern captures the value of a sig parameter, the HMAC that
+// authorizes an Azure SAS URL or token. It is URL-encoded base64, so the
+// entropy layer only ever sees fragments of it. Parameter order does not
+// matter to a SAS token, so sig may also start a bare token or follow the '='
+// of a connection-string setting. SAS parameter names are lowercase.
+var sasSignaturePattern = regexp.MustCompile(`(?:^|[?&=\s"'])sig=([A-Za-z0-9%+/=]{20,})`)
 
 // dbPasswordKeyShape matches a DB-prefixed credential key (vendor prefix +
 // optional `_word`/`-word` segments + `password`/`passwd`/`pwd`). Used to
@@ -502,26 +505,34 @@ func detectConnectionStringRule(s string, rule connectionStringRule) []taggedReg
 	return regions
 }
 
+// maxConnectionKeyWords is the most words an ODBC or ADO.NET key has
+// ("Multiple Active Result Sets").
+const maxConnectionKeyWords = 4
+
 // connectionStringStart returns where the connection string in s[start:end]
 // begins. Semicolon-string keys may contain spaces ("Data Source"), so a match
 // can begin at the words before the string ("Use Server=..."), and those words
-// make the server check fail. A rejected match is retried from each later word
-// of its first key, so the words stay visible and the string is still caught.
+// make the server check fail. A rejected match is retried from the start of
+// each of the last maxConnectionKeyWords words of its first key, earliest
+// first, so the words before the string stay visible. Bounding the retries
+// keeps a long rejected line linear.
 func connectionStringStart(s string, start, end int, hasSecret func(string) bool) (int, bool) {
+	if hasSecret(s[start:end]) {
+		return start, true
+	}
 	keyEnd := start + max(strings.IndexByte(s[start:end], '='), 0)
-	for i := start; ; {
-		if hasSecret(s[i:end]) {
-			return i, true
-		}
-		space := strings.IndexByte(s[i:keyEnd], ' ')
-		if space < 0 {
-			return 0, false
-		}
-		i += space + 1
-		for i < keyEnd && s[i] == ' ' {
-			i++
+	var wordStarts []int
+	for i := keyEnd - 1; i > start && len(wordStarts) < maxConnectionKeyWords; i-- {
+		if s[i] != ' ' && s[i-1] == ' ' {
+			wordStarts = append(wordStarts, i)
 		}
 	}
+	for j := len(wordStarts) - 1; j >= 0; j-- {
+		if hasSecret(s[wordStarts[j]:end]) {
+			return wordStarts[j], true
+		}
+	}
+	return 0, false
 }
 
 func trimConnectionStringEnd(s string, start, end int) int {
@@ -613,11 +624,15 @@ func detectCredentialValues(s string) []taggedRegion {
 // extendPastValueSeparators continues an unquoted credential value across ',',
 // ';' and '&' while the text after the separator is not another key=value
 // pair, so "ab;cd" is redacted whole while "x;DB_USER=bob" and
-// "x&sslmode=require" still stop at the separator. Like the value itself, it
-// never crosses whitespace.
+// "x&sslmode=require" still stop at the separator. A run of separators counts
+// as one. Like the value itself, it never crosses whitespace.
 func extendPastValueSeparators(s string, end int) int {
 	for end < len(s) && strings.IndexByte(",;&", s[end]) >= 0 {
-		rest := s[end+1:]
+		next := end + 1
+		for next < len(s) && strings.IndexByte(",;&", s[next]) >= 0 {
+			next++
+		}
+		rest := s[next:]
 		n := strings.IndexAny(rest, " \t\n\f\r,;&")
 		if n < 0 {
 			n = len(rest)
@@ -625,7 +640,7 @@ func extendPastValueSeparators(s string, end int) int {
 		if n == 0 || strings.Contains(rest[:n], "=") {
 			break
 		}
-		end += 1 + n
+		end = next + n
 	}
 	return end
 }

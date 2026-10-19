@@ -1,6 +1,9 @@
 package redact
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // shapeSecret is short enough that the entropy layer never flags it, so each
 // case below is caught (or missed) by the shape-specific layer under test.
@@ -75,6 +78,16 @@ func TestString_AzureSASSignature(t *testing.T) {
 			name:  "unencoded signature",
 			input: blob + "?sv=2022-11-02&" + sasSigParam + slashedSig,
 			want:  blob + "?sv=2022-11-02&" + sasSigParam + "REDACTED",
+		},
+		{
+			name:  "signature first in a bare SAS token",
+			input: sasSigParam + sasSig + "&sv=2022-11-02&sp=r",
+			want:  sasSigParam + "REDACTED&sv=2022-11-02&sp=r",
+		},
+		{
+			name:  "signature first in a connection-string SAS value",
+			input: "SharedAccessSignature=" + sasSigParam + sasSig + "&sv=2022-11-02",
+			want:  "SharedAccessSignature=" + sasSigParam + "REDACTED&sv=2022-11-02",
 		},
 		{
 			name:  "SAS URL without a signature is preserved",
@@ -172,6 +185,18 @@ func TestString_CredentialValueSeparators(t *testing.T) {
 			want:  "MYSQL_PASSWORD=REDACTED",
 		},
 		{
+			name:  "repeated separators inside the value",
+			input: "MYSQL_PASSWORD=ab;;" + shapeSecret,
+			want:  "MYSQL_PASSWORD=REDACTED",
+		},
+		{
+			// Without a space, a command cannot be told apart from the rest of
+			// a password such as "ab;Zq8v", so it is redacted with the value.
+			name:  "command glued to a semicolon is redacted with the value",
+			input: "DB_PASSWORD=" + shapeSecret + ";echo done",
+			want:  "DB_PASSWORD=REDACTED done",
+		},
+		{
 			name:  "several separators inside the value",
 			input: "MYSQL_PASSWORD=ab;cd," + shapeSecret,
 			want:  "MYSQL_PASSWORD=REDACTED",
@@ -187,7 +212,7 @@ func TestString_CredentialValueSeparators(t *testing.T) {
 			want:  "DB_PASSWORD=REDACTED,DB_HOST=db",
 		},
 		{
-			name:  "shell command after semicolon is preserved",
+			name:  "shell command after semicolon and space is preserved",
 			input: "export DB_PASSWORD=" + shapeSecret + "; echo ok",
 			want:  "export DB_PASSWORD=REDACTED; echo ok",
 		},
@@ -288,6 +313,24 @@ func TestString_ConnectionStringAfterWords(t *testing.T) {
 	})
 }
 
+// A rejected candidate whose first key is a long run of words must not be
+// re-checked from every word; that made a long line quadratic.
+func TestConnectionStringStart_BoundedRetries(t *testing.T) {
+	t.Parallel()
+	s := strings.Repeat("word ", 1000) + "mode=fast;level=2;debug=true"
+	calls := 0
+	_, ok := connectionStringStart(s, 0, len(s), func(string) bool {
+		calls++
+		return false
+	})
+	if ok {
+		t.Fatal("connectionStringStart accepted a candidate the predicate rejected")
+	}
+	if calls > 5 {
+		t.Fatalf("hasSecret called %d times for one candidate, want at most 5", calls)
+	}
+}
+
 func TestString_DatabaseURIPasswordCharacters(t *testing.T) {
 	t.Parallel()
 	assertStringRedactionCases(t, []stringRedactionCase{
@@ -305,6 +348,11 @@ func TestString_DatabaseURIPasswordCharacters(t *testing.T) {
 			name:  "both, after a key",
 			input: "DATABASE_URL=mysql://root:pa/ss'word9@localhost:3306/app",
 			want:  "DATABASE_URL=REDACTED",
+		},
+		{
+			name:  "digits then apostrophe in password",
+			input: "postgres://app:123'" + shapeSecret + "@db/app",
+			want:  "REDACTED",
 		},
 		{
 			name:  "digits then slash in password",
@@ -362,6 +410,21 @@ func TestString_OracleUserPassword(t *testing.T) {
 			name:  "sqlplus connect identifier",
 			input: "sqlplus scott/" + shapeSecret + "@ORCL",
 			want:  "sqlplus REDACTED",
+		},
+		{
+			name:  "sqlplus login in double quotes",
+			input: `sqlplus -s "scott/` + shapeSecret + `@ORCL"`,
+			want:  `sqlplus -s "REDACTED"`,
+		},
+		{
+			name:  "sqlplus login in single quotes",
+			input: "sqlplus 'scott/" + shapeSecret + "@ORCL'",
+			want:  "sqlplus 'REDACTED'",
+		},
+		{
+			name:  "jdbc quoted password",
+			input: `jdbc:oracle:thin:scott/"` + shapeSecret + `"@//db:1521/ORCL`,
+			want:  "REDACTED",
 		},
 		{
 			name:  "sqlplus with flags and trailing clause",
