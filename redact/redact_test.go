@@ -1069,6 +1069,21 @@ func TestString_ConnectionSecretsCaughtWithoutScanners(t *testing.T) {
 			want:  "DB_PASSWORD=REDACTED",
 		},
 		{
+			name:  "credentialed URI with a literal in a pattern-removal expansion",
+			input: "amqp://app:${VAR%hunter2}@host/vhost",
+			want:  "REDACTED",
+		},
+		{
+			name:  "credential value with a literal in a substitution expansion",
+			input: "DB_PASSWORD=${VAR/x/hunter2}",
+			want:  "DB_PASSWORD=REDACTED",
+		},
+		{
+			name:  "credential value with a literal in a prefix-removal expansion",
+			input: "DB_PASSWORD=${VAR#hunter2}",
+			want:  "DB_PASSWORD=REDACTED",
+		},
+		{
 			name:  "env block with a bare password",
 			input: "HOST=db\nUSER=app\nPASSWORD=postgres\n",
 			want:  "REDACTED\n",

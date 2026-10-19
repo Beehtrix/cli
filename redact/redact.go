@@ -582,12 +582,17 @@ func isPlaceholderShellExpansion(s string) bool {
 	if !isSingleBraceExpression(s) {
 		return false
 	}
-	m := shellExpansionWordRE.FindStringSubmatch(s)
-	if m == nil {
-		return true
+	if m := shellExpansionWordRE.FindStringSubmatch(s); m != nil {
+		return isPlaceholderSecretValue(m[1])
 	}
-	return isPlaceholderSecretValue(m[1])
+	return !shellTextOperatorRE.MatchString(s)
 }
+
+// shellTextOperatorRE matches ${NAME<op>...} for shell operators whose text can
+// carry a literal value: pattern substitution and removal (/ # %), case
+// changes (^ ,), and substrings (:offset). Non-shell forms such as ${var.x},
+// ${env:X} and ${{secrets.X}} do not match.
+var shellTextOperatorRE = regexp.MustCompile(`^\$\{[A-Za-z_][A-Za-z0-9_]*(?:[/#%^,]|:[-0-9 ])`)
 
 // isSingleBraceExpression reports whether the brace opened by the leading "${"
 // of s is closed by its final "}".
