@@ -154,3 +154,14 @@ func TestForeignCommit_PostCommitDoesNotCondenseForeignSession(t *testing.T) {
 	env.AssertCheckpointContainsSession(t, summary, committer.ID)
 	env.AssertCheckpointExcludesSession(t, summary, foreign.ID)
 }
+
+func TestForeignCommit_RunningSubagentEditLinksForeignParent(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	// The parent's running subagent wrote a committed file, and the commit
+	// comes from another session outside the parent's agent. The subagent's
+	// edit is committed-file overlap, so the parent still co-authors it.
+	jointCommitWithRunningSubagent(t, env, func(parentID string) {
+		makeOwnerForeign(t, env, parentID)
+	})
+}

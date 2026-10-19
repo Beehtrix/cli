@@ -431,8 +431,14 @@ func TestSubagentCheckpoints_BackgroundTaskCompletesMidTurn_ParentCommitLinks(t 
 // transcript before treating the parent as read-only.
 func TestSubagentCheckpoints_JointCommitWithRunningSubagent_KeepsBothSessions(t *testing.T) {
 	t.Parallel()
-	env := NewFeatureBranchEnv(t)
+	jointCommitWithRunningSubagent(t, NewFeatureBranchEnv(t), nil)
+}
 
+// jointCommitWithRunningSubagent runs the joint-commit scenario above;
+// beforeCommit, when set, adjusts the IDLE parent's state just before the
+// commit.
+func jointCommitWithRunningSubagent(t *testing.T, env *TestEnv, beforeCommit func(parentID string)) {
+	t.Helper()
 	const (
 		taskToolUseID = "toolu_01JointCommit"
 		subagentID    = "f4444555566667777"
@@ -482,6 +488,9 @@ func TestSubagentCheckpoints_JointCommitWithRunningSubagent_KeepsBothSessions(t 
 	env.WriteFile(codingFile, codingBody)
 	coding.CreateTranscript("Add the feature and commit everything", []FileChange{{Path: codingFile, Content: codingBody}})
 
+	if beforeCommit != nil {
+		beforeCommit(parent.ID)
+	}
 	env.GitCommitWithHooksAsAgent("Add feature and joint doc", codingFile, subagentFile)
 
 	checkpointID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())

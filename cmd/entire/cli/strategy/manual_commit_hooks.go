@@ -1122,7 +1122,8 @@ func (h *postCommitActionHandler) HandleCondenseIfFilesTouched(state *session.St
 // another session claims the committed files is somebody else's commit. Every
 // other session (a stale ACTIVE one, an IDLE one with no fresh in-flight
 // record, an ENDED one) must show file-overlap evidence between its tracked files and the
-// committed files, and so must a session whose agent provably did not make the commit.
+// committed files, and so must a session whose agent provably did not make the
+// commit, though for that one a running subagent's committed edit counts.
 func (h *postCommitActionHandler) shouldCondenseWithOverlapCheck(isActive bool, lastInteraction *time.Time, hasLiveTask bool) bool {
 	if !h.hasNew {
 		return false
@@ -1139,6 +1140,12 @@ func (h *postCommitActionHandler) shouldCondenseWithOverlapCheck(isActive bool, 
 			)
 			return false
 		}
+		return true
+	}
+	// A running subagent's edit is overlap too: its files reach
+	// filesTouchedBefore only when it completes. This keeps a foreign parent
+	// whose subagent wrote a committed file.
+	if h.liveTaskCoauthored(hasLiveTask) {
 		return true
 	}
 	if len(h.filesTouchedBefore) == 0 {
