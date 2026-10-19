@@ -438,6 +438,95 @@ func TestDetectPII_AllowlistedEmails(t *testing.T) {
 	}
 }
 
+// redactPIIOnly applies only the PII layer, so expectations are not affected
+// by the secret layers.
+func redactPIIOnly(cfg *PIIConfig, s string) string {
+	return applyRegions(s, detectPII(cfg, s))
+}
+
+func TestDetectPII_GitRemotesAreNotEmails(t *testing.T) {
+	t.Parallel()
+	cfg := &PIIConfig{
+		Enabled:    true,
+		Categories: map[PIICategory]bool{PIIEmail: true},
+	}
+	tests := []struct{ input, want string }{
+		{"git@github.com:entireio/cli.git", "git@github.com:entireio/cli.git"},
+		{"git clone git@gitlab.com:group/sub/project.git", "git clone git@gitlab.com:group/sub/project.git"},
+		{"ssh://git@github.com/entireio/cli", "ssh://git@github.com/entireio/cli"},
+		{"url = git@ssh.dev.azure.com:v3/org/proj/repo", "url = git@ssh.dev.azure.com:v3/org/proj/repo"},
+		{"contact alice@github.com", "contact [REDACTED_EMAIL]"},
+		{"contact legit@example.com", "contact [REDACTED_EMAIL]"},
+		{"contact gitter@example.com", "contact [REDACTED_EMAIL]"},
+	}
+	for _, tt := range tests {
+		if got := redactPIIOnly(cfg, tt.input); got != tt.want {
+			t.Errorf("redactPIIOnly(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestDetectPII_AddressWordBoundaries(t *testing.T) {
+	t.Parallel()
+	cfg := &PIIConfig{
+		Enabled:    true,
+		Categories: map[PIICategory]bool{PIIAddress: true},
+	}
+	tests := []struct{ input, want string }{
+		{"Phase 2 Implementation Plan: 3 Tests Started", "Phase 2 Implementation Plan: 3 Tests Started"},
+		{"x123456 Main Street", "x123456 Main Street"},
+		{"live at 123 Main St. today", "live at [REDACTED_ADDRESS] today"},
+		{"456 Oak Ave, Suite 5", "[REDACTED_ADDRESS], Suite 5"},
+		{"7 Plantation Way", "[REDACTED_ADDRESS]"},
+	}
+	for _, tt := range tests {
+		if got := redactPIIOnly(cfg, tt.input); got != tt.want {
+			t.Errorf("redactPIIOnly(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestDetectPII_PhoneDigitBoundaries(t *testing.T) {
+	t.Parallel()
+	cfg := &PIIConfig{
+		Enabled:    true,
+		Categories: map[PIICategory]bool{PIIPhone: true},
+	}
+	tests := []struct{ input, want string }{
+		{"build 2024-123-4567890", "build 2024-123-4567890"},
+		{"order 12555-123-4567", "order 12555-123-4567"},
+		{"ticket 555-123-45678", "ticket 555-123-45678"},
+		{"tel:555-123-4567", "tel:[REDACTED_PHONE]"},
+		{"555-123-4567,555-123-4568", "[REDACTED_PHONE],[REDACTED_PHONE]"},
+		{"call (555) 123-4567 now", "call [REDACTED_PHONE] now"},
+		{"call +1-555-123-4567 now", "call [REDACTED_PHONE] now"},
+		{"call 1-555-123-4567 now", "call [REDACTED_PHONE] now"},
+		{"555-123-4567x89", "[REDACTED_PHONE]x89"},
+	}
+	for _, tt := range tests {
+		if got := redactPIIOnly(cfg, tt.input); got != tt.want {
+			t.Errorf("redactPIIOnly(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestPIIIntegration_GitRemoteNotRedacted(t *testing.T) {
+	ConfigurePII(PIIConfig{
+		Enabled:    true,
+		Categories: map[PIICategory]bool{PIIEmail: true},
+	})
+	t.Cleanup(resetPIIConfig)
+
+	input := `{"type":"tool_result","content":"origin\tgit@github.com:entireio/cli.git (fetch)"}`
+	got, err := JSONLContent(input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != input {
+		t.Errorf("JSONLContent() = %s, want unchanged", got)
+	}
+}
+
 func TestDetectPII_GitAuthorNoreplyNotRedacted(t *testing.T) {
 	t.Parallel()
 	cfg := &PIIConfig{
