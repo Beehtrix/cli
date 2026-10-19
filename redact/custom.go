@@ -142,8 +142,8 @@ func canMatchEmpty(re *syntax.Regexp) bool {
 
 // ActiveCustomRules reports how many user-defined rules (inline + pack)
 // actually compiled and are live in the detection pipeline — as opposed to
-// how many were configured, which silently diverges when a regex fails to
-// compile.
+// how many were configured, which silently diverges when a rule is rejected:
+// its regex fails to compile or can match the empty string.
 func ActiveCustomRules() int {
 	cfg := getCustomRulesConfig()
 	if cfg == nil {

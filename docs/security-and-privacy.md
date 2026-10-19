@@ -187,7 +187,7 @@ Add a label → regex map under `redaction.custom_redactions` in `.entire/settin
 - A failed compile is logged once at startup and the rule is skipped — it will never crash the redactor.
 - A pattern that can match the empty string is skipped the same way. That covers `""`, `x*`, a trailing `|` as in `ACME-[0-9]{8}|`, an optional group like `(EMP-\d{6})?`, and a bare `\b`. Left active, such a pattern would insert `REDACTED` between characters throughout the transcript. The warning names the label and the reason, never the pattern.
 - Override in `.entire/settings.local.json` for personal additions; entries merge per-key (override replaces the same key, leaves other keys intact).
-- An empty value has no special meaning: it is a pattern that matches the empty string, so it is skipped with a warning. Because the override replaces the rule with the same label, an empty value in `.entire/settings.local.json` turns that `.entire/settings.json` rule off for you, and the warning is logged each time Entire loads the rules.
+- An empty value is not a supported way to disable a rule. It is a pattern that matches the empty string, so it is skipped with a warning each time Entire loads the rules. Because the override replaces the rule with the same label, an empty value in `.entire/settings.local.json` still turns that `.entire/settings.json` rule off for you, and text only that rule would catch is stored unredacted.
 
 ### Surface 2: Rule packs
 
