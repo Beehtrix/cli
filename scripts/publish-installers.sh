@@ -22,9 +22,11 @@
 # installer that stable users fetch. Nightly users are served by the same
 # stable installer, which takes --channel nightly.
 #
-# Run it BEFORE the channel pointer is flipped: the pointer is what makes a
-# version visible, and an installer that is newer than the pointer is harmless
-# while the reverse is not.
+# Run it AFTER the channel pointer is flipped. These keys are shared across
+# versions, so publishing them first means a release the pointer then refuses --
+# an older tag re-dispatched -- leaves them rolled back with nothing advanced.
+# The installer is version-independent, so a pointer that moved first is
+# harmless; the reverse leaves a silent rollback behind a failed job.
 #
 # Usage:
 #   publish-installers.sh --bucket NAME [--region R]

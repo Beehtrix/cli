@@ -174,15 +174,21 @@ Order of operations inside `release.yml` is load-bearing:
 
 1. GoReleaser uploads the artifacts (`blobs`).
 2. The macOS Developer ID check passes.
-3. The install scripts go to `installers/` — stable releases only.
-4. The channel pointer is flipped **last**.
+3. The channel pointer is flipped.
+4. The install scripts go to `installers/` — stable releases only.
 
-The pointer is what makes a version visible, so advertising a release whose
-binaries Gatekeeper kills would be worse than not advertising it at all. The
-installers go before it for the same reason in reverse: an installer newer than
-the pointer is harmless, the opposite is not.
+The pointer comes after 1 and 2 because it is what makes a version visible, and
+advertising a release whose binaries Gatekeeper kills would be worse than not
+advertising it at all.
 
-Step 3 is stable-only because `installers/install.sh` and `installers/install.ps1`
+Step 4 comes after the pointer rather than before it, which is the opposite of
+what it looks like it should be. Those keys are **shared across versions**, so
+uploading them first means a release the pointer then refuses — an older tag
+re-dispatched — leaves the installers rolled back with nothing advanced. The
+installer is version-independent, so a pointer that moved before it is harmless;
+the reverse leaves a silent rollback behind a failed job.
+
+Step 4 is stable-only because `installers/install.sh` and `installers/install.ps1`
 are overwritten on every release rather than versioned — a nightly publishing
 there would replace the installer stable users fetch. Nightly users run the same
 stable installer with `--channel nightly`. For the same reason those two keys get
