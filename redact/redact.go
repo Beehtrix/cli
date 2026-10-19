@@ -1421,6 +1421,11 @@ func isSingleJSONValue(dec *json.Decoder) bool {
 // applying transform to each eligible string leaf. key is the leaf's object
 // key, empty inside arrays and at the root.
 //
+// A skip key preserves its own string values, including the strings in its
+// arrays, but objects beneath it are walked with their own keys. The id rule
+// matches any key ending in "id", so {"android":{"apiKey":...}} is not an
+// identifier, and {"path":{"env":...}} is not a path.
+//
 // It returns a copy-on-write tree: containers are re-allocated only along
 // paths where transform changed a leaf, and changed reports whether any leaf
 // did. Every consumer of the skip rules goes through this one walk. The splice
@@ -1428,8 +1433,8 @@ func isSingleJSONValue(dec *json.Decoder) bool {
 // fallback must all agree on which leaves are redactable, and a second copy of
 // the rules is how they would drift apart.
 func walkRedactableStrings(v any, transform func(key string, credentialContext bool, val string) string) (any, bool) {
-	var walk func(key string, credentialContext bool, v any) (any, bool)
-	walk = func(key string, credentialContext bool, v any) (any, bool) {
+	var walk func(key string, credentialContext, skipStrings bool, v any) (any, bool)
+	walk = func(key string, credentialContext, skipStrings bool, v any) (any, bool) {
 		switch val := v.(type) {
 		case map[string]any:
 			if shouldSkipJSONLObject(val) {
@@ -1438,10 +1443,7 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 			childCredentialContext := credentialContext || isCredentialJSONObject(val)
 			var out map[string]any
 			for k, child := range val {
-				if shouldSkipJSONLField(k) {
-					continue
-				}
-				newChild, childChanged := walk(k, childCredentialContext, child)
+				newChild, childChanged := walk(k, childCredentialContext, shouldSkipJSONLField(k), child)
 				if !childChanged {
 					continue
 				}
@@ -1457,7 +1459,7 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 		case []any:
 			var out []any
 			for i, child := range val {
-				newChild, childChanged := walk("", credentialContext, child)
+				newChild, childChanged := walk("", credentialContext, skipStrings, child)
 				if !childChanged {
 					continue
 				}
@@ -1472,6 +1474,9 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 			}
 			return out, true
 		case string:
+			if skipStrings {
+				return v, false
+			}
 			redacted := transform(key, credentialContext, val)
 			if redacted == val {
 				return v, false
@@ -1481,18 +1486,72 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 			return v, false
 		}
 	}
-	return walk("", false, v)
+	return walk("", false, false, v)
 }
 
 // redactLeafValue is the per-leaf redaction rule shared by the splice
-// collection pass and the structural re-encode fallback: the redactor first,
-// then the credential-key placeholder for values the redactor left alone.
+// collection pass and the structural re-encode fallback: the placeholder for
+// a value whose key reveals a secret the value alone does not, otherwise the
+// redactor, then the credential-key placeholder for values it left alone.
+//
+// The redactor always sees the unchanged value. Rewriting part of it first
+// would stop a rule that needs the whole value, such as an anchored custom
+// rule, from matching, and expose text it used to redact.
 func redactLeafValue(key string, credentialContext bool, val string, redactor func(string) string) string {
+	if keyContextFindsMore(key, val) {
+		return RedactedPlaceholder
+	}
 	redacted := redactor(val)
 	if redacted == val && isCredentialJSONSecretKey(key, credentialContext) && hasNonPlaceholderPasswordValue(val) {
 		redacted = RedactedPlaceholder
 	}
 	return redacted
+}
+
+// credentialKeyWords are stems of the keywords of betterleaks' generic-api-key
+// and generic-password rules. Those rules flag a bare value only when a key
+// containing one of them precedes it, as in api_key=<value>.
+var credentialKeyWords = []string{"access", "api", "auth", "cred", "key", "secret", "token", "passw", "psw", "pw"}
+
+// keyContextFindsMore reports whether scanning val as the "key":"val" text it
+// came from flags any part of val that scanning val alone leaves. A leaf
+// scanned on its own has lost its key, so without this {"api_key":"<hex>"}
+// would pass where api_key=<hex> in prose is redacted. Findings inside the key
+// itself do not count.
+//
+// Only keys containing a credentialKeyWords stem pay for the extra scans.
+func keyContextFindsMore(key, val string) bool {
+	if val == "" || !containsCredentialKeyWord(key) {
+		return false
+	}
+	prefix := `"` + key + `":"`
+	start, end := len(prefix), len(prefix)+len(val)
+	var coveredAlone []bool
+	for _, r := range detectAllLayers(prefix + val + `"`) {
+		s, e := max(r.start, start)-start, min(r.end, end)-start
+		if s >= e {
+			continue
+		}
+		if coveredAlone == nil {
+			coveredAlone = make([]bool, len(val))
+			for _, a := range detectAllLayers(val) {
+				for i := a.start; i < a.end; i++ {
+					coveredAlone[i] = true
+				}
+			}
+		}
+		if slices.Contains(coveredAlone[s:e], false) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsCredentialKeyWord(key string) bool {
+	lower := strings.ToLower(key)
+	return slices.ContainsFunc(credentialKeyWords, func(word string) bool {
+		return strings.Contains(lower, word)
+	})
 }
 
 // replKey identifies one (key, original) replacement pair for deduplication.
@@ -1724,9 +1783,10 @@ func reencodeRedacted(content string, redactor func(string) string) (string, err
 	return lead + encoded + trail, nil
 }
 
-// shouldSkipJSONLField returns true if a JSON key should be excluded from scanning/redaction.
-// Skips signature fields (any key ending in "signature"), ID fields (ending in "id"/"ids"),
-// and common path/directory fields.
+// shouldSkipJSONLField returns true if a JSON key's string values should be
+// excluded from scanning/redaction. Skips signature fields (any key ending in
+// "signature"), ID fields (ending in "id"/"ids"), and common path/directory
+// fields. Objects under such a key are still scanned; see walkRedactableStrings.
 func shouldSkipJSONLField(key string) bool {
 	lower := strings.ToLower(key)
 
