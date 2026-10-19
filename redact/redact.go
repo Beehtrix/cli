@@ -491,11 +491,33 @@ func detectConnectionStringRule(s string, rule connectionStringRule) []taggedReg
 		if start >= end {
 			continue
 		}
-		if rule.hasSecret(s[start:end]) {
+		if start, ok := connectionStringStart(s, start, end, rule.hasSecret); ok {
 			regions = append(regions, taggedRegion{region: region{start, end}})
 		}
 	}
 	return regions
+}
+
+// connectionStringStart returns where the connection string in s[start:end]
+// begins. Semicolon-string keys may contain spaces ("Data Source"), so a match
+// can begin at the words before the string ("Use Server=..."), and those words
+// make the server check fail. A rejected match is retried from each later word
+// of its first key, so the words stay visible and the string is still caught.
+func connectionStringStart(s string, start, end int, hasSecret func(string) bool) (int, bool) {
+	keyEnd := start + max(strings.IndexByte(s[start:end], '='), 0)
+	for i := start; ; {
+		if hasSecret(s[i:end]) {
+			return i, true
+		}
+		space := strings.IndexByte(s[i:keyEnd], ' ')
+		if space < 0 {
+			return 0, false
+		}
+		i += space + 1
+		for i < keyEnd && s[i] == ' ' {
+			i++
+		}
+	}
 }
 
 func trimConnectionStringEnd(s string, start, end int) int {

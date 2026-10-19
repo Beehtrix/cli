@@ -250,6 +250,44 @@ func TestString_ODBCValuesWithSpaces(t *testing.T) {
 	})
 }
 
+// Keys may contain spaces, so a match can begin at the words before the
+// string; those words must neither hide the string nor be redacted with it.
+func TestString_ConnectionStringAfterWords(t *testing.T) {
+	t.Parallel()
+	assertStringRedactionCases(t, []stringRedactionCase{
+		{
+			name:  "unterminated string after a word",
+			input: "Use Server=x;Database=app;User Id=sa;Password=" + shapeSecret + " and restart",
+			want:  "Use REDACTED",
+		},
+		{
+			name:  "terminated string after a word",
+			input: "Use Server=x;Database=app;User Id=sa;Password=" + shapeSecret + "; then restart",
+			want:  "Use REDACTED; then restart",
+		},
+		{
+			name:  "two-word first key after a word",
+			input: "Try Data Source=db;Initial Catalog=App;User ID=sa;Password=correct horse battery",
+			want:  "Try REDACTED",
+		},
+		{
+			name:  "password first after two words",
+			input: "Please set Password=" + shapeSecret + ";Server=x;User Id=sa;",
+			want:  "Please set REDACTED;",
+		},
+		{
+			name:  "placeholder password after a word is preserved",
+			input: "Use Server=x;Database=app;User Id=sa;Password=changeme;",
+			want:  "Use Server=x;Database=app;User Id=sa;Password=changeme;",
+		},
+		{
+			name:  "settings that are not a connection string are preserved",
+			input: "Use mode=fast;level=2;debug=true",
+			want:  "Use mode=fast;level=2;debug=true",
+		},
+	})
+}
+
 func TestString_DatabaseURIPasswordCharacters(t *testing.T) {
 	t.Parallel()
 	assertStringRedactionCases(t, []stringRedactionCase{
