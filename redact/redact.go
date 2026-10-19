@@ -814,7 +814,14 @@ func detectCredentialKeyCaptures(
 		}
 		key := s[keyStart:keyEnd]
 		credentialContext := genericPasswordContext || key == "PASSWORD" || key == "PASSWD"
-		if !isCredentialJSONSecretKey(key, credentialContext) {
+		if genericPasswordContext {
+			// A literal piped into a secrets-store write is a secret whatever
+			// the key is called (STRIPE_KEY, DATABASE_URL); only a pure
+			// identifier key such as CLIENT_ID names a non-secret.
+			if isPureIdentifierKey(key) {
+				continue
+			}
+		} else if !isCredentialJSONSecretKey(key, credentialContext) {
 			continue
 		}
 		if valueStart, valueEnd, valueOK := captureRange(match, valueGroup); valueOK &&
@@ -1054,17 +1061,23 @@ func isPlaceholderSecretValueQuoted(value string, singleQuoted bool) bool {
 	// Only a bare prefix (empty, or ending at a `-`/`_` separator) counts:
 	// `hunter2...` is a real value followed by prose, and a short one is
 	// below what entropy catches.
-	if stem, ok := strings.CutSuffix(normalized, "..."); ok &&
-		(stem == "" || strings.HasSuffix(stem, "-") || strings.HasSuffix(stem, "_")) {
+	if stem, ok := strings.CutSuffix(normalized, "..."); ok && (stem == "" || ellipsisPrefixStemRE.MatchString(stem)) {
 		return true
 	}
 	return goTemplateReferencePattern.MatchString(trimmed)
 }
 
-// docFillInPlaceholderRE matches documentation fill-in values made only of
-// lowercase words: "your_..." or a credential noun followed by "_here"
-// (`your_api_key_here`, `api-token-here`).
-var docFillInPlaceholderRE = regexp.MustCompile(`^(?:your[_-][a-z_-]+|[a-z_-]*(?:key|token|secret|password)[_-]here)$`)
+// ellipsisPrefixStemRE matches the vendor prefix before a documentation
+// ellipsis (`sk-ant-`, `ghp_`, `sb_secret_`): short, letters only, ending in a
+// separator. Digits or length mean key material, as in `hunter2-...`.
+var ellipsisPrefixStemRE = regexp.MustCompile(`^[a-z]{1,10}(?:[-_][a-z]{1,10}){0,2}[-_]$`)
+
+// docFillInPlaceholderRE matches documentation fill-in values that name a
+// credential: "your_..._<noun>" optionally followed by "_here", or a
+// credential noun followed by "_here" (`your_api_key_here`, `your-token`,
+// `api-token-goes-here`). A lowercase phrase without a credential noun, such
+// as `your-dog-name`, can be a real passphrase.
+var docFillInPlaceholderRE = regexp.MustCompile(`^(?:your[_-](?:[a-z]+[_-])*(?:api[_-]?key|key|token|secret|password|passphrase|pat)(?:[_-](?:goes[_-])?here)?|[a-z_-]*(?:key|token|secret|password)[_-](?:goes[_-])?here)$`)
 
 // secretRecipeCommands are commands that fetch a secret from somewhere else,
 // so `$(cmd ...)` names where the value lives rather than containing it.
@@ -1278,13 +1291,27 @@ func isNonSecretIdentifierAssignment(candidate string) bool {
 	// Deliberately broader than isCredentialIdentifierKey: this only decides
 	// whether the entropy layer may stay silent, so failing closed costs
 	// readability, not a leak.
-	if credentialWordInKeyRE.MatchString(normalized) {
+	if credentialWordInKeyRE.MatchString(normalized) || bearerIdentifierKeyRE.MatchString(normalized) {
 		return false
 	}
 	if isHighEntropySecretCandidate(value) {
 		return false
 	}
 	return isIdentifierAssignmentKey(normalized)
+}
+
+// bearerIdentifierKeyRE spots identifier keys whose value can double as a
+// bearer credential (session, request, nonce, CSRF, cookie ids). They keep
+// the entropy layer's combined key=value scoring.
+var bearerIdentifierKeyRE = regexp.MustCompile(`(?:^|_)(?:session|sess|sid|request|req|nonce|csrf|xsrf|cookie|jti)(?:_|$)`)
+
+// isPureIdentifierKey reports whether key is an id/account key that names no
+// credential or bearer-style value (CLIENT_ID, tenant_id).
+func isPureIdentifierKey(key string) bool {
+	normalized := normalizeCredentialJSONKey(key)
+	return isIdentifierAssignmentKey(normalized) &&
+		!credentialWordInKeyRE.MatchString(normalized) &&
+		!bearerIdentifierKeyRE.MatchString(normalized)
 }
 
 func isIdentifierAssignmentKey(normalized string) bool {

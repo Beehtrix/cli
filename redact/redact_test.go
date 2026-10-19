@@ -3047,3 +3047,34 @@ func TestString_KeyValuePlaceholdersStayOutOfConnectionStrings(t *testing.T) {
 		t.Errorf("JSON mask under a non-password key redacted: %s", out)
 	}
 }
+
+// Trail-finding regressions (post-merge review): secrets-store writes redact
+// whatever the key, bearer-style ids keep entropy coverage, and the doc
+// fill-in and ellipsis placeholders accept only placeholder-shaped values.
+func TestString_PostMergeTrailFindings(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{
+		`printf 'sk_live_hunter2' | mycli secrets put STRIPE_KEY`,
+		`printf 'postgres://u:hunter2@db/app' | mycli secrets put DATABASE_URL`,
+		"session_id=" + "Zx9QwErTy7UiOp3AsDfGh",
+		`API_KEY=your-dog-name`,
+		`client_secret=your_mom_is_nice`,
+		`API_KEY=Zk9f3QpL7x-...`,
+		`DB_PASSWORD=hunter2-...`,
+	} {
+		if out := String(in); !strings.Contains(out, RedactedPlaceholder) {
+			t.Errorf("String(%q) = %q, want a redaction", in, out)
+		}
+	}
+	for _, in := range []string{
+		`printf 'example-client-id.apps.example.test' | mycli secrets put CLIENT_ID`,
+		`API_KEY=your_api_key_here`,
+		`API_KEY=your-token`,
+		`ANTHROPIC_API_KEY=sk-ant-...`,
+		`GITHUB_TOKEN=ghp_...`,
+	} {
+		if out := String(in); out != in {
+			t.Errorf("String(%q) = %q, want unchanged", in, out)
+		}
+	}
+}
