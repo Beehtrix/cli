@@ -79,7 +79,11 @@ done
 command -v aws >/dev/null 2>&1 || die "the aws CLI is required"
 
 VERSION="${TAG#v}"
-[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.+-]+)?$ ]] \
+# No "+" in the prerelease: both readers reject build metadata (install.sh's
+# regex has none, and versioncheck requires semver.Canonical(tag) == tag), so
+# allowing it here publishes a pointer every reader ignores and leaves the
+# channel silently stuck on the previous version.
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
     || die "tag '${TAG}' is not a semver release tag"
 
 # A nightly prerelease belongs to nightly, no prerelease to stable. Any other

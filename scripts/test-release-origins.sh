@@ -247,6 +247,43 @@ expect "the install completes despite the hung origin" test -x "$WORK/home-hang/
 expect "gives up on the hung origin within the budget" test "$elapsed" -lt 20
 
 # ============================================================ channel pointer
+section "install.sh — the GitHub fallback is held to the same rules"
+
+# The fallback used a bare "nightly" substring and validated nothing, so the two
+# origins in this script disagreed about what counts as installable.
+build_origin "$WORK/ghloose" 5.5.5
+mkdir -p "$WORK/ghloose/api"
+# Pretty-printed, one "tag_name" per line, as the real API returns it. A
+# single-line fixture never exercises the per-line filter this guards.
+cat > "$WORK/ghloose/api/releases" <<'JSON'
+[
+  {
+    "tag_name": "v4.4.4-prenightly",
+    "prerelease": true
+  },
+  {
+    "tag_name": "v3.3.3-nightly.202604061200.abc1234",
+    "prerelease": true
+  }
+]
+JSON
+GHLOOSE_PORT="$(serve "$WORK/ghloose")"
+GHL="http://127.0.0.1:$GHLOOSE_PORT"
+DEADL="http://127.0.0.1:$(free_port)"
+build_origin "$WORK/ghloose" 3.3.3-nightly.202604061200.abc1234
+repoint "$WORK/install-ghloose.sh" "$DEADL" "$GHL" "$GHL/api"
+out="$(run_install "$WORK/home-ghloose" "$WORK/install-ghloose.sh" --channel nightly)"
+expect "a near-miss nightly tag is skipped on the fallback too" \
+    contains "$out" "Installing version: 3.3.3-nightly.202604061200.abc1234"
+refute "the near-miss tag is never selected" contains "$out" "prenightly"
+
+section "install.sh — --version and --channel cannot contradict"
+
+repoint "$WORK/install-conflict.sh" "$DEAD" "$GH" "$GH/api"
+out="$(run_install "$WORK/home-conflict" "$WORK/install-conflict.sh" --channel nightly --version 0.11.0; printf 'rc=%s' "$?")"
+refute "a stable version under --channel nightly is not installed" contains "$out" "Installing version: 0.11.0"
+expect "it says the version is not of that channel" contains "$out" "is not a nightly version"
+
 section "install.sh — unusable manifest metadata falls back"
 
 # A version that is not a version must not end discovery. Both origins would

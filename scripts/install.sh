@@ -169,10 +169,6 @@ origin_label() {
     esac
 }
 
-# resolve_version_from_entire reads the channel pointer we publish at release
-# time. One request, one answer — no list-and-filter, and no GitHub API rate
-# limit (60/hour per IP unauthenticated, which a shared office or CI egress IP
-# can exhaust on its own).
 # version_valid_for_channel rejects a manifest value that is not a version, or
 # that belongs to the other channel. Without this a value like "not-a-version"
 # ends discovery here, and both origins are then asked for a release that does
@@ -206,6 +202,10 @@ manifest_field() {
         | head -n 1 || true
 }
 
+# resolve_version_from_entire reads the channel pointer we publish at release
+# time. One request, one answer — no list-and-filter, and no GitHub API rate
+# limit (60/hour per IP unauthenticated, which a shared office or CI egress IP
+# can exhaust on its own).
 resolve_version_from_entire() {
     local channel="$1"
     local base body declared version
@@ -236,18 +236,29 @@ resolve_version_from_entire() {
 }
 
 resolve_version_from_github() {
-    local channel="$1"
+    local channel="$1" version
     if [[ "$channel" == "nightly" ]]; then
-        fetch_github_json "${GITHUB_API}/releases?per_page=20" \
+        # The literal -nightly. segment, not a bare "nightly" substring: a
+        # looser match here selects tags every other reader rejects, so the two
+        # origins in this script would disagree about what is installable.
+        version="$(fetch_github_json "${GITHUB_API}/releases?per_page=20" \
             | grep '"tag_name"' \
-            | grep 'nightly' \
+            | grep -- '-nightly\.' \
             | head -n 1 \
-            | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/'
-        return
+            | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/' || true)"
+    else
+        version="$(fetch_github_json "${GITHUB_API}/releases/latest" \
+            | grep '"tag_name"' \
+            | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/' || true)"
     fi
-    fetch_github_json "${GITHUB_API}/releases/latest" \
-        | grep '"tag_name"' \
-        | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/'
+
+    # Validated exactly like the release origin's answer. An origin we do not
+    # own is not more trustworthy than one we do.
+    if [[ -n "$version" ]] && version_valid_for_channel "$version" "$channel"; then
+        printf '%s' "$version"
+        return 0
+    fi
+    return 1
 }
 
 resolve_version_from_origin() {
@@ -349,6 +360,7 @@ fetch_release_from_origin() {
 
 main() {
     local channel="${DEFAULT_CHANNEL}"
+    local channel_given=0
     local version=""
 
     while [[ $# -gt 0 ]]; do
@@ -357,6 +369,7 @@ main() {
                 shift
                 [[ $# -gt 0 ]] || error "--channel requires a value"
                 channel="$1"
+                channel_given=1
                 ;;
             --version)
                 shift
@@ -384,6 +397,16 @@ main() {
             error "Unsupported channel: ${channel}. Expected 'stable' or 'nightly'."
             ;;
     esac
+
+    # --version pins a specific build and skips discovery, so it cannot also
+    # honour --channel. Silently installing a stable build under
+    # `--channel nightly --version X` is the worst outcome; refusing is better
+    # than guessing which half of a contradictory request was meant.
+    if [[ -n "$version" && "$channel_given" -eq 1 ]]; then
+        if ! version_valid_for_channel "$version" "$channel"; then
+            error "--version ${version} is not a ${channel} version. Drop --channel to install it, or pick a ${channel} version."
+        fi
+    fi
 
     info "Installing Entire CLI..."
 

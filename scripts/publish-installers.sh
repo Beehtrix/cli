@@ -66,7 +66,7 @@ while [[ $# -gt 0 ]]; do
         --origin-url) shift; [[ $# -gt 0 ]] || die "--origin-url requires a value"; ORIGIN_URL="$1" ;;
         -h|--help)
             cat <<USAGE
-Usage: publish-installers.sh --bucket NAME [--region R]
+Usage: publish-installers.sh --bucket NAME [--region R] [--dist DIR] [--origin-url URL]
 
 Mirrors scripts/install.sh and scripts/install.ps1 to <bucket>/installers/ so
 the install one-liner keeps working during a GitHub outage.
