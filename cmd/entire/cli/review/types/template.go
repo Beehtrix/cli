@@ -47,6 +47,11 @@ type ReviewerTemplate struct {
 	// after the process exits. An error aborts the run before anything is
 	// spawned.
 	Prepare func(ctx context.Context, cfg RunConfig) (RunConfig, func(), error)
+
+	// Preflight, when set, runs before BuildCmd and refuses an environment the
+	// command cannot work in (for example an agent CLI too old for the argv
+	// shape BuildCmd produces), so the review fails before any paid run.
+	Preflight func(ctx context.Context) error
 }
 
 // Compile-time check.
@@ -72,6 +77,11 @@ func (t *ReviewerTemplate) Start(ctx context.Context, cfg RunConfig) (Process, e
 	}
 	if t.Parser == nil {
 		return nil, fmt.Errorf("ReviewerTemplate.Start: %w (nil Parser for agent %q)", ErrTemplateMisconfigured, t.AgentName)
+	}
+	if t.Preflight != nil {
+		if err := t.Preflight(ctx); err != nil {
+			return nil, fmt.Errorf("%s: %w", t.AgentName, err)
+		}
 	}
 	cleanup := func() {}
 	if t.Prepare != nil {
