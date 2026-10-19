@@ -140,8 +140,13 @@ blobs:
     # an empty string — so isEnvSet is true on every release. Gating on
     # presence would enable this pipe with an empty bucket and no credentials
     # (configure-aws-credentials is correctly skipped), failing every release
-    # instead of staying inert. `.Env.<missing>` renders empty rather than
-    # erroring, so one expression covers absent and empty alike.
+    # instead of staying inert.
+    #
+    # The isEnvSet half is kept rather than testing emptiness alone: GoReleaser
+    # is not consistent about missing env keys — build ldflags fail with "map
+    # has no entry for key", while other templates render empty — so the guard
+    # does not rely on which engine this field uses. Verified by rendering the
+    # gate with the variable absent, present-but-empty, and set.
     disable: '{{ if and (isEnvSet "ENTIRE_RELEASE_BUCKET") (ne .Env.ENTIRE_RELEASE_BUCKET "") }}false{{ else }}true{{ end }}'
     bucket: '{{ if and (isEnvSet "ENTIRE_RELEASE_BUCKET") (ne .Env.ENTIRE_RELEASE_BUCKET "") }}{{ .Env.ENTIRE_RELEASE_BUCKET }}{{ else }}unset{{ end }}'
     region: '{{ if and (isEnvSet "ENTIRE_RELEASE_REGION") (ne .Env.ENTIRE_RELEASE_REGION "") }}{{ .Env.ENTIRE_RELEASE_REGION }}{{ else }}us-east-2{{ end }}'

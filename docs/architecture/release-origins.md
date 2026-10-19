@@ -29,6 +29,7 @@ both:
 | Checksums | `https://install.entire.com/v0.10.0/checksums.txt` | `…/v0.10.0/checksums.txt` |
 | Current version | `https://install.entire.com/channels/stable.json` | `https://api.github.com/repos/entireio/cli/releases/latest` |
 | Install scripts | `https://install.entire.com/installers/install.sh` | `raw.githubusercontent.com/entireio/cli/refs/heads/main/scripts/install.sh` |
+| Scoop manifest | `https://install.entire.com/scoop/entire.json` | `github.com/entireio/scoop-bucket` (git) |
 
 ### The channel pointer
 
@@ -175,7 +176,8 @@ Order of operations inside `release.yml` is load-bearing:
 1. GoReleaser uploads the artifacts (`blobs`).
 2. The macOS Developer ID check passes.
 3. The channel pointer is flipped.
-4. The install scripts go to `installers/` — stable releases only.
+4. The install scripts and the Scoop manifest go to `installers/` and
+   `scoop/` — stable releases only.
 
 The pointer comes after 1 and 2 because it is what makes a version visible, and
 advertising a release whose binaries Gatekeeper kills would be worse than not
@@ -188,12 +190,12 @@ re-dispatched — leaves the installers rolled back with nothing advanced. The
 installer is version-independent, so a pointer that moved before it is harmless;
 the reverse leaves a silent rollback behind a failed job.
 
-Step 4 is stable-only because `installers/install.sh` and `installers/install.ps1`
-are overwritten on every release rather than versioned — a nightly publishing
-there would replace the installer stable users fetch. Nightly users run the same
-stable installer with `--channel nightly`. For the same reason those two keys get
-`max-age=300` rather than the artifacts' immutable TTL: a long max-age on an
-overwritten key pins a stale installer in every edge cache for its lifetime.
+Step 4 is stable-only because `installers/install.{sh,ps1}` and
+`scoop/entire.json` are overwritten on every release rather than versioned — a
+nightly publishing there would replace what stable users fetch. Nightly users run
+the same stable installer with `--channel nightly`. For the same reason those
+keys get `max-age=300` rather than the artifacts' immutable TTL: a long max-age
+on an overwritten key pins a stale copy in every edge cache for its lifetime.
 
 ## The origin, as built
 
@@ -225,6 +227,28 @@ If the Worker is down, the bucket is unreachable; there is no bypass URL. The
 fallback for that case is the same one as for a GitHub outage — the other origin
 — which is why the chain reads two origins rather than two paths to one.
 
+### Scoop without a bucket
+
+Scoop does not require git. `scoop install <url-to-manifest.json>` installs from
+a URL with no bucket added, records that URL as the app's source, and
+`scoop update` re-fetches it and upgrades in place. Both verified against Scoop
+v0.6.0.
+
+So `scoop/entire.json` is mirrored here with its artifact URLs rewritten to this
+origin — Scoop has no fallback of its own, so a mirrored manifest naming GitHub
+would depend on the thing it exists to route around. The rewrite fails the
+release if it matches nothing, because a manifest that still named GitHub would
+publish cleanly and only be discovered during an outage.
+
+The bucket manifest keeps its GitHub URLs on purpose. The ordinary
+`scoop install entire` path is unchanged, so this is an additional GitHub-free
+route rather than one that makes every Scoop install depend on a single origin.
+
+One trap for anything generating these: Scoop rejects a manifest written with a
+UTF-8 BOM, and its error for that is `Error parsing JSON`, followed by a
+suggestion to run `scoop bucket add` — which reads like the URL was never
+supported at all.
+
 ## Installing while GitHub is down
 
 `install.sh` handles this automatically once the origin is live. The manual
@@ -239,6 +263,9 @@ curl -fsSL https://entire.com/install.sh | bash -s -- --version 0.10.0
 
 # From the Go module proxy, which caches independently of GitHub
 go install github.com/entireio/cli/cmd/entire@v0.10.0
+
+# Windows, via Scoop, with no bucket and no git
+scoop install https://install.entire.com/scoop/entire.json
 ```
 
 The `go install` route works today, with no infrastructure at all:
@@ -250,12 +277,14 @@ keeps its default, so experimental commands are visible.
 
 ## Remaining work
 
-- **Windows is still GitHub-dependent.** `install.ps1` is mirrored to
-  `installers/` so it can be *fetched* during an outage, but it resolves
-  versions through `api.github.com`, downloads archives from GitHub releases,
-  and adds the Scoop bucket by git URL. None of the two-origin work covers it.
-  Scoop in particular is a git dependency that two-origin HTTP cannot fix, so
-  Windows needs its own answer rather than a copy of this one.
+- **`install.ps1` is still GitHub-dependent.** It is mirrored to `installers/`
+  so it can be *fetched* during an outage, but it resolves versions through
+  `api.github.com` and downloads archives from GitHub releases. Porting the
+  two-origin loop is tractable — it already has `Save-RemoteFile` and
+  `Assert-Checksum`, structurally parallel to `install.sh` — but it would add a
+  fourth reader of the channel manifest, so it should land with the same
+  validation and the same shared test cases rather than its own interpretation
+  of the contract.
 - **Set the repository variables and watch a release.** Nothing has assumed the
   upload role from GitHub yet. If `configure-aws-credentials` fails the release
   job fails *before* GoReleaser runs, so do this on a release someone is

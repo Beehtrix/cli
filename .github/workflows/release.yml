@@ -185,17 +185,18 @@ jobs:
             --bucket "${{ vars.ENTIRE_RELEASE_BUCKET }}" \
             --region "${{ vars.ENTIRE_RELEASE_REGION || 'us-east-2' }}"
 
-      # After the pointer, and stable-only. These two keys are overwritten on
-      # every release rather than versioned, so a nightly publishing here would
-      # replace the installer stable users fetch; nightly users are served by
-      # the same stable installer, which takes --channel nightly.
+      # After the pointer, and stable-only. These keys (the two installers and
+      # the Scoop manifest) are overwritten on every release rather than
+      # versioned, so a nightly publishing here would replace the installer
+      # stable users fetch; nightly users are served by the same stable
+      # installer, which takes --channel nightly.
       #
       # After the pointer rather than before it: these keys are shared across
       # versions, so uploading first means a release the pointer then refuses
       # (an older tag re-dispatched) leaves the installers rolled back with
       # nothing advanced. The installer is version-independent, so a pointer
       # that moved before it is harmless.
-      - name: Publish install scripts
+      - name: Publish install scripts and Scoop manifest
         if: vars.ENTIRE_RELEASE_BUCKET != '' && steps.release-type.outputs.prerelease == 'false'
         run: |
           scripts/publish-installers.sh \

@@ -519,7 +519,11 @@ printf '\n\033[1m%s\033[0m\n' "publish-installers.sh"
 installers() { PATH="$STUB_BIN:$SAFE_PATH" bash "$REPO_ROOT/scripts/publish-installers.sh" "$@" 2>&1; }
 
 fresh installers
-out="$(installers --bucket b; printf 'rc=%s' "$?")"
+mkdir -p "$WORK/dist0/scoop"
+cat > "$WORK/dist0/scoop/entire.json" <<'JSON'
+{"version":"1.2.3","url":"https://github.com/entireio/cli/releases/download/v1.2.3/entire_windows_amd64.zip","hash":"bbbb"}
+JSON
+out="$(installers --bucket b --dist "$WORK/dist0"; printf 'rc=%s' "$?")"
 expect "publishes both installers" contains "$out" "rc=0"
 expect "install.sh lands under installers/" \
     [ -f "$AWS_STUB_ROOT/b/installers/install.sh" ]
@@ -542,6 +546,48 @@ expect "install.sh is published as a shell script" \
     grep -qF "text/x-shellscript" "$AWS_STUB_ROOT/calls.log"
 expect "install.ps1 is published as readable text" \
     grep -qF "text/plain; charset=utf-8" "$AWS_STUB_ROOT/calls.log"
+
+# Scoop installs from a manifest URL with no bucket and therefore no git, and
+# records that URL as the app's source so `scoop update` re-fetches it. Verified
+# against Scoop v0.6.0 on Windows. The mirrored manifest has to name this origin
+# for its artifacts, because Scoop has no fallback of its own.
+fresh scoopmanifest
+mkdir -p "$WORK/dist/scoop"
+cat > "$WORK/dist/scoop/entire.json" <<'JSON'
+{
+  "version": "1.2.3",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/entireio/cli/releases/download/v1.2.3/entire_windows_amd64.zip",
+      "hash": "aaaa"
+    }
+  }
+}
+JSON
+out="$(installers --bucket b --dist "$WORK/dist" --origin-url https://example.test; printf 'rc=%s' "$?")"
+expect "publishes the scoop manifest" contains "$out" "rc=0"
+expect "it lands at scoop/entire.json" test -f "$AWS_STUB_ROOT/b/scoop/entire.json"
+expect "artifact urls are repointed at the origin" \
+    grep -qF "https://example.test/v1.2.3/entire_windows_amd64.zip" "$AWS_STUB_ROOT/b/scoop/entire.json"
+refute "no GitHub download url survives" \
+    grep -qF "github.com/entireio/cli/releases/download" "$AWS_STUB_ROOT/b/scoop/entire.json"
+expect "the hash is left untouched" \
+    grep -qF '"hash": "aaaa"' "$AWS_STUB_ROOT/b/scoop/entire.json"
+expect "it is served as json" grep -qF "application/json" "$AWS_STUB_ROOT/calls.log"
+
+# A silently un-rewritten manifest would publish fine and only fail during the
+# outage it exists for, so the rewrite asserts it changed something.
+fresh scoopunchanged
+mkdir -p "$WORK/dist2/scoop"
+printf '{"version":"1.2.3","url":"https://cdn.example.org/x.zip"}\n' > "$WORK/dist2/scoop/entire.json"
+out="$(installers --bucket b --dist "$WORK/dist2" --origin-url https://example.test; printf 'rc=%s' "$?")"
+expect "a manifest nothing was repointed in is refused" contains "$out" "rc=1"
+expect "the refusal says nothing was repointed" contains "$out" "nothing was repointed"
+
+fresh scoopmissing
+out="$(installers --bucket b --dist "$WORK/nope"; printf 'rc=%s' "$?")"
+expect "a missing scoop manifest is an error, not a silent skip" contains "$out" "rc=1"
+expect "the error names the path" contains "$out" "Scoop manifest not found"
 
 out="$(installers; printf 'rc=%s' "$?")"
 expect "requires --bucket" contains "$out" "rc=1"
