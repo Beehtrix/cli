@@ -166,5 +166,10 @@ func TestLegacyResumeIgnoresDeprecatedRepoFlag(t *testing.T) {
 	for _, command := range resumed.Commands {
 		require.NotContains(t, command, "--repo")
 	}
+	var raw struct {
+		Trail map[string]any `json:"trail"`
+	}
+	require.NoError(t, json.Unmarshal(out.Bytes(), &raw))
+	require.NotContains(t, raw.Trail, "repo", "resume context no longer reports a repository")
 	require.Contains(t, errOut.String(), "--repo has been deprecated")
 }

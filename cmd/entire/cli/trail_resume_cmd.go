@@ -55,7 +55,6 @@ type trailResumeTrailContext struct {
 	ID      string `json:"id,omitempty"`
 	Number  int    `json:"number,omitempty"`
 	Title   string `json:"title,omitempty"`
-	Repo    string `json:"repo,omitempty"`
 	Project string `json:"project,omitempty"`
 	Branch  string `json:"branch"`
 	Base    string `json:"base,omitempty"`
@@ -209,10 +208,6 @@ func runTrailResume(cmd *cobra.Command, mode *trailMode, opts trailResumeOptions
 	// home an agent reads from its own settings is invisible to the environment.
 	agent.EnableHomeProbes()
 	ctx := cmd.Context()
-	forge, owner, repo, err := resolveTrailRemote(ctx)
-	if err != nil {
-		return err
-	}
 	selected, err := mode.workingContext(cmd, opts.Selector, opts.ExpectedBranch, true)
 	if err != nil {
 		return err
@@ -239,12 +234,10 @@ func runTrailResume(cmd *cobra.Command, mode *trailMode, opts trailResumeOptions
 	}
 
 	display := *found
-	repoRef := owner + "/" + repo
 	if selected.Target != nil {
 		display.Title, display.Status = selected.Parent.Title, selected.Parent.Status
-		repoRef = forge + "/" + repoRef
 	}
-	resumeCtx := buildTrailResumeContextForRepoWithSkipped(display, sessions, sessionsUnavailable, sessionsSkipped, findings, repoRef)
+	resumeCtx := buildTrailResumeContext(display, sessions, sessionsUnavailable, sessionsSkipped, findings)
 	if opts.JSON {
 		return encodeTrailResumeContextJSON(cmd.OutOrStdout(), resumeCtx)
 	}
@@ -623,12 +616,11 @@ func trailResumeTopFindingOptions() trailReviewListOptions {
 	}
 }
 
-func buildTrailResumeContextForRepoWithSkipped(found api.TrailResource, sessions []trailResumeSessionContext, sessionsUnavailable string, sessionsSkipped int, findings trailResumeFindingsContext, repoFullName string) trailResumeContext {
+func buildTrailResumeContext(found api.TrailResource, sessions []trailResumeSessionContext, sessionsUnavailable string, sessionsSkipped int, findings trailResumeFindingsContext) trailResumeContext {
 	trailCtx := trailResumeTrailContext{
 		ID:     found.ID,
 		Number: found.Number,
 		Title:  strings.TrimSpace(found.Title),
-		Repo:   strings.TrimSpace(repoFullName),
 		Branch: strings.TrimSpace(found.Branch),
 		Base:   strings.TrimSpace(found.Base),
 		Status: strings.TrimSpace(found.Status),
