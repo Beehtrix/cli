@@ -65,7 +65,10 @@ func runOpenCodeExportToFile(ctx context.Context, root *os.Root, sessionID, outp
 	cmd := exec.CommandContext(ctx, "opencode", "export", sessionID)
 	// The npm launcher runs the real binary as a child that inherits stderr;
 	// killing only the launcher would leave Run waiting on that pipe past the
-	// deadline, and a commit's fetch budget depends on this cut-off.
+	// deadline, and a commit's fetch budget depends on this cut-off. The new
+	// process group leaves the terminal's foreground group: a first Ctrl-C
+	// cancels ctx and so the export, but a forced second one exits the CLI
+	// without reaching it, which leaves the export and its staging file.
 	execx.TerminateOnCancel(cmd)
 	// Exports run inside git hooks (condensation in post-commit),
 	// whose GIT_DIR / GIT_INDEX_FILE would otherwise reach OpenCode's own git

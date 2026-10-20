@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
 
 // resumedChildExportFixture is a child resumed through `task_id`: its first
@@ -249,7 +250,9 @@ func TestFetchSubagentTranscript_NeverPromptedCallDeclaresNothing(t *testing.T) 
 // stop's complete transcript.
 func TestLiveSubagentModifiedFiles_WritesNothingACaptureReads(t *testing.T) {
 	// Not parallel: t.Chdir and stubExport.
-	t.Chdir(t.TempDir())
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	t.Chdir(dir)
 	paths.ClearWorktreeRootCache()
 	t.Cleanup(paths.ClearWorktreeRootCache)
 	stubExport(t, func(_ context.Context, root *os.Root, _, outputName string) error {

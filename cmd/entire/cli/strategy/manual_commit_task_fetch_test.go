@@ -196,7 +196,7 @@ func (r *reportingAgent) LiveSubagentModifiedFiles(ctx context.Context, agentID,
 func TestLiveTaskFilesInCommit_AsksTheAgentForARunningSubagent(t *testing.T) {
 	t.Parallel()
 	committed := map[string]struct{}{"docs/red.md": {}}
-	spent := withLiveTaskFetchDeadline(withCommitFetchBudgets(context.Background(), time.Now().Add(-time.Hour)))
+	spent := withLiveTaskFetchDeadline(withCoauthorshipFetchDeadline(context.Background(), time.Now().Add(-time.Hour)))
 
 	tests := []struct {
 		name         string
@@ -235,10 +235,55 @@ func TestCommitFetchBudgets_CoauthorshipGetsAShare(t *testing.T) {
 	now := time.Now()
 	ag := &reportingAgent{}
 	state := &SessionState{TaskRecords: []session.TaskRecord{{ToolUseID: "call_1", AgentID: "ses_child", StartedAt: now}}}
-	liveTaskFilesInCommitFor(withLiveTaskFetchDeadline(withCommitFetchBudgets(context.Background(), now)), ag, state, nil)
+	liveTaskFilesInCommitFor(withLiveTaskFetchDeadline(withCoauthorshipFetchDeadline(context.Background(), now)), ag, state, nil)
 	require.Len(t, ag.deadlines, 1)
 	require.WithinDuration(t, now.Add(liveTaskFetchBudget), ag.deadlines[0], time.Second)
 	require.Less(t, liveTaskFetchBudget, agent.SubagentFetchBudget)
+}
+
+// TestCommitFetchBudgets_CondensationKeepsItsOwnBudget pins that the commit's
+// co-authorship deadline does not bound condensation: once it has passed, a
+// session's re-exports still get their own agent.SubagentFetchBudget, as
+// materializeTaskRecords starts one per session.
+func TestCommitFetchBudgets_CondensationKeepsItsOwnBudget(t *testing.T) {
+	t.Parallel()
+	loopCtx := withCoauthorshipFetchDeadline(context.Background(), time.Now().Add(-time.Hour))
+	ag := &fetchingAgent{dir: t.TempDir(), content: "{}"}
+
+	_, err := agent.FetchSubagentTranscript(agent.WithSubagentFetchBudget(loopCtx, agent.SubagentFetchBudget), ag, "ses_child", "call_1", time.Time{}, time.Time{})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"ses_child"}, ag.fetched)
+}
+
+// TestShouldCondense_RunningSubagentCreditsAnActiveParent pins the read-only
+// gate for any agent: an ACTIVE session with no tracked files of its own,
+// while another session claims the committed files, is condensed only when its
+// running subagent wrote a committed file.
+func TestShouldCondense_RunningSubagentCreditsAnActiveParent(t *testing.T) {
+	t.Parallel()
+	recent := time.Now()
+	for _, tt := range []struct {
+		name          string
+		evidence      bool
+		subagentWrote bool
+		want          bool
+	}{
+		{"subagent wrote a committed file", true, true, true},
+		{"subagent wrote other files", true, false, false},
+		{"no live task", false, true, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := &postCommitActionHandler{
+				ctx:                        context.Background(),
+				hasNew:                     true,
+				sessionsWithCommittedFiles: 1,
+				liveTaskClaimsCommit:       func() bool { return tt.subagentWrote },
+			}
+			require.Equal(t, tt.want, h.shouldCondenseWithOverlapCheck(true, &recent, false, tt.evidence))
+		})
+	}
 }
 
 func TestHasFreshLiveTaskRecord_AnyPhaseButEnded(t *testing.T) {

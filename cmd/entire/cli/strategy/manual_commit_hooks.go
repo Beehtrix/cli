@@ -1158,24 +1158,25 @@ func (h *postCommitActionHandler) shouldCondenseWithOverlapCheck(isActive bool, 
 	})
 }
 
-// liveTaskFetchBudget is the share of a commit's subagent fetch budget
-// (agent.SubagentFetchBudget) the co-authorship checks of all its sessions may
-// spend together. They are best-effort, and a running subagent's files are
-// recorded when it completes anyway; condensation's re-exports of completed
-// tasks, which cannot be redone, keep the rest.
+// liveTaskFetchBudget is how long the co-authorship checks of all a commit's
+// sessions may spend together, counted from the start of the commit's session
+// loop. They are best-effort, and a running subagent's files are recorded when
+// it completes anyway. Condensation's re-exports of completed tasks, which
+// cannot be redone, are not bounded by it: each session's condensation keeps
+// its own agent.SubagentFetchBudget.
 const liveTaskFetchBudget = 10 * time.Second
 
 type liveTaskFetchDeadlineKey struct{}
 
-// withCommitFetchBudgets sets a commit's subagent fetch budgets: one for every
-// fetch post-commit makes, and the co-authorship checks' share of it.
-func withCommitFetchBudgets(ctx context.Context, now time.Time) context.Context {
-	ctx = agent.WithSubagentFetchBudget(ctx, agent.SubagentFetchBudget)
+// withCoauthorshipFetchDeadline sets the deadline the commit's co-authorship
+// checks share. It sets no fetch budget on ctx itself, so condensation's
+// re-exports still start their own per session.
+func withCoauthorshipFetchDeadline(ctx context.Context, now time.Time) context.Context {
 	return context.WithValue(ctx, liveTaskFetchDeadlineKey{}, now.Add(liveTaskFetchBudget))
 }
 
 // withLiveTaskFetchDeadline caps ctx's fetch budget at the commit's
-// co-authorship share, when one is set.
+// co-authorship deadline, when one is set.
 func withLiveTaskFetchDeadline(ctx context.Context) context.Context {
 	if deadline, ok := ctx.Value(liveTaskFetchDeadlineKey{}).(time.Time); ok {
 		return agent.WithSubagentFetchDeadline(ctx, deadline)
@@ -1441,7 +1442,7 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 	// pre-loop snapshot would warn about sessions this commit just condensed.
 	staleEnded := 0
 
-	loopCtx, processSessionsLoop := perf.StartLoop(withCommitFetchBudgets(ctx, time.Now()), "process_sessions")
+	loopCtx, processSessionsLoop := perf.StartLoop(withCoauthorshipFetchDeadline(ctx, time.Now()), "process_sessions")
 	for _, sess := range sessions {
 		if sess.FullyCondensed && sess.Phase == session.PhaseEnded {
 			continue

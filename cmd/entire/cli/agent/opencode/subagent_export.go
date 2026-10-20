@@ -171,18 +171,18 @@ func (a *OpenCodeAgent) LiveSubagentModifiedFiles(ctx context.Context, childID, 
 	if err := validation.ValidateSessionID(childID); err != nil {
 		return nil, fmt.Errorf("invalid session ID for live subagent export: %w", err)
 	}
+	// Best-effort: an unresolved repository is no evidence, never the CWD.
 	repoRoot, err := paths.WorktreeRoot(ctx)
 	if err != nil {
-		repoRoot = "."
+		return nil, fmt.Errorf("resolve worktree for live subagent export: %w", err)
 	}
 	root, err := entiredir.OpenAt(repoRoot)
 	if err != nil {
 		return nil, fmt.Errorf("open %s for live subagent export: %w", paths.EntireDir, err)
 	}
 	var data []byte
-	if os.Getenv("ENTIRE_TEST_OPENCODE_MOCK_EXPORT") != "" {
-		// Integration tests pre-write the child's export (see fetchAndCacheExport).
-		data, err = entiredir.ReadFile(root, entireTmpName+"/"+childID+".json")
+	if name, ok := mockExportName(childID); ok {
+		data, err = entiredir.ReadFile(root, name)
 	} else {
 		data, err = exportToPrivateFile(ctx, root, childID)
 	}
