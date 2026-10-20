@@ -180,6 +180,14 @@ type Event struct {
 	// it so a resumed child's export can be cut to the call that produced it.
 	SubagentStartedAt time.Time
 
+	// SubagentUsageOutsideParent, on a Final SubagentEnd, says the child's
+	// token usage is recorded only in its own session, never in the parent's
+	// transcript (OpenCode child sessions). The completion that claims the
+	// task record credits that usage to the parent session's total, once per
+	// call. Leave it false when the parent's transcript or its subagent
+	// snapshot already counts the child, or the child would count twice.
+	SubagentUsageOutsideParent bool
+
 	// SubagentTranscriptUnavailable records that no child transcript is
 	// obtainable for this completion — either by contract (Copilot CLI) or
 	// because the fetch failed (OpenCode). It prevents later generic layout

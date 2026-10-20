@@ -1059,8 +1059,9 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 	// runs before the no-changes gate: a read-only Worker turn is still the
 	// parent's task, and a zero-file completed record is itself a condensation
 	// trigger (State.HasTaskContent), so its transcript and tokens reach the
-	// parent's next checkpoint. Its usage goes on that record only, never on
-	// the Worker's own session total, so it is counted once.
+	// parent's next checkpoint. Its usage goes on that record and the parent's
+	// subagent total, never on the Worker's own session total, so it is
+	// counted once.
 	if link, isSubagent := resolveSubagentSessionLink(ctx, ag, transcriptRef); isSubagent {
 		return saveSubagentSessionTaskStep(ctx, subagentSessionStep{
 			link:          link,
@@ -2405,7 +2406,12 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 		_ = CleanupPreTaskState(logCtx, event.ToolUseID) //nolint:errcheck // best-effort cleanup
 		return nil
 	}
-	completed, err := strategy.CompleteTaskRecord(logCtx, event.SessionID, rec)
+	var completed bool
+	if event.SubagentUsageOutsideParent {
+		completed, err = strategy.CompleteChildSessionTaskRecord(logCtx, event.SessionID, rec, event.SubagentStartedAt)
+	} else {
+		completed, err = strategy.CompleteTaskRecord(logCtx, event.SessionID, rec)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to complete task record: %w", err)
 	}
@@ -2617,8 +2623,9 @@ type subagentSessionStep struct {
 // The record also carries the Worker's token usage. Each turn adds its own
 // usage, scoped to the turn's transcript slice, and only the Stop that ends
 // the Worker's active turn adds it, so a turn condensed into one checkpoint is
-// never counted again by a later one, and none of it lands on the Worker's
-// own session total.
+// never counted again by a later one. The same usage is credited to the
+// parent's subagent total, and none of it lands on the Worker's own session
+// total.
 func saveSubagentSessionTaskStep(ctx context.Context, step subagentSessionStep) error {
 	logCtx := logging.WithComponent(ctx, "lifecycle")
 	logging.Info(logCtx, "recording subagent session as task record",

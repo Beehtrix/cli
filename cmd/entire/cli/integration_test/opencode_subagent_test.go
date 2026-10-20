@@ -359,3 +359,77 @@ func TestOpenCodeSubagentReusedCallIDRecordsEachCall(t *testing.T) {
 		})
 	}
 }
+
+// TestOpenCodeChildTokensCountOnceInParentTotal covers child-session usage,
+// which the parent's own export never carries: a foreground child in turn 1,
+// whose stop repeats after turn 1 is condensed, then a background child that
+// finishes after turn 2 has ended and been committed. Each child must count
+// once in the parent's total, in the checkpoint that stores its transcript.
+// Every assistant message in these exports is 150 input tokens (see
+// CreateOpenCodeTranscript).
+func TestOpenCodeChildTokensCountOnceInParentTotal(t *testing.T) {
+	t.Parallel()
+
+	env := NewFeatureBranchEnv(t)
+	env.InitEntireWithAgent(agent.AgentNameOpenCode)
+	parent := env.NewOpenCodeSession()
+	require.NoError(t, env.SimulateOpenCodeSessionStart(parent.ID, parent.TranscriptPath))
+
+	turn := func(prompt, file string) {
+		t.Helper()
+		env.WriteFile(file, prompt+"\n")
+		parent.CreateOpenCodeTranscript(prompt, []FileChange{{Path: file, Content: prompt + "\n"}})
+		require.NoError(t, env.SimulateOpenCodeTurnEnd(parent.ID, parent.TranscriptPath))
+		env.GitCommitWithHooks(prompt, file)
+	}
+	checkpointSubagentInput := func() int {
+		t.Helper()
+		usage := readCommittedTokenUsage(t, env, env.TryGetLatestCheckpointID())
+		require.NotNil(t, usage)
+		require.Equal(t, 150, usage.InputTokens, "the parent's own turn")
+		if usage.SubagentTokens == nil {
+			return 0
+		}
+		return usage.SubagentTokens.InputTokens
+	}
+
+	// Turn 1: a foreground child completes inside the turn.
+	require.NoError(t, env.SimulateOpenCodeTurnStart(parent.ID, parent.TranscriptPath, "red"))
+	foreground := env.NewOpenCodeSession()
+	require.NoError(t, env.SimulateOpenCodeSubagentStart(parent.ID, "call_fg", foreground.ID, "general", "Look"))
+	env.CopyTranscriptToEntireTmp(foreground.ID, foreground.CreateOpenCodeTranscript("Look", nil))
+	require.NoError(t, env.SimulateOpenCodeSubagentStop(parent.ID, "call_fg", foreground.ID, "general", "Look"))
+	turn("red", "docs/red.md")
+	require.Equal(t, 150, checkpointSubagentInput(), "checkpoint 1 holds the foreground child")
+
+	// The same stop again, after condensation removed the child's record.
+	require.NoError(t, env.SimulateOpenCodeSubagentStop(parent.ID, "call_fg", foreground.ID, "general", "Look"))
+
+	// Turn 2: a background child is still running when the turn ends and commits.
+	require.NoError(t, env.SimulateOpenCodeTurnStart(parent.ID, parent.TranscriptPath, "blue"))
+	background := env.NewOpenCodeSession()
+	require.NoError(t, env.SimulateOpenCodeSubagentStart(parent.ID, "call_bg", background.ID, "general", "Review"))
+	turn("blue", "docs/blue.md")
+	require.Zero(t, checkpointSubagentInput(), "checkpoint 2 has no new child; turn 1's repeated stop is not counted again")
+
+	// The background child goes idle after the parent's turn.
+	env.CopyTranscriptToEntireTmp(background.ID, background.CreateOpenCodeTranscript("Review", nil))
+	require.NoError(t, env.SimulateOpenCodeSubagentStop(parent.ID, "call_bg", background.ID, "general", "Review"))
+	require.NoError(t, env.SimulateOpenCodeSubagentStop(parent.ID, "call_bg", background.ID, "general", "Review"))
+
+	// Turn 3: the next checkpoint stores the late child, and only it.
+	require.NoError(t, env.SimulateOpenCodeTurnStart(parent.ID, parent.TranscriptPath, "green"))
+	turn("green", "docs/green.md")
+	require.Equal(t, 150, checkpointSubagentInput(), "checkpoint 3 holds the late child once")
+	_, ok := env.ReadFileFromBranch(paths.MetadataBranchName, CheckpointTaskFilePath(env.TryGetLatestCheckpointID(), "call_bg", "task.json"))
+	require.True(t, ok, "the late child's task is stored with the checkpoint that counts its tokens")
+
+	state, err := env.GetSessionState(parent.ID)
+	require.NoError(t, err)
+	total := state.TotalTokenUsage()
+	require.NotNil(t, total)
+	require.Equal(t, 450, total.InputTokens, "the parent's three turns")
+	require.NotNil(t, total.SubagentTokens)
+	require.Equal(t, 300, total.SubagentTokens.InputTokens, "each child once")
+	require.Equal(t, 2, total.SubagentTokens.APICallCount)
+}
