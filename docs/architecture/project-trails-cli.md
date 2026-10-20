@@ -14,7 +14,7 @@ by the first-turn injection, both through `projectTrailsEnabled`.
   `list`, `create`, `update`, `link`, `unlink`, `comment` in
   `project_trail_*.go`.
 - Commands that act on one repository branch in both models (`checkout`,
-  `resume`, `finding`, `watch`, `approve`, `request-changes`, `approvals`) are
+  `resume`, `finding`, `watch`, `approve`, `approvals`) are
   shared. Each receives a `trailMode` (`trail_mode.go`) that resolves the
   selector to that branch and supplies the model's help text.
 
