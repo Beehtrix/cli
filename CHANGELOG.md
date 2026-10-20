@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Breaking changes and migrations
+
+- With project Trails enabled (`ENTIRE_PROJECT_TRAILS=1`), branch-linked `entire trail create` now creates the parent Trail and its Change in separate requests so repository writers can use it. `--idempotency-key` covers only the Change, not parent creation: **do not automatically retry `trail create`, even with the same key**. A timeout after parent creation can otherwise produce a duplicate. If the command reports a created Trail ID, retry only `entire trail link <id>` with the printed key and identical repository, branch, base, branch action and creation fields. If parent creation has an uncertain outcome, inspect existing Trails before creating again. Branch-linked Trails were already repository-scoped; their scope has not changed ([#2836](https://github.com/entireio/cli/pull/2836)).
+- In project-Trails mode, `entire trail create --no-branch` now scopes intent to the current or explicit `--repo` repository. For unscoped project intent, use `--no-branch --project <forge>/<project>` without `--repo`; this still requires project management. Scoped intent-only creation sends no idempotency key by default; supplying one explicitly retains the manager-only idempotent request. Legacy repository-Trails mode is unchanged ([#2836](https://github.com/entireio/cli/pull/2836)).
+
 ## [0.11.5] - 2026-10-14
 
 ### Breaking changes and migrations
