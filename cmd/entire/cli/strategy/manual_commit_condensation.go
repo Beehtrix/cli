@@ -2094,7 +2094,8 @@ func reserveDoctorCondensationAttempt(ctx context.Context, state *SessionState) 
 
 // openSessionCondensationRepository uses the session's recorded worktree when
 // it is still available. The state path only selects a registered worktree of
-// this repository; a removed worktree falls back to the caller's repository.
+// this repository; a removed or replaced worktree falls back to the caller's
+// repository. Registration alone does not establish the repository's identity.
 // The caller owns the returned repository.
 func openSessionCondensationRepository(ctx context.Context, state *SessionState) (*git.Repository, error) {
 	current, err := paths.WorktreeRoot(ctx)
@@ -2110,12 +2111,26 @@ func openSessionCondensationRepository(ctx context.Context, state *SessionState)
 			if !filepath.IsAbs(root) || filepath.Clean(root) != filepath.Clean(state.WorktreePath) {
 				continue
 			}
+			currentCommon, err := gitCommonDirForWorktree(ctx, current)
+			if err != nil {
+				return nil, fmt.Errorf("resolve current repository identity: %w", err)
+			}
 			repo, err := gitrepo.OpenPath(root)
 			if errors.Is(err, fs.ErrNotExist) {
 				break // Removed without pruning its git worktree registration.
 			}
 			if err != nil {
 				return nil, fmt.Errorf("open session worktree repository: %w", err)
+			}
+			sessionCommon, err := gitCommonDirForWorktree(ctx, root)
+			if err != nil {
+				return nil, errors.Join(fmt.Errorf("resolve session repository identity: %w", err), repo.Close())
+			}
+			if sessionCommon != currentCommon {
+				if err := repo.Close(); err != nil {
+					return nil, fmt.Errorf("close replaced session repository: %w", err)
+				}
+				break // Stale registration now points to an unrelated repository.
 			}
 			return repo, nil
 		}

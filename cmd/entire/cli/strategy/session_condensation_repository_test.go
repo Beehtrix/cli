@@ -8,8 +8,26 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
+
+func TestOpenSessionCondensationRepository_ReusedRegisteredPath(t *testing.T) { //nolint:paralleltest // uses t.Chdir
+	mainDir, linkedDir := twoWorktrees(t)
+	t.Chdir(mainDir)
+	require.NoError(t, os.RemoveAll(linkedDir))
+	testutil.InitRepo(t, linkedDir)
+	registered, err := gitrepo.ListWorktreePaths(t.Context(), mainDir)
+	require.NoError(t, err)
+	require.Contains(t, registered, linkedDir, "fixture must retain the stale worktree registration")
+
+	repo, err := openSessionCondensationRepository(t.Context(), &SessionState{WorktreePath: linkedDir})
+	require.NoError(t, err)
+	defer repo.Close()
+	worktree, err := repo.Worktree()
+	require.NoError(t, err)
+	assert.Equal(t, mainDir, worktree.Filesystem().Root(), "a replacement repository must not receive the session's checkpoint")
+}
 
 func TestOpenSessionCondensationRepository(t *testing.T) { //nolint:paralleltest // uses t.Chdir
 	mainDir, linkedDir := twoWorktrees(t)
