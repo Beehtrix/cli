@@ -137,9 +137,12 @@ there.`,
 // exit non-zero.
 type trailMergeResultJSON struct {
 	Number int `json:"number"`
-	// Change is the project trail change merged, as <repo>/<number>; Number
-	// is then that change's repository-local number. Omitted for legacy trails.
+	// Change is the project trail change merged, as <repo>/<number>, in
+	// Project's project trail Trail; Number is then that change's
+	// repository-local number. All three are omitted for legacy trails.
 	Change         string                  `json:"change,omitempty"`
+	Project        string                  `json:"project,omitempty"`
+	Trail          int                     `json:"trail,omitempty"`
 	Branch         string                  `json:"branch"`
 	Base           string                  `json:"base"`
 	HeadSha        *string                 `json:"headSha"`
@@ -177,7 +180,7 @@ type trailMergeBlockerJSON struct {
 
 func newTrailMergeResultJSON(t *api.TrailResource, ref trailMergeRef, m *api.TrailMergeabilityResponse, gates []api.TrailGate, dryRun bool) *trailMergeResultJSON {
 	out := &trailMergeResultJSON{
-		Number: t.Number, Change: ref.Change, Branch: t.Branch, Base: t.Base, HeadSha: m.HeadSHA,
+		Number: t.Number, Change: ref.Change, Project: ref.Project, Trail: ref.Trail, Branch: t.Branch, Base: t.Base, HeadSha: m.HeadSHA,
 		Mergeable: m.Mergeable, ConflictStatus: m.ConflictStatus, BypassPolicy: m.BypassPolicy,
 		Blockers: make([]trailMergeBlockerJSON, 0, len(gates)), DryRun: dryRun,
 		DeleteBranchOnMerge: m.DeleteBranchOnMerge,
@@ -246,34 +249,42 @@ func runProjectTrailMerge(cmd *cobra.Command, mode *trailMode, opts trailMergeOp
 	if selected.Work.Number <= 0 {
 		return errors.New("the selected change has no number yet")
 	}
-	ref := projectTrailMergeRef(selected.Repo, selected.Work.Number, selected.Parent.Number)
+	ref := projectTrailMergeRef(selected.Repo, selected.Work.Number, selected.Parent.Number, selected.Target.Host+"/"+selected.Target.Project)
 	return mergeResolvedTrail(ctx, cmd.OutOrStdout(), w, selected.Client, selected.RepoID, &selected.Work, ref, opts)
 }
 
 var errTrailMergeDeleteBranchGitHub = errors.New("--delete-branch and --no-delete-branch apply to native trails only; GitHub's own auto-delete setting decides for a GitHub-backed trail")
 
 // trailMergeRef names what is merged in messages and in the commands hints
-// suggest. A legacy trail is its repository number; a project trail change is
-// <repo>/<number>, since a bare number there means a project trail.
+// suggest. A legacy trail is its repository number. A project trail change is
+// <repo>/<number> plus its project: a bare number there means a project trail,
+// and a change selector without --project resolves in origin's owner, which a
+// fork or another project's clone does not share.
 type trailMergeRef struct {
-	Label    string // "trail #7", "change widget/7 of trail #42"
-	Selector string // "7", "widget/7"
-	Details  string // the command that explains why it is blocked
-	Change   string // <repo>/<number> for --json; empty for legacy
+	Label string // "trail #7", "change widget/7 of trail #42"
+	Args  string // what follows `entire trail merge` in hints: "7", "widget/7 --project gh/acme"
+	// Details is the command that explains a block, or "" when the merge
+	// output's own readiness report is all there is (project changes).
+	Details string
+	// For --json; empty for legacy trails.
+	Change  string // <repo>/<number>
+	Project string // <forge>/<project>
+	Trail   int    // the project trail number
 }
 
 func legacyTrailMergeRef(number int) trailMergeRef {
 	n := strconv.Itoa(number)
-	return trailMergeRef{Label: "trail #" + n, Selector: n, Details: "entire trail show " + n}
+	return trailMergeRef{Label: "trail #" + n, Args: n, Details: "entire trail show " + n}
 }
 
-func projectTrailMergeRef(repo string, number, parent int) trailMergeRef {
+func projectTrailMergeRef(repo string, number, parent int, project string) trailMergeRef {
 	change := repo + "/" + strconv.Itoa(number)
 	return trailMergeRef{
-		Label:    fmt.Sprintf("change %s of trail #%d", change, parent),
-		Selector: change,
-		Details:  "entire trail merge " + change + " --dry-run",
-		Change:   change,
+		Label:   fmt.Sprintf("change %s of trail #%d", change, parent),
+		Args:    change + " --project " + shellArg(project),
+		Change:  change,
+		Project: project,
+		Trail:   parent,
 	}
 }
 
@@ -563,7 +574,7 @@ func recheckTrailMergeBypass(ctx context.Context, client *api.Client, mergePath 
 		trailGateFingerprint(trailMergeBlockingGates(now)) == trailGateFingerprint(confirmedGates) {
 		return nil
 	}
-	return fmt.Errorf("%s changed while you were confirming the bypass; nothing was merged\nhint: rerun 'entire trail merge %s --force' to review the current gates", ref.Label, ref.Selector)
+	return fmt.Errorf("%s changed while you were confirming the bypass; nothing was merged\nhint: rerun 'entire trail merge %s --force' to review the current gates", ref.Label, ref.Args)
 }
 
 // trailGateFingerprint identifies a set of blocking gates by key and status.
@@ -710,17 +721,17 @@ func trailMergeRefusal(e *api.HTTPError, ref trailMergeRef, v trailBypassVerdict
 	}
 	forceHint := ""
 	if v.allowed {
-		forceHint = fmt.Sprintf(", or rerun 'entire trail merge %s --force' to bypass", ref.Selector)
+		forceHint = fmt.Sprintf(", or rerun 'entire trail merge %s --force' to bypass", ref.Args)
 	}
 	switch {
 	case e.StatusCode == http.StatusForbidden && code == trailMergeOverrideDenied:
 		return fmt.Errorf("cannot merge %s with --force: this repo's bypass policy (%s) does not allow you to bypass failing gates", ref.Label, trailBypassPolicyDisplay(bypassPolicy))
 	case e.StatusCode == http.StatusUnprocessableEntity && code == "merge_gates_failed":
-		return fmt.Errorf("%s is not mergeable: a blocking gate failed when the merge was attempted\nhint: run 'entire trail merge %s --dry-run' to see why%s", ref.Label, ref.Selector, forceHint)
+		return fmt.Errorf("%s is not mergeable: a blocking gate failed when the merge was attempted\nhint: run 'entire trail merge %s --dry-run' to see why%s", ref.Label, ref.Args, forceHint)
 	case e.StatusCode == http.StatusUnprocessableEntity && code == "merge_gates_pending":
 		return fmt.Errorf("%s is not mergeable yet: a blocking gate is still pending\nhint: wait for it to finish%s", ref.Label, forceHint)
 	case e.StatusCode == http.StatusConflict && strings.HasPrefix(code, "merge_head_mismatch"):
-		return fmt.Errorf("%s changed while it was being merged (%s)\nhint: rerun 'entire trail merge %s' to merge the new head", ref.Label, tuiutil.SanitizeDisplayText(code), ref.Selector)
+		return fmt.Errorf("%s changed while it was being merged (%s)\nhint: rerun 'entire trail merge %s' to merge the new head", ref.Label, tuiutil.SanitizeDisplayText(code), ref.Args)
 	case e.StatusCode == http.StatusConflict && code == "merge_in_progress":
 		return fmt.Errorf("%s is already being merged; try again shortly", ref.Label)
 	}
@@ -732,6 +743,9 @@ func trailMergeRefusal(e *api.HTTPError, ref trailMergeRef, v trailBypassVerdict
 // when there are gates to bypass and this caller may bypass them.
 func trailMergeBlockedError(ref trailMergeRef, v trailBypassVerdict, gates []api.TrailGate) error {
 	if len(gates) == 0 {
+		if ref.Details == "" {
+			return fmt.Errorf("%s is not mergeable", ref.Label)
+		}
 		return fmt.Errorf("%s is not mergeable\nhint: run '%s' for details", ref.Label, ref.Details)
 	}
 	pending := 0
@@ -760,9 +774,9 @@ func trailMergeBlockedError(ref trailMergeRef, v trailBypassVerdict, gates []api
 	case !v.allowed:
 		return fmt.Errorf("%s\nhint: %s", msg, v.denial)
 	case wait != "":
-		return fmt.Errorf("%s\nhint: %s, or rerun 'entire trail merge %s --force' to bypass them", msg, wait, ref.Selector)
+		return fmt.Errorf("%s\nhint: %s, or rerun 'entire trail merge %s --force' to bypass them", msg, wait, ref.Args)
 	default:
-		return fmt.Errorf("%s\nhint: rerun 'entire trail merge %s --force' to merge anyway, bypassing the blocking gates", msg, ref.Selector)
+		return fmt.Errorf("%s\nhint: rerun 'entire trail merge %s --force' to merge anyway, bypassing the blocking gates", msg, ref.Args)
 	}
 }
 
@@ -874,7 +888,11 @@ func describeMergeabilityBlockers(ref trailMergeRef, m *api.TrailMergeabilityRes
 		reasons = append(reasons, fmt.Sprintf("branch is %d %s behind its base", m.BehindBy, pluralize("commit", m.BehindBy)))
 	}
 	if len(reasons) == 0 && m.ConflictStatus != trailConflictConflicting {
-		reasons = append(reasons, fmt.Sprintf("a blocking gate failed (run '%s' for details)", ref.Details))
+		reason := "a blocking gate failed"
+		if ref.Details != "" {
+			reason += fmt.Sprintf(" (run '%s' for details)", ref.Details)
+		}
+		reasons = append(reasons, reason)
 	}
 	return reasons
 }
