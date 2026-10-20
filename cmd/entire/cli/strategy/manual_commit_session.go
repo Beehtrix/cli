@@ -140,9 +140,9 @@ func (s *ManualCommitStrategy) listAllSessionStates(ctx context.Context) ([]*Ses
 		}
 
 		// Skip and clean up orphaned sessions: ended, never condensed, and
-		// holding no pending work. Keep non-ended sessions (including legacy
-		// empty phases normalized to IDLE) and sessions with LastCheckpointID
-		// (needed for checkpoint ID reuse on subsequent commits).
+		// holding no pending work or tokens. Keep non-ended sessions (including
+		// legacy empty phases normalized to IDLE) and sessions with
+		// LastCheckpointID (needed for checkpoint ID reuse on subsequent commits).
 		if isOrphanedSessionState(state) {
 			logging.Debug(logging.WithComponent(ctx, "session"), "removing orphaned session state with no pending work",
 				slog.String("session_id", state.SessionID),
@@ -162,8 +162,17 @@ func (s *ManualCommitStrategy) listAllSessionStates(ctx context.Context) ([]*Ses
 // pending work (State.HasPendingWork). IDLE states — including legacy empty
 // phases, which normalize to IDLE — are live sessions between turns or belong
 // to the exited-owner finalizer, so they age out through StaleSessionThreshold.
+//
+// A state that holds uncommitted tokens, or transcript offsets from an earlier
+// checkpoint, is kept until it is stale too. A headless agent ends its session
+// after every prompt, and a turn that changes no files clears LastCheckpointID
+// without adding pending work. Deleting that state would lose the turn's tokens
+// and restart the offsets at 0, so the next checkpoint would store the earlier
+// turns a second time.
 func isOrphanedSessionState(state *SessionState) bool {
-	return state.IsEnded() && state.LastCheckpointID.IsEmpty() && !state.HasPendingWork()
+	return state.IsEnded() && state.LastCheckpointID.IsEmpty() && !state.HasPendingWork() &&
+		!hasTokenUsageData(state.CheckpointTokenUsage) &&
+		state.TokenStart() == 0 && state.CheckpointTranscriptStart == 0
 }
 
 // IsCondensableEndedSession reports whether an ENDED, not fully condensed
