@@ -147,7 +147,7 @@ func TestProjectResumeCommandsKeepOptIn(t *testing.T) {
 	}, nil, "", 0, trailResumeFindingsContext{}, "gh/acme/widget")
 	for _, command := range ctx.Commands {
 		require.Contains(t, command, "ENTIRE_PROJECT_TRAILS=1 entire trail")
-		require.Contains(t, command, "42 --project gh/acme --repo gh/acme/widget --branch feature/work")
+		require.Contains(t, command, "42 --project gh/acme --branch feature/work")
 	}
 }
 
