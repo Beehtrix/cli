@@ -64,25 +64,24 @@ not every repository on the trail. The branch work must be open.`),
 }
 
 // newTrailRequestChangesCmd keeps the removed command's name so scripts and
-// agents get a pointer to entire.io rather than "unknown command". Changes
-// requested there still show in `trail approvals`.
+// agents learn it was removed rather than seeing "unknown command".
 func newTrailRequestChangesCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:    "request-changes [<trail>]",
-		Short:  "Removed: request changes on entire.io instead",
+		Short:  "Removed from the CLI",
 		Args:   cobra.MaximumNArgs(1),
 		Hidden: true,
 		RunE: func(*cobra.Command, []string) error {
 			return errTrailRequestChangesRemoved
 		},
 	}
-	cmd.Flags().StringP("message", "m", "", "Unused; requesting changes was removed")
-	cmd.Flags().String("branch", "", "Unused; requesting changes was removed")
+	cmd.Flags().StringP("message", "m", "", "Unused")
+	cmd.Flags().String("branch", "", "Unused")
 	return cmd
 }
 
 var errTrailRequestChangesRemoved = errors.New(
-	"requesting changes was removed from the CLI; request changes on the trail's page on entire.io")
+	"trail request-changes was removed from the CLI")
 
 func newTrailApprovalsCmd(mode *trailMode) *cobra.Command {
 	var branch string
