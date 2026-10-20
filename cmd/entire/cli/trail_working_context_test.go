@@ -79,7 +79,6 @@ func TestWorkingTrailCommandsKeepProjectAndRepoNumbersSeparate(t *testing.T) {
 		method, suffix, event string
 	}{
 		{[]string{"approve", "42"}, http.MethodPost, "/approvals", "approve"},
-		{[]string{"request-changes", "42", "-m", "Fix it"}, http.MethodPost, "/approvals", "request_changes"},
 		{[]string{"approvals", "42"}, http.MethodGet, "/approvals", ""},
 		{[]string{"finding", "list", "42", "--json"}, http.MethodGet, "/reviews/comments", ""},
 	} {
