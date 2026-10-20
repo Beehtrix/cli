@@ -32,7 +32,7 @@ One JSON object per line, each line terminated by `\n`.
 | `reasoning_tokens` | int | no | Assistant lines only; subset of `output_tokens` when reported by the source, not additional output. |
 | `content` | array of blocks, string, or `null` | yes | Normally an array. A string can appear when an assistant message's source content was a string. `null` can appear because the writer does not omit empty content. |
 
-Usage and model fields are per call, never copied from a session aggregate. Claude Code and Codex native transcripts supply per-call usage/model; other native agents populate only fields their own per-call records actually report. Copilot CLI has only a shutdown aggregate, Cursor is hook-only, and external plugins and Antigravity report usage out of band: their assistant lines do not acquire these optional fields from those sources. A zero omitted by JSON encoding does not assert that the source reported zero. Native timestamps are preserved where present; absence remains empty rather than a fabricated time.
+Usage and model fields are per call, never copied from a session aggregate. Claude Code and Codex native transcripts supply per-call usage/model, but this format/decode change does not yet make converters emit the new optional model, cache, or reasoning fields. A converter follow-up will emit them from native per-call data. Other native agents may populate only fields their own per-call records actually report. Copilot CLI has only a shutdown aggregate, Cursor is hook-only, and external plugins and Antigravity report usage out of band: their assistant lines do not acquire these optional fields from those sources. A zero omitted by JSON encoding does not assert that the source reported zero. Native timestamps are preserved where present; absence remains empty rather than a fabricated time.
 
 ### Blocks
 
@@ -68,6 +68,11 @@ A line is skipped when it:
 - has a known field of the wrong JSON type, for example `"agent": 42`
   or `"input_tokens": "x"` (reason `invalid field: <name>`). A `ts` that is
   not a string is ignored rather than skipped.
+
+For optional scalar fields, JSON `null` is treated like absence, not a wrong
+type: strings (including `model`) become empty, token totals (including the
+historical `input_tokens` and `output_tokens`) become zero, and cache-write
+splits remain unknown (`nil`). These values do not cause a line to be skipped.
 
 `Decode` normalizes three v1 quirks:
 

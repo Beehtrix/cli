@@ -244,6 +244,29 @@ func TestDecode_PartialResultWithError(t *testing.T) {
 	assert.Contains(t, err.Error(), "line 4: not a JSON object")
 }
 
+func TestDecode_NullOptionalUsageFields(t *testing.T) {
+	t.Parallel()
+
+	for _, field := range []string{
+		"model",
+		"input_tokens",
+		"output_tokens",
+		"cache_read_tokens",
+		"cache_write_tokens",
+		"cache_write_5m_tokens",
+		"cache_write_1h_tokens",
+		"reasoning_tokens",
+	} {
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+
+			lines, err := Decode([]byte(`{"v":1,"type":"assistant","` + field + `":null}`))
+			require.NoError(t, err)
+			assert.Equal(t, []Line{{Version: 1, Type: TypeAssistant}}, lines)
+		})
+	}
+}
+
 func TestDecode_CacheWriteSplitPresence(t *testing.T) {
 	t.Parallel()
 
