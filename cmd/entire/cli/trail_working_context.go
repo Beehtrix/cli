@@ -74,6 +74,7 @@ func resolveProjectTrailWorkingContext(cmd *cobra.Command, selector, branch stri
 	}
 
 	var target *projectTrailTarget
+	discovered := ""
 	if selector == "" {
 		branch, err = resolveTrailBranch(ctx, branch)
 		if err != nil {
@@ -87,6 +88,7 @@ func resolveProjectTrailWorkingContext(cmd *cobra.Command, selector, branch stri
 		if err != nil {
 			return nil, err
 		}
+		discovered = work.ID
 	} else {
 		forge, project, err := trailProjectReferenceOr(cmd, host, owner)
 		if err != nil {
@@ -105,7 +107,7 @@ func resolveProjectTrailWorkingContext(cmd *cobra.Command, selector, branch stri
 	if err != nil {
 		return nil, err
 	}
-	choice := trailChangeChoice{Branch: branch, LocalOnly: localOnly}
+	choice := trailChangeChoice{ID: discovered, Branch: branch, LocalOnly: localOnly}
 	if repoOverride == "" {
 		choice.Local = repoID
 		if !trailChangeWriteCommands[cmd.Name()] {
@@ -214,6 +216,9 @@ func changeBranchName(work api.TrailResource) string {
 // trailChangeChoice picks the one change a branch-level command acts on from
 // a project trail's open (branch-bearing) changes.
 type trailChangeChoice struct {
+	// ID is the change branch discovery already found in this repository; a
+	// same-named branch elsewhere in the trail must not make it ambiguous.
+	ID string
 	// Scope limits candidates to one repository ID: an explicit --repo, or
 	// this clone for local-only commands. Empty means every repository.
 	Scope string
@@ -229,10 +234,19 @@ type trailChangeChoice struct {
 	Preferred string
 }
 
-// selectFrom applies, in order: --branch, the checked-out branch, then a sole
+// selectFrom applies, in order: the discovered change, --branch, the checked-out branch, then a sole
 // open change. Anything else lists the candidates as <repo>/<number> and names
 // the command to re-run; retry renders that command for one change selector.
 func (c trailChangeChoice) selectFrom(parent api.ProjectTrail, retry func(change string) string) (api.ChangeSummary, error) {
+	label := "trail #" + strconv.Itoa(parent.Number)
+	if c.ID != "" {
+		for _, item := range parent.Changes {
+			if item.ID == c.ID {
+				return item, nil
+			}
+		}
+		return api.ChangeSummary{}, fmt.Errorf("%s does not list branch %q (it may be hidden by access filtering)", label, tuiutil.SanitizeTerminalLabel(c.Branch))
+	}
 	var candidates, elsewhere []api.ChangeSummary
 	for _, item := range parent.Changes {
 		switch {
@@ -244,7 +258,6 @@ func (c trailChangeChoice) selectFrom(parent api.ProjectTrail, retry func(change
 			elsewhere = append(elsewhere, item)
 		}
 	}
-	label := "trail #" + strconv.Itoa(parent.Number)
 	if c.Branch != "" {
 		var matches []api.ChangeSummary
 		for _, item := range candidates {

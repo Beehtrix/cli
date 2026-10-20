@@ -32,6 +32,9 @@ func TestTrailChangeChoice(t *testing.T) {
 		failures []string
 		absent   []string
 	}{
+		{name: "discovered change wins over a same-named branch elsewhere", choice: trailChangeChoice{ID: "c", Branch: "feature/a", Local: "two"}, id: "c"},
+		{name: "discovered change hidden from the trail", choice: trailChangeChoice{ID: "gone", Branch: "feature/gone"},
+			failures: []string{`trail #42 does not list branch "feature/gone"`}},
 		{name: "explicit branch in scope", choice: trailChangeChoice{Scope: "one", Branch: "feature/b", Preferred: "feature/a", Local: "one"}, id: "b"},
 		{name: "checked-out branch in this clone", choice: trailChangeChoice{Local: "one", Preferred: "feature/b"}, id: "b"},
 		{name: "checked-out branch never picks another repository", choice: trailChangeChoice{Local: "three", Preferred: "feature/a"},
@@ -387,4 +390,47 @@ func TestTrailWatchTargetDescription(t *testing.T) {
 			require.Equal(t, tt.want, trailWatchTargetDescription(trailReviewTarget{Host: "gh", Owner: "acme", Repo: "widget", Trail: tt.work}))
 		})
 	}
+}
+
+// Branch discovery already found this repository's change, so a same-named
+// branch in another repository of the trail must not make it ambiguous.
+// Not parallel: changes CWD and replaces client constructors.
+func TestWorkingTrailBranchDiscoveryIgnoresSameBranchElsewhere(t *testing.T) {
+	repoDir := t.TempDir()
+	testutil.InitRepo(t, repoDir)
+	testutil.IsolateGitConfigEnv(t)
+	testutil.RunGit(t, repoDir, "remote", "add", "origin", "git@github.com:acme/widget.git")
+	testutil.WriteFile(t, repoDir, "README.md", "widget")
+	testutil.GitAdd(t, repoDir, "README.md")
+	testutil.GitCommit(t, repoDir, "initial")
+	testutil.RunGit(t, repoDir, "switch", "-c", "feature/work")
+	t.Chdir(repoDir)
+	parent := workingProjectTestResource()
+	parent.Changes = append(parent.Changes, api.ChangeSummary{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAY", RepositoryID: "api-id", Repository: "api", Number: 9, Branch: "feature/work"})
+	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case projectTrailTestPath:
+			assert.NoError(t, json.NewEncoder(w).Encode(parent))
+		default:
+			if !serveWorkingProjectRead(t, w, r) {
+				t.Errorf("unexpected project request: %s %s", r.Method, r.URL.Path)
+				http.NotFound(w, r)
+			}
+		}
+	})
+	var writes []string
+	setupWorkingRepoClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			writes = append(writes, r.URL.Path)
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		ref := &api.TrailParentReference{ID: projectTrailTestID, ProjectID: projectTrailTestProject, Number: 42,
+			Host: "gh", Project: "acme", Path: projectTrailTestPath, Jurisdiction: "eu", PrimaryProcessingCell: "project-cell"}
+		assert.NoError(t, json.NewEncoder(w).Encode(api.TrailListResponse{Trails: []api.TrailResource{{ID: projectTrailTestChange, Number: 7, Branch: "feature/work", Parent: ref}}}))
+	})
+
+	_, _, err := executeProjectTrailTest(t, "approve")
+	require.NoError(t, err)
+	require.Equal(t, []string{"/api/v1/trails/gh/acme/widget/7/approvals"}, writes)
 }
