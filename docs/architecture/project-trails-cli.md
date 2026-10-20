@@ -72,8 +72,11 @@ Selectors are project-local numbers or trail ULIDs, or `<repo>/<number>` for one
 - Updates and linking require the resource's ETag; a 412 never triggers an
   unconditional retry. With a branch, `--idempotency-key` applies only to the
   Change, not to parent creation. If linking fails, the command reports the
-  created Trail ID and retry key: use `trail link` with that ID and identical
-  repository, branch action, base and creation fields, not `trail create`.
+  created Trail ID and a complete, shell-quoted `trail link` retry command,
+  including the resolved repository (even when originally implicit), project,
+  branch action, base, creation fields and retry key. Copy that command instead
+  of rerunning `trail create`; it preserves the Change request hash. The hint
+  names the target shell: POSIX on Unix, PowerShell on Windows.
   A successful link is followed by a fresh parent read for the final output.
   Neither stage retries automatically or deletes the parent/branch on failure.
   After an uncertain parent-create result, inspect Trails before creating again.

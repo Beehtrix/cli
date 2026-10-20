@@ -47,7 +47,7 @@ func createRepositoryScopedProjectTrail(cmd *cobra.Command, request api.ProjectT
 		fmt.Fprintf(cmd.ErrOrStderr(), "Created trail #%d (%s); linking branch\n", out.Number, out.ID)
 		key = projectTrailIdempotencyKey(cmd.ErrOrStderr(), key)
 		if _, err := linkProjectTrailChange(cmd.Context(), target, change, etag, key); err != nil {
-			return fmt.Errorf("trail %s was created but branch linking did not complete: %w; do not rerun trail create; use entire trail link %s --branch %q --idempotency-key %q with the same repository, project, branch action, base and creation fields", out.ID, err, out.ID, change.BranchName, key)
+			return fmt.Errorf("trail %s was created but branch linking did not complete: %w; do not rerun trail create\n%s", out.ID, err, projectTrailLinkRetry(cmd, target, change, key))
 		}
 		out, _, err = target.read(cmd.Context())
 		if err != nil {
@@ -94,5 +94,6 @@ func resolveRepositoryProjectTrailTarget(cmd *cobra.Command) (*projectTrailTarge
 		return nil, "", err
 	}
 	target.Client = client
+	target.RepoRef = forge + "/" + owner + "/" + repo
 	return target, repoID, nil
 }

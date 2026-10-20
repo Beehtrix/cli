@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -50,43 +51,67 @@ func repositoryTrailCreationHandler(t *testing.T, forge string, inspectChange fu
 }
 
 func TestProjectTrailCreateRetriesOnlyChangeWithLink(t *testing.T) {
-	parents, changes := 0, 0
-	var first api.ChangeCreateRequest
-	_, project := setupRepositoryTrailCreation(t, "gh", func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && !strings.HasSuffix(r.URL.Path, "/changes"):
-			parents++
-			assert.Empty(t, r.Header.Get("Idempotency-Key"))
-			w.Header().Set("ETag", `W/"original"`)
-			assert.NoError(t, json.NewEncoder(w).Encode(projectTrailTestResource()))
-		case r.Method == http.MethodGet:
-			w.Header().Set("ETag", `W/"current"`)
-			assert.NoError(t, json.NewEncoder(w).Encode(projectTrailTestResource()))
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/changes"):
-			changes++
-			assert.Equal(t, "change-retry", r.Header.Get("Idempotency-Key"))
-			var request api.ChangeCreateRequest
-			assert.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-			if changes == 1 {
-				first = request
-				http.Error(w, "response lost", http.StatusServiceUnavailable)
-				return
+	// Serial: replaces clients and changes CWD to prove recovery is checkout-independent.
+	for _, tc := range []struct {
+		name   string
+		fields []string
+	}{
+		{"all fields", []string{"--repo", "gh/acme/widget", "--branch-action", "create", "--base", "main", "--body", "Plan", "--status", "draft", "--type", "feature", "--priority", "high", "--assignee", "alice,bob"}},
+		{"defaults", []string{"--repo", "gh/acme/widget"}},
+		{"implicit repository", nil},
+		{"shell and CSV quoting", []string{"--repo", "gh/acme/widget", "--body", "--leading flag\nquotes: 'single' \"double\"; $(printf expanded) `printf expanded` $HOME \\ path ☃\n", "--assignee", `"alice,team","bob""quoted"`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.fields == nil {
+				setupProjectTrailPublication(t)
 			}
-			assert.Equal(t, first, request)
-			assert.Equal(t, `W/"current"`, r.Header.Get("If-Match"))
-			assert.NoError(t, json.NewEncoder(w).Encode(api.ChangeCreateResponse{ID: projectTrailTestChange, TrailID: projectTrailTestID, RepositoryID: projectTrailTestChange}))
-		default:
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
-		}
-	})
-	fields := []string{"--repo", "gh/acme/widget", "--branch", "feature/work", "--branch-action", "create", "--base", "main", "--title", "Intent", "--body", "Plan", "--priority", "high", "--assignee", "alice", "--idempotency-key", "change-retry"}
-	_, _, err := executeProjectTrailTest(t, append([]string{"create"}, fields...)...)
-	require.ErrorContains(t, err, "entire trail link "+projectTrailTestID)
-	_, _, err = executeProjectTrailTest(t, append([]string{"link", projectTrailTestID}, fields...)...)
-	require.NoError(t, err)
-	require.Equal(t, 1, parents)
-	require.Equal(t, 2, changes)
-	require.Zero(t, project.resolveCalls)
+			parents, changes := 0, 0
+			var first []byte
+			_, project := setupRepositoryTrailCreation(t, "gh", func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && !strings.HasSuffix(r.URL.Path, "/changes"):
+					parents++
+					assert.Empty(t, r.Header.Get("Idempotency-Key"))
+					w.Header().Set("ETag", `W/"original"`)
+					assert.NoError(t, json.NewEncoder(w).Encode(projectTrailTestResource()))
+				case r.Method == http.MethodGet:
+					w.Header().Set("ETag", `W/"current"`)
+					assert.NoError(t, json.NewEncoder(w).Encode(projectTrailTestResource()))
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/changes"):
+					changes++
+					assert.Equal(t, "change-retry", r.Header.Get("Idempotency-Key"))
+					body, err := io.ReadAll(r.Body)
+					assert.NoError(t, err)
+					if changes == 1 {
+						first = body
+						http.Error(w, "response lost", http.StatusServiceUnavailable)
+						return
+					}
+					assert.Equal(t, string(first), string(body), "retry must preserve the request hash")
+					assert.Equal(t, `W/"current"`, r.Header.Get("If-Match"))
+					assert.NoError(t, json.NewEncoder(w).Encode(api.ChangeCreateResponse{ID: projectTrailTestChange, TrailID: projectTrailTestID, RepositoryID: projectTrailTestChange}))
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+				}
+			})
+			args := append([]string{"create", "--branch", "feature/work", "--title", "Intent's \"quoted\" title", "--idempotency-key", "change-retry"}, tc.fields...)
+			_, _, err := executeProjectTrailTest(t, args...)
+			require.ErrorContains(t, err, "entire trail link "+projectTrailTestID)
+			_, hint, found := strings.Cut(err.Error(), "\nRetry in ")
+			require.True(t, found)
+			_, command, found := strings.Cut(hint, ":\n")
+			require.True(t, found)
+			t.Chdir(t.TempDir())
+			retryArgs := executeTrailRetryShell(t, command)
+			require.Greater(t, len(retryArgs), 2)
+			require.Equal(t, "trail", retryArgs[0])
+			_, _, err = executeProjectTrailTest(t, retryArgs[1:]...)
+			require.NoError(t, err)
+			require.Equal(t, 1, parents)
+			require.Equal(t, 2, changes)
+			require.Zero(t, project.resolveCalls)
+		})
+	}
 }
 
 func TestProjectTrailCreateChangeFailurePreservesParent(t *testing.T) {
