@@ -27,15 +27,17 @@ const authQuote = "[\"'`]"
 // literal JSON escape (\n, \") may precede it in the raw-text fall-back path.
 // A comma separates name and value only after a quoted name, as in
 // Header.Set("Authorization", ...); in prose, "authorization, token ..." is a
-// list.
+// list. Only a quoted name's value may start on the next line, as in wrapped
+// code: an empty raw header must not take the next header line as its value.
 var authorizationHeaderPattern = regexp.MustCompile(
 	`(?i)(?:^|[^A-Za-z0-9]|\\[bfnrt]|\\u[0-9A-Fa-f]{4})` +
 		`(?:proxy-)?authorization` +
 		// a quoted name (possibly JSON-escaped, possibly a subscript key)
 		// with its separator, or a bare name with its separator
-		`(?:\\?` + authQuote + `\]?[ \t]*(?:=>|[:=,])|[ \t]*(?:=>|[:=]))[ \t]*` +
-		// a Go http.Header value is a []string literal
-		`(?:\[\]string\{[ \t]*)?` +
+		`(?:\\?` + authQuote + `\]?[ \t]*(?:=>|[:=,])\s*|[ \t]*(?:=>|[:=])[ \t]*)` +
+		// an http.Header value is a list: a Go []string literal, or a JSON
+		// array as json.Marshal writes it
+		`(?:(?:\[\]string\{|\[)\s*)?` +
 		// optional opening quote of the value, with a Python string prefix
 		`(?:[frbu]{0,2}\\?` + authQuote + `[ \t]*)?` +
 		`(?:([a-z][a-z0-9-]*)[ \t]+)?` +
@@ -90,8 +92,12 @@ func isKnownAuthScheme(s string, start, end int) bool {
 }
 
 // endsHeaderValue reports whether the value ending at end is the whole header
-// value: the end of the line or text, a closing quote, or a JSON escape.
+// value: trailing spaces and tabs, then the end of the line or text, a closing
+// quote, or a JSON escape.
 func endsHeaderValue(s string, end int) bool {
+	for end < len(s) && (s[end] == ' ' || s[end] == '\t') {
+		end++
+	}
 	return end == len(s) || strings.IndexByte("\r\n\"'`\\", s[end]) >= 0
 }
 

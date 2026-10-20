@@ -64,6 +64,21 @@ func TestString_AuthorizationHeaderValues(t *testing.T) {
 			want:  `req.Header.Set("Authorization", "token REDACTED")`,
 		},
 		{
+			name:  "Go header set call wrapped onto the next line",
+			input: "req.Header.Set(\"Authorization\",\n\t\"Bearer " + authUUIDToken + "\")",
+			want:  "req.Header.Set(\"Authorization\",\n\t\"Bearer REDACTED\")",
+		},
+		{
+			name:  "Go http.Header literal wrapped onto the next line",
+			input: "http.Header{\"Authorization\": []string{\n\t\"Bearer " + authUUIDToken + "\",\n}}",
+			want:  "http.Header{\"Authorization\": []string{\n\t\"Bearer REDACTED\",\n}}",
+		},
+		{
+			name:  "JSON array value as json.Marshal writes an http.Header",
+			input: `{"Authorization":["Bearer ` + authUUIDToken + `"]}`,
+			want:  `{"Authorization":["Bearer REDACTED"]}`,
+		},
+		{
 			name:  "Go http.Header literal",
 			input: `http.Header{"Authorization": []string{"Bearer ` + authUUIDToken + `"}}`,
 			want:  `http.Header{"Authorization": []string{"Bearer REDACTED"}}`,
@@ -181,6 +196,8 @@ func TestDetectAuthorizationHeaders_WholeCredential(t *testing.T) {
 		{"underscore after a short prefix", "Authorization: Bearer ab12_" + authUUIDToken, "ab12_" + authUUIDToken},
 		{"raw key without a scheme", "Authorization: " + authLinearKey + "\n", authLinearKey},
 		{"base64url JWT-style segments", "Authorization: Bearer eyJ0_x-Y.c2Vj_cmV0.c2ln_bmF0dXJl", "eyJ0_x-Y.c2Vj_cmV0.c2ln_bmF0dXJl"},
+		{"unlisted scheme before trailing whitespace", "Authorization: GenieKey " + authUUIDToken + " \r\n", authUUIDToken},
+		{"raw key before trailing whitespace", "Authorization: " + authLinearKey + " \t\r\n", authLinearKey},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -227,5 +244,37 @@ func TestJSONLContent_AuthorizationHeaderLeaf(t *testing.T) {
 	}
 	if !strings.Contains(got, `"Authorization":"`) {
 		t.Fatalf("header key should be preserved: %s", got)
+	}
+}
+
+// TestDetectAuthorizationHeaders_EmptyRawHeader checks that only a quoted
+// name's value may continue onto the next line: an empty raw header must not
+// take the next header's value as its credential.
+func TestDetectAuthorizationHeaders_EmptyRawHeader(t *testing.T) {
+	t.Parallel()
+
+	for _, input := range []string{
+		"Authorization:\nX-Request-Id: " + authHexToken,
+		"Authorization: \n" + authLinearKey + "\n",
+	} {
+		if regions := detectAuthorizationHeaders(input); len(regions) != 0 {
+			t.Errorf("detectAuthorizationHeaders(%q) = %v, want none", input, regions)
+		}
+	}
+}
+
+// TestJSONLContent_AuthorizationHeaderArray covers an http.Header written by
+// json.Marshal, whose values are arrays: each element is walked with the
+// array's key, so the key-context rescan still sees "Authorization".
+func TestJSONLContent_AuthorizationHeaderArray(t *testing.T) {
+	t.Parallel()
+
+	input := `{"type":"tool_result","content":{"headers":{"Authorization":["Bearer ` + authUUIDToken + `"]}}}`
+	got, err := JSONLContent(input)
+	if err != nil {
+		t.Fatalf("JSONLContent: %v", err)
+	}
+	if strings.Contains(got, authUUIDToken) {
+		t.Fatalf("bearer token in a header array survived JSONL redaction: %s", got)
 	}
 }

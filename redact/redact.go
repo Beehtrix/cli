@@ -1422,7 +1422,9 @@ func isSingleJSONValue(dec *json.Decoder) bool {
 // walkRedactableStrings walks a parsed JSON value with the shared JSONL skip
 // rules (shouldSkipJSONLField, shouldSkipJSONLObject, credential context),
 // applying transform to each eligible string leaf. key is the leaf's object
-// key, empty inside arrays and at the root.
+// key, empty at the root. An array element takes the key of the array that
+// holds it, so {"Authorization":["Bearer <token>"]}, as json.Marshal writes an
+// http.Header, keeps the key context of {"Authorization":"Bearer <token>"}.
 //
 // A skip key preserves its own string values, including the strings in its
 // arrays, but objects beneath it are walked with their own keys. The id rule
@@ -1462,7 +1464,7 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 		case []any:
 			var out []any
 			for i, child := range val {
-				newChild, childChanged := walk("", credentialContext, skipStrings, child)
+				newChild, childChanged := walk(key, credentialContext, skipStrings, child)
 				if !childChanged {
 					continue
 				}
