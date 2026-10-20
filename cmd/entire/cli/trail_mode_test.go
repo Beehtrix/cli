@@ -141,13 +141,13 @@ func TestLegacyTrailRequestsDoNotResolveProject(t *testing.T) {
 
 func TestProjectResumeCommandsKeepOptIn(t *testing.T) {
 	t.Parallel()
-	ctx := buildTrailResumeContextForRepoWithSkipped(api.TrailResource{
+	ctx := buildTrailResumeContext(api.TrailResource{
 		ID: projectTrailTestChange, Number: 7, Branch: "feature/work",
 		Parent: &api.TrailParentReference{ID: projectTrailTestID, Number: 42, Host: "gh", Project: "acme"},
-	}, nil, "", 0, trailResumeFindingsContext{}, "gh/acme/widget")
+	}, nil, "", 0, trailResumeFindingsContext{})
 	for _, command := range ctx.Commands {
 		require.Contains(t, command, "ENTIRE_PROJECT_TRAILS=1 entire trail")
-		require.Contains(t, command, "42 --project gh/acme --repo gh/acme/widget --branch feature/work")
+		require.Contains(t, command, "42 --project gh/acme --branch feature/work")
 	}
 }
 

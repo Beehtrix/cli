@@ -34,8 +34,8 @@ func (t *trailWorkingContext) description() string {
 }
 
 // resolveProjectTrailWorkingContext is projectTrailMode.workingContext.
-// localOnly is used by checkout/resume: --repo may assert a local repository,
-// but must never cause these commands to check out a foreign branch here.
+// localOnly is used by checkout/resume, which act on the local clone: checkout
+// rejects --repo and resume ignores it, so neither targets a foreign repository.
 func resolveProjectTrailWorkingContext(cmd *cobra.Command, selector, branch string, localOnly bool) (_ *trailWorkingContext, err error) {
 	if change, ok := parseProjectTrailChangeSelector(selector); ok {
 		if strings.TrimSpace(branch) != "" {
