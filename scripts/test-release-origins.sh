@@ -277,6 +277,18 @@ expect "a near-miss nightly tag is skipped on the fallback too" \
     contains "$out" "Installing version: 3.3.3-nightly.202604061200.abc1234"
 refute "the near-miss tag is never selected" contains "$out" "prenightly"
 
+section "install.sh — --version is validated on its own"
+
+# It is interpolated into ${base}/v${version}/..., and curl normalises ".."
+# segments, so an unchecked value addresses something outside the version
+# prefix and fails later as a generic download error.
+repoint "$WORK/install-badver.sh" "$DEAD" "$GH" "$GH/api"
+for bad in "../../y" "not-a-version" "1.2"; do
+    out="$(run_install "$WORK/home-badver" "$WORK/install-badver.sh" --version "$bad"; printf 'rc=%s' "$?")"
+    refute "--version $bad does not reach a download" contains "$out" "Installing version"
+    expect "--version $bad is rejected as not a version" contains "$out" "is not a version"
+done
+
 section "install.sh — --version and --channel cannot contradict"
 
 repoint "$WORK/install-conflict.sh" "$DEAD" "$GH" "$GH/api"
@@ -492,10 +504,21 @@ fresh badinput
 publish --tag not-a-version --bucket b >/dev/null 2>&1; rc=$?
 expect "rejects a tag that is not semver" eq "$rc" 1
 publish --bucket b >/dev/null 2>&1; rc=$?
+# A prerelease no channel claims is "nothing to publish", not a failed release:
+# GoReleaser has already published by this point, so dying would fail the job
+# after the fact, fire Slack and skip mirror-nightly.
 fresh rctag
 out="$(publish --tag v1.2.3-rc.1 --bucket b; printf 'rc=%s' "$?")"
-expect "refuses a prerelease no channel claims" contains "$out" "rc=1"
-expect "the refusal says no channel claims it" contains "$out" "no channel claims it"
+expect "an unclaimed prerelease is not a failure" contains "$out" "rc=0"
+expect "it says no channel claims the tag" contains "$out" "No channel claims"
+refute "no stable pointer is written" test -f "$AWS_STUB_ROOT/b/channels/stable.json"
+refute "no nightly pointer is written" test -f "$AWS_STUB_ROOT/b/channels/nightly.json"
+
+# A tag that is not a version at all stays a hard error — that is a broken
+# release, not an unclaimed one.
+fresh junktag
+out="$(publish --tag vnot-a-version --bucket b; printf 'rc=%s' "$?")"
+expect "a non-semver tag still fails" contains "$out" "rc=1"
 
 # The publisher's nightly test must be the readers' test, not a looser one. A
 # prerelease merely containing "nightly" would be routed to the channel, where
@@ -503,8 +526,8 @@ expect "the refusal says no channel claims it" contains "$out" "no channel claim
 for t in v0.5.4-nightly v0.5.4-prenightly v0.5.4-rc.nightly.1; do
     fresh "nearmiss-$t"
     out="$(publish --tag "$t" --bucket b; printf 'rc=%s' "$?")"
-    expect "refuses $t, which only looks like a nightly" contains "$out" "rc=1"
     refute "$t never reaches the nightly pointer" test -f "$AWS_STUB_ROOT/b/channels/nightly.json"
+    expect "$t is reported as unclaimed" contains "$out" "No channel claims"
 done
 
 fresh realnightly

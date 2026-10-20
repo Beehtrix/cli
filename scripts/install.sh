@@ -174,10 +174,20 @@ origin_label() {
 # ends discovery here, and both origins are then asked for a release that does
 # not exist — failing the install even when GitHub has a valid one. Invalid
 # metadata has to advance to the fallback, not stop the walk.
+# version_is_release_version checks the shape alone. Split out because every
+# version that reaches a URL has to pass it, including one pinned with
+# --version, where there is no channel to check against. It is interpolated
+# into ${base}/v${version}/..., and curl normalises ".." segments, so an
+# unchecked value can address something outside the v<version>/ prefix
+# entirely and fail later as a generic download error.
+version_is_release_version() {
+    printf '%s' "$1" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+}
+
 version_valid_for_channel() {
     local version="$1" channel="$2"
 
-    if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+    if ! version_is_release_version "$version"; then
         return 1
     fi
     if [[ "$channel" == "nightly" ]]; then
@@ -402,8 +412,11 @@ main() {
     # honour --channel. Silently installing a stable build under
     # `--channel nightly --version X` is the worst outcome; refusing is better
     # than guessing which half of a contradictory request was meant.
-    if [[ -n "$version" && "$channel_given" -eq 1 ]]; then
-        if ! version_valid_for_channel "$version" "$channel"; then
+    if [[ -n "$version" ]]; then
+        if ! version_is_release_version "$version"; then
+            error "--version ${version} is not a version. Expected X.Y.Z, optionally with a prerelease suffix."
+        fi
+        if [[ "$channel_given" -eq 1 ]] && ! version_valid_for_channel "$version" "$channel"; then
             error "--version ${version} is not a ${channel} version. Drop --channel to install it, or pick a ${channel} version."
         fi
     fi

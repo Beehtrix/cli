@@ -101,7 +101,15 @@ VERSION="${TAG#v}"
 if [[ "$VERSION" == *-nightly.* ]]; then
     CHANNEL="nightly"
 elif [[ "$VERSION" == *-* ]]; then
-    die "tag '${TAG}' carries a prerelease segment that is not a nightly; no channel claims it"
+    # Not an error. The release itself is fine — GoReleaser has already
+    # published it and the artifacts are mirrored; there is simply no channel
+    # to advertise it on. Dying here would fail the release job after
+    # publication, fire the Slack notification and skip mirror-nightly, so a
+    # valid prerelease would look like a broken release. Said loudly on stderr
+    # so a typo'd nightly tag is still visible in the release log.
+    printf 'No channel claims %s: its prerelease segment is not a nightly, so no pointer was moved. The release itself is unaffected.\n' \
+        "$TAG" >&2
+    exit 0
 else
     CHANNEL="stable"
 fi
