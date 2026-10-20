@@ -260,19 +260,9 @@ func (c trailChangeChoice) selectFrom(parent api.ProjectTrail, retry func(change
 		}
 	}
 	if c.Branch != "" {
-		var matches []api.ChangeSummary
-		for _, item := range candidates {
-			if item.Branch == c.Branch {
-				matches = append(matches, item)
-			}
-		}
-		switch len(matches) {
-		case 1:
-			return matches[0], nil
-		case 0:
-			return api.ChangeSummary{}, fmt.Errorf("%s has no open change on branch %q%s", label, tuiutil.SanitizeTerminalLabel(c.Branch), c.scopeSuffix())
-		}
-		candidates, elsewhere = matches, nil
+		// Narrow both lists, so a local-only miss still shows the branch's
+		// change in another repository rather than reporting nothing.
+		candidates, elsewhere = changesOnBranch(candidates, c.Branch), changesOnBranch(elsewhere, c.Branch)
 	} else if c.Preferred != "" && c.Local != "" {
 		for _, item := range candidates {
 			if item.RepositoryID == c.Local && item.Branch == c.Preferred {
@@ -284,9 +274,12 @@ func (c trailChangeChoice) selectFrom(parent api.ProjectTrail, retry func(change
 		return candidates[0], nil
 	}
 	var b strings.Builder
-	if len(candidates) == 0 {
+	switch {
+	case len(candidates) == 0 && c.Branch != "":
+		fmt.Fprintf(&b, "%s has no open change on branch %q%s", label, tuiutil.SanitizeTerminalLabel(c.Branch), c.scopeSuffix())
+	case len(candidates) == 0:
 		fmt.Fprintf(&b, "%s has no open changes%s", label, c.scopeSuffix())
-	} else {
+	default:
 		fmt.Fprintf(&b, "%s has %d open changes%s; choose one:", label, len(candidates), c.scopeSuffix())
 	}
 	for _, item := range candidates {
@@ -299,12 +292,31 @@ func (c trailChangeChoice) selectFrom(parent api.ProjectTrail, retry func(change
 		}
 	}
 	for _, item := range candidates {
-		if validTrailChangeRepoName(item.Repository) {
-			fmt.Fprintf(&b, "\nRun, for example: %s", retry(item.Repository+"/"+strconv.Itoa(item.Number)))
+		if selector, ok := trailChangeSelectorFor(item); ok {
+			fmt.Fprintf(&b, "\nRun, for example: %s", retry(selector))
 			break
 		}
 	}
 	return api.ChangeSummary{}, errors.New(b.String())
+}
+
+func changesOnBranch(changes []api.ChangeSummary, branch string) []api.ChangeSummary {
+	var out []api.ChangeSummary
+	for _, item := range changes {
+		if item.Branch == branch {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// trailChangeSelectorFor is the <repo>/<number> selector for a change, when
+// both parts have resolved; otherwise it can only be named by its branch.
+func trailChangeSelectorFor(item api.ChangeSummary) (string, bool) {
+	if !validTrailChangeRepoName(item.Repository) || item.Number <= 0 {
+		return "", false
+	}
+	return item.Repository + "/" + strconv.Itoa(item.Number), true
 }
 
 func (c trailChangeChoice) scopeSuffix() string {
@@ -321,10 +333,10 @@ func (c trailChangeChoice) scopeSuffix() string {
 // trailChangeListing is one candidate line: "<repo>/<number> - <title>". A
 // repository whose name has not resolved yet can only be named by its branch.
 func trailChangeListing(item api.ChangeSummary) string {
-	if !validTrailChangeRepoName(item.Repository) || item.Number <= 0 {
+	line, ok := trailChangeSelectorFor(item)
+	if !ok {
 		return "branch " + tuiutil.SanitizeTerminalLabel(item.Branch) + " (repository not resolved yet; select it with --branch)"
 	}
-	line := item.Repository + "/" + strconv.Itoa(item.Number)
 	if title := strings.TrimSpace(tuiutil.SanitizeTerminalLabel(item.Title)); title != "" {
 		return line + " - " + title
 	}
