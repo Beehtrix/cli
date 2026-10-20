@@ -51,28 +51,34 @@ Selectors are project-local numbers or trail ULIDs, or `<repo>/<number>` for one
   Server pagination tokens pass through unchanged. A numeric selector is one
   `GET /{host}/{project}/trails/{number}` (the detail route accepts a
   project-local number); later requests use the returned ULID. JSON preserves counts, groups, jurisdiction, and capabilities.
-- Explicit selectors resolve through Core `/projects/resolve/{host}/{project}`.
-  Branch discovery follows the backing row's parent. Neither falls back to
-  legacy semantics or another cell on failure.
+- Explicit selectors normally resolve through Core `/projects/resolve/{host}/{project}`.
+  Creation and `link` instead use the destination repository's placement and
+  ownership, so repo-only writers need no project inspection. Branch discovery
+  follows the backing row's parent. None falls back to legacy semantics or
+  another cell on failure.
 - Branch operations verify project membership before using repository-local
   IDs for subresource requests. Permission-filtered detail may be incomplete.
 - Project commands retain the standard login and repository-onboarding hints.
   Branch reads refresh the local trails-enablement cache only when their
   repository is known to be this clone; foreign change selectors never do.
   `link` takes a project trail number or ULID, not `<repo>/<number>`.
-- `create --no-branch` scopes intent to the current or explicit `--repo`
-  repository. It routes through repository placement and ownership, without
-  project inspection, and sends `repoIds` plus the verified `project_id`.
-  Repository write access suffices; it grants no project-management authority.
-  `--project` without `--repo` instead creates unscoped intent. Unscoped creation
-  and creation with an initial Change still require project management.
-- Updates require the resource's ETag; a 412 never triggers an unconditional
-  retry. Manager-only create/link print an idempotency key for retries with
-  identical inputs. Repository-scoped `create --no-branch` sends no idempotency
-  header by default and no initial Changes. An explicit `--idempotency-key`
-  retains manager-only idempotent creation; denial never triggers a downgrade.
-  Creation never retries automatically. After an uncertain non-idempotent
-  result, inspect Trails before creating again.
+- `create` first creates a Trail scoped to the current or explicit `--repo`
+  repository (`repoIds` plus verified `project_id`, no initial Changes or
+  idempotency header). It then creates/links a branch-backed Change using the
+  parent's ETag and a Change idempotency key. Both steps support repo writers;
+  creating a Change cannot extend scope without project management.
+  `--no-branch` skips the Change. `--no-branch --project` without `--repo`
+  instead creates unscoped intent, which requires project management.
+- Updates and linking require the resource's ETag; a 412 never triggers an
+  unconditional retry. With a branch, `--idempotency-key` applies only to the
+  Change, not to parent creation. If linking fails, the command reports the
+  created Trail ID and retry key: use `trail link` with that ID and identical
+  repository, branch action, base and creation fields, not `trail create`.
+  A successful link is followed by a fresh parent read for the final output.
+  Neither stage retries automatically or deletes the parent/branch on failure.
+  After an uncertain parent-create result, inspect Trails before creating again.
+  For intent-only creation, an explicit key retains the manager-only idempotent
+  request; the CLI never downgrades a denied request.
 - Local create publishes the branch but never commits, force-pushes, or deletes
   it on failure. `--repo`, `--no-branch`, and `--branch-action create` skip local
   publication. Unlink preserves the branch and its work.

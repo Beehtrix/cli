@@ -14,32 +14,51 @@ import (
 	"github.com/entireio/cli/internal/coreapi"
 )
 
-func createRepositoryScopedProjectTrail(cmd *cobra.Command, request api.ProjectTrailCreateRequest, key string) error {
-	target, repoID, err := resolveRepositoryTrailCreationTarget(cmd)
+func createRepositoryScopedProjectTrail(cmd *cobra.Command, request api.ProjectTrailCreateRequest, change api.ChangeCreateRequest, key string) error {
+	target, repoID, err := resolveRepositoryProjectTrailTarget(cmd)
 	if err != nil {
 		return err
 	}
 	request.RepositoryIDs = []string{repoID}
+	change.RepositoryID = repoID
+	if change.BranchName != "" && change.BranchAction == trailBranchActionLink && trailRepoFlag(cmd) == "" {
+		if err := publishProjectTrailBranch(cmd, change.BranchName); err != nil {
+			return err
+		}
+	}
 	path := target.BasePath + "?" + url.Values{"project_id": {target.ProjectID}}.Encode()
 	var headers http.Header
-	if key != "" {
+	if change.BranchName == "" && key != "" {
 		headers = http.Header{"Idempotency-Key": {projectTrailIdempotencyKey(cmd.ErrOrStderr(), key)}}
 	}
 	var out api.ProjectTrail
-	if _, err := target.Client.ProjectTrailRequest(cmd.Context(), http.MethodPost, path, request, headers, &out); err != nil {
-		if key != "" {
+	etag, err := target.Client.ProjectTrailRequest(cmd.Context(), http.MethodPost, path, request, headers, &out)
+	if err != nil {
+		if headers != nil {
 			return fmt.Errorf("create repository-scoped trail (retry with --idempotency-key %s and the same fields): %w", key, err)
 		}
-		return fmt.Errorf("create repository-scoped trail: %w", err)
+		return fmt.Errorf("create repository-scoped trail (inspect trails before retrying; creation may have succeeded): %w", err)
 	}
 	if err := target.validateResponse(out); err != nil {
 		return err
+	}
+	if change.BranchName != "" {
+		target.TrailID, target.Number = out.ID, out.Number
+		fmt.Fprintf(cmd.ErrOrStderr(), "Created trail #%d (%s); linking branch\n", out.Number, out.ID)
+		key = projectTrailIdempotencyKey(cmd.ErrOrStderr(), key)
+		if _, err := linkProjectTrailChange(cmd.Context(), target, change, etag, key); err != nil {
+			return fmt.Errorf("trail %s was created but branch linking did not complete: %w; do not rerun trail create; use entire trail link %s --branch %q --idempotency-key %q with the same repository, project, branch action, base and creation fields", out.ID, err, out.ID, change.BranchName, key)
+		}
+		out, _, err = target.read(cmd.Context())
+		if err != nil {
+			return fmt.Errorf("trail %s was created and branch linked, but reading the result failed: %w; do not rerun trail create", target.TrailID, err)
+		}
 	}
 	return printProjectTrail(cmd, out)
 }
 
 // Repository access supplies placement and ownership without project inspection.
-func resolveRepositoryTrailCreationTarget(cmd *cobra.Command) (*projectTrailTarget, string, error) {
+func resolveRepositoryProjectTrailTarget(cmd *cobra.Command) (*projectTrailTarget, string, error) {
 	ctx, cancel := context.WithTimeout(cmd.Context(), requiredCellResolveTimeout)
 	defer cancel()
 	forge, owner, repo, err := resolveTrailRepoOrRemote(ctx, trailRepoFlag(cmd))
