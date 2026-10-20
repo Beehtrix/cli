@@ -6,6 +6,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/testutil/gitenv"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/entireio/cli/internal/entireclient/contexts"
@@ -64,6 +65,13 @@ func TestMain(m *testing.M) {
 	// keeps the empty orphan (ENCLI-378). Set process-wide (not per-test) so
 	// it covers spawned binaries and git hooks. Mirrors the e2e TestMains.
 	gitenv.IsolateMain()
+
+	// External agents are discovered by scanning PATH and registered in a
+	// process-wide registry that nothing resets. Tests that enable external
+	// agents extend PATH rather than replace it, so an entire-agent-* on the
+	// developer's PATH would register there and answer every later detection
+	// test. Drop those directories once for the whole package.
+	os.Setenv("PATH", pathWithoutExternalAgents(os.Getenv("PATH")))
 
 	// ENTIRE_TOKEN is isolated by ABSENCE, not by a redirected path, so it is
 	// not in the block above. Left set, it outranks every stored context in
@@ -159,4 +167,17 @@ func TestUnsetEnv(t *testing.T) {
 			t.Fatalf("%s = %q after restore, want still absent", key, v)
 		}
 	})
+}
+
+// pathWithoutExternalAgents returns path without the directories that hold an
+// entire-agent-* executable.
+func pathWithoutExternalAgents(path string) string {
+	var kept []string
+	for _, dir := range filepath.SplitList(path) {
+		if matches, err := filepath.Glob(filepath.Join(dir, "entire-agent-*")); err == nil && len(matches) > 0 {
+			continue
+		}
+		kept = append(kept, dir)
+	}
+	return strings.Join(kept, string(os.PathListSeparator))
 }
