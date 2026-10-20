@@ -2425,7 +2425,9 @@ func (s *ManualCommitStrategy) resolveFilesTouched(ctx context.Context, state *S
 }
 
 // filesTouchedWithLiveTranscript returns FilesTouched together with the files
-// the live transcript modified since the last condensation. FilesTouched holds
+// the live transcript modified since its last checkpointed content
+// (uncheckpointedTranscriptStart: carry-forward resets
+// CheckpointTranscriptStart, and earlier edits are already in a checkpoint). FilesTouched holds
 // only what earlier turn ends recorded for an agent without file-edit hooks,
 // so for a mid-turn session it misses the current turn's edits. Used for a
 // foreign session, whose link rests on overlap alone; the other paths keep
@@ -2433,7 +2435,7 @@ func (s *ManualCommitStrategy) resolveFilesTouched(ctx context.Context, state *S
 func (s *ManualCommitStrategy) filesTouchedWithLiveTranscript(ctx context.Context, state *SessionState) []string {
 	prepareTranscriptForState(ctx, state)
 	files := slices.Clone(state.FilesTouched)
-	for _, f := range s.extractModifiedFilesFromLiveTranscript(ctx, state, state.CheckpointTranscriptStart) {
+	for _, f := range s.extractModifiedFilesFromLiveTranscript(ctx, state, uncheckpointedTranscriptStart(state)) {
 		if !slices.Contains(files, f) {
 			files = append(files, f)
 		}

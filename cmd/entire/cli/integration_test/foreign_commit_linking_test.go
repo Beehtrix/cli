@@ -258,3 +258,29 @@ func TestForeignCommit_SecondTurnDoesNotLinkUnrelatedFile(t *testing.T) {
 
 	require.Empty(t, headCheckpointID(t, env), "an unrelated file stays unlinked in later turns too")
 }
+
+func TestForeignCommit_CarryForwardCheckpointedEditDoesNotLink(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	session := env.NewSession()
+	require.NoError(t, env.SimulateUserPromptSubmitWithTranscriptPath(session.ID, session.TranscriptPath))
+	env.WriteFile("a.txt", "agent a")
+	env.WriteFile("b.txt", "agent b")
+	session.CreateTranscript("Create a.txt and b.txt", []FileChange{{Path: "a.txt", Content: "agent a"}, {Path: "b.txt", Content: "agent b"}})
+	require.NoError(t, env.SimulateStop(session.ID, session.TranscriptPath))
+	// The agent commits a.txt only; b.txt carries forward.
+	env.GitCommitWithHooksAsAgent("commit a.txt", "a.txt")
+	require.NotEmpty(t, headCheckpointID(t, env), "the agent's own commit links")
+
+	require.NoError(t, env.SimulateUserPromptSubmitWithTranscriptPath(session.ID, session.TranscriptPath))
+	env.WriteFile("c.txt", "agent c")
+	session.CreateTranscript("Create c.txt", []FileChange{{Path: "c.txt", Content: "agent c"}})
+	makeOwnerForeign(t, env, session.ID)
+
+	// Someone else edits a.txt, whose agent edit is already in the first
+	// checkpoint, and commits it from outside the agent.
+	env.WriteFile("a.txt", "edited by a person")
+	env.GitCommitWithHooksAsAgent("person edits a.txt", "a.txt")
+
+	require.Empty(t, headCheckpointID(t, env), "an edit already in an earlier checkpoint is no evidence for a later commit")
+}
