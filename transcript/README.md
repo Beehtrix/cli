@@ -22,10 +22,17 @@ One JSON object per line, each line terminated by `\n`.
 | `type` | string | yes | `user` or `assistant`. |
 | `agent` | string | no | The CLI agent registry name (`claude-code`, `codex`, `copilot-cli`, `cursor`, `factoryai-droid`, `opencode`, `pi`, `antigravity`); otherwise the agent type string, e.g. for external agents. An open set. |
 | `cli_version` | string | no | Version of the producer that wrote the line. The name is historical. |
-| `ts` | string | no | RFC 3339 timestamp. May be omitted or empty (codex, gemini and copilot write `""`). The generic JSONL converter copies the source timestamp verbatim, so a non-string value can occur; readers ignore it. |
+| `ts` | string | no | Source timestamp where available, normally RFC 3339. May be omitted or empty when the native transcript has no timestamp. The generic JSONL converter copies source timestamps verbatim, so a non-string value can occur; readers ignore it. |
 | `id` | string | no | Assistant message ID. Streaming fragments with the same ID are merged into one line. |
-| `input_tokens`, `output_tokens` | int | no | Assistant lines only. |
+| `model` | string | no | Assistant lines only; native per-call model when reported. No inference from a session-wide default. |
+| `input_tokens` | int | no | Assistant lines only. Fresh, non-cached input when produced by the new converters. Historical v1 Codex/OpenAI lines may include cached input in this field; readers must not reinterpret stored old lines. |
+| `output_tokens` | int | no | Assistant lines only; includes reasoning tokens when the source reports them as part of output. |
+| `cache_read_tokens`, `cache_write_tokens` | int | no | Assistant lines only; per-call cached input read and total cached input written. Cache counts are separate from fresh `input_tokens`. |
+| `cache_write_5m_tokens`, `cache_write_1h_tokens` | int | no | Assistant lines only; an optional breakdown of `cache_write_tokens`, emitted only when the source reports the split (even when a reported value is zero). Absence means unknown, not zero or all 5m. Do not add the split to the total when summing usage. |
+| `reasoning_tokens` | int | no | Assistant lines only; subset of `output_tokens` when reported by the source, not additional output. |
 | `content` | array of blocks, string, or `null` | yes | Normally an array. A string can appear when an assistant message's source content was a string. `null` can appear because the writer does not omit empty content. |
+
+Usage and model fields are per call, never copied from a session aggregate. Claude Code and Codex native transcripts supply per-call usage/model; other native agents populate only fields their own per-call records actually report. Copilot CLI has only a shutdown aggregate, Cursor is hook-only, and external plugins and Antigravity report usage out of band: their assistant lines do not acquire these optional fields from those sources. A zero omitted by JSON encoding does not assert that the source reported zero. Native timestamps are preserved where present; absence remains empty rather than a fabricated time.
 
 ### Blocks
 
@@ -44,7 +51,7 @@ One JSON object per line, each line terminated by `\n`.
 1. Readers ignore unknown fields, keep unknown block types (available through
    `Block.Raw`), and return lines with an unknown `type` as they are, so
    consumers can skip them.
-2. New fields, block types and line types are additive and optional. `v` stays `1`.
+2. New fields, block types and line types are additive and optional. `v` stays `1`. Old v1 lines without the new usage/model fields remain valid, including lines whose historical `input_tokens` was cache-inclusive; readers cannot distinguish that older meaning from the field alone.
 3. `v` is bumped only for a breaking change.
 
 ## Reading
