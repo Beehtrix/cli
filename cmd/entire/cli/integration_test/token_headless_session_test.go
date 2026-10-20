@@ -75,6 +75,23 @@ func TestTokenScope_HeadlessSessionEndedAfterNoChangeTurn(t *testing.T) {
 				r.commit("c.txt")
 			},
 		},
+		{
+			name: "first turn ran a subagent",
+			run: func(r *tokenTurnRun) {
+				r.start(10, 5, "a.txt")
+				r.stop()
+				r.commit("a.txt", "sub1.txt")
+				r.end()
+				r.start(20, 0) // no files changed
+				r.stop()
+				r.end()
+				r.resume()
+				r.start(30, 0, "c.txt")
+				r.stop()
+				r.checkTotal()
+				r.commit("c.txt") // must not store the subagent's tokens again
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
