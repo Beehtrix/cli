@@ -85,9 +85,11 @@ non-zero when the merge would be refused, so it can gate CI.
 After merging a native trail, the server deletes the trail's branch when the
 repo's delete-branch-on-merge setting is on; your local branch is not touched.
 Pass --delete-branch or --no-delete-branch to override that setting for this
-merge. The server can still keep the branch, for example when another open
-trail is based on it; the output says why. A GitHub-backed trail's branch is
-left to GitHub's own auto-delete setting, so both flags are refused there.`,
+merge. Before deleting the branch, the server moves any open trails based on
+it onto this trail's base. It keeps the branch when one of them cannot be
+moved, or for another reason the output gives. A GitHub-backed trail's
+branch is left to GitHub's own auto-delete setting, so both flags are refused
+there.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Selector = selectorFromArgs(args)
@@ -218,7 +220,7 @@ func runTrailMerge(ctx context.Context, out, errW io.Writer, insecureHTTP bool, 
 		if err != nil {
 			return err
 		}
-		printTrailMergeReadiness(w, found, m, trailMergeBranchPlan(m.DeleteBranchOnMerge, opts.DeleteBranch))
+		printTrailMergeReadiness(w, found, m, trailMergeBranchPlan(m.DeleteBranchOnMerge, opts.DeleteBranch, found.Base))
 
 		gates := trailMergeBlockingGates(m)
 		result := newTrailMergeResultJSON(found, m, gates, opts.DryRun)
@@ -343,34 +345,27 @@ func trailMergeAfterRead(ctx context.Context, w io.Writer, client *api.Client, m
 	return nil
 }
 
-// trailMergeDeleteBranchFlag returns the flag that sets deleteBranch to v.
-func trailMergeDeleteBranchFlag(v bool) string {
-	if v {
-		return "--delete-branch"
-	}
-	return "--no-delete-branch"
-}
-
 // trailMergeBranchPlan returns what the merge will do with the trail's branch,
 // given the repo setting and the flag override, or "" when the server reports
-// no setting (a GitHub-backed trail, or the setting is unknown). The server
-// can still keep a branch it was asked to delete; trailMergeBranchOutcome says
-// why.
-func trailMergeBranchPlan(repoDefault, override *bool) string {
-	switch {
-	case repoDefault == nil:
+// no setting (a GitHub-backed trail, or the setting is unknown). A delete
+// also moves the open trails based on the branch onto base; the readiness
+// read does not say whether there are any. The server can still keep a branch
+// it was asked to delete; trailMergeBranchOutcome says why.
+func trailMergeBranchPlan(repoDefault, override *bool, base string) string {
+	if repoDefault == nil {
 		return ""
-	case override != nil:
-		action := "keep"
-		if *override {
-			action = "delete"
-		}
-		return action + " after merge (" + trailMergeDeleteBranchFlag(*override) + ")"
-	case *repoDefault:
-		return "delete after merge (repo default)"
-	default:
-		return "keep after merge (repo default)"
 	}
+	del, source := *repoDefault, "repo default"
+	if override != nil {
+		del, source = *override, "requested"
+	}
+	if !del {
+		return "keep after merge (" + source + ")"
+	}
+	if base = tuiutil.SanitizeDisplayText(strings.TrimSpace(base)); base == "" {
+		base = "this trail's base"
+	}
+	return "delete after merge (" + source + "); open trails based on it move to " + base
 }
 
 // trailMergeBranchOutcome returns the line saying what the merge did with the
@@ -389,13 +384,13 @@ func trailMergeBranchOutcome(branch string, res *api.TrailMergeResponse) string 
 	case "":
 		return ""
 	case trailBranchKeptNotRequested:
-		why = "--no-delete-branch was passed"
+		why = "the merge was asked to keep it"
 	case trailBranchKeptDisabled:
 		why = "the repo's delete-branch-on-merge setting is off"
 	case trailBranchKeptBase:
 		why = "it is the trail's base"
 	case trailBranchKeptStacked:
-		why = "another open trail is based on it"
+		why = "an open trail based on it could not be moved"
 	case trailBranchKeptClaimed:
 		why = "another trail claims its name"
 	case trailBranchKeptMoved:
@@ -405,7 +400,7 @@ func trailMergeBranchOutcome(branch string, res *api.TrailMergeResponse) string 
 	case trailBranchKeptDefaultBranch:
 		why = "it is the repo's default branch"
 	case trailBranchKeptFailed:
-		why = "deleting it failed"
+		why = "deleting it, or moving the trails based on it, failed"
 	default:
 		why = tuiutil.SanitizeDisplayText(reason)
 	}

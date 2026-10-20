@@ -324,14 +324,15 @@ func TestTrailMerge_ReportsBranchOutcome(t *testing.T) {
 	}{
 		{name: "deleted", body: `"branchDeleted":true`, want: "Deleted branch feature/example\n"},
 		{name: "kept by repo setting", body: `"branchDeleted":false,"branchKeptReason":"disabled"`, want: "Kept branch feature/example: the repo's delete-branch-on-merge setting is off\n"},
-		{name: "kept by flag", args: []string{"--no-delete-branch"}, body: `"branchDeleted":false,"branchKeptReason":"not_requested"`, want: "Kept branch feature/example: --no-delete-branch was passed\n"},
+		{name: "kept by flag", args: []string{"--no-delete-branch"}, body: `"branchDeleted":false,"branchKeptReason":"not_requested"`, want: "Kept branch feature/example: the merge was asked to keep it\n"},
+		{name: "kept by negated delete flag", args: []string{"--delete-branch=false"}, body: `"branchDeleted":false,"branchKeptReason":"not_requested"`, want: "Kept branch feature/example: the merge was asked to keep it\n"},
 		{name: "base", body: `"branchDeleted":false,"branchKeptReason":"base"`, want: "Kept branch feature/example: it is the trail's base\n"},
-		{name: "stacked", body: `"branchDeleted":false,"branchKeptReason":"stacked"`, want: "Kept branch feature/example: another open trail is based on it\n"},
+		{name: "stacked", body: `"branchDeleted":false,"branchKeptReason":"stacked"`, want: "Kept branch feature/example: an open trail based on it could not be moved\n"},
 		{name: "claimed", body: `"branchDeleted":false,"branchKeptReason":"claimed"`, want: "Kept branch feature/example: another trail claims its name\n"},
 		{name: "moved", body: `"branchDeleted":false,"branchKeptReason":"moved"`, want: "Kept branch feature/example: it no longer points at the merged commit\n"},
 		{name: "protected", body: `"branchDeleted":false,"branchKeptReason":"protected"`, want: "Kept branch feature/example: it is protected\n"},
 		{name: "default branch", body: `"branchDeleted":false,"branchKeptReason":"default_branch"`, want: "Kept branch feature/example: it is the repo's default branch\n"},
-		{name: "failed", body: `"branchDeleted":false,"branchKeptReason":"failed"`, want: "Kept branch feature/example: deleting it failed\n"},
+		{name: "failed", body: `"branchDeleted":false,"branchKeptReason":"failed"`, want: "Kept branch feature/example: deleting it, or moving the trails based on it, failed\n"},
 		{name: "unknown reason is shown sanitized", body: `"branchDeleted":false,"branchKeptReason":"new\u001b[2J_reason"`, want: "Kept branch feature/example: new_reason\n"},
 		{
 			name:  "branch name is sanitized",
@@ -396,16 +397,23 @@ func TestTrailMerge_ReadinessShowsBranchPlan(t *testing.T) {
 		name  string
 		edits []func(map[string]any)
 		args  []string
+		trail string
 		want  string
 	}{
-		{name: "repo deletes", edits: []func(map[string]any){withField("delete_branch_on_merge", true)}, want: "Branch:    delete after merge (repo default)"},
-		{name: "repo keeps", edits: []func(map[string]any){withField("delete_branch_on_merge", false)}, want: "Branch:    keep after merge (repo default)"},
-		{name: "flag deletes", edits: []func(map[string]any){withField("delete_branch_on_merge", false)}, args: []string{"--delete-branch"}, want: "Branch:    delete after merge (--delete-branch)"},
-		{name: "flag keeps", edits: []func(map[string]any){withField("delete_branch_on_merge", true)}, args: []string{"--no-delete-branch"}, want: "Branch:    keep after merge (--no-delete-branch)"},
-		{name: "negated keep flag defers", edits: []func(map[string]any){withField("delete_branch_on_merge", true)}, args: []string{"--no-delete-branch=false"}, want: "Branch:    delete after merge (repo default)"},
+		{name: "repo deletes", edits: []func(map[string]any){withField("delete_branch_on_merge", true)}, want: "Branch:    delete after merge (repo default); open trails based on it move to trunk\n"},
+		{name: "repo keeps", edits: []func(map[string]any){withField("delete_branch_on_merge", false)}, want: "Branch:    keep after merge (repo default)\n"},
+		{name: "flag deletes", edits: []func(map[string]any){withField("delete_branch_on_merge", false)}, args: []string{"--delete-branch"}, want: "Branch:    delete after merge (requested); open trails based on it move to trunk\n"},
+		{name: "flag keeps", edits: []func(map[string]any){withField("delete_branch_on_merge", true)}, args: []string{"--no-delete-branch"}, want: "Branch:    keep after merge (requested)\n"},
+		{name: "negated delete flag keeps", edits: []func(map[string]any){withField("delete_branch_on_merge", true)}, args: []string{"--delete-branch=false"}, want: "Branch:    keep after merge (requested)\n"},
+		{name: "negated keep flag defers", edits: []func(map[string]any){withField("delete_branch_on_merge", true)}, args: []string{"--no-delete-branch=false"}, want: "Branch:    delete after merge (repo default); open trails based on it move to trunk\n"},
+		{
+			name: "base is sanitized", edits: []func(map[string]any){withField("delete_branch_on_merge", true)},
+			trail: `{"id":"trail-example","number":7,"status":"open","branch":"feature/example","base":"tru\u001b[2Jnk","title":"Example"}`,
+			want:  "open trails based on it move to trunk\n",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			stub := &trailMergeStub{t: t, lookupBase: trailMergeLookupBase, mergeability: trailMergeability(t, tc.edits...)}
+			stub := &trailMergeStub{t: t, lookupBase: trailMergeLookupBase, trailJSON: tc.trail, mergeability: trailMergeability(t, tc.edits...)}
 			out, err := runTrailMergeTest(t, stub, "et/acme/widget", append([]string{"--dry-run"}, tc.args...)...)
 
 			require.NoError(t, err)
