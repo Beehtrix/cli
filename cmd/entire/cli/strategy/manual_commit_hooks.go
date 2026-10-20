@@ -1052,14 +1052,17 @@ func (h *postCommitActionHandler) searchProbeGate() func() bool {
 
 func (h *postCommitActionHandler) HandleCondense(state *session.State) error {
 	logCtx := logging.WithComponent(h.ctx, "checkpoint")
-	hasLiveTask := idleWithLiveTaskRecord(state, time.Now())
-	shouldCondense := h.shouldCondenseWithOverlapCheck(state.Phase.IsActive(), state.LastInteractionTime, hasLiveTask)
+	now := time.Now()
+	hasLiveTask := idleWithLiveTaskRecord(state, now)
+	liveTaskEvidence := hasFreshLiveTaskRecord(state, now)
+	shouldCondense := h.shouldCondenseWithOverlapCheck(state.Phase.IsActive(), state.LastInteractionTime, hasLiveTask, liveTaskEvidence)
 
 	logging.Debug(logCtx, "post-commit: HandleCondense decision",
 		slog.String("session_id", state.SessionID),
 		slog.String("phase", string(state.Phase)),
 		slog.Bool("has_new", h.hasNew),
 		slog.Bool("idle_with_live_task", hasLiveTask),
+		slog.Bool("live_task_evidence", liveTaskEvidence),
 		slog.Int("task_records", len(state.TaskRecords)),
 		slog.Bool("should_condense", shouldCondense),
 	)
@@ -1079,7 +1082,8 @@ func (h *postCommitActionHandler) HandleCondense(state *session.State) error {
 
 func (h *postCommitActionHandler) HandleCondenseIfFilesTouched(state *session.State) error {
 	logCtx := logging.WithComponent(h.ctx, "checkpoint")
-	shouldCondense := len(state.FilesTouched) > 0 && h.shouldCondenseWithOverlapCheck(state.Phase.IsActive(), state.LastInteractionTime, idleWithLiveTaskRecord(state, time.Now()))
+	now := time.Now()
+	shouldCondense := len(state.FilesTouched) > 0 && h.shouldCondenseWithOverlapCheck(state.Phase.IsActive(), state.LastInteractionTime, idleWithLiveTaskRecord(state, now), hasFreshLiveTaskRecord(state, now))
 
 	logging.Debug(logCtx, "post-commit: HandleCondenseIfFilesTouched decision",
 		slog.String("session_id", state.SessionID),
@@ -1106,11 +1110,13 @@ func (h *postCommitActionHandler) HandleCondenseIfFilesTouched(state *session.St
 // into this commit. Two shapes skip the overlap check: an ACTIVE session with
 // recent interaction, and an IDLE session with a fresh in-flight task record.
 // Both are still subject to the read-only gate — a session with no tracked files while
-// another session claims the committed files is somebody else's commit. Every
+// another session claims the committed files is somebody else's commit, unless
+// a running subagent of the session wrote one of them (liveTaskEvidence; an
+// ACTIVE session counts too, since it keeps working while its subagent runs). Every
 // other session (a stale ACTIVE one, an IDLE one with no fresh in-flight
 // record, an ENDED one) must show file-overlap evidence between its tracked files and the
 // committed files.
-func (h *postCommitActionHandler) shouldCondenseWithOverlapCheck(isActive bool, lastInteraction *time.Time, hasLiveTask bool) bool {
+func (h *postCommitActionHandler) shouldCondenseWithOverlapCheck(isActive bool, lastInteraction *time.Time, hasLiveTask, liveTaskEvidence bool) bool {
 	if !h.hasNew {
 		return false
 	}
@@ -1119,7 +1125,7 @@ func (h *postCommitActionHandler) shouldCondenseWithOverlapCheck(isActive bool, 
 	// LastInteractionTime keeps a stale ACTIVE session (agent killed without a
 	// Stop hook) from condensing into every subsequent commit.
 	if (isActive && isRecentInteraction(lastInteraction)) || hasLiveTask {
-		if h.sessionsWithCommittedFiles > 0 && len(h.filesTouchedBefore) == 0 && !h.liveTaskCoauthored(hasLiveTask) {
+		if h.sessionsWithCommittedFiles > 0 && len(h.filesTouchedBefore) == 0 && !h.liveTaskCoauthored(liveTaskEvidence) {
 			logging.Debug(logging.WithComponent(h.ctx, "checkpoint"), "post-commit: skipping read-only session (no tracked files, other sessions claim committed files)",
 				slog.Bool("is_active", isActive),
 				slog.Int("sessions_with_committed_files", h.sessionsWithCommittedFiles),
@@ -1179,10 +1185,11 @@ func withLiveTaskFetchDeadline(ctx context.Context) context.Context {
 
 // liveTaskCoauthored reports whether a session with a live task record
 // contributed to this commit through a running subagent. The subagent's edits
-// are not in FilesTouched until it completes, so without this an IDLE session
+// are not in FilesTouched until it completes, so without this a session
 // co-authoring a commit that another session also claims looks read-only.
-func (h *postCommitActionHandler) liveTaskCoauthored(hasLiveTask bool) bool {
-	return hasLiveTask && h.liveTaskClaimsCommit != nil && h.liveTaskClaimsCommit()
+// liveTaskEvidence is hasFreshLiveTaskRecord's answer for the session.
+func (h *postCommitActionHandler) liveTaskCoauthored(liveTaskEvidence bool) bool {
+	return liveTaskEvidence && h.liveTaskClaimsCommit != nil && h.liveTaskClaimsCommit()
 }
 
 const (
@@ -1256,7 +1263,17 @@ func isRecentInteraction(lastInteraction *time.Time) bool {
 // shouldCondenseWithOverlapCheck's overlap-check bypass so the trigger and
 // the condensation trust can never drift apart into two different rules.
 func idleWithLiveTaskRecord(state *SessionState, now time.Time) bool {
-	if state.Phase != session.PhaseIdle {
+	return state.Phase == session.PhaseIdle && hasFreshLiveTaskRecord(state, now)
+}
+
+// hasFreshLiveTaskRecord reports whether a session that has not ENDED has a
+// task record in flight that started within activeSessionInteractionThreshold.
+// It decides only whether a running subagent's edits are evidence for a
+// commit, never whether to skip the overlap check (idleWithLiveTaskRecord):
+// an ACTIVE session keeps working while its background subagent runs, so the
+// evidence applies in either phase.
+func hasFreshLiveTaskRecord(state *SessionState, now time.Time) bool {
+	if state.Phase == session.PhaseEnded {
 		return false
 	}
 	for _, task := range state.LiveTaskRecords() {

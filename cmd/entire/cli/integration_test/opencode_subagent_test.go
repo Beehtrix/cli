@@ -409,3 +409,48 @@ func TestOpenCodeSubagentRunningChildCoauthorsCommit(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(summaryContent), &summary))
 	require.Len(t, summary.Sessions, 2, "the parent co-authored the commit through its running child")
 }
+
+// The parent is still in its turn (ACTIVE) when the commit lands, as it is
+// while it keeps working after launching the background child.
+func TestOpenCodeSubagentRunningChildCoauthorsCommit_ActiveParent(t *testing.T) {
+	t.Parallel()
+
+	env := NewFeatureBranchEnv(t)
+	env.InitEntireWithAgent(agent.AgentNameOpenCode)
+	const shared = "docs/shared.md"
+
+	coder := env.NewOpenCodeSession()
+	require.NoError(t, env.SimulateOpenCodeSessionStart(coder.ID, coder.TranscriptPath))
+	require.NoError(t, env.SimulateOpenCodeTurnStart(coder.ID, coder.TranscriptPath, "create docs/shared.md"))
+	env.WriteFile(shared, "first draft\n")
+	coder.CreateOpenCodeTranscript("create docs/shared.md", []FileChange{{Path: shared, Content: "first draft\n"}})
+	require.NoError(t, env.SimulateOpenCodeTurnEnd(coder.ID, coder.TranscriptPath))
+
+	parent := env.NewOpenCodeSession()
+	child := env.NewOpenCodeSession()
+	// A live record counts only while fresh, so the call starts now.
+	child.TimeBase = time.Now().UnixMilli()
+	require.NoError(t, env.SimulateOpenCodeSessionStart(parent.ID, parent.TranscriptPath))
+	require.NoError(t, env.SimulateOpenCodeTurnStart(parent.ID, parent.TranscriptPath, "polish docs/shared.md in the background"))
+	require.NoError(t, env.SimulateOpenCodeSubagentStartAt(parent.ID, "call_polish", child.ID, "general", "Polish docs/shared.md", child.TimeBase))
+	// Mid-turn: no TurnEnd, so the parent's live export is what OpenCode would
+	// return at commit time.
+	env.CopyTranscriptToEntireTmp(parent.ID, parent.CreateOpenCodeTranscript("polish docs/shared.md in the background", nil))
+
+	// The child, still running, edits the shared file; its export names it.
+	env.WriteFile(shared, "polished\n")
+	env.CopyTranscriptToEntireTmp(child.ID, child.CreateOpenCodeTranscript("Polish docs/shared.md", []FileChange{{Path: shared, Content: "polished\n"}}))
+
+	state, err := env.GetSessionState(parent.ID)
+	require.NoError(t, err)
+	require.Empty(t, state.FilesTouched, "the parent has no files of its own before the child completes")
+
+	env.GitCommitWithHooks("Polish shared doc", shared)
+	cpID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
+	require.NotEmpty(t, cpID)
+	summaryContent, found := env.ReadFileFromBranch(paths.MetadataBranchName, CheckpointSummaryPath(cpID))
+	require.True(t, found)
+	var summary checkpoint.CheckpointSummary
+	require.NoError(t, json.Unmarshal([]byte(summaryContent), &summary))
+	require.Len(t, summary.Sessions, 2, "the parent co-authored the commit through its running child")
+}

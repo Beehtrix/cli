@@ -560,8 +560,9 @@ commit's condensation stores each record's transcript-so-far under the
 checkpoint's `tasks/` subtree (where one is on disk; an agent whose live
 transcript needs a re-export, OpenCode, gets it once the task completes), so
 no separate commit-time capture is needed. When another session also claims
-the committed files and the IDLE session has none of its own, it condenses
-only if a live record modified a committed file (`liveTaskFilesInCommit`):
+the committed files and the session (IDLE, or ACTIVE while its background
+subagent runs) has none of its own, it condenses only if a live record
+modified a committed file (`liveTaskFilesInCommit`):
 per the transcript on disk, or, for an agent with none yet, its own report
 (`agent.LiveSubagentFileReporter`) within a 10s share of the commit's
 subagent fetch budget. The check reads the whole running call, so while it

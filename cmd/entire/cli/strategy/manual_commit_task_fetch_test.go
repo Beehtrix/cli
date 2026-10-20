@@ -240,3 +240,34 @@ func TestCommitFetchBudgets_CoauthorshipGetsAShare(t *testing.T) {
 	require.WithinDuration(t, now.Add(liveTaskFetchBudget), ag.deadlines[0], time.Second)
 	require.Less(t, liveTaskFetchBudget, agent.SubagentFetchBudget)
 }
+
+func TestHasFreshLiveTaskRecord_AnyPhaseButEnded(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	live := []session.TaskRecord{{ToolUseID: "call_live", StartedAt: now.Add(-time.Minute)}}
+	stale := []session.TaskRecord{{ToolUseID: "call_stale", StartedAt: now.Add(-25 * time.Hour)}}
+	done := []session.TaskRecord{{ToolUseID: "call_done", StartedAt: now.Add(-time.Minute), CompletedAt: now}}
+
+	tests := []struct {
+		name    string
+		phase   session.Phase
+		records []session.TaskRecord
+		want    bool
+	}{
+		{"active", session.PhaseActive, live, true},
+		{"idle", session.PhaseIdle, live, true},
+		{"ended", session.PhaseEnded, live, false},
+		{"started over a day ago", session.PhaseActive, stale, false},
+		{"completed", session.PhaseActive, done, false},
+		{"no records", session.PhaseActive, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			state := &SessionState{SessionID: "s", Phase: tt.phase, TaskRecords: tt.records}
+			require.Equal(t, tt.want, hasFreshLiveTaskRecord(state, now))
+			require.Equal(t, tt.want && tt.phase == session.PhaseIdle, idleWithLiveTaskRecord(state, now),
+				"the overlap-check bypass stays IDLE-only")
+		})
+	}
+}
