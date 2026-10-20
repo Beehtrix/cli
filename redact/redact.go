@@ -702,6 +702,7 @@ func detectCredentialValues(s string) []taggedRegion {
 			regions = append(regions, taggedRegion{region: region{start, end}})
 		}
 	}
+	regions = append(regions, detectAuthorizationHeaders(s)...)
 	if strings.Contains(s, "sig=") {
 		for _, loc := range sasSignaturePattern.FindAllStringSubmatchIndex(s, -1) {
 			regions = append(regions, taggedRegion{region: region{loc[2], loc[3]}})
