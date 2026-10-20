@@ -76,6 +76,21 @@ func TestTokenScope_HeadlessSessionEndedAfterNoChangeTurn(t *testing.T) {
 			},
 		},
 		{
+			// Before any checkpoint the offsets are still 0, so only the
+			// pending tokens keep the ended state.
+			name: "first turn changes nothing",
+			run: func(r *tokenTurnRun) {
+				r.start(20, 0) // no files changed
+				r.stop()
+				r.end()
+				r.resume()
+				r.start(30, 0, "c.txt")
+				r.stop()
+				r.checkTotal()
+				r.commit("c.txt")
+			},
+		},
+		{
 			name: "first turn ran a subagent",
 			run: func(r *tokenTurnRun) {
 				r.start(10, 5, "a.txt")

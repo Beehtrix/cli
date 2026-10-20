@@ -313,8 +313,14 @@ func TestManualCommit_ListAllSessionStates_CleansUpStaleSessions(t *testing.T) {
 		SessionID: "ended-with-offsets", BaseCommit: "ggg7779", StartedAt: now.Add(-2 * time.Hour), Phase: "ended",
 		CheckpointTranscriptStart: 12,
 	}
-	// A condensation that could not read the transcript leaves the offsets at 0
-	// but still re-baselines subagent tokens it stored.
+	// A condensation that could not read the transcript resets the transcript
+	// window to 0 (AdvanceCheckpointWindow(0)) and keeps the token offset.
+	endedWithTokenOffset := &SessionState{
+		SessionID: "ended-with-token-offset", BaseCommit: "ggg7782", StartedAt: now.Add(-2 * time.Hour), Phase: "ended",
+		CheckpointTranscriptStart: 0,
+	}
+	endedWithTokenOffset.SetTokenStart(12)
+	// The same condensation still re-baselines subagent tokens it stored.
 	endedWithSubagentBaseline := &SessionState{
 		SessionID: "ended-with-subagent-baseline", BaseCommit: "ggg7781", StartedAt: now.Add(-2 * time.Hour), Phase: "ended",
 		SubagentTokensBaseline: &agent.TokenUsage{OutputTokens: 4},
@@ -328,9 +334,9 @@ func TestManualCommit_ListAllSessionStates_CleansUpStaleSessions(t *testing.T) {
 	}
 
 	fixtures := []*SessionState{legacyEmpty, idleUnknownOwner, idleDeadOwner, staleEnded, idleWithEndedAt, endedWithSteps, activeNoShadow, condensedIdle, recordEnded,
-		endedWithTokens, endedWithSubagentTokens, endedWithOffsets, endedWithSubagentBaseline, endedWithZeroTokens}
+		endedWithTokens, endedWithSubagentTokens, endedWithOffsets, endedWithTokenOffset, endedWithSubagentBaseline, endedWithZeroTokens}
 	wantKept := []string{"active-no-shadow", "condensed-idle", "ended-with-steps", "record-ended", "idle-dead-owner", "idle-unknown-owner", "legacy-empty-phase",
-		"ended-with-tokens", "ended-with-subagent-tokens", "ended-with-offsets", "ended-with-subagent-baseline"}
+		"ended-with-tokens", "ended-with-subagent-tokens", "ended-with-offsets", "ended-with-token-offset", "ended-with-subagent-baseline"}
 	for _, state := range fixtures {
 		if err := s.saveSessionState(context.Background(), state); err != nil {
 			t.Fatalf("saveSessionState(%s) error = %v", state.SessionID, err)
