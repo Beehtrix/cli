@@ -168,6 +168,30 @@ func TestDetectAuthorizationHeaders_Boundary(t *testing.T) {
 	}
 }
 
+// TestDetectAuthorizationHeaders_WholeCredential checks the layer directly
+// that a credential containing token68 punctuation is matched whole: through
+// String, betterleaks or the entropy layer may cover the tail and hide a
+// credential cut short.
+func TestDetectAuthorizationHeaders_WholeCredential(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, input, want string
+	}{
+		{"underscore after a short prefix", "Authorization: Bearer ab12_" + authUUIDToken, "ab12_" + authUUIDToken},
+		{"raw key without a scheme", "Authorization: " + authLinearKey + "\n", authLinearKey},
+		{"base64url JWT-style segments", "Authorization: Bearer eyJ0_x-Y.c2Vj_cmV0.c2ln_bmF0dXJl", "eyJ0_x-Y.c2Vj_cmV0.c2ln_bmF0dXJl"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			regions := detectAuthorizationHeaders(tc.input)
+			if len(regions) != 1 || tc.input[regions[0].start:regions[0].end] != tc.want {
+				t.Fatalf("detectAuthorizationHeaders(%q) = %v, want exactly %q", tc.input, regions, tc.want)
+			}
+		})
+	}
+}
+
 func TestContainsFoldASCII(t *testing.T) {
 	t.Parallel()
 

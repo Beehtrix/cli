@@ -39,7 +39,7 @@ var authorizationHeaderPattern = regexp.MustCompile(
 		// optional opening quote of the value, with a Python string prefix
 		`(?:[frbu]{0,2}\\?` + authQuote + `[ \t]*)?` +
 		`(?:([a-z][a-z0-9-]*)[ \t]+)?` +
-		`([A-Za-z0-9._~+/-]{16,}=*)`)
+		`([A-Za-z0-9_.~+/-]{16,}=*)`)
 
 // authSchemes are the schemes whose credential is redacted wherever it ends.
 // Any other scheme, or a credential with no scheme at all (Linear's raw
