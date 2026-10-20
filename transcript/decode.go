@@ -34,8 +34,8 @@ type wireLine struct {
 	TS                 json.RawMessage `json:"ts"`
 	ID                 string          `json:"id"`
 	Model              string          `json:"model"`
-	InputTokens        int             `json:"input_tokens"`
-	OutputTokens       int             `json:"output_tokens"`
+	InputTokens        int64           `json:"input_tokens"`
+	OutputTokens       int64           `json:"output_tokens"`
 	CacheReadTokens    int64           `json:"cache_read_tokens"`
 	CacheWriteTokens   int64           `json:"cache_write_tokens"`
 	CacheWrite5mTokens *int64          `json:"cache_write_5m_tokens"`

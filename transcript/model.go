@@ -24,8 +24,8 @@ type Line struct {
 	Timestamp          string
 	ID                 string
 	Model              string
-	InputTokens        int
-	OutputTokens       int
+	InputTokens        int64
+	OutputTokens       int64
 	CacheReadTokens    int64
 	CacheWriteTokens   int64
 	CacheWrite5mTokens *int64 // nil means the split is unknown

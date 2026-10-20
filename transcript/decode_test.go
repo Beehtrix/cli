@@ -195,6 +195,8 @@ func TestDecode_SkippedLines(t *testing.T) {
 		{"wrong-typed cache write 5m", `{"v":1,"type":"assistant","cache_write_5m_tokens":{}}`, "invalid field: cache_write_5m_tokens"},
 		{"wrong-typed cache write 1h", `{"v":1,"type":"assistant","cache_write_1h_tokens":[]}`, "invalid field: cache_write_1h_tokens"},
 		{"wrong-typed reasoning", `{"v":1,"type":"assistant","reasoning_tokens":1.5}`, "invalid field: reasoning_tokens"},
+		{"overflowing input", `{"v":1,"type":"assistant","input_tokens":9223372036854775808}`, "invalid field: input_tokens"},
+		{"overflowing output", `{"v":1,"type":"assistant","output_tokens":9223372036854775808}`, "invalid field: output_tokens"},
 		{"overflowing cache read", `{"v":1,"type":"assistant","cache_read_tokens":9223372036854775808}`, "invalid field: cache_read_tokens"},
 	}
 
@@ -359,6 +361,33 @@ func TestDecode_OptionalUsageRoundTrip(t *testing.T) {
 			lines, err := Decode(encoded)
 			require.NoError(t, err)
 			assert.Equal(t, []Line{tc.want}, lines)
+		})
+	}
+}
+
+func TestDecode_Int64TokenCounts(t *testing.T) {
+	t.Parallel()
+
+	input, output := int64(3000000001), int64(3000000002)
+	version, lineType := 1, TypeAssistant
+	tests := []struct {
+		name string
+		line any
+	}{
+		{"compact", transcriptLine{V: version, Type: lineType, InputTokens: input, OutputTokens: output, CacheReadTokens: 3}},
+		{"wire", wireLine{V: &version, Type: &lineType, InputTokens: input, OutputTokens: output, CacheReadTokens: 3}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			encoded, err := json.Marshal(tc.line)
+			require.NoError(t, err)
+			lines, err := Decode(encoded)
+			require.NoError(t, err)
+			require.Equal(t, []Line{{Version: 1, Type: TypeAssistant, InputTokens: input, OutputTokens: output, CacheReadTokens: 3}}, lines)
+			total := lines[0].InputTokens + lines[0].OutputTokens + lines[0].CacheReadTokens
+			assert.Equal(t, int64(6000000006), total)
 		})
 	}
 }

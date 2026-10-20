@@ -209,7 +209,7 @@ func copilotAssistantLine(base transcriptLine, line copilotLine) *transcriptLine
 	out.Type = TypeAssistant
 	out.TS = ts
 	out.ID = data.MessageID
-	out.OutputTokens = data.OutputTokens
+	out.OutputTokens = int64(data.OutputTokens)
 	out.Content = contentJSON
 	return &out
 }
