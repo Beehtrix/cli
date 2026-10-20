@@ -1797,7 +1797,8 @@ branch. Without one, the trail for the current branch is used. The trail's branc
 is checked out, fetching it from origin first when it only exists there.`, `The trail may be given as the first argument or via --trail, as a project number,
 ID, or <repo>/<number>. Without one, the current branch's parent is used. --branch selects the
 working branch; otherwise the current branch or sole branch in this repository
-is selected. Ambiguity requires --branch. Remote-only branches are fetched.`) + `
+is selected. Otherwise the open changes are listed; pass one as <repo>/<number>.
+Remote-only branches are fetched.`) + `
 
 With --worktree, the branch is checked out into a git worktree under
 .entire/worktrees at the repo root instead of switching this checkout, and the
