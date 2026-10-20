@@ -102,21 +102,66 @@ func TestPrepareReviewAgentConfigNoConfig(t *testing.T) {
 	}
 }
 
-// A symlinked skill is refused rather than followed.
-func TestPrepareReviewAgentConfigRefusesSymlinkedSkill(t *testing.T) {
-	dir := newReviewConfigRepo(t, map[string]string{"elsewhere.md": "x"})
-	if err := os.MkdirAll(filepath.Join(dir, ".claude", "skills"), 0o750); err != nil {
+// A symlinked skills dir is skipped, not followed: the trust gate lists it as
+// not inspected, so the review runs without it instead of failing.
+func TestPrepareReviewAgentConfigSkipsSymlinkedSkillsDir(t *testing.T) {
+	dir := newReviewConfigRepo(t, map[string]string{".agents/skills/review/SKILL.md": "---\nname: review\ndescription: d\n---\nReview."})
+	if err := os.MkdirAll(filepath.Join(dir, ".claude"), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("../../elsewhere.md", filepath.Join(dir, ".claude", "skills", "link.md")); err != nil {
+	if err := os.Symlink("../.agents/skills", filepath.Join(dir, ".claude", "skills")); err != nil {
 		t.Fatal(err)
 	}
-	testutil.GitAdd(t, dir, ".claude/skills/link.md")
+	testutil.GitAdd(t, dir, ".claude/skills")
 	testutil.GitCommit(t, dir, "symlink")
 
-	_, _, err := prepareReviewAgentConfig(t.Context(), reviewtypes.RunConfig{AgentConfig: &reviewtypes.AgentConfig{}})
-	if err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("err = %v, want a symlink refusal", err)
+	got, cleanup, err := prepareReviewAgentConfig(t.Context(), reviewtypes.RunConfig{Skills: []string{"/review"}, AgentConfig: &reviewtypes.AgentConfig{}})
+	if err != nil {
+		t.Fatalf("a symlinked skills dir must not fail the review: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if slices.Contains(got.ExtraArgs, "--plugin-dir") {
+		t.Errorf("nothing was copied, yet a plugin is loaded: %v", got.ExtraArgs)
+	}
+	if !slices.Equal(got.Skills, []string{"/review"}) {
+		t.Errorf("Skills = %v, want the skipped skill left as is", got.Skills)
+	}
+}
+
+// A symlinked skill or a submodule beside regular skills is skipped; the
+// regular ones load, and only they are namespaced.
+func TestPrepareReviewAgentConfigSkipsSymlinkAndSubmoduleEntries(t *testing.T) {
+	dir := newReviewConfigRepo(t, map[string]string{
+		"elsewhere/SKILL.md":           "x",
+		".claude/skills/kept/SKILL.md": "---\nname: kept\ndescription: d\n---\nKept.",
+	})
+	if err := os.Symlink("../../elsewhere", filepath.Join(dir, ".claude", "skills", "linked")); err != nil {
+		t.Fatal(err)
+	}
+	testutil.GitAdd(t, dir, ".claude/skills/linked")
+	head := strings.TrimSpace(testutil.RunGit(t, dir, "rev-parse", "HEAD"))
+	testutil.RunGit(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+head+",.claude/skills/sub")
+	testutil.GitCommit(t, dir, "symlink and submodule")
+
+	got, cleanup, err := prepareReviewAgentConfig(t.Context(), reviewtypes.RunConfig{
+		Skills:      []string{"/kept", "/linked", "/sub"},
+		AgentConfig: &reviewtypes.AgentConfig{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cleanup)
+	pluginDir := argAfter(got.ExtraArgs, "--plugin-dir")
+	if _, err := os.Stat(filepath.Join(pluginDir, "skills", "kept", "SKILL.md")); err != nil {
+		t.Errorf("regular skill not copied: %v", err)
+	}
+	for _, name := range []string{"linked", "sub"} {
+		if _, err := os.Lstat(filepath.Join(pluginDir, "skills", name)); !os.IsNotExist(err) {
+			t.Errorf("skipped entry %s is in the plugin (%v)", name, err)
+		}
+	}
+	if !slices.Equal(got.Skills, []string{"/project:kept", "/linked", "/sub"}) {
+		t.Errorf("Skills = %v, want only the copied skill namespaced", got.Skills)
 	}
 }
 

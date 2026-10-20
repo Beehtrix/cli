@@ -2,6 +2,7 @@ package codex
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -22,6 +23,7 @@ func TestPrepareCodexReviewConfigLinkedWorktree(t *testing.T) {
 	testutil.GitCommit(t, main, "init")
 	wt := filepath.Join(t.TempDir(), "wt")
 	testutil.RunGit(t, main, "worktree", "add", "-q", "-b", "review", wt)
+	t.Setenv("CODEX_HOME", t.TempDir())
 	t.Chdir(wt)
 	paths.ClearWorktreeRootCache()
 	t.Cleanup(paths.ClearWorktreeRootCache)
@@ -49,15 +51,25 @@ func TestPrepareCodexReviewConfigLinkedWorktree(t *testing.T) {
 	}
 }
 
-func TestPrepareCodexReviewConfigRefusesUnsupported(t *testing.T) {
+// codexReviewRepo chdirs into a fresh repo with an isolated, empty Codex home,
+// and returns that home.
+func codexReviewRepo(t *testing.T) string {
+	t.Helper()
 	dir := t.TempDir()
 	testutil.InitRepo(t, dir)
 	testutil.WriteFile(t, dir, "README.md", "x")
 	testutil.GitAdd(t, dir, "README.md")
 	testutil.GitCommit(t, dir, "init")
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
 	t.Chdir(dir)
 	paths.ClearWorktreeRootCache()
 	t.Cleanup(paths.ClearWorktreeRootCache)
+	return home
+}
+
+func TestPrepareCodexReviewConfigRefusesUnsupported(t *testing.T) {
+	codexReviewRepo(t)
 
 	for name, cfg := range map[string]reviewtypes.AgentConfig{
 		"hooks via settings": {Settings: json.RawMessage(`{"hooks":{}}`)},
@@ -67,6 +79,54 @@ func TestPrepareCodexReviewConfigRefusesUnsupported(t *testing.T) {
 		if _, _, err := prepareCodexReviewConfig(t.Context(), reviewtypes.RunConfig{AgentConfig: &c}); err == nil {
 			t.Errorf("%s: want an error", name)
 		}
+	}
+}
+
+// Codex merges -c flags into the user's config table by table, so a profile
+// MCP server named like one in ~/.codex/config.toml would run as a mix of the
+// two. That name is refused; other names, and a profile without MCP servers,
+// are not affected.
+func TestPrepareCodexReviewConfigRefusesUserMCPServerName(t *testing.T) {
+	docs := map[string]json.RawMessage{"docs": json.RawMessage(`{"command":"/opt/mcp/docs"}`)}
+	other := map[string]json.RawMessage{"other": json.RawMessage(`{"command":"/opt/mcp/other"}`)}
+	userConfig := "[mcp_servers.docs]\nurl = \"https://mcp.example\"\nbearer_token_env_var = \"DOCS_TOKEN\"\n"
+	for _, tc := range []struct {
+		name    string
+		config  string // "" writes no config.toml
+		link    bool   // config.toml is a symlink to the file
+		servers map[string]json.RawMessage
+		wantErr string
+	}{
+		{name: "same name", config: userConfig, servers: docs, wantErr: `MCP server "docs" is also defined in`},
+		{name: "same name through a symlinked config", config: userConfig, link: true, servers: docs, wantErr: `MCP server "docs" is also defined in`},
+		{name: "other name", config: userConfig, servers: other},
+		{name: "no user config", servers: docs},
+		{name: "unparseable config", config: "[mcp_servers.docs\n", servers: docs, wantErr: "parse"},
+		{name: "oversized config", config: "# " + strings.Repeat("x", maxHooksFileBytes) + "\n", servers: docs, wantErr: "too large"},
+		{name: "no profile servers never reads the config", config: "[mcp_servers.docs\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := codexReviewRepo(t)
+			if tc.config != "" {
+				target := filepath.Join(home, "config.toml")
+				if tc.link {
+					target = filepath.Join(t.TempDir(), "dotfiles.toml")
+					if err := os.Symlink(target, filepath.Join(home, "config.toml")); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.WriteFile(target, []byte(tc.config), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _, err := prepareCodexReviewConfig(t.Context(), reviewtypes.RunConfig{AgentConfig: &reviewtypes.AgentConfig{MCPServers: tc.servers}})
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("err = %v, want one containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 

@@ -3,9 +3,14 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"slices"
 	"strings"
+
+	"github.com/pelletier/go-toml/v2"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/review"
@@ -38,6 +43,9 @@ func prepareCodexReviewConfig(ctx context.Context, cfg reviewtypes.RunConfig) (r
 		roots = append(roots, mainRoot)
 	}
 	cfg.ExtraArgs = append(cfg.ExtraArgs, "-c", untrustedProjectOverride(roots))
+	if err := refuseUserMCPServerClash(cfg.AgentConfig.MCPServers); err != nil {
+		return cfg, nil, err
+	}
 	servers, err := codexMCPOverrides(cfg.AgentConfig.MCPServers)
 	if err != nil {
 		return cfg, nil, err
@@ -117,6 +125,55 @@ func codexMCPOverrides(servers map[string]json.RawMessage) ([]string, error) {
 		}
 	}
 	return args, nil
+}
+
+// refuseUserMCPServerClash refuses a profile MCP server whose name the user's
+// Codex config.toml (CODEX_HOME or ~/.codex) already defines. Codex merges the
+// -c session flags into that config table by table, so the server that ran
+// would keep the user's env, headers, args or url alongside the profile's. A
+// config that can't be read or parsed is refused too: Codex would not start
+// on it, and a clash can't be ruled out. Only the user's config is checked;
+// the reviewed checkout's project config is untrusted for the run.
+func refuseUserMCPServerClash(servers map[string]json.RawMessage) error {
+	if len(servers) == 0 {
+		return nil
+	}
+	configPath := codexConfigPath()
+	if configPath == "" {
+		return errors.New("MCP servers in a Codex review profile: the Codex home can't be resolved to check config.toml for servers of the same name")
+	}
+	file, err := os.Open(configPath) //nolint:gosec // path resolved from CODEX_HOME or HOME
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("MCP servers in a Codex review profile: read %s: %w", configPath, err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxHooksFileBytes+1))
+	if err != nil {
+		return fmt.Errorf("MCP servers in a Codex review profile: read %s: %w", configPath, err)
+	}
+	if len(data) > maxHooksFileBytes {
+		return fmt.Errorf("MCP servers in a Codex review profile: %s is over %d bytes, too large to check for servers of the same name", configPath, maxHooksFileBytes)
+	}
+	var config struct {
+		MCPServers map[string]any `toml:"mcp_servers"`
+	}
+	if err := toml.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("MCP servers in a Codex review profile: parse %s: %w", configPath, err)
+	}
+	names := make([]string, 0, len(servers))
+	for name := range servers {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		if _, ok := config.MCPServers[name]; ok {
+			return fmt.Errorf("MCP server %q is also defined in %s; Codex would merge the two, so rename it in the review profile", name, configPath)
+		}
+	}
+	return nil
 }
 
 // entireHookOverrides returns -c overrides that register Entire's managed

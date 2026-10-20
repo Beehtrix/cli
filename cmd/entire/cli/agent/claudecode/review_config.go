@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
+	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/review"
 	reviewtypes "github.com/entireio/cli/cmd/entire/cli/review/types"
 )
@@ -59,21 +61,24 @@ func prepareReviewAgentConfig(ctx context.Context, cfg reviewtypes.RunConfig) (r
 	}
 	cfg.ExtraArgs = append(cfg.ExtraArgs, flagSettingSources, "user", "--settings", settingsPath, "--strict-mcp-config", "--mcp-config", mcpPath)
 
-	copied, err := run.CopyCheckoutTree(ctx, map[string]string{
+	copied, skipped, err := run.CopyCheckoutTree(ctx, map[string]string{
 		".claude/skills":   "claude/plugin/skills",
 		".claude/commands": "claude/plugin/commands",
 	})
 	if err != nil {
 		return fail(fmt.Errorf("load the checkout's skills: %w", err))
 	}
-	if copied > 0 {
+	for _, name := range skipped {
+		logging.Warn(ctx, "review: a symlink or submodule among the checkout's skills is not loaded", slog.String("path", name))
+	}
+	if len(copied) > 0 {
 		manifest := fmt.Sprintf(`{"name":%q,"version":"0.0.0","description":"Skills and commands from the reviewed checkout"}`, reviewPluginName)
 		manifestPath, err := run.WriteFile("claude/plugin/.claude-plugin/plugin.json", []byte(manifest))
 		if err != nil {
 			return fail(err)
 		}
 		cfg.ExtraArgs = append(cfg.ExtraArgs, "--plugin-dir", filepath.Dir(filepath.Dir(manifestPath)))
-		cfg.Skills = namespaceProjectSkills(ctx, run, cfg.Skills)
+		cfg.Skills = namespaceProjectSkills(copied, cfg.Skills)
 	}
 	return cfg, run.Cleanup, nil
 }
@@ -122,13 +127,16 @@ func reviewProfileSettings(profile json.RawMessage) ([]byte, error) {
 }
 
 // namespaceProjectSkills rewrites "/name" to "/project:name" for skills and
-// commands that came from the checkout, since plugin skills are invoked with
-// the plugin's prefix.
-func namespaceProjectSkills(ctx context.Context, run *review.AgentConfigRun, skills []string) []string {
+// commands copied from the checkout (copied holds their checkout paths), since
+// plugin skills are invoked with the plugin's prefix.
+func namespaceProjectSkills(copied, skills []string) []string {
 	names := map[string]bool{}
-	for _, dir := range []string{".claude/skills", ".claude/commands"} {
-		for _, name := range run.TreeEntryNames(ctx, dir) {
-			names[strings.TrimSuffix(name, ".md")] = true
+	for _, name := range copied {
+		for _, dir := range []string{".claude/skills/", ".claude/commands/"} {
+			if rel, ok := strings.CutPrefix(name, dir); ok {
+				first, _, _ := strings.Cut(rel, "/")
+				names[strings.TrimSuffix(first, ".md")] = true
+			}
 		}
 	}
 	out := make([]string, 0, len(skills))

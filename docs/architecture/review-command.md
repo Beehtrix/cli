@@ -168,8 +168,8 @@ own config with nothing extra, or load a JSON file) or
 
 | Agent | Checkout config dropped | Profile config applied | Still loaded from the checkout |
 |---|---|---|---|
-| Claude Code | `--setting-sources user`, `--strict-mcp-config` | `settings` (with Entire's tracking hooks added) via `--settings`; `mcp_servers` via `--mcp-config` | CLAUDE.md; `.claude/skills` and `.claude/commands`, copied from the committed tree as the `project` plugin (`/review` becomes `/project:review`) |
-| Codex | checkout and main repo marked untrusted for the run (project config, hooks, rules) | `mcp_servers` via `-c` (`command`, `args`, `url` and `default_tools_approval_mode`; other fields and literal `env` values are refused); Entire's tracking hooks via `-c` with `--dangerously-bypass-hook-trust`, which also runs the user's own untrusted hooks | AGENTS.md; skills |
+| Claude Code | `--setting-sources user`, `--strict-mcp-config` | `settings` (with Entire's tracking hooks added) via `--settings`; `mcp_servers` via `--mcp-config` | CLAUDE.md; `.claude/skills` and `.claude/commands`, copied from the committed tree as the `project` plugin (`/review` becomes `/project:review`); symlinks and submodules there are skipped, not followed (the trust gate lists them as not inspected) |
+| Codex | checkout and main repo marked untrusted for the run (project config, hooks, rules) | `mcp_servers` via `-c` (`command`, `args`, `url` and `default_tools_approval_mode`; other fields and literal `env` values are refused, and so is a server name the user's `~/.codex/config.toml` already defines, since Codex would merge the two); Entire's tracking hooks via `-c` with `--dangerously-bypass-hook-trust`, which also runs the user's own untrusted hooks | AGENTS.md; skills |
 | Pi | `--no-extensions` | `extensions` via `--extension`, plus Entire's own | AGENTS.md/CLAUDE.md, skills, prompt templates, `.pi/settings.json` |
 
 Rules:

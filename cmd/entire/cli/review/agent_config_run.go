@@ -86,15 +86,15 @@ func (r *AgentConfigRun) Cleanup() {
 
 // CopyCheckoutTree copies the regular files under each dir of the checkout's
 // HEAD commit into the run dir at dest/<path relative to dir>. It reads the
-// committed tree, so the copy matches what the trust gate inspected, and it
-// refuses symlinks and submodules rather than following them. It reports how
-// many files it copied.
-func (r *AgentConfigRun) CopyCheckoutTree(ctx context.Context, dirs map[string]string) (int, error) {
-	copied := 0
+// committed tree, so the copy matches what the trust gate inspected. Symlinks
+// and submodules are skipped, never followed: the gate lists them as not
+// inspected, and the review runs without them. It returns the checkout paths
+// it copied and the ones it skipped.
+func (r *AgentConfigRun) CopyCheckoutTree(ctx context.Context, dirs map[string]string) (copied, skipped []string, err error) {
 	for src, dest := range dirs {
 		out, err := gitexec.Run(ctx, r.CheckoutRoot, "ls-tree", "-r", "-z", "--full-tree", "--end-of-options", "HEAD", "--", src)
 		if err != nil {
-			return copied, fmt.Errorf("list %s: %w", src, err)
+			return copied, skipped, fmt.Errorf("list %s: %w", src, err)
 		}
 		for _, record := range strings.Split(out, "\x00") {
 			if record == "" {
@@ -103,26 +103,33 @@ func (r *AgentConfigRun) CopyCheckoutTree(ctx context.Context, dirs map[string]s
 			meta, name, found := strings.Cut(record, "\t")
 			fields := strings.Fields(meta)
 			if !found || len(fields) != 3 {
-				return copied, fmt.Errorf("unexpected git ls-tree output %q", record)
+				return copied, skipped, fmt.Errorf("unexpected git ls-tree output %q", record)
 			}
-			if fields[0] != "100644" && fields[0] != "100755" {
-				return copied, fmt.Errorf("%s is a symlink or submodule; the review will not load it", name)
+			switch fields[0] {
+			case "100644", "100755":
+			case "120000", "160000":
+				// Checked before the path: a linked dir itself (src) is
+				// listed as one entry.
+				skipped = append(skipped, name)
+				continue
+			default:
+				return copied, skipped, fmt.Errorf("%s has unexpected mode %s", name, fields[0])
 			}
 			rel := strings.TrimPrefix(name, src+"/")
 			if rel == name || slices.Contains(strings.Split(rel, "/"), "..") {
-				return copied, fmt.Errorf("unexpected path %q under %s", name, src)
+				return copied, skipped, fmt.Errorf("unexpected path %q under %s", name, src)
 			}
 			blob, err := gitexec.Run(ctx, r.CheckoutRoot, "cat-file", "blob", fields[2])
 			if err != nil {
-				return copied, fmt.Errorf("read %s: %w", name, err)
+				return copied, skipped, fmt.Errorf("read %s: %w", name, err)
 			}
 			if _, err := r.WriteFile(path.Join(dest, rel), []byte(blob)); err != nil {
-				return copied, err
+				return copied, skipped, err
 			}
-			copied++
+			copied = append(copied, name)
 		}
 	}
-	return copied, nil
+	return copied, skipped, nil
 }
 
 // MainRepoRoot returns the main checkout of the reviewed repository (the
@@ -138,20 +145,4 @@ func (r *AgentConfigRun) MainRepoRoot(_ context.Context) (string, error) {
 		root = resolved
 	}
 	return root, nil
-}
-
-// TreeEntryNames lists the names directly under dir in the checkout's HEAD
-// tree, or nil when it has none.
-func (r *AgentConfigRun) TreeEntryNames(ctx context.Context, dir string) []string {
-	out, err := gitexec.Run(ctx, r.CheckoutRoot, "ls-tree", "-z", "--name-only", "--full-tree", "--end-of-options", "HEAD:"+dir)
-	if err != nil {
-		return nil
-	}
-	var names []string
-	for _, name := range strings.Split(out, "\x00") {
-		if name != "" {
-			names = append(names, name)
-		}
-	}
-	return names
 }
