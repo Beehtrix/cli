@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
 	"github.com/entireio/cli/cmd/entire/cli/tuiutil"
@@ -331,8 +332,9 @@ func trailChangeListing(item api.ChangeSummary) string {
 }
 
 // trailChangeRetryCommand is the invocation with change in place of the trail
-// selector: positional arguments are kept, flags are not, since --branch and
-// a change selector cannot be combined.
+// selector. Positional arguments and the flags the user set are kept, so
+// --project, -m, and --json still apply; --trail and --branch are dropped,
+// since the change replaces them and cannot be combined with --branch.
 func trailChangeRetryCommand(cmd *cobra.Command, selector, change string) string {
 	args := slices.Clone(cmd.Flags().Args())
 	replaced := false
@@ -348,6 +350,21 @@ func trailChangeRetryCommand(cmd *cobra.Command, selector, change string) string
 	for _, arg := range args {
 		parts = append(parts, shellArg(arg))
 	}
+	cmd.Flags().Visit(func(f *pflag.Flag) {
+		switch {
+		case f.Name == cmdTrail || f.Name == "branch": // --trail is named after the command
+		case f.Value.Type() == "bool" && f.Value.String() == "true":
+			parts = append(parts, "--"+f.Name)
+		default:
+			values := []string{f.Value.String()}
+			if slice, ok := f.Value.(pflag.SliceValue); ok {
+				values = slice.GetSlice()
+			}
+			for _, value := range values {
+				parts = append(parts, "--"+f.Name+"="+shellArg(value))
+			}
+		}
+	})
 	return strings.Join(parts, " ")
 }
 

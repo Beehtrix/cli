@@ -80,6 +80,33 @@ func TestTrailChangeChoice(t *testing.T) {
 	}
 }
 
+// The suggested command keeps what the user typed except the trail and branch
+// selection the change replaces: dropping --project would resolve the change
+// in origin's project, and dropping -m would leave request-changes incomplete.
+func TestTrailChangeRetryCommandKeepsFlags(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"positional selector", []string{"request-changes", "42", "-m", "Fix it", "--project", "gh/acme", "--branch", "feature/a"},
+			"trail request-changes widget/7 --message='Fix it' --project=gh/acme"},
+		{"trail flag with a finding ID", []string{"finding", "resolve", "finding-one", "--trail", "42", "-m", "done"},
+			"trail finding resolve widget/7 finding-one --message=done"},
+		{"bool flag", []string{"finding", "list", "42", "--json"}, "trail finding list widget/7 --json"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			root := newTrailCmdForMode(true)
+			cmd, rest, err := root.Find(tt.args)
+			require.NoError(t, err)
+			require.NoError(t, cmd.ParseFlags(rest))
+			require.Equal(t, tt.want, trailChangeRetryCommand(cmd, "42", "widget/7"))
+		})
+	}
+}
+
 // approve writes to the change it selects, so with several open changes it
 // lists them even when one is on the checked-out branch, and never writes.
 // Not parallel: changes CWD and replaces client constructors.
