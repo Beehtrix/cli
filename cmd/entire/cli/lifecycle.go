@@ -8,6 +8,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -651,7 +652,8 @@ func handleLifecycleTurnStart(ctx context.Context, ag agent.Agent, event *agent.
 
 	// Capture pre-prompt state (including transcript position via TranscriptAnalyzer)
 	_, captureSpan := perf.Start(ctx, "capture_pre_prompt_state")
-	if err := CapturePrePromptState(ctx, ag, sessionID, event.SessionRef); err != nil {
+	tokenBaseline, err := capturePrePromptState(ctx, ag, sessionID, event.SessionRef)
+	if err != nil {
 		captureSpan.RecordError(err)
 		captureSpan.End()
 		return err
@@ -726,11 +728,18 @@ func handleLifecycleTurnStart(ctx context.Context, ag agent.Agent, event *agent.
 			)
 		}
 		appendedSkillEvents = appendEventSkillEventsToState(&skillEventSource, state)
+		// The turn start's out-of-band token position becomes the stored one,
+		// so a Stop of an earlier turn that arrives late, measured from the
+		// old position, finds it moved and adds nothing.
+		if _, ok := agent.AsOutOfBandTokenSource(ag); ok {
+			state.OutOfBandTokenBaseline = tokenBaseline
+		}
 		if state.Kind == before.Kind &&
 			state.ReviewPrompt == before.ReviewPrompt &&
 			slices.Equal(state.ReviewSkills, before.ReviewSkills) &&
 			state.InvestigateRunID == before.InvestigateRunID &&
 			state.InvestigateTopic == before.InvestigateTopic &&
+			bytes.Equal(state.OutOfBandTokenBaseline, before.OutOfBandTokenBaseline) &&
 			len(appendedSkillEvents) == 0 {
 			return strategy.ErrMutationSkip
 		}
@@ -1105,8 +1114,8 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 		// its work mid-turn (its normal flow) lands here with a clean tree.
 		// The tokens are applied by the turn-end transition itself, so a
 		// repeated or concurrent Stop for the same turn adds nothing.
-		turnUsage := resolveTurnTokenUsage(ctx, ag, event, sessionID, preState, transcriptData, subagentsDir, codexInventoryUsage)
-		transitionSessionTurnEnd(ctx, sessionID, ag.Type(), event, &checkpointlessTurnUsage{usage: turnUsage, ledgerVersion: codexLedgerVersion})
+		turnUsage, oobAdvance := resolveTurnTokenUsage(ctx, ag, event, sessionID, preState, transcriptData, subagentsDir, codexInventoryUsage)
+		transitionSessionTurnEnd(ctx, sessionID, ag.Type(), event, &checkpointlessTurnUsage{usage: turnUsage, ledgerVersion: codexLedgerVersion}, oobAdvance)
 		if cleanupErr := CleanupPrePromptState(ctx, sessionID); cleanupErr != nil {
 			logging.Warn(logCtx, "failed to cleanup pre-prompt state",
 				slog.String("error", cleanupErr.Error()))
@@ -1135,7 +1144,7 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 		transcriptLinesAtStart = preState.TranscriptOffset
 	}
 
-	tokenUsage := resolveTurnTokenUsage(ctx, ag, event, sessionID, preState, transcriptData, subagentsDir, codexInventoryUsage)
+	tokenUsage, oobAdvance := resolveTurnTokenUsage(ctx, ag, event, sessionID, preState, transcriptData, subagentsDir, codexInventoryUsage)
 
 	// Build fully-populated step context and delegate to strategy
 	stepCtx := strategy.StepContext{
@@ -1153,6 +1162,9 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 		StepTranscriptStart:      transcriptLinesAtStart,
 		TokenUsage:               tokenUsage,
 		SubagentLedgerVersion:    codexLedgerVersion,
+	}
+	if oobAdvance != nil {
+		stepCtx.OutOfBandFrom, stepCtx.OutOfBandTo = oobAdvance.from, oobAdvance.to
 	}
 
 	// The hook's worktree, then each other worktree the turn edited: one
@@ -1195,7 +1207,7 @@ func handleLifecycleTurnEnd(ctx context.Context, ag agent.Agent, event *agent.Ev
 		}
 	}
 	recordCaptureDegraded(ctx, sessionID, captureDegraded)
-	transitionSessionTurnEnd(ctx, sessionID, agentType, event, nil)
+	transitionSessionTurnEnd(ctx, sessionID, agentType, event, nil, oobAdvance)
 	if cleanupErr := CleanupPrePromptState(ctx, sessionID); cleanupErr != nil {
 		logging.Warn(logCtx, "failed to cleanup pre-prompt state",
 			slog.String("error", cleanupErr.Error()))
@@ -1220,7 +1232,10 @@ func workerTurnTokenUsage(ctx context.Context, ag agent.Agent, event *agent.Even
 	if usage := agent.CalculateTokenUsage(ctx, ag, transcriptData, turnStart, ""); strategy.HasTokenUsageData(usage) {
 		return usage
 	}
-	return computeOutOfBandTokenUsage(ctx, ag, event.SessionID, event.SessionRef, preState)
+	// A Worker's usage goes on its parent's task record, phase-gated there,
+	// so it needs no stored position (and skips the extra read).
+	usage, _ := computeOutOfBandTokenUsage(ctx, ag, event.SessionID, event.SessionRef, preState, false)
+	return usage
 }
 
 // resolveTurnTokenUsage returns the token usage of the turn ending now.
@@ -1235,13 +1250,13 @@ func workerTurnTokenUsage(ctx context.Context, ag agent.Agent, event *agent.Even
 // TurnStart baseline stored in PrePromptState. Factory AI Droid is the same
 // shape: its transcript carries no usage, and its running total lives in the
 // session's .settings.json. Only one source is used, so a turn is never
-// counted twice.
-func resolveTurnTokenUsage(ctx context.Context, ag agent.Agent, event *agent.Event, sessionID string, preState *PrePromptState, transcriptData []byte, subagentsDir string, codexInventoryUsage *agent.TokenUsage) *agent.TokenUsage {
+// counted twice. The advance is non-nil when the out-of-band source was read.
+func resolveTurnTokenUsage(ctx context.Context, ag agent.Agent, event *agent.Event, sessionID string, preState *PrePromptState, transcriptData []byte, subagentsDir string, codexInventoryUsage *agent.TokenUsage) (*agent.TokenUsage, *outOfBandAdvance) {
 	if event.TokenUsage != nil {
-		return event.TokenUsage
+		return event.TokenUsage, nil
 	}
 	if codexInventoryUsage != nil {
-		return codexInventoryUsage
+		return codexInventoryUsage, nil
 	}
 	turnStart := 0
 	if preState != nil {
@@ -1249,14 +1264,15 @@ func resolveTurnTokenUsage(ctx context.Context, ag agent.Agent, event *agent.Eve
 	}
 	usage := agent.CalculateTokenUsage(ctx, ag, transcriptData, turnStart, subagentsDir)
 	if strategy.HasTokenUsageData(usage) {
-		return usage
+		return usage, nil
 	}
 	// A transcript without usage reports zeros rather than nil, so an empty
 	// result also falls through to the out-of-band source.
-	if oob := computeOutOfBandTokenUsage(ctx, ag, sessionID, event.SessionRef, preState); oob != nil {
-		return oob
+	oob, advance := computeOutOfBandTokenUsage(ctx, ag, sessionID, event.SessionRef, preState, true)
+	if oob != nil {
+		return oob, advance
 	}
-	return usage
+	return usage, advance
 }
 
 // handleLifecycleCompaction handles context compaction: saves current progress
@@ -2653,7 +2669,7 @@ func saveSubagentSessionTaskStep(ctx context.Context, step subagentSessionStep) 
 	// Ending it first is what claims the turn's usage: a repeated Stop finds
 	// the Worker already IDLE and adds none.
 	var turnUsage *agent.TokenUsage
-	if transitionSessionTurnEnd(ctx, step.sessionID, step.ag.Type(), step.event, nil) {
+	if transitionSessionTurnEnd(ctx, step.sessionID, step.ag.Type(), step.event, nil, nil) {
 		turnUsage = step.turnUsage
 	}
 
@@ -2746,19 +2762,38 @@ func recordCaptureDegraded(ctx context.Context, sessionID string, degraded bool)
 // transitionSessionTurnEnd transitions the session phase to IDLE and dispatches turn-end actions.
 // agentType is the agent running this hook: its host's timeout bounds the
 // finalize, while state.AgentType can be empty.
-func transitionSessionTurnEnd(ctx context.Context, sessionID string, agentType types.AgentType, event *agent.Event, turnUsage *checkpointlessTurnUsage) (endedActiveTurn bool) {
+//
+// oobAdvance, when set, moves the session's stored out-of-band token position
+// from where this Stop measured to where it read up to, if no other Stop has
+// moved it first. A Stop whose usage SaveStep already counted (turnUsage nil)
+// finds the position moved and leaves it. A file-changing Stop whose step was
+// skipped still moves it, without counting: it can lose tokens, never double
+// count them.
+func transitionSessionTurnEnd(ctx context.Context, sessionID string, agentType types.AgentType, event *agent.Event, turnUsage *checkpointlessTurnUsage, oobAdvance *outOfBandAdvance) (endedActiveTurn bool) {
 	logCtx := logging.WithComponent(ctx, "lifecycle")
 	var appendedSkillEvents []agent.SkillEvent
-	wasActive := false
+	wasActive, recorded := false, false
 	mutErr := strategy.MutateSessionStateOnSaved(ctx, sessionID, func(state *strategy.SessionState) error {
 		appendedSkillEvents = persistEventMetadataToState(event, state)
 		// Only the Stop that ends the ACTIVE turn records its tokens. A
 		// repeated, retried, or concurrent Stop for the same turn finds the
 		// session already IDLE (this closure runs under the session lock), so
-		// it adds nothing.
+		// it adds nothing. Usage measured from a stored out-of-band position
+		// counts instead iff that position is still stored: a later Stop with
+		// no turn start of its own (Droid stops again when a Worker's result
+		// returns) counts what followed the previous Stop, and a Stop that
+		// lost the race, or that a newer turn start overtook, adds nothing.
 		wasActive = state.Phase.IsActive()
-		if turnUsage != nil && wasActive {
+		counted := wasActive
+		if oobAdvance != nil {
+			claimed := strategy.ClaimOutOfBandTokenPosition(state, oobAdvance.from, oobAdvance.to)
+			if len(oobAdvance.from) > 0 {
+				counted = claimed
+			}
+		}
+		if turnUsage != nil && counted {
 			strategy.ApplyTurnTokenUsage(state, turnUsage.usage, turnUsage.ledgerVersion)
+			recorded = true
 		}
 		if err := strategy.TransitionAndLog(ctx, state, session.EventTurnEnd, session.TransitionContext{}, session.NoOpActionHandler{}); err != nil {
 			logging.Warn(logCtx, "turn-end transition failed",
@@ -2793,7 +2828,8 @@ func transitionSessionTurnEnd(ctx context.Context, sessionID string, agentType t
 	}
 	// The closure's changes count only once they are saved.
 	endedActiveTurn = wasActive && mutErr == nil
-	if turnUsage != nil && turnUsage.usage != nil && !endedActiveTurn {
+	recorded = recorded && mutErr == nil
+	if turnUsage != nil && turnUsage.usage != nil && !recorded {
 		// This is the only path that records a checkpoint-less turn's tokens,
 		// so name why they were not: no state to attribute them to, a failed
 		// write, or no active turn to end.
@@ -2913,16 +2949,29 @@ func markSessionEnded(ctx context.Context, event *agent.Event, sessionID string,
 	return ended, nil
 }
 
+// outOfBandAdvance moves a session's stored out-of-band token position across
+// a turn end. from is the position the turn's usage was measured from (the
+// turn start's, which TurnStart also stores, or the previous Stop's); to is
+// the position now, for a later Stop with no turn start of its own. A nil
+// from (nothing known) keeps the phase-gated rule.
+type outOfBandAdvance struct {
+	from json.RawMessage
+	to   json.RawMessage
+}
+
 // computeOutOfBandTokenUsage returns the turn's token delta for
 // OutOfBandTokenSource agents (e.g. Antigravity, whose only token surface is
 // the title/statusline pipe captured by the title-tee shim, and Factory AI
 // Droid, which keeps a running total beside its transcript): current
-// cumulative totals minus the TurnStart baseline stored in PrePromptState.
-// Returns nil for other agents, on error (logged), or when no data exists.
-func computeOutOfBandTokenUsage(ctx context.Context, ag agent.Agent, sessionID, sessionRef string, preState *PrePromptState) *agent.TokenUsage {
+// cumulative totals minus the TurnStart baseline stored in PrePromptState, or,
+// with trackPosition and no turn start of its own, minus the position the
+// session stores. Usage is nil for other agents, on error (logged), or when no
+// data exists. The advance is non-nil only with trackPosition, for an
+// out-of-band agent.
+func computeOutOfBandTokenUsage(ctx context.Context, ag agent.Agent, sessionID, sessionRef string, preState *PrePromptState, trackPosition bool) (*agent.TokenUsage, *outOfBandAdvance) {
 	src, ok := agent.AsOutOfBandTokenSource(ag)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	var baseline json.RawMessage
 	if preState != nil {
@@ -2930,26 +2979,48 @@ func computeOutOfBandTokenUsage(ctx context.Context, ag agent.Agent, sessionID, 
 	}
 	// A missing baseline means count-from-zero, which is only legitimate on
 	// the session's first tracked turn (no snapshot existed yet). Mid-session
-	// — after earlier turns already accumulated deltas — it means the
-	// PrePromptState was lost or corrupt: counting from zero would return
-	// session-cumulative totals and ApplyTurnTokenUsage would re-add
-	// tokens the earlier turns already recorded. Degrade to no-data instead.
+	// — after earlier turns already accumulated deltas — it means either a
+	// later Stop of a turn an earlier Stop already ended (Factory AI Droid
+	// stops again once a Worker's result returns), which counts from the
+	// position that Stop stored, or a lost or corrupt PrePromptState: counting
+	// from zero would return session-cumulative totals and ApplyTurnTokenUsage
+	// would re-add tokens the earlier turns already recorded. Degrade to
+	// no-data instead.
+	skip := false
 	if len(baseline) == 0 {
-		if state, stateErr := strategy.LoadSessionState(ctx, sessionID); stateErr == nil &&
-			state != nil && state.TokenUsage != nil && state.TokenUsage.APICallCount > 0 {
-			logging.Warn(logging.WithComponent(ctx, "lifecycle"),
-				"out-of-band token baseline missing mid-session; skipping this turn's token delta to avoid double counting",
-				slog.String("session_id", sessionID))
-			return nil
+		if state, stateErr := strategy.LoadSessionState(ctx, sessionID); stateErr == nil && state != nil {
+			switch {
+			case trackPosition && len(state.OutOfBandTokenBaseline) > 0:
+				baseline = state.OutOfBandTokenBaseline
+			case state.TokenUsage != nil && state.TokenUsage.APICallCount > 0:
+				logging.Warn(logging.WithComponent(ctx, "lifecycle"),
+					"out-of-band token baseline missing mid-session; skipping this turn's token delta to avoid double counting",
+					slog.String("session_id", sessionID))
+				skip = true
+			}
 		}
 	}
-	oobUsage, oobErr := src.CalculateTokenUsageSince(ctx, sessionID, sessionRef, baseline)
-	if oobErr != nil {
-		logging.Warn(logging.WithComponent(ctx, "lifecycle"), "failed to compute out-of-band token usage",
-			slog.String("error", oobErr.Error()))
-		return nil
+	var oobUsage *agent.TokenUsage
+	if !skip {
+		var oobErr error
+		oobUsage, oobErr = src.CalculateTokenUsageSince(ctx, sessionID, sessionRef, baseline)
+		if oobErr != nil {
+			logging.Warn(logging.WithComponent(ctx, "lifecycle"), "failed to compute out-of-band token usage",
+				slog.String("error", oobErr.Error()))
+			oobUsage = nil
+		}
 	}
-	return oobUsage
+	if !trackPosition {
+		return oobUsage, nil
+	}
+	advance := &outOfBandAdvance{from: baseline}
+	// Read after the delta: a call landing between the two reads is left
+	// uncounted rather than counted twice. A failed read stores no position,
+	// so a later Stop degrades to no data rather than re-counting.
+	if to, err := src.SnapshotTokenBaseline(ctx, sessionID, sessionRef); err == nil {
+		advance.to = to
+	}
+	return oobUsage, advance
 }
 
 // shouldSuppressConditionalTurnStart reports whether a conditional TurnStart

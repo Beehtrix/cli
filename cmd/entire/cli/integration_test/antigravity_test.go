@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -356,36 +357,8 @@ func gitCLICommitWithEntireHooks(t *testing.T, env *TestEnv, message string, fil
 func TestAntigravity_TokenUsageInCheckpointMetadata(t *testing.T) {
 	t.Parallel()
 	env := newAntigravityEnv(t)
-
-	statusDir := t.TempDir()
-	configDir := t.TempDir()
 	conversationID := "antigravity-tokens-it"
-	extraEnv := []string{
-		"ENTIRE_ANTIGRAVITY_STATUS_DIR=" + statusDir,
-		"ENTIRE_ANTIGRAVITY_CONFIG_DIR=" + configDir,
-	}
-
-	snapshotPath := filepath.Join(statusDir, conversationID+".jsonl")
-	appendSnapshotLine := func(line string) {
-		f, err := os.OpenFile(snapshotPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-		require.NoError(t, err)
-		_, werr := f.WriteString(line + "\n")
-		require.NoError(t, f.Close())
-		require.NoError(t, werr)
-	}
-
-	transcriptPath := filepath.Join(antigravityBrainDir(env.RepoDir), conversationID, ".system_generated", "logs", "transcript.jsonl")
-	require.NoError(t, os.MkdirAll(filepath.Dir(transcriptPath), 0o750))
-	require.NoError(t, os.WriteFile(transcriptPath,
-		[]byte(`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"create tok.txt"}`+"\n"),
-		0o600))
-
-	common := map[string]any{
-		"conversationId":        conversationID,
-		"workspacePaths":        []string{env.RepoDir},
-		"transcriptPath":        transcriptPath,
-		"artifactDirectoryPath": filepath.Join(env.RepoDir, ".gemini", "antigravity-cli", "artifacts"),
-	}
+	common, extraEnv, appendSnapshotLine := newAntigravityTokenConversation(t, env, conversationID)
 
 	// 1. Seed the BASELINE snapshot before TurnStart captures it.
 	appendSnapshotLine(`{"ts":"2026-06-03T10:00:00Z","conversation_id":"` + conversationID +
@@ -489,6 +462,74 @@ func TestAntigravity_TokenUsageInCheckpointMetadata(t *testing.T) {
 //     git commit (simulating agy finishing its late write).
 //  5. git commit → PostCommit condensation → the committed session metadata's
 //     prompt is recovered from the now-populated transcript.
+//
+// newAntigravityTokenConversation sets up a conversation whose token snapshots
+// the test appends: it returns the hook input common to every hook, the env
+// pointing the hooks at the snapshot store, and an appender for snapshot lines.
+func newAntigravityTokenConversation(t *testing.T, env *TestEnv, conversationID string) (map[string]any, []string, func(string)) {
+	t.Helper()
+	statusDir := t.TempDir()
+	extraEnv := []string{
+		"ENTIRE_ANTIGRAVITY_STATUS_DIR=" + statusDir,
+		"ENTIRE_ANTIGRAVITY_CONFIG_DIR=" + t.TempDir(),
+	}
+
+	snapshotPath := filepath.Join(statusDir, conversationID+".jsonl")
+	appendSnapshotLine := func(line string) {
+		f, err := os.OpenFile(snapshotPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		require.NoError(t, err)
+		_, werr := f.WriteString(line + "\n")
+		require.NoError(t, f.Close())
+		require.NoError(t, werr)
+	}
+
+	transcriptPath := filepath.Join(antigravityBrainDir(env.RepoDir), conversationID, ".system_generated", "logs", "transcript.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(transcriptPath), 0o750))
+	require.NoError(t, os.WriteFile(transcriptPath,
+		[]byte(`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"create tok.txt"}`+"\n"),
+		0o600))
+
+	common := map[string]any{
+		"conversationId":        conversationID,
+		"workspacePaths":        []string{env.RepoDir},
+		"transcriptPath":        transcriptPath,
+		"artifactDirectoryPath": filepath.Join(env.RepoDir, ".gemini", "antigravity-cli", "artifacts"),
+	}
+	return common, extraEnv, appendSnapshotLine
+}
+
+// An Antigravity Stop with no turn start before it counts from the previous
+// Stop's position: only the tokens since then, once, even when repeated.
+func TestAntigravity_StopWithoutTurnStartCountsFromThePreviousStop(t *testing.T) {
+	t.Parallel()
+	env := newAntigravityEnv(t)
+	conversationID := "antigravity-later-stop-it"
+	common, extraEnv, appendSnapshotLine := newAntigravityTokenConversation(t, env, conversationID)
+	snapshot := func(ts string, input, output int) {
+		appendSnapshotLine(fmt.Sprintf(`{"ts":%q,"conversation_id":%q,"context_window":{"total_input_tokens":%d,"total_output_tokens":%d}}`,
+			ts, conversationID, input, output))
+	}
+	stop := func() {
+		require.NoError(t, runAntigravityHookWithEnv(t, env.RepoDir, "stop", mergeMaps(common, map[string]any{
+			"executionNum": 1, "terminationReason": "model_stop", "error": "", "fullyIdle": true,
+		}), extraEnv))
+	}
+
+	snapshot("2026-06-03T10:00:00Z", 1000, 100)
+	require.NoError(t, runAntigravityHookWithEnv(t, env.RepoDir, "pre-invocation",
+		mergeMaps(common, map[string]any{"invocationNum": 0, "initialNumSteps": 1}), extraEnv))
+	snapshot("2026-06-03T10:05:00Z", 4500, 400)
+	stop()
+	got := sessionTokenTotal(t, env, conversationID)
+	require.Equal(t, []int{3500, 300}, []int{got.InputTokens, got.OutputTokens})
+
+	snapshot("2026-06-03T10:06:00Z", 6000, 500)
+	stop()
+	stop()
+	got = sessionTokenTotal(t, env, conversationID)
+	require.Equal(t, []int{5000, 400}, []int{got.InputTokens, got.OutputTokens})
+}
+
 func TestAntigravity_PromptInCheckpointMetadata(t *testing.T) {
 	t.Parallel()
 	env := newAntigravityEnv(t)
