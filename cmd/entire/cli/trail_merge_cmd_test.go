@@ -289,7 +289,7 @@ func TestTrailMerge_DeleteBranchFlags(t *testing.T) {
 		{name: "delete-branch", args: []string{"--delete-branch"}, want: `{"expectedHeadSha":"` + trailMergeTestHead + `","deleteBranch":true}`},
 		{name: "no-delete-branch sends an explicit false", args: []string{"--no-delete-branch"}, want: `{"expectedHeadSha":"` + trailMergeTestHead + `","deleteBranch":false}`},
 		{name: "delete-branch=false keeps the branch", args: []string{"--delete-branch=false"}, want: `{"expectedHeadSha":"` + trailMergeTestHead + `","deleteBranch":false}`},
-		{name: "no-delete-branch=false deletes the branch", args: []string{"--no-delete-branch=false"}, want: `{"expectedHeadSha":"` + trailMergeTestHead + `","deleteBranch":true}`},
+		{name: "no-delete-branch=false leaves it to the repo", args: []string{"--no-delete-branch=false"}, want: `{"expectedHeadSha":"` + trailMergeTestHead + `"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := &trailMergeStub{
@@ -402,6 +402,7 @@ func TestTrailMerge_ReadinessShowsBranchPlan(t *testing.T) {
 		{name: "repo keeps", edits: []func(map[string]any){withField("delete_branch_on_merge", false)}, want: "Branch:    keep after merge (repo default)"},
 		{name: "flag deletes", edits: []func(map[string]any){withField("delete_branch_on_merge", false)}, args: []string{"--delete-branch"}, want: "Branch:    delete after merge (--delete-branch)"},
 		{name: "flag keeps", edits: []func(map[string]any){withField("delete_branch_on_merge", true)}, args: []string{"--no-delete-branch"}, want: "Branch:    keep after merge (--no-delete-branch)"},
+		{name: "negated keep flag defers", edits: []func(map[string]any){withField("delete_branch_on_merge", true)}, args: []string{"--no-delete-branch=false"}, want: "Branch:    delete after merge (repo default)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := &trailMergeStub{t: t, lookupBase: trailMergeLookupBase, mergeability: trailMergeability(t, tc.edits...)}

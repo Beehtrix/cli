@@ -91,15 +91,15 @@ left to GitHub's own auto-delete setting, so both flags are refused there.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Selector = selectorFromArgs(args)
-			// Decided by which flag was given, not by its value alone, so
-			// --delete-branch=false keeps the branch rather than deferring to
-			// the repo setting.
+			// --delete-branch=false keeps the branch, while
+			// --no-delete-branch=false only declines to keep it and, like the
+			// other --no-* flags, leaves the repo setting in charge.
 			switch flags := cmd.Flags(); {
 			case flags.Changed("delete-branch"):
 				opts.DeleteBranch = &deleteBranch
-			case flags.Changed("no-delete-branch"):
-				del := !noDeleteBranch
-				opts.DeleteBranch = &del
+			case noDeleteBranch:
+				keep := false
+				opts.DeleteBranch = &keep
 			}
 			if err := ensureTrailRepoHasTarget(cmd, opts.Selector != "" || strings.TrimSpace(opts.Branch) != "", "pass a trail selector or --branch"); err != nil {
 				return err
