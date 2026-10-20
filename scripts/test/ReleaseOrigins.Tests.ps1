@@ -11,11 +11,17 @@ Describe 'Release origin metadata' {
     }
 
     BeforeEach {
+        $script:savedBaseUrl = $env:ENTIRE_INSTALL_BASE_URL
+        $env:ENTIRE_INSTALL_BASE_URL = $null
         Set-StrictMode -Version 2.0
         Mock Get-ReleaseOrigin { 'https://mirror.invalid'; $GitHubReleaseOrigin }
         Mock Invoke-RestMethod { throw 'offline' }
         Mock Invoke-WebRequest { throw 'unexpected download' }
         Mock Invoke-GitHubApi { '{"tag_name":"v1.2.3"}' | ConvertFrom-Json }
+    }
+
+    AfterEach {
+        $env:ENTIRE_INSTALL_BASE_URL = $script:savedBaseUrl
     }
 
     It 'prefers tag over version and never consults GitHub on success' {
@@ -129,6 +135,17 @@ Describe 'Origin selection' {
         $origins | Should -HaveCount 2
         $origins[0] | Should -Be 'https://install.entire.com'
         $origins[1] | Should -Be 'https://github.com/entireio/cli/releases/download'
+    }
+
+    It 'treats even a GitHub-shaped override as an authoritative manifest origin' {
+        $env:ENTIRE_INSTALL_BASE_URL = $GitHubReleaseOrigin
+        Mock Invoke-RestMethod { '{"tag":"v2.3.4"}' | ConvertFrom-Json }
+        Mock Invoke-GitHubApi { throw 'must not be reached' }
+        Get-ReleaseVersion stable | Should -Be '2.3.4'
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
+            $Uri -eq "$GitHubReleaseOrigin/channels/stable.json"
+        }
+        Should -Invoke Invoke-GitHubApi -Times 0 -Exactly
     }
 
     It 'uses only the explicit mirror even when it fails' {

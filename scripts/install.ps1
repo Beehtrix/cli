@@ -4,11 +4,14 @@
 # parameter, so a new unused parameter still reports.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Channel')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'InstallDir')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Version')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'NoPathUpdate')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'Help')]
 param(
     [ValidateSet("stable", "nightly")]
     [string] $Channel = "stable",
+
+    [string] $Version,
 
     [ValidateNotNullOrEmpty()]
     [string] $InstallDir = (Join-Path $HOME ".local\bin"),
@@ -28,6 +31,8 @@ $GitHubApi = "https://api.github.com/repos/$GitHubRepo"
 # $PSBoundParameters inside a function is that function's own; the functions
 # read this the way they read $InstallDir.
 $InstallDirExplicit = $PSBoundParameters.ContainsKey('InstallDir')
+$ChannelExplicit = $PSBoundParameters.ContainsKey('Channel')
+$VersionExplicit = $PSBoundParameters.ContainsKey('Version')
 
 # Two limits, deliberately not one: the API calls get a whole-request cap,
 # the archive download gets only a stall guard. See Save-RemoteFile.
@@ -51,10 +56,11 @@ function Write-InstallerWarning {
 
 function Write-Usage {
     Write-Host @"
-Usage: install.ps1 [-Channel stable|nightly] [-InstallDir <path>] [-NoPathUpdate]
+Usage: install.ps1 [-Channel stable|nightly] [-Version <version>] [-InstallDir <path>] [-NoPathUpdate]
 
 Options:
   -Channel       Release channel to install (default: stable)
+  -Version       Pin a version, skipping discovery and Scoop (optional v prefix)
   -InstallDir    Direct-install destination (default: `$HOME\.local\bin)
   -NoPathUpdate  Do not add a direct-install destination to the user PATH
   -Help, -h      Show this help message
@@ -65,6 +71,9 @@ verified release archive because the Scoop bucket only publishes stable builds.
 Scoop chooses its own install location and manages its own PATH entry.
 An explicit -InstallDir selects a release-archive install even when Scoop
 is available; -NoPathUpdate applies only to release-archive installs.
+-Version also selects the archive path; an explicit -Channel must match it.
+ENTIRE_INSTALL_BASE_URL selects a single mirror for metadata and downloads,
+with no GitHub fallback. It also selects the archive path rather than Scoop.
 "@
 }
 
@@ -303,7 +312,7 @@ function Get-ReleaseVersion {
     $failures = @()
     foreach ($origin in Get-ReleaseOrigin) {
         try {
-            if ($origin -ceq $GitHubReleaseOrigin) {
+            if ($origin -ceq $GitHubReleaseOrigin -and [string]::IsNullOrEmpty($env:ENTIRE_INSTALL_BASE_URL)) {
                 return Get-GitHubReleaseVersion -ReleaseChannel $ReleaseChannel
             }
             return Get-EntireReleaseVersion -BaseUrl $origin -ReleaseChannel $ReleaseChannel
@@ -383,19 +392,11 @@ function Save-RemoteFile {
     if ((Get-Command Invoke-WebRequest).Parameters.ContainsKey('OperationTimeoutSeconds')) {
         $stallGuard['OperationTimeoutSeconds'] = $DownloadStallTimeoutSec
     }
-    Invoke-WebRequest -Uri $Uri -OutFile $Destination -UseBasicParsing @stallGuard
+    Invoke-WebRequest -Uri $Uri -OutFile $Destination -UseBasicParsing -ErrorAction Stop @stallGuard
 }
 
-# Verifies the archive against checksums.txt from the same release. That
-# guards against a corrupted transfer and against installing the wrong asset
-# (another architecture or version). It does not guard against a compromised
-# release origin or TLS path: the checksum and the archive share a trust root.
-function Assert-Checksum {
-    param(
-        [string] $ArchivePath,
-        [string] $ArchiveName,
-        [string] $ChecksumsPath
-    )
+function Get-ArchiveChecksum {
+    param([string] $ArchiveName, [string] $ChecksumsPath)
 
     $escapedArchiveName = [regex]::Escape($ArchiveName)
     $checksumLine = Get-Content -LiteralPath $ChecksumsPath |
@@ -406,11 +407,49 @@ function Assert-Checksum {
         throw "Checksum for $ArchiveName was not found in checksums.txt."
     }
 
-    $expectedChecksum = ([string] $checksumLine -split "\s+")[0]
+    return ([string] $checksumLine -split "\s+")[0]
+}
+
+# Verifies bytes against their own origin, not authenticity: both share a trust
+# root. A mismatch is fatal and must stay outside the download fallback catch.
+function Assert-Checksum {
+    param([string] $ArchivePath, [string] $ExpectedChecksum)
+
     $actualChecksum = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash
     if (-not [string]::Equals($actualChecksum, $expectedChecksum, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Checksum verification failed. Expected: $expectedChecksum, actual: $actualChecksum"
     }
+}
+
+function Save-ReleaseArchive {
+    param(
+        [string] $ReleaseVersion,
+        [string] $ArchiveName,
+        [string] $ArchivePath,
+        [string] $ChecksumsPath
+    )
+
+    $failures = @()
+    foreach ($origin in Get-ReleaseOrigin) {
+        $baseUrl = "$origin/v$ReleaseVersion"
+        try {
+            # Always download BOTH files again on fallback. Checksums from one
+            # origin must never vouch for bytes from another.
+            Write-Info "Downloading $ArchiveName from $origin..."
+            Save-RemoteFile -Uri "$baseUrl/$ArchiveName" -Destination $ArchivePath
+            Save-RemoteFile -Uri "$baseUrl/checksums.txt" -Destination $ChecksumsPath
+            $expected = Get-ArchiveChecksum -ArchiveName $ArchiveName -ChecksumsPath $ChecksumsPath
+        }
+        catch {
+            $failures += "${origin}: $($_.Exception.Message)"
+            Write-InstallerWarning "Could not fetch a complete release from ${origin}: $($_.Exception.Message)"
+            continue
+        }
+        Assert-Checksum -ArchivePath $ArchivePath -ExpectedChecksum $expected
+        Write-Success "Checksum verified"
+        return
+    }
+    throw "Could not download release $ReleaseVersion. Tried: $($failures -join '; ')"
 }
 
 # Classifies a failed file operation by its cause, walking the exception
@@ -832,10 +871,22 @@ function Install-Entire {
     # ValidateSet accepts mixed case, but channel keys on the origin do not.
     $Channel = $Channel.ToLowerInvariant()
 
+    # Validate pinned input before either package-manager or URL use, even
+    # when the caller did not select a channel (the default is not a constraint).
+    $releaseVersion = $Version -creplace '^v', ''
+    if ($VersionExplicit -or $Version) {
+        if (-not (Test-ReleaseVersion $releaseVersion)) {
+            throw "Invalid release version: $Version"
+        }
+        if ($ChannelExplicit -and -not (Test-ReleaseVersion $releaseVersion $Channel)) {
+            throw "Version $Version does not belong to channel $Channel."
+        }
+    }
+
     Write-Info "Installing Entire CLI..."
 
     $scoopCommand = Get-Command "scoop" -ErrorAction SilentlyContinue
-    if ($Channel -eq "stable" -and $null -ne $scoopCommand -and -not $InstallDirExplicit) {
+    if ($Channel -eq "stable" -and $null -ne $scoopCommand -and -not $InstallDirExplicit -and -not $Version -and -not $env:ENTIRE_INSTALL_BASE_URL) {
         # Scoop owns the install location and the shims directory it puts on
         # PATH, so -NoPathUpdate does not apply on this branch, and a caller
         # who chose a directory is sent to the archive install instead (the
@@ -888,7 +939,7 @@ function Install-Entire {
         Write-InstallerWarning "Scoop only publishes stable releases; installing nightly from the verified release archive."
     }
     elseif ($null -ne $scoopCommand) {
-        Write-Info "Scoop detected, but -InstallDir was given; installing from the verified release archive."
+        Write-Info "Scoop detected, but a direct install was requested; installing from the verified release archive."
     }
 
     $resolvedInstallDir = Get-NormalizedPath -Path $InstallDir
@@ -902,14 +953,13 @@ function Install-Entire {
     $architecture = Get-PlatformArchitecture
     Write-Info "Detected platform: windows/$architecture"
 
-    Write-Info "Fetching latest $Channel version..."
-    $version = Get-ReleaseVersion -ReleaseChannel $Channel
-    Write-Info "Installing version: $version"
+    if (-not $releaseVersion) {
+        Write-Info "Fetching latest $Channel version..."
+        $releaseVersion = Get-ReleaseVersion -ReleaseChannel $Channel
+    }
+    Write-Info "Installing version: $releaseVersion"
 
     $archiveName = "entire_windows_$architecture.zip"
-    $releaseBaseUrl = "https://github.com/$GitHubRepo/releases/download/v$version"
-    $downloadUrl = "$releaseBaseUrl/$archiveName"
-    $checksumsUrl = "$releaseBaseUrl/checksums.txt"
 
     $tempDir = Join-Path ([IO.Path]::GetTempPath()) ("entire-install-" + [guid]::NewGuid().ToString("N"))
     [IO.Directory]::CreateDirectory($tempDir) | Out-Null
@@ -919,15 +969,7 @@ function Install-Entire {
         $checksumsPath = Join-Path $tempDir "checksums.txt"
         $extractDir = Join-Path $tempDir "extracted"
 
-        Write-Info "Downloading $archiveName..."
-        Save-RemoteFile -Uri $downloadUrl -Destination $archivePath
-
-        Write-Info "Downloading checksums..."
-        Save-RemoteFile -Uri $checksumsUrl -Destination $checksumsPath
-
-        Write-Info "Verifying checksum..."
-        Assert-Checksum -ArchivePath $archivePath -ArchiveName $archiveName -ChecksumsPath $checksumsPath
-        Write-Success "Checksum verified"
+        Save-ReleaseArchive -ReleaseVersion $releaseVersion -ArchiveName $archiveName -ArchivePath $archivePath -ChecksumsPath $checksumsPath
 
         Write-Info "Extracting..."
         Expand-Archive -LiteralPath $archivePath -DestinationPath $extractDir -Force

@@ -552,12 +552,18 @@ Describe 'Scoop or archive selection' {
     }
 
     BeforeEach {
+        $script:savedBaseUrl = $env:ENTIRE_INSTALL_BASE_URL
+        $env:ENTIRE_INSTALL_BASE_URL = $null
         Mock Assert-Prerequisite {}
         Mock Write-Info {}
         Mock Install-EntireWithScoop {}
         Mock Get-PlatformArchitecture { 'amd64' }
         # The archive branch's first step after the directory is resolved; stop there.
         Mock Get-ReleaseVersion { throw 'stop-here' }
+    }
+
+    AfterEach {
+        $env:ENTIRE_INSTALL_BASE_URL = $script:savedBaseUrl
     }
 
     It 'takes the archive path when -InstallDir is explicit even with Scoop on PATH' {
