@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -103,15 +105,51 @@ func resolveProjectTrailWorkingContext(cmd *cobra.Command, selector, branch stri
 	if err != nil {
 		return nil, err
 	}
-	preferred := ""
+	choice := trailChangeChoice{Branch: branch, LocalOnly: localOnly}
 	if repoOverride == "" {
-		preferred, _ = GetCurrentBranch(ctx) //nolint:errcheck // no preference outside a checkout or on detached HEAD
+		choice.Local = repoID
+		if !trailChangeWriteCommands[cmd.Name()] {
+			choice.Preferred, _ = GetCurrentBranch(ctx) //nolint:errcheck // no preference outside a checkout or on detached HEAD
+		}
 	}
-	selected, err := selectTrailWorkingBranch(parent.Changes, repoID, branch, preferred)
+	if repoOverride != "" || localOnly {
+		choice.Scope = repoID
+	}
+	selected, err := choice.selectFrom(parent, func(change string) string { return trailChangeRetryCommand(cmd, selector, change) })
 	if err != nil {
 		return nil, err
 	}
-	return finishTrailWorkingContext(ctx, target, parent, etag, selected, client, base, host, owner, repo, repoID)
+	if selected.RepositoryID == repoID {
+		return finishTrailWorkingContext(ctx, target, parent, etag, selected, client, base, host, owner, repo, repoID)
+	}
+	return finishForeignTrailWorkingContext(cmd, target, parent, etag, selected)
+}
+
+// trailChangeWriteCommands act on the selected change itself, so a trail with
+// several changes must be disambiguated explicitly rather than by whichever
+// branch happens to be checked out.
+var trailChangeWriteCommands = map[string]bool{"approve": true, "request-changes": true, "unlink": true}
+
+// finishForeignTrailWorkingContext opens the repository a sole change in
+// another repository belongs to. Repository is the server's basename in the
+// trail's project; the opened repository must be the one the change names.
+func finishForeignTrailWorkingContext(cmd *cobra.Command, target *projectTrailTarget, parent api.ProjectTrail, etag string, selected api.ChangeSummary) (*trailWorkingContext, error) {
+	ctx := cmd.Context()
+	if !validTrailChangeRepoName(selected.Repository) {
+		return nil, fmt.Errorf("%s's only change is on branch %q in a repository whose name has not resolved yet; retry shortly", target.label(), tuiutil.SanitizeTerminalLabel(selected.Branch))
+	}
+	client, repoID, err := newTrailAPIClient(ctx, trailInsecureHTTP(cmd), target.Host, target.Project, selected.Repository)
+	if err != nil {
+		return nil, renderDataAPIAuthError(ctx, cmd.ErrOrStderr(), target.Project+"/"+selected.Repository, err)
+	}
+	if repoID != selected.RepositoryID {
+		return nil, fmt.Errorf("repository %s/%s does not match the trail's change", target.Project, selected.Repository)
+	}
+	base, err := trailRepoBasePath(target.Host, target.Project, selected.Repository, repoID)
+	if err != nil {
+		return nil, err
+	}
+	return finishTrailWorkingContext(ctx, target, parent, etag, selected, client, base, target.Host, target.Project, selected.Repository, repoID)
 }
 
 // resolveProjectTrailChangeContext selects branch work by its <repo>/<number>
@@ -173,37 +211,131 @@ func changeBranchName(work api.TrailResource) string {
 	return work.OriginalBranch
 }
 
-func selectTrailWorkingBranch(changes []api.ChangeSummary, repoID, explicit, preferred string) (api.ChangeSummary, error) {
-	var candidates []api.ChangeSummary
-	for _, item := range changes {
-		if item.RepositoryID == repoID && item.Branch != "" {
+// trailChangeChoice picks the one change a branch-level command acts on from
+// a project trail's open (branch-bearing) changes.
+type trailChangeChoice struct {
+	// Scope limits candidates to one repository ID: an explicit --repo, or
+	// this clone for local-only commands. Empty means every repository.
+	Scope string
+	// Local is this clone's repository ID; empty under --repo.
+	Local string
+	// LocalOnly commands act on this clone, so changes elsewhere are listed
+	// as needing another clone rather than silently left out.
+	LocalOnly bool
+	// Branch is an explicit --branch.
+	Branch string
+	// Preferred is the checked-out branch; it settles ambiguity only for a
+	// change in this clone's repository.
+	Preferred string
+}
+
+// selectFrom applies, in order: --branch, the checked-out branch, then a sole
+// open change. Anything else lists the candidates as <repo>/<number> and names
+// the command to re-run; retry renders that command for one change selector.
+func (c trailChangeChoice) selectFrom(parent api.ProjectTrail, retry func(change string) string) (api.ChangeSummary, error) {
+	var candidates, elsewhere []api.ChangeSummary
+	for _, item := range parent.Changes {
+		switch {
+		case item.Branch == "":
+			// Merged or detached work has no branch left to act on.
+		case c.Scope == "" || item.RepositoryID == c.Scope:
 			candidates = append(candidates, item)
+		case c.LocalOnly:
+			elsewhere = append(elsewhere, item)
 		}
 	}
-	for _, item := range candidates {
-		if explicit != "" && item.Branch == explicit {
-			return item, nil
+	label := "trail #" + strconv.Itoa(parent.Number)
+	if c.Branch != "" {
+		var matches []api.ChangeSummary
+		for _, item := range candidates {
+			if item.Branch == c.Branch {
+				matches = append(matches, item)
+			}
 		}
-	}
-	if explicit != "" {
-		return api.ChangeSummary{}, fmt.Errorf("trail has no visible branch %q in the selected repository", explicit)
-	}
-	for _, item := range candidates {
-		if preferred != "" && item.Branch == preferred {
-			return item, nil
+		switch len(matches) {
+		case 1:
+			return matches[0], nil
+		case 0:
+			return api.ChangeSummary{}, fmt.Errorf("%s has no open change on branch %q%s", label, tuiutil.SanitizeTerminalLabel(c.Branch), c.scopeSuffix())
+		}
+		candidates, elsewhere = matches, nil
+	} else if c.Preferred != "" && c.Local != "" {
+		for _, item := range candidates {
+			if item.RepositoryID == c.Local && item.Branch == c.Preferred {
+				return item, nil
+			}
 		}
 	}
 	if len(candidates) == 1 {
 		return candidates[0], nil
 	}
+	var b strings.Builder
 	if len(candidates) == 0 {
-		return api.ChangeSummary{}, errors.New("trail has no visible branches in the selected repository; choose --repo")
+		fmt.Fprintf(&b, "%s has no open changes%s", label, c.scopeSuffix())
+	} else {
+		fmt.Fprintf(&b, "%s has %d open changes%s; choose one:", label, len(candidates), c.scopeSuffix())
 	}
-	branches := make([]string, len(candidates))
-	for i, item := range candidates {
-		branches[i] = tuiutil.SanitizeTerminalLabel(item.Branch)
+	for _, item := range candidates {
+		b.WriteString("\n  " + trailChangeListing(item))
 	}
-	return api.ChangeSummary{}, fmt.Errorf("trail has multiple branches in this repository; select --branch: %s", strings.Join(branches, ", "))
+	if len(elsewhere) > 0 {
+		b.WriteString("\nChanges in other repositories need a clone of that repository:")
+		for _, item := range elsewhere {
+			b.WriteString("\n  " + trailChangeListing(item))
+		}
+	}
+	for _, item := range candidates {
+		if validTrailChangeRepoName(item.Repository) {
+			fmt.Fprintf(&b, "\nRun, for example: %s", retry(item.Repository+"/"+strconv.Itoa(item.Number)))
+			break
+		}
+	}
+	return api.ChangeSummary{}, errors.New(b.String())
+}
+
+func (c trailChangeChoice) scopeSuffix() string {
+	switch {
+	case c.Scope == "":
+		return ""
+	case c.LocalOnly && c.Scope == c.Local:
+		return " in this clone's repository"
+	default:
+		return " in the selected repository"
+	}
+}
+
+// trailChangeListing is one candidate line: "<repo>/<number> - <title>". A
+// repository whose name has not resolved yet can only be named by its branch.
+func trailChangeListing(item api.ChangeSummary) string {
+	if !validTrailChangeRepoName(item.Repository) || item.Number <= 0 {
+		return "branch " + tuiutil.SanitizeTerminalLabel(item.Branch) + " (repository not resolved yet; select it with --branch)"
+	}
+	line := item.Repository + "/" + strconv.Itoa(item.Number)
+	if title := strings.TrimSpace(tuiutil.SanitizeTerminalLabel(item.Title)); title != "" {
+		return line + " - " + title
+	}
+	return line + " - branch " + tuiutil.SanitizeTerminalLabel(item.Branch)
+}
+
+// trailChangeRetryCommand is the invocation with change in place of the trail
+// selector: positional arguments are kept, flags are not, since --branch and
+// a change selector cannot be combined.
+func trailChangeRetryCommand(cmd *cobra.Command, selector, change string) string {
+	args := slices.Clone(cmd.Flags().Args())
+	replaced := false
+	for i, arg := range args {
+		if !replaced && strings.TrimSpace(arg) == selector {
+			args[i], replaced = change, true
+		}
+	}
+	if !replaced {
+		args = append([]string{change}, args...)
+	}
+	parts := []string{cmd.CommandPath()}
+	for _, arg := range args {
+		parts = append(parts, shellArg(arg))
+	}
+	return strings.Join(parts, " ")
 }
 
 func trailForDisplay(work api.TrailResource) api.TrailResource {

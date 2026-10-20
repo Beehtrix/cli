@@ -5,36 +5,162 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
 
-func TestSelectTrailWorkingBranch(t *testing.T) {
+func TestTrailChangeChoice(t *testing.T) {
 	t.Parallel()
-	changes := []api.ChangeSummary{{ID: "a", RepositoryID: "one", Branch: "feature/a"}, {ID: "b", RepositoryID: "one", Branch: "feature/b"}, {ID: "c", RepositoryID: "two", Branch: "feature/a"}}
-	for _, tt := range []struct{ name, repo, explicit, preferred, id, failure string }{
-		{"explicit wins", "one", "feature/b", "feature/a", "b", ""},
-		{"checkout match", "one", "", "feature/a", "a", ""},
-		{"sole branch", "two", "", "unrelated", "c", ""},
-		{"ambiguous", "one", "", "unrelated", "", "select --branch: feature/a, feature/b"},
-		{"foreign repository", "three", "", "feature/a", "", "no visible branches"},
-		{"explicit missing", "one", "missing", "feature/a", "", "no visible branch"},
+	parent := api.ProjectTrail{Number: 42, Changes: []api.ChangeSummary{
+		{ID: "a", RepositoryID: "one", Repository: "cli", Number: 11, Title: "Add merge", Branch: "feature/a"},
+		{ID: "b", RepositoryID: "one", Repository: "cli", Number: 12, Branch: "feature/b"},
+		{ID: "c", RepositoryID: "two", Repository: "api", Number: 21, Title: "Expose mergeability", Branch: "feature/a"},
+		{ID: "merged", RepositoryID: "three", Repository: "web", Number: 31, Title: "Merged work"},
+	}}
+	retry := func(change string) string { return "entire trail approve " + change }
+	for _, tt := range []struct {
+		name     string
+		choice   trailChangeChoice
+		parent   *api.ProjectTrail
+		id       string
+		failures []string
+		absent   []string
+	}{
+		{name: "explicit branch in scope", choice: trailChangeChoice{Scope: "one", Branch: "feature/b", Preferred: "feature/a", Local: "one"}, id: "b"},
+		{name: "checked-out branch in this clone", choice: trailChangeChoice{Local: "one", Preferred: "feature/b"}, id: "b"},
+		{name: "checked-out branch never picks another repository", choice: trailChangeChoice{Local: "three", Preferred: "feature/a"},
+			failures: []string{"trail #42 has 3 open changes; choose one:", "cli/11 - Add merge", "cli/12 - branch feature/b", "api/21 - Expose mergeability", "Run, for example: entire trail approve cli/11"},
+			absent:   []string{"web/31"}},
+		{name: "sole open change in another repository", choice: trailChangeChoice{Local: "three"},
+			parent: &api.ProjectTrail{Number: 42, Changes: []api.ChangeSummary{parent.Changes[2], parent.Changes[3]}}, id: "c"},
+		{name: "sole change in --repo", choice: trailChangeChoice{Scope: "two"}, id: "c"},
+		{name: "explicit branch ambiguous across repositories", choice: trailChangeChoice{Local: "three", Branch: "feature/a"},
+			failures: []string{"trail #42 has 2 open changes; choose one:", "cli/11 - Add merge", "api/21 - Expose mergeability"},
+			absent:   []string{"cli/12"}},
+		{name: "explicit branch missing", choice: trailChangeChoice{Scope: "one", Branch: "missing"},
+			failures: []string{`trail #42 has no open change on branch "missing" in the selected repository`}},
+		{name: "local-only lists other repositories as needing a clone", choice: trailChangeChoice{Scope: "one", Local: "one", LocalOnly: true},
+			failures: []string{"has 2 open changes in this clone's repository; choose one:", "Changes in other repositories need a clone of that repository:\n  api/21 - Expose mergeability"}},
+		{name: "local-only with nothing here", choice: trailChangeChoice{Scope: "three", Local: "three", LocalOnly: true},
+			failures: []string{"trail #42 has no open changes in this clone's repository", "need a clone", "cli/11 - Add merge"},
+			absent:   []string{"Run, for example"}},
+		{name: "unresolved repository is named by branch", choice: trailChangeChoice{},
+			parent:   &api.ProjectTrail{Number: 42, Changes: []api.ChangeSummary{{ID: "x", RepositoryID: "one", Branch: "feature/x"}, parent.Changes[2]}},
+			failures: []string{"branch feature/x (repository not resolved yet; select it with --branch)", "Run, for example: entire trail approve api/21"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := selectTrailWorkingBranch(changes, tt.repo, tt.explicit, tt.preferred)
-			if tt.failure != "" {
-				require.ErrorContains(t, err, tt.failure)
+			from := parent
+			if tt.parent != nil {
+				from = *tt.parent
+			}
+			got, err := tt.choice.selectFrom(from, retry)
+			if len(tt.failures) > 0 {
+				require.Error(t, err)
+				for _, want := range tt.failures {
+					require.Contains(t, err.Error(), want)
+				}
+				for _, unwanted := range tt.absent {
+					require.NotContains(t, err.Error(), unwanted)
+				}
 				return
 			}
 			require.NoError(t, err)
 			require.Equal(t, tt.id, got.ID)
 		})
 	}
+}
+
+// approve writes to the change it selects, so with several open changes it
+// lists them even when one is on the checked-out branch, and never writes.
+// Not parallel: changes CWD and replaces client constructors.
+func TestWorkingTrailWriteListsChangesInsteadOfGuessing(t *testing.T) {
+	repoDir := t.TempDir()
+	testutil.InitRepo(t, repoDir)
+	testutil.IsolateGitConfigEnv(t)
+	testutil.RunGit(t, repoDir, "remote", "add", "origin", "git@github.com:acme/widget.git")
+	testutil.WriteFile(t, repoDir, "README.md", "widget")
+	testutil.GitAdd(t, repoDir, "README.md")
+	testutil.GitCommit(t, repoDir, "initial")
+	current := strings.TrimSpace(testutil.RunGit(t, repoDir, "branch", "--show-current"))
+	require.NotEmpty(t, current)
+	t.Chdir(repoDir)
+	parent := projectTrailTestResource()
+	parent.Changes = []api.ChangeSummary{
+		{ID: projectTrailTestChange, RepositoryID: "repo-id", Repository: "widget", Number: 7, Title: "Widget work", Branch: current},
+		{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAY", RepositoryID: "api-id", Repository: "api", Number: 9, Title: "API work", Branch: "feature/api"},
+	}
+	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Contains(t, []string{"/api/v1/gh/acme/trails/42", projectTrailTestPath}, r.URL.Path)
+		assert.NoError(t, json.NewEncoder(w).Encode(parent))
+	})
+	setupWorkingRepoClient(t, func(w http.ResponseWriter, r *http.Request) {
+		// The failed command re-probes enablement; that read is all it may send.
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/trails/gh/acme/widget" {
+			t.Errorf("must not touch repository work: %s %s", r.Method, r.URL.Path)
+		}
+		http.NotFound(w, r)
+	})
+
+	_, _, err := executeProjectTrailTest(t, "approve", "42")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "trail #42 has 2 open changes; choose one:\n  widget/7 - Widget work\n  api/9 - API work")
+	require.Contains(t, err.Error(), "Run, for example: trail approve widget/7")
+}
+
+// A trail whose only open change lives in another repository acts on that
+// repository's work without --repo. Not parallel: changes CWD and replaces
+// client constructors.
+func TestWorkingTrailSoleChangeInAnotherRepository(t *testing.T) {
+	repoDir := t.TempDir()
+	testutil.InitRepo(t, repoDir)
+	testutil.IsolateGitConfigEnv(t)
+	testutil.RunGit(t, repoDir, "remote", "add", "origin", "git@github.com:acme/widget.git")
+	t.Chdir(repoDir)
+	const apiChange = "01ARZ3NDEKTSV4RRFFQ69G5FAY"
+	parent := projectTrailTestResource()
+	parent.Changes = []api.ChangeSummary{
+		{ID: projectTrailTestChange, RepositoryID: "repo-id", Repository: "widget", Number: 7, Title: "Merged widget work"},
+		{ID: apiChange, RepositoryID: "api-id", Repository: "api", Number: 9, Title: "API work", Branch: "feature/api"},
+	}
+	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/gh/acme/trails/42", projectTrailTestPath:
+			w.Header().Set("ETag", `W/"parent-version"`)
+			assert.NoError(t, json.NewEncoder(w).Encode(parent))
+		case projectTrailTestPath + "/changes/" + apiChange:
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": apiChange, "number": 9, "trailId": projectTrailTestID, "repositoryId": "api-id", "branch": "feature/api", "status": "open"}))
+		default:
+			t.Errorf("unexpected project request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	})
+	var writes []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writes = append(writes, r.Method+" "+r.URL.Path)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(server.Close)
+	old := newTrailAPIClient
+	var opened []string
+	newTrailAPIClient = func(_ context.Context, _ bool, forge, owner, repo string) (*api.Client, string, error) {
+		opened = append(opened, forge+"/"+owner+"/"+repo)
+		return api.NewClientWithBaseURL("repo-token", server.URL), map[string]string{"widget": "repo-id", "api": "api-id"}[repo], nil
+	}
+	t.Cleanup(func() { newTrailAPIClient = old })
+
+	out, _, err := executeProjectTrailTest(t, "approve", "42")
+	require.NoError(t, err)
+	require.Equal(t, []string{"gh/acme/widget", "gh/acme/api"}, opened)
+	require.Equal(t, []string{"POST /api/v1/trails/gh/acme/api/9/approvals"}, writes)
+	require.Contains(t, out, "gh/acme/api / feature/api")
 }
 
 // Not parallel: replaces the repository client constructor with an isolated cell.
