@@ -66,8 +66,15 @@ func resolveProjectTrailWorkingContext(cmd *cobra.Command, selector, branch stri
 	if err != nil {
 		return nil, renderDataAPIAuthError(ctx, cmd.ErrOrStderr(), owner+"/"+repo, err)
 	}
+	// A change in another repository reads nothing about this one, so only
+	// lookups that stay here may record this clone's trails enablement.
+	foreign := false
 	if repoOverride == "" {
-		defer func() { noteTrailCommandEnablement(ctx, client, err) }()
+		defer func() {
+			if !foreign {
+				noteTrailCommandEnablement(ctx, client, err)
+			}
+		}()
 	}
 	base, err := trailRepoBasePath(host, owner, repo, repoID)
 	if err != nil {
@@ -119,7 +126,9 @@ func resolveProjectTrailWorkingContext(cmd *cobra.Command, selector, branch stri
 		choice.Scope = repoID
 	}
 	choice.PreferUnapproved = cmd.Name() == "approve"
-	retry := func(change string) string { return trailChangeRetryCommand(cmd, selector, change) }
+	retry := func(change string) string {
+		return trailChangeRetryCommand(cmd, selector, change, target.Host+"/"+target.Project)
+	}
 	reviews := func(changes []api.ChangeSummary) map[string]trailChangeReviews {
 		return lookupTrailChangeReviews(ctx, trailInsecureHTTP(cmd), target, trailRepoAccess{Client: client, BasePath: base, RepoID: repoID}, changes)
 	}
@@ -130,6 +139,7 @@ func resolveProjectTrailWorkingContext(cmd *cobra.Command, selector, branch stri
 	if selected.RepositoryID == repoID {
 		return finishTrailWorkingContext(ctx, target, parent, etag, selected, client, base, host, owner, repo, repoID)
 	}
+	foreign = true
 	return finishForeignTrailWorkingContext(cmd, target, parent, etag, selected)
 }
 
@@ -383,7 +393,10 @@ func trailChangeListing(item api.ChangeSummary) string {
 // selector. Positional arguments and the flags the user set are kept, so
 // --project, -m, and --json still apply; --trail and --branch are dropped,
 // since the change replaces them and cannot be combined with --branch.
-func trailChangeRetryCommand(cmd *cobra.Command, selector, change string) string {
+// project is the trail's <forge>/<project>: a change selector resolves in
+// --project or origin's owner, never --repo's, so a project the user implied
+// through --repo is spelled out.
+func trailChangeRetryCommand(cmd *cobra.Command, selector, change, project string) string {
 	args := slices.Clone(cmd.Flags().Args())
 	replaced := false
 	for i, arg := range args {
@@ -408,11 +421,18 @@ func trailChangeRetryCommand(cmd *cobra.Command, selector, change string) string
 			if slice, ok := f.Value.(pflag.SliceValue); ok {
 				values = slice.GetSlice()
 			}
+			if len(values) == 0 {
+				// An explicitly empty list (--assignee=) still clears.
+				parts = append(parts, "--"+f.Name+"=")
+			}
 			for _, value := range values {
 				parts = append(parts, "--"+f.Name+"="+shellArg(value))
 			}
 		}
 	})
+	if !cmd.Flags().Changed("project") && trailRepoFlag(cmd) != "" {
+		parts = append(parts, "--project="+shellArg(project))
+	}
 	return strings.Join(parts, " ")
 }
 

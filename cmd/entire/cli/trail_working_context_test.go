@@ -163,6 +163,10 @@ func TestTrailChangeRetryCommandKeepsFlags(t *testing.T) {
 		{"trail flag with a finding ID", []string{"finding", "resolve", "finding-one", "--trail", "42", "-m", "done"},
 			"trail finding resolve widget/7 finding-one --message=done"},
 		{"bool flag", []string{"finding", "list", "42", "--json"}, "trail finding list widget/7 --json"},
+		{"explicitly empty list still clears", []string{"update", "42", "--branch", "feat", "--assignee=", "--title", "X"},
+			"trail update widget/7 --assignee= --title=X"},
+		{"project implied by --repo is spelled out", []string{"approve", "42", "--repo", "gh/other/widget"},
+			"trail approve widget/7 --repo=gh/other/widget --project=gh/other"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -170,7 +174,7 @@ func TestTrailChangeRetryCommandKeepsFlags(t *testing.T) {
 			cmd, rest, err := root.Find(tt.args)
 			require.NoError(t, err)
 			require.NoError(t, cmd.ParseFlags(rest))
-			require.Equal(t, tt.want, trailChangeRetryCommand(cmd, "42", "widget/7"))
+			require.Equal(t, tt.want, trailChangeRetryCommand(cmd, "42", "widget/7", "gh/other"))
 		})
 	}
 }
@@ -280,6 +284,39 @@ func TestWorkingTrailSoleChangeInAnotherRepository(t *testing.T) {
 	require.Equal(t, []string{"gh/acme/widget", "gh/acme/api"}, opened)
 	require.Equal(t, []string{"POST /api/v1/trails/gh/acme/api/9/approvals"}, writes)
 	require.Contains(t, out, "gh/acme/api / feature/api")
+	// Nothing about widget was read, so its trails enablement stays unknown.
+	scope, err := currentTrailEnablementScope(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, trailEnablementCacheUnknown, cachedTrailsEnablementForScope(t.Context(), scope, time.Now()))
+}
+
+// finding add reads a patch or file location from this worktree, so it must
+// not attach them to a sole change in another repository that happens to
+// share the path. Not parallel: changes CWD and replaces client constructors.
+func TestWorkingTrailFindingAddWithLocalAnchorStaysInThisClone(t *testing.T) {
+	repoDir := t.TempDir()
+	testutil.InitRepo(t, repoDir)
+	testutil.IsolateGitConfigEnv(t)
+	testutil.RunGit(t, repoDir, "remote", "add", "origin", "git@github.com:acme/widget.git")
+	testutil.WriteFile(t, repoDir, "README.md", "widget")
+	t.Chdir(repoDir)
+	parent := projectTrailTestResource()
+	parent.Changes = []api.ChangeSummary{{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAY", RepositoryID: "api-id", Repository: "api", Number: 9, Title: "API work", Branch: "feature/api"}}
+	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.NoError(t, json.NewEncoder(w).Encode(parent))
+	})
+	setupWorkingRepoClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("must not post a finding: %s %s", r.Method, r.URL.Path)
+		}
+		http.NotFound(w, r)
+	})
+
+	_, _, err := executeProjectTrailTest(t, "finding", "add", "42", "-m", "Check this", "--file", "README.md", "--line", "1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "trail #42 has no open changes in this clone's repository")
+	require.Contains(t, err.Error(), "need a clone of that repository:\n  api/9 - API work")
 }
 
 // Not parallel: replaces the repository client constructor with an isolated cell.
