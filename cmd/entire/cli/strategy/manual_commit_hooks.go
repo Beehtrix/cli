@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -1712,9 +1713,12 @@ func (s *ManualCommitStrategy) postCommitProcessSessionLocked(
 	// Only fall back to transcript extraction for ACTIVE sessions — IDLE/ENDED
 	// sessions have FilesTouched already populated by SaveStep/mergeFilesTouched.
 	var filesTouchedBefore []string
-	if state.Phase.IsActive() {
+	switch {
+	case state.Phase.IsActive() && foreign:
+		filesTouchedBefore = s.filesTouchedWithLiveTranscript(ctx, state)
+	case state.Phase.IsActive():
 		filesTouchedBefore = s.resolveFilesTouched(ctx, state)
-	} else if len(state.FilesTouched) > 0 {
+	case len(state.FilesTouched) > 0:
 		filesTouchedBefore = make([]string, len(state.FilesTouched))
 		copy(filesTouchedBefore, state.FilesTouched)
 	}
@@ -2106,6 +2110,9 @@ func (s *ManualCommitStrategy) filterSessionsWithNewContent(ctx context.Context,
 			}
 			withoutRecords := *state
 			withoutRecords.TaskRecords = nil
+			if state.Phase.IsActive() {
+				withoutRecords.FilesTouched = s.filesTouchedWithLiveTranscript(ctx, state)
+			}
 			checked = &withoutRecords
 		}
 		hasNew, err := s.sessionHasNewContent(ctx, repo, checked, contentCheckOpts{stagedFiles: stagedFiles})
@@ -2415,6 +2422,23 @@ func (s *ManualCommitStrategy) resolveFilesTouched(ctx context.Context, state *S
 	prepareTranscriptForState(ctx, state)
 
 	return s.extractModifiedFilesFromLiveTranscript(ctx, state, state.CheckpointTranscriptStart)
+}
+
+// filesTouchedWithLiveTranscript returns FilesTouched together with the files
+// the live transcript modified since the last condensation. FilesTouched holds
+// only what earlier turn ends recorded for an agent without file-edit hooks,
+// so for a mid-turn session it misses the current turn's edits. Used for a
+// foreign session, whose link rests on overlap alone; the other paths keep
+// resolveFilesTouched's FilesTouched-first answer.
+func (s *ManualCommitStrategy) filesTouchedWithLiveTranscript(ctx context.Context, state *SessionState) []string {
+	prepareTranscriptForState(ctx, state)
+	files := slices.Clone(state.FilesTouched)
+	for _, f := range s.extractModifiedFilesFromLiveTranscript(ctx, state, state.CheckpointTranscriptStart) {
+		if !slices.Contains(files, f) {
+			files = append(files, f)
+		}
+	}
+	return files
 }
 
 // hasNewTranscriptWork checks if the agent has done work since the last condensation.

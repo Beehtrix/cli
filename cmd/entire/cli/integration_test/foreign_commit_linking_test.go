@@ -197,3 +197,64 @@ func TestForeignCommit_RunningSubagentDoesNotLinkUnrelatedFile(t *testing.T) {
 
 	require.Empty(t, headCheckpointID(t, env), "a running subagent is no evidence for a file it did not write")
 }
+
+// foreignSessionInSecondTurn runs a turn that edits turn1.txt to its Stop,
+// then starts a second turn that edits turn2.txt, and records the session's
+// owner as a live process outside the commit hook's ancestry.
+func foreignSessionInSecondTurn(t *testing.T, env *TestEnv) *Session {
+	t.Helper()
+	session := env.NewSession()
+	require.NoError(t, env.SimulateUserPromptSubmitWithTranscriptPath(session.ID, session.TranscriptPath))
+	env.WriteFile("turn1.txt", "first turn")
+	session.CreateTranscript("Create turn1.txt", []FileChange{{Path: "turn1.txt", Content: "first turn"}})
+	require.NoError(t, env.SimulateStop(session.ID, session.TranscriptPath))
+
+	require.NoError(t, env.SimulateUserPromptSubmitWithTranscriptPath(session.ID, session.TranscriptPath))
+	env.WriteFile("turn2.txt", "second turn")
+	session.CreateTranscript("Create turn2.txt", []FileChange{{Path: "turn2.txt", Content: "second turn"}})
+	makeOwnerForeign(t, env, session.ID)
+	return session
+}
+
+func requireCheckpointHasSession(t *testing.T, env *TestEnv, sessionID string) {
+	t.Helper()
+	cpID := headCheckpointID(t, env)
+	require.NotEmpty(t, cpID, "the commit links the session")
+	summaryContent, found := env.ReadFileFromBranch(paths.MetadataBranchName, CheckpointSummaryPath(cpID))
+	require.True(t, found, "checkpoint summary must exist")
+	var summary checkpoint.CheckpointSummary
+	require.NoError(t, json.Unmarshal([]byte(summaryContent), &summary))
+	env.AssertCheckpointContainsSession(t, summary, sessionID)
+}
+
+func TestForeignCommit_SecondTurnEditLinksNoTTY(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	session := foreignSessionInSecondTurn(t, env)
+
+	env.GitCommitWithHooksAsAgent("commit the second turn's file", "turn2.txt")
+
+	requireCheckpointHasSession(t, env, session.ID)
+}
+
+func TestForeignCommit_SecondTurnEditLinksWithAlwaysAtTerminal(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	env.WriteSettings(map[string]any{"enabled": true, "commit_linking": "always"})
+	session := foreignSessionInSecondTurn(t, env)
+
+	env.GitCommitWithHooks("commit the second turn's file", "turn2.txt")
+
+	requireCheckpointHasSession(t, env, session.ID)
+}
+
+func TestForeignCommit_SecondTurnDoesNotLinkUnrelatedFile(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	foreignSessionInSecondTurn(t, env)
+
+	env.WriteFile("other_file.txt", "from a hookless agent")
+	env.GitCommitWithHooksAsAgent("hookless agent commit", "other_file.txt")
+
+	require.Empty(t, headCheckpointID(t, env), "an unrelated file stays unlinked in later turns too")
+}
