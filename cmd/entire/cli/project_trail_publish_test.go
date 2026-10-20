@@ -116,7 +116,7 @@ func TestProjectTrailCreateNoBranchOrServerCreationDoesNotPush(t *testing.T) {
 			})
 			args := []string{"create", "--title", "Remote work"}
 			if noBranch {
-				args = append(args, "--no-branch")
+				args = append(args, "--no-branch", "--project", "gh/acme")
 			} else {
 				args = append(args, "--branch-action", "create")
 			}

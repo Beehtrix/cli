@@ -231,7 +231,7 @@ func newProjectTrailCreateCmd() *cobra.Command {
 	var noBranch bool
 	cmd := &cobra.Command{
 		Use: cmdCreate, Short: "Create a trail and publish its branch",
-		Long: "Create project intent and link a branch atomically. In the current repository, publish the local branch first; no separate commit or push is required. Uses the current feature branch, or derives a new branch from the title when on the base branch. Use --branch to choose a branch, or --no-branch for intent only. With --repo, no local branch is published: link existing remote work or use --branch-action create to create it on the server from --base. This command does not commit changes or change the local checkout. Branches are preserved if creation fails.",
+		Long: "Create project intent and link a branch atomically. In the current repository, publish the local branch first; no separate commit or push is required. Uses the current feature branch, or derives a new branch from the title when on the base branch. Use --branch to choose a branch, or --no-branch for intent only. With --no-branch, the current or --repo repository becomes the Trail scope and requires repository write access; --project without --repo creates unscoped intent instead. Linking branches, unscoped creation, and explicit --idempotency-key require project management. With --repo, no local branch is published: link existing remote work or use --branch-action create to create it on the server from --base. This command does not commit changes or change the local checkout. Branches are preserved if creation fails.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := fields.validate(cmd, true); err != nil {
@@ -239,6 +239,13 @@ func newProjectTrailCreateCmd() *cobra.Command {
 			}
 			if noBranch && (cmd.Flags().Changed("branch") || cmd.Flags().Changed("base") || cmd.Flags().Changed("branch-action")) {
 				return errors.New("--no-branch cannot be combined with --branch, --base, or --branch-action")
+			}
+			request := api.ProjectTrailCreateRequest{
+				Title: fields.Title, Body: fields.Body, Status: fields.Status,
+				Type: fields.Type, Priority: fields.Priority, Assignees: fields.Assignees,
+			}
+			if noBranch && (trailRepoFlag(cmd) != "" || projectTrailProjectFlag(cmd) == "") {
+				return createRepositoryScopedProjectTrail(cmd, request, key)
 			}
 			if !noBranch {
 				var err error
@@ -253,10 +260,6 @@ func newProjectTrailCreateCmd() *cobra.Command {
 			target, err := resolveProjectTrailCollection(cmd)
 			if err != nil {
 				return err
-			}
-			request := api.ProjectTrailCreateRequest{
-				Title: fields.Title, Body: fields.Body, Status: fields.Status,
-				Type: fields.Type, Priority: fields.Priority, Assignees: fields.Assignees,
 			}
 			if branch != "" {
 				change, err := projectTrailChangeRequest(cmd, fields, branch, base, action)
@@ -282,7 +285,7 @@ func newProjectTrailCreateCmd() *cobra.Command {
 		},
 	}
 	fields.flags(cmd)
-	cmd.Flags().BoolVar(&noBranch, "no-branch", false, "Create intent without linking a repository branch")
+	cmd.Flags().BoolVar(&noBranch, "no-branch", false, "Create intent scoped to the current or --repo repository; --project alone creates unscoped intent")
 	addProjectTrailCreationFlags(cmd, &branch, &base, &action, &key)
 	addJSONFlag(cmd)
 	return cmd
@@ -292,7 +295,7 @@ func addProjectTrailCreationFlags(cmd *cobra.Command, branch, base, action, key 
 	cmd.Flags().StringVar(branch, "branch", "", "Branch to use (defaults to the current feature branch; create derives one from the title on the base branch)")
 	cmd.Flags().StringVar(base, "base", "", "Base branch for new code work")
 	cmd.Flags().StringVar(action, "branch-action", trailBranchActionLink, "Branch action: link existing remote work, or create a new branch")
-	cmd.Flags().StringVar(key, "idempotency-key", "", "Creation retry key; generated and printed to stderr if omitted (reuse with identical fields)")
+	cmd.Flags().StringVar(key, "idempotency-key", "", "Manager-only creation retry key; generated unless creating repository-scoped intent (reuse with identical fields)")
 }
 
 func validateProjectTrailBranch(cmd *cobra.Command, branch, action string) error {

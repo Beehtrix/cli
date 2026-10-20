@@ -31,7 +31,9 @@ entire trail list --project gh/entireio --json
 entire trail list --project gh/entireio --limit 50 --page-token '<nextPageToken>'
 entire trail show 42 --project gh/entireio
 entire trail create --title 'Cross-repository work'
-entire trail create --project gh/entireio --title 'Plan' --no-branch
+entire trail create --title 'Repository-scoped plan' --no-branch
+entire trail create --repo gh/entireio/cli --title 'Repository-scoped plan' --no-branch
+entire trail create --project gh/entireio --title 'Unscoped plan' --no-branch
 entire trail update 42 --body 'Updated intent'
 entire trail link 42 --repo gh/entireio/api --branch feature/api
 entire trail unlink 42 --repo gh/entireio/api --branch feature/api
@@ -58,8 +60,19 @@ Selectors are project-local numbers or trail ULIDs, or `<repo>/<number>` for one
   Branch reads refresh the local trails-enablement cache only when their
   repository is known to be this clone; foreign change selectors never do.
   `link` takes a project trail number or ULID, not `<repo>/<number>`.
+- `create --no-branch` scopes intent to the current or explicit `--repo`
+  repository. It routes through repository placement and ownership, without
+  project inspection, and sends `repoIds` plus the verified `project_id`.
+  Repository write access suffices; it grants no project-management authority.
+  `--project` without `--repo` instead creates unscoped intent. Unscoped creation
+  and creation with an initial Change still require project management.
 - Updates require the resource's ETag; a 412 never triggers an unconditional
-  retry. Create/link print an idempotency key for retries with identical inputs.
+  retry. Manager-only create/link print an idempotency key for retries with
+  identical inputs. Repository-scoped `create --no-branch` sends no idempotency
+  header by default and no initial Changes. An explicit `--idempotency-key`
+  retains manager-only idempotent creation; denial never triggers a downgrade.
+  Creation never retries automatically. After an uncertain non-idempotent
+  result, inspect Trails before creating again.
 - Local create publishes the branch but never commits, force-pushes, or deletes
   it on failure. `--repo`, `--no-branch`, and `--branch-action create` skip local
   publication. Unlink preserves the branch and its work.
