@@ -21,6 +21,9 @@ param(
 
 $GitHubRepo = "entireio/cli"
 $ScoopBucketUrl = "https://github.com/entireio/scoop-bucket.git"
+$DefaultReleaseOrigin = "https://install.entire.com"
+$GitHubReleaseOrigin = "https://github.com/$GitHubRepo/releases/download"
+$GitHubApi = "https://api.github.com/repos/$GitHubRepo"
 # Whether the caller chose the install directory. Read here because
 # $PSBoundParameters inside a function is that function's own; the functions
 # read this the way they read $InstallDir.
@@ -224,7 +227,7 @@ function Invoke-GitHubApi {
     # Explorer HTML parser on Windows PowerShell 5.1; Invoke-RestMethod
     # decodes the body itself. See Save-RemoteFile for the one that needs it.
     try {
-        Invoke-RestMethod -Uri $Uri -Headers $headers -TimeoutSec $ApiTimeoutSec
+        Invoke-RestMethod -Uri $Uri -Headers $headers -TimeoutSec $ApiTimeoutSec -ErrorAction Stop
     }
     catch {
         # Only WebException (5.1) and HttpResponseException (pwsh) carry a
@@ -238,11 +241,85 @@ function Invoke-GitHubApi {
     }
 }
 
+# Match install.sh's version_is_release_version and version_valid_for_channel.
+# Use case-sensitive matches: release paths and the nightly segment are literal.
+function Test-ReleaseVersion {
+    param([string] $ReleaseVersion, [string] $ReleaseChannel)
+
+    if ($ReleaseVersion -cnotmatch '\A[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\z') {
+        return $false
+    }
+    if ($ReleaseChannel -ceq 'nightly') {
+        return $ReleaseVersion -cmatch '-nightly\.'
+    }
+    if ($ReleaseChannel -ceq 'stable') {
+        return $ReleaseVersion -notmatch '-'
+    }
+    return $true
+}
+
+function Get-ReleaseOrigin {
+    # Like install.sh, a caller-selected mirror is authoritative, not a hint.
+    if (-not [string]::IsNullOrEmpty($env:ENTIRE_INSTALL_BASE_URL)) {
+        return $env:ENTIRE_INSTALL_BASE_URL.TrimEnd('/')
+    }
+    $DefaultReleaseOrigin
+    $GitHubReleaseOrigin
+}
+
+# Missing fields are normal in fallback metadata, including under StrictMode.
+function Get-MetadataString {
+    param($Metadata, [string] $Name)
+
+    if ($null -eq $Metadata) { return '' }
+    $property = $Metadata.PSObject.Properties[$Name]
+    if ($null -ne $property -and $property.Value -is [string]) {
+        return $property.Value
+    }
+    return ''
+}
+
+function Get-EntireReleaseVersion {
+    param([string] $BaseUrl, [string] $ReleaseChannel)
+
+    # Never send GITHUB_TOKEN to the mirror, including a caller-selected one.
+    $manifest = Invoke-RestMethod -Uri "$BaseUrl/channels/$ReleaseChannel.json" -TimeoutSec $ApiTimeoutSec -ErrorAction Stop
+    $declared = Get-MetadataString $manifest 'channel'
+    if ($declared -and $declared -cne $ReleaseChannel) {
+        throw "Manifest declares channel '$declared', not '$ReleaseChannel'."
+    }
+    $tag = Get-MetadataString $manifest 'tag'
+    if (-not $tag) { $tag = Get-MetadataString $manifest 'version' }
+    $releaseVersion = $tag -creplace '^v', ''
+    if (-not (Test-ReleaseVersion $releaseVersion $ReleaseChannel)) {
+        throw "Invalid $ReleaseChannel release version: $tag"
+    }
+    return $releaseVersion
+}
+
 function Get-ReleaseVersion {
     param([string] $ReleaseChannel)
 
+    $failures = @()
+    foreach ($origin in Get-ReleaseOrigin) {
+        try {
+            if ($origin -ceq $GitHubReleaseOrigin) {
+                return Get-GitHubReleaseVersion -ReleaseChannel $ReleaseChannel
+            }
+            return Get-EntireReleaseVersion -BaseUrl $origin -ReleaseChannel $ReleaseChannel
+        }
+        catch {
+            $failures += "${origin}: $($_.Exception.Message)"
+        }
+    }
+    throw "Could not determine the latest $ReleaseChannel version. Tried: $($failures -join '; ')"
+}
+
+function Get-GitHubReleaseVersion {
+    param([string] $ReleaseChannel)
+
     if ($ReleaseChannel -eq "nightly") {
-        $uri = "https://api.github.com/repos/$GitHubRepo/releases?per_page=20"
+        $uri = "$GitHubApi/releases?per_page=20"
         $releases = Invoke-GitHubApi -Uri $uri
         $release = $null
         $checked = 0
@@ -253,7 +330,7 @@ function Get-ReleaseVersion {
         # explicitly instead of piping to Where-Object.
         foreach ($candidate in $releases) {
             $checked++
-            if ($candidate.tag_name -like "*nightly*") {
+            if (Test-ReleaseVersion ((Get-MetadataString $candidate 'tag_name') -creplace '^v', '') 'nightly') {
                 $release = $candidate
                 break
             }
@@ -266,16 +343,17 @@ function Get-ReleaseVersion {
         }
     }
     else {
-        $uri = "https://api.github.com/repos/$GitHubRepo/releases/latest"
+        $uri = "$GitHubApi/releases/latest"
         $release = Invoke-GitHubApi -Uri $uri
     }
 
-    if ($null -eq $release -or [string]::IsNullOrWhiteSpace([string] $release.tag_name)) {
+    $tag = Get-MetadataString $release 'tag_name'
+    if ([string]::IsNullOrWhiteSpace($tag)) {
         throw "GitHub returned the latest release of $GitHubRepo without a tag name, so the version cannot be determined."
     }
 
-    $version = ([string] $release.tag_name) -replace "^v", ""
-    if ($version -notmatch "^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$") {
+    $version = $tag -creplace '^v', ''
+    if (-not (Test-ReleaseVersion $version $ReleaseChannel)) {
         throw "GitHub returned an invalid release version: $version"
     }
 
@@ -751,6 +829,8 @@ function Install-Entire {
     }
 
     Assert-Prerequisite
+    # ValidateSet accepts mixed case, but channel keys on the origin do not.
+    $Channel = $Channel.ToLowerInvariant()
 
     Write-Info "Installing Entire CLI..."
 
