@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -70,7 +71,7 @@ func TestTrailChangeChoice(t *testing.T) {
 			if tt.parent != nil {
 				from = *tt.parent
 			}
-			got, err := tt.choice.selectFrom(from, retry)
+			got, err := tt.choice.selectFrom(from, retry, nil)
 			if len(tt.failures) > 0 {
 				require.Error(t, err)
 				for _, want := range tt.failures {
@@ -85,6 +86,66 @@ func TestTrailChangeChoice(t *testing.T) {
 			require.Equal(t, tt.id, got.ID)
 		})
 	}
+}
+
+func TestSummarizeTrailApprovals(t *testing.T) {
+	t.Parallel()
+	at := func(hour int) time.Time { return time.Date(2026, 10, 20, hour, 0, 0, 0, time.UTC) }
+	for _, tt := range []struct {
+		name      string
+		approvals []api.TrailApproval
+		want      string
+	}{
+		{"none", nil, "no reviews yet"},
+		{"latest decision per reviewer", []api.TrailApproval{
+			{Author: "bob", Event: "approve", CreatedAt: at(9)},
+			{Author: "alice", Event: "approve", CreatedAt: at(10)},
+			{Author: "bob", Event: "request_changes", CreatedAt: at(11)},
+			{Author: "carol", Event: "approve", CreatedAt: at(12)},
+		}, "approved by alice, carol; changes requested by bob"},
+		{"repeat approvals count once", []api.TrailApproval{
+			{Author: "alice", Event: "approve", CreatedAt: at(10)},
+			{Author: "alice", Event: "approve", CreatedAt: at(11)},
+		}, "approved by alice"},
+		{"anonymous records are ignored", []api.TrailApproval{{Event: "approve", CreatedAt: at(10)}}, "no reviews yet"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.want, summarizeTrailApprovals(tt.approvals).String())
+		})
+	}
+}
+
+func TestTrailChangeChoiceListsReviewState(t *testing.T) {
+	t.Parallel()
+	parent := api.ProjectTrail{Number: 42, Changes: []api.ChangeSummary{
+		{ID: "a", RepositoryID: "one", Repository: "cli", Number: 11, Title: "Add merge", Branch: "feature/a"},
+		{ID: "b", RepositoryID: "two", Repository: "api", Number: 21, Title: "Expose mergeability", Branch: "feature/b"},
+		{ID: "c", RepositoryID: "three", Repository: "web", Number: 31, Title: "Show state", Branch: "feature/c"},
+	}}
+	var asked []string
+	reviews := func(changes []api.ChangeSummary) map[string]trailChangeReviews {
+		for _, item := range changes {
+			asked = append(asked, item.ID)
+		}
+		// c's lookup failed: it is listed without state.
+		return map[string]trailChangeReviews{"a": {Approved: []string{"alice"}}, "b": {}}
+	}
+	retry := func(change string) string { return "entire trail approve " + change }
+	_, err := trailChangeChoice{PreferUnapproved: true}.selectFrom(parent, retry, reviews)
+	require.Error(t, err)
+	require.Equal(t, "trail #42 has 3 open changes; choose one:\n"+
+		"  cli/11 - Add merge (approved by alice)\n"+
+		"  api/21 - Expose mergeability (no reviews yet)\n"+
+		"  web/31 - Show state\n"+
+		"Run, for example: entire trail approve api/21", err.Error())
+	require.Equal(t, []string{"a", "b", "c"}, asked)
+
+	asked = nil
+	got, err := trailChangeChoice{Scope: "two"}.selectFrom(parent, retry, reviews)
+	require.NoError(t, err)
+	require.Equal(t, "b", got.ID)
+	require.Empty(t, asked, "a selected change needs no review lookups")
 }
 
 // The suggested command keeps what the user typed except the trail and branch
@@ -115,7 +176,8 @@ func TestTrailChangeRetryCommandKeepsFlags(t *testing.T) {
 }
 
 // approve writes to the change it selects, so with several open changes it
-// lists them even when one is on the checked-out branch, and never writes.
+// lists them with their review state, even when one is on the checked-out
+// branch, suggests the unapproved one, and never writes.
 // Not parallel: changes CWD and replaces client constructors.
 func TestWorkingTrailWriteListsChangesInsteadOfGuessing(t *testing.T) {
 	repoDir := t.TempDir()
@@ -138,18 +200,38 @@ func TestWorkingTrailWriteListsChangesInsteadOfGuessing(t *testing.T) {
 		assert.Contains(t, []string{"/api/v1/gh/acme/trails/42", projectTrailTestPath}, r.URL.Path)
 		assert.NoError(t, json.NewEncoder(w).Encode(parent))
 	})
-	setupWorkingRepoClient(t, func(w http.ResponseWriter, r *http.Request) {
-		// The failed command re-probes enablement; that read is all it may send.
-		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/trails/gh/acme/widget" {
+	// Both repositories share one stub cell; reads only, never a write.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
 			t.Errorf("must not touch repository work: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
 		}
-		http.NotFound(w, r)
-	})
+		switch r.URL.Path {
+		case "/api/v1/trails/gh/acme/widget/7/approvals":
+			// alice requested changes, then approved: her latest decision counts.
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"approvals": []map[string]any{
+				{"id": "1", "author": "alice", "event": "request_changes", "created_at": "2026-10-20T10:00:00Z"},
+				{"id": "2", "author": "alice", "event": "approve", "created_at": "2026-10-20T11:00:00Z"},
+			}}))
+		case "/api/v1/trails/gh/acme/api/9/approvals":
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"approvals": []any{}}))
+		default:
+			// The failed command also re-probes enablement.
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	old := newTrailAPIClient
+	newTrailAPIClient = func(_ context.Context, _ bool, _, _, repo string) (*api.Client, string, error) {
+		return api.NewClientWithBaseURL("repo-token", server.URL), map[string]string{"widget": "repo-id", "api": "api-id"}[repo], nil
+	}
+	t.Cleanup(func() { newTrailAPIClient = old })
 
 	_, _, err := executeProjectTrailTest(t, "approve", "42")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "trail #42 has 2 open changes; choose one:\n  widget/7 - Widget work\n  api/9 - API work")
-	require.Contains(t, err.Error(), "Run, for example: trail approve widget/7")
+	require.Contains(t, err.Error(), "trail #42 has 2 open changes; choose one:\n  widget/7 - Widget work (approved by alice)\n  api/9 - API work (no reviews yet)")
+	require.Contains(t, err.Error(), "Run, for example: trail approve api/9")
 }
 
 // A trail whose only open change lives in another repository acts on that

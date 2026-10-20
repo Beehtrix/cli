@@ -118,7 +118,12 @@ func resolveProjectTrailWorkingContext(cmd *cobra.Command, selector, branch stri
 	if repoOverride != "" || localOnly {
 		choice.Scope = repoID
 	}
-	selected, err := choice.selectFrom(parent, func(change string) string { return trailChangeRetryCommand(cmd, selector, change) })
+	choice.PreferUnapproved = cmd.Name() == "approve"
+	retry := func(change string) string { return trailChangeRetryCommand(cmd, selector, change) }
+	reviews := func(changes []api.ChangeSummary) map[string]trailChangeReviews {
+		return lookupTrailChangeReviews(ctx, trailInsecureHTTP(cmd), target, trailRepoAccess{Client: client, BasePath: base, RepoID: repoID}, changes)
+	}
+	selected, err := choice.selectFrom(parent, retry, reviews)
 	if err != nil {
 		return nil, err
 	}
@@ -230,15 +235,19 @@ type trailChangeChoice struct {
 	LocalOnly bool
 	// Branch is an explicit --branch.
 	Branch string
+	// PreferUnapproved makes the suggested command name a change nobody has
+	// approved yet, when review state is known (approve).
+	PreferUnapproved bool
 	// Preferred is the checked-out branch; it settles ambiguity only for a
 	// change in this clone's repository.
 	Preferred string
 }
 
 // selectFrom applies, in order: the discovered change, --branch, the checked-out branch, then a sole
-// open change. Anything else lists the candidates as <repo>/<number> and names
-// the command to re-run; retry renders that command for one change selector.
-func (c trailChangeChoice) selectFrom(parent api.ProjectTrail, retry func(change string) string) (api.ChangeSummary, error) {
+// open change. Anything else lists the candidates as <repo>/<number> with their
+// review state and names the command to re-run; retry renders that command for
+// one change selector. reviews is called only when listing, and may be nil.
+func (c trailChangeChoice) selectFrom(parent api.ProjectTrail, retry func(change string) string, reviews func([]api.ChangeSummary) map[string]trailChangeReviews) (api.ChangeSummary, error) {
 	label := "trail #" + strconv.Itoa(parent.Number)
 	if c.ID != "" {
 		for _, item := range parent.Changes {
@@ -273,6 +282,16 @@ func (c trailChangeChoice) selectFrom(parent api.ProjectTrail, retry func(change
 	if len(candidates) == 1 {
 		return candidates[0], nil
 	}
+	state := map[string]trailChangeReviews{}
+	if reviews != nil {
+		state = reviews(append(slices.Clone(candidates), elsewhere...))
+	}
+	line := func(item api.ChangeSummary) string {
+		if r, ok := state[item.ID]; ok {
+			return trailChangeListing(item) + " (" + r.String() + ")"
+		}
+		return trailChangeListing(item)
+	}
 	var b strings.Builder
 	switch {
 	case len(candidates) == 0 && c.Branch != "":
@@ -283,21 +302,38 @@ func (c trailChangeChoice) selectFrom(parent api.ProjectTrail, retry func(change
 		fmt.Fprintf(&b, "%s has %d open changes%s; choose one:", label, len(candidates), c.scopeSuffix())
 	}
 	for _, item := range candidates {
-		b.WriteString("\n  " + trailChangeListing(item))
+		b.WriteString("\n  " + line(item))
 	}
 	if len(elsewhere) > 0 {
 		b.WriteString("\nChanges in other repositories need a clone of that repository:")
 		for _, item := range elsewhere {
-			b.WriteString("\n  " + trailChangeListing(item))
+			b.WriteString("\n  " + line(item))
+		}
+	}
+	if example, ok := c.exampleChange(candidates, state); ok {
+		fmt.Fprintf(&b, "\nRun, for example: %s", retry(example))
+	}
+	return api.ChangeSummary{}, errors.New(b.String())
+}
+
+// exampleChange is the change the suggested command names: for approve, the
+// first one with known state and no approvals; otherwise the first selectable.
+func (c trailChangeChoice) exampleChange(candidates []api.ChangeSummary, state map[string]trailChangeReviews) (string, bool) {
+	if c.PreferUnapproved {
+		for _, item := range candidates {
+			if r, ok := state[item.ID]; ok && len(r.Approved) == 0 {
+				if selector, ok := trailChangeSelectorFor(item); ok {
+					return selector, true
+				}
+			}
 		}
 	}
 	for _, item := range candidates {
 		if selector, ok := trailChangeSelectorFor(item); ok {
-			fmt.Fprintf(&b, "\nRun, for example: %s", retry(selector))
-			break
+			return selector, true
 		}
 	}
-	return api.ChangeSummary{}, errors.New(b.String())
+	return "", false
 }
 
 func changesOnBranch(changes []api.ChangeSummary, branch string) []api.ChangeSummary {
