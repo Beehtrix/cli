@@ -213,7 +213,6 @@ var vouchableDirs = []string{
 	".github/hooks",
 	".opencode",
 	".opencode/plugin",
-	".opencode/plugins", // where earlier CLIs wrote the plugin; installs still remove it from there
 	".pi",
 	".pi/extensions",
 	// .pi/extensions/entire is deliberately absent, and neverVouchable refuses
