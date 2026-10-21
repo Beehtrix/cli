@@ -32,7 +32,7 @@ func TestOpenCodeV2ImportPayload_DropsAttachmentsTheRedactorReplaced(t *testing.
 	if strings.Contains(string(redacted.Bytes()), image) {
 		t.Skip("the redactor kept this attachment; nothing to drop")
 	}
-	payload, err := openCodeV2ImportPayload(redacted.Bytes(), "/repo")
+	payload, err := openCodeV2ImportPayload(redacted.Bytes(), sessionIDOf(t, redacted.Bytes()), "/repo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestOpenCodeV2ImportPayload_RestoresOnlySafeSessionInfo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := openCodeV2ImportPayload(stored, "/repo")
+	payload, err := openCodeV2ImportPayload(stored, sessionIDOf(t, stored), "/repo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,5 +81,29 @@ func TestOpenCodeV2ImportPayload_RestoresOnlySafeSessionInfo(t *testing.T) {
 		if _, ok := doc.Info[key]; !ok {
 			t.Errorf("info.%s missing; OpenCode needs it to import", key)
 		}
+	}
+}
+
+// sessionIDOf returns a stored transcript's session ID.
+func sessionIDOf(t *testing.T, data []byte) string {
+	t.Helper()
+	var doc struct {
+		Info struct {
+			ID string `json:"id"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	return doc.Info.ID
+}
+
+// The import keeps the transcript's own session ID, so a transcript for
+// another session must not be imported in the requested one's place.
+func TestOpenCodeV2ImportPayload_RejectsAnotherSessionsTranscript(t *testing.T) {
+	t.Parallel()
+	_, stored := normalizeFixture(t, "tools")
+	if _, err := openCodeV2ImportPayload(stored, "ses_someone_else", "/repo"); err == nil {
+		t.Fatal("imported a transcript for a different session")
 	}
 }

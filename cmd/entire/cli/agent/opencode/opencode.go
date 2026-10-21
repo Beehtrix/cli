@@ -253,7 +253,7 @@ func (a *OpenCodeAgent) importSessionIntoOpenCode(ctx context.Context, session *
 				return fmt.Errorf("resolve worktree for OpenCode import: %w", err)
 			}
 		}
-		payload, err := openCodeV2ImportPayload(session.NativeData, dir)
+		payload, err := openCodeV2ImportPayload(session.NativeData, sessionID, dir)
 		if errors.Is(err, errNotOpenCode2Capture) {
 			return fmt.Errorf("OpenCode session %s is not in OpenCode's local store, and its checkpoint has no OpenCode 2 messages to import (captured with OpenCode 1 or an older Entire)", sessionID)
 		}

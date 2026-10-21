@@ -28,10 +28,11 @@ var openCodeImportInfoKeys = []string{"id", "projectID", "model", "cost", "token
 
 // openCodeV2ImportPayload rebuilds the OpenCode 2 export a stored transcript
 // was converted from (see normalizeOpenCodeExport), for `opencode session
-// import`. directory becomes the session's location. Attachments whose data
+// import`. The transcript must be sessionID's: the import keeps the ID it
+// carries. directory becomes the session's location. Attachments whose data
 // redaction or image externalization changed are dropped, since OpenCode
 // validates them and rejects the whole import otherwise.
-func openCodeV2ImportPayload(data []byte, directory string) ([]byte, error) {
+func openCodeV2ImportPayload(data []byte, sessionID, directory string) ([]byte, error) {
 	var doc struct {
 		Info     map[string]any `json:"info"`
 		Messages []struct {
@@ -43,6 +44,9 @@ func openCodeV2ImportPayload(data []byte, directory string) ([]byte, error) {
 	}
 	if doc.Info == nil {
 		return nil, errNotOpenCode2Capture
+	}
+	if id := v2String(doc.Info, "id"); id != sessionID {
+		return nil, fmt.Errorf("stored OpenCode transcript is for session %q, not %q", id, sessionID)
 	}
 	messages := make([]any, 0, len(doc.Messages))
 	for _, msg := range doc.Messages {

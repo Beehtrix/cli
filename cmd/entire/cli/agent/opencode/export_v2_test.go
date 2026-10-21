@@ -314,7 +314,7 @@ func TestOpenCodeV2ImportPayload_RoundTrip(t *testing.T) {
 			t.Parallel()
 			raw := loadOpenCode2Fixture(t, name)
 			_, stored := normalizeFixture(t, name)
-			payload, err := openCodeV2ImportPayload(stored, "/elsewhere")
+			payload, err := openCodeV2ImportPayload(stored, sessionIDOf(t, stored), "/elsewhere")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -356,7 +356,7 @@ func TestOpenCodeV2ImportPayload_RoundTrip(t *testing.T) {
 func TestOpenCodeV2ImportPayload_OpenCode1CaptureIsRejected(t *testing.T) {
 	t.Parallel()
 	v1 := `{"info":{"id":"ses_1"},"messages":[{"info":{"id":"m1","role":"user","time":{"created":1}},"parts":[{"type":"text","text":"hi"}]}]}`
-	if _, err := openCodeV2ImportPayload([]byte(v1), "/repo"); !errors.Is(err, errNotOpenCode2Capture) {
+	if _, err := openCodeV2ImportPayload([]byte(v1), "ses_1", "/repo"); !errors.Is(err, errNotOpenCode2Capture) {
 		t.Fatalf("err = %v, want errNotOpenCode2Capture", err)
 	}
 }
@@ -375,7 +375,7 @@ func TestOpenCodeV2ImportPayload_DropsChangedAttachments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := openCodeV2ImportPayload(stored, "/repo")
+	payload, err := openCodeV2ImportPayload(stored, sessionIDOf(t, stored), "/repo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,11 +408,11 @@ func TestChunkTranscript_KeepsOpenCode2Originals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := openCodeV2ImportPayload(stored, "/repo")
+	want, err := openCodeV2ImportPayload(stored, sessionIDOf(t, stored), "/repo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := openCodeV2ImportPayload(joined, "/repo")
+	got, err := openCodeV2ImportPayload(joined, sessionIDOf(t, joined), "/repo")
 	if err != nil {
 		t.Fatalf("reassembled transcript lost its OpenCode 2 originals: %v", err)
 	}
