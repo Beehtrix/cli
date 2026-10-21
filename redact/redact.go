@@ -29,9 +29,10 @@ import (
 var secretPattern = regexp.MustCompile(`[A-Za-z0-9+_=-]{10,}`)
 
 // pathSegmentPattern matches a path component that random base64 almost never
-// produces: a word ("refs", "Library") or a long lowercase hex name, as in
-// content-addressed caches.
-var pathSegmentPattern = regexp.MustCompile(`^(?:[A-Z]?[a-z]{3,}|[0-9a-f]{16,})$`)
+// produces: a word ("refs", "Library"), a long lowercase hex name, as in
+// content-addressed caches, or a version tail with a build suffix, as in Go's
+// v1.2.10+incompatible module directories.
+var pathSegmentPattern = regexp.MustCompile(`^(?:[A-Z]?[a-z]{3,}|[0-9a-f]{16,}|[0-9]+\+[a-z]{3,})$`)
 
 // credentialedURIPattern matches URLs that embed userinfo with a password, such
 // as postgres://user:pass@host/db or redis://:pass@host/0. These often have
@@ -474,7 +475,7 @@ func detectSlashedBase64(s string) []taggedRegion {
 		}
 		i = end
 		start = skipJSONEscapeLetter(s, start)
-		if end-start >= 20 && isSlashedBase64Secret(s, start, end) {
+		if end-start >= 20 && isSlashedBase64Secret(s[start:end]) {
 			regions = append(regions, taggedRegion{region: region{start, end}})
 		}
 	}
@@ -485,17 +486,12 @@ func isBase64Byte(c byte) bool {
 	return 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '+' || c == '/'
 }
 
-// isSlashedBase64Secret reports whether s[start:end], a base64 run, is a
-// high-entropy value rather than a path. A run after a digit and '.' continues
-// a version number (v1.2.10+incompatible/CONTRIBUTING). Other glue is still
-// scored, since a secret often follows a flag, a key prefix or a name
-// (-p<secret>, token_<secret>, user@<secret>).
-func isSlashedBase64Secret(s string, start, end int) bool {
-	run := s[start:end]
+// isSlashedBase64Secret reports whether run, a base64 run, is a
+// high-entropy value rather than a path. Only the run's own segments decide:
+// the text before it says nothing, since a secret often follows a flag, a key
+// prefix or a name (-p<secret>, token_<secret>, user@<secret>).
+func isSlashedBase64Secret(run string) bool {
 	if !strings.Contains(run, "/") {
-		return false
-	}
-	if start > 1 && s[start-1] == '.' && '0' <= s[start-2] && s[start-2] <= '9' {
 		return false
 	}
 	for segment := range strings.SplitSeq(run, "/") {

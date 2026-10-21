@@ -158,6 +158,21 @@ func TestString_Base64WithSlash(t *testing.T) {
 			input: "~" + slashedSig,
 			want:  "~REDACTED",
 		},
+		{
+			name:  "after a version prefix",
+			input: "release v2." + slashedSig,
+			want:  "release v2.REDACTED",
+		},
+		{
+			name:  "after a numbered key prefix",
+			input: "k1." + slashedSig,
+			want:  "k1.REDACTED",
+		},
+		{
+			name:  "starting with a digit after a number and a dot",
+			input: "3.9IbLuLz+MZUa/Y6vxL7EyYTULHLRfYvkLln7hKQfQq4=",
+			want:  "3.REDACTED",
+		},
 	})
 }
 
