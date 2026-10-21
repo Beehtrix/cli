@@ -119,8 +119,17 @@ OpenCode 1 sets `OPENCODE=1` in its own environment and gets the plugin
 function; anything else gets `{id, server, setup}`. Verified live on 1.0.224,
 1.1.65, 1.2.27, 1.3.0, 1.3.3, 1.4.17, 1.14.51, 1.17.20, 1.18.33, 1.19.3 and
 2.0.0, 2.0.16, 2.0.32, 2.1.1, 2.1.2. OpenCode 1 also calls `setup` with a
-reduced context, which the plugin ignores. (0.15.x and 1.0.0 reject the
-`.opencode/plugins` directory name and fail to start, as they do on main.)
+reduced context, which the plugin ignores.
+
+The plugin lives in `.opencode/plugin/entire.ts`, which every OpenCode loads.
+Earlier CLIs wrote `.opencode/plugins/entire.ts`; OpenCode 0.15.x and 1.0.0
+refuse to start while `.opencode/plugins` exists, and 1.0.224+ and 2.x load
+both directories. Installing removes an Entire plugin from the old directory
+(and the directory, when that empties it), `entire status`/`doctor` report one
+left there as outdated, and an install from an earlier CLI still counts as
+installed. On 0.15.31 and 1.0.0 the plugin loads and its hooks fire
+(verified live); those versions then crash on today's provider responses
+(`DecimalError`) before finishing a turn, with or without Entire.
 
 - **Shared service.** OpenCode 2 runs plugins in a background service shared
   by every repository (`opencode run --standalone` runs a private one). Prompt,
