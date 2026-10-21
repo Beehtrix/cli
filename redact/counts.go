@@ -11,9 +11,11 @@ import "maps"
 type Counts struct {
 	// Replacements is the number of placeholders written.
 	Replacements int `json:"replacements"`
-	// Layers maps each layer that ran to the matches it found. Overlapping
-	// matches count in every layer that found them but are replaced once, so
-	// the layers can sum to more than Replacements.
+	// Layers maps each layer that ran to the matches it found in the values
+	// it scanned. The sum can differ from Replacements either way: overlapping
+	// matches count in every layer that found them but are replaced once, and
+	// a JSON line's splice also replaces copies of a found value in fields the
+	// scan skips, such as IDs.
 	Layers map[string]int `json:"layers"`
 	// CustomRulesActive is how many custom rules compiled and ran. Rule names
 	// are left out: they can name things a team keeps out of shared metadata.

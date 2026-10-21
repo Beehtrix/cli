@@ -226,6 +226,45 @@ func TestJSONLBytesCounts_LineRedactedTwiceCountsOnce(t *testing.T) {
 	require.Equal(t, 1, got.Layers["entropy"])
 }
 
+// The splice rewrites every copy of a redacted value in the line, including
+// copies in fields the walk skips and under the same key outside a credential
+// context. Replacements must count the placeholders stored; the layers count
+// what each layer found in the values it scanned.
+func TestJSONLBytesCounts_ReplacementsMatchWhatTheSpliceWrites(t *testing.T) {
+	resetCustomRulesForTest(t)
+	ConfigureCustomRules(CustomRulesConfig{Inline: map[string]string{"acme": `ACME-[0-9]{8}`}})
+
+	cases := []struct {
+		name   string
+		line   string
+		layers map[string]int
+	}{
+		{
+			name:   "array value also under a skipped id field",
+			line:   `{"content":["ACME-12345678"],"session_id":"ACME-12345678"}`,
+			layers: map[string]int{"custom": 1},
+		},
+		{
+			name:   "credential key value repeated outside its credential context",
+			line:   `{"db":{"host":"db","user":"app","pwd":"hunter"},"misc":{"pwd":"hunter"}}`,
+			layers: map[string]int{"credential_key": 1},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := JSONLBytes([]byte(tc.line + "\n"))
+			require.NoError(t, err)
+			stored := strings.Count(string(out.Bytes()), RedactedPlaceholder)
+			require.Equal(t, 2, stored, "both copies are replaced in the stored line")
+			require.NotNil(t, out.Counts())
+			require.Equal(t, stored, out.Counts().Replacements)
+			for layer, n := range tc.layers {
+				require.Equal(t, n, out.Counts().Layers[layer], "layer %q counts the value it scanned", layer)
+			}
+		})
+	}
+}
+
 // Redaction is per line, so the counts of a whole transcript are the sum of the
 // counts of its parts. The prefix cache relies on this, and the whole here is
 // large enough to be redacted in parallel shards while each half is not.

@@ -274,6 +274,9 @@ type jsonReplacement struct {
 	key      string
 	original string
 	redacted string
+	// placeholders is how many placeholders redacting original wrote, when
+	// the walk counts.
+	placeholders int
 }
 
 type connectionStringRule struct {
@@ -1073,6 +1076,24 @@ func (r leafRedactor) rollback(to tally) {
 	}
 }
 
+// replacements returns the placeholders counted so far, 0 when not counting.
+func (r leafRedactor) replacements() int {
+	if r.counts == nil {
+		return 0
+	}
+	return r.counts.replacements
+}
+
+// spliced replaces the placeholders counted since before with those the
+// splice wrote. The splice rewrites every copy of a collected value in the
+// line, including copies the walk never scanned, so it can write more than
+// the scanned values account for. Layer matches stay as scanned.
+func (r leafRedactor) spliced(before tally, written int) {
+	if r.counts != nil {
+		r.counts.replacements = before.replacements + written
+	}
+}
+
 // jsonlContentImpl is the body of JSONLContent parameterized by a per-leaf
 // redactor. JSONLContent passes the regex layers. The OPF-enabled flow uses
 // two passes: one with a collector that records leaves and finds nothing, one
@@ -1120,10 +1141,11 @@ func redactSingleJSONValue(content string, redactor leafRedactor) (result string
 	}
 	before := redactor.mark()
 	repls := collectJSONLReplacements(parsed, redactor)
-	result, err = applyJSONReplacements(content, repls)
+	result, written, err := applyJSONReplacements(content, repls)
 	if err != nil {
 		return "", true, err
 	}
+	redactor.spliced(before, written)
 	if len(repls) > 0 {
 		result, err = ensureReplacementsLanded(content, result, repls, redactor, before)
 		if err != nil {
@@ -1304,10 +1326,11 @@ func redactJSONLLines(lines []string, redactor leafRedactor) (string, error) {
 		}
 		before := redactor.mark()
 		repls := collectJSONLReplacements(parsed, redactor)
-		result, err := applyJSONReplacements(line, repls)
+		result, written, err := applyJSONReplacements(line, repls)
 		if err != nil {
 			return "", err
 		}
+		redactor.spliced(before, written)
 		if len(repls) > 0 {
 			result, err = ensureReplacementsLanded(line, result, repls, redactor, before)
 			if err != nil {
@@ -1404,41 +1427,46 @@ func JSONLContentWithPrivacyFilter(ctx context.Context, content string) (string,
 
 // applyJSONReplacements applies collected (original, redacted) string pairs
 // to the raw JSON text, replacing JSON-encoded originals with their redacted forms.
-// Returns s unchanged if repls is empty.
-func applyJSONReplacements(s string, repls []jsonReplacement) (string, error) {
+// Returns s unchanged if repls is empty. written is how many placeholders the
+// replacements put in: each copy replaced carries its pair's placeholders.
+func applyJSONReplacements(s string, repls []jsonReplacement) (result string, written int, err error) {
 	if len(repls) == 0 {
-		return s, nil
+		return s, 0, nil
 	}
 	for _, r := range repls {
 		origJSON, err := jsonEncodeString(r.original)
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		replJSON, err := jsonEncodeString(r.redacted)
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		if r.key == "" {
+			written += strings.Count(s, origJSON) * r.placeholders
 			s = strings.ReplaceAll(s, origJSON, replJSON)
 			continue
 		}
 		keyJSON, err := jsonEncodeString(r.key)
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
-		s = replaceKeyedJSONValue(s, keyJSON, origJSON, replJSON)
+		var replaced int
+		s, replaced = replaceKeyedJSONValue(s, keyJSON, origJSON, replJSON)
+		written += replaced * r.placeholders
 	}
-	return s, nil
+	return s, written, nil
 }
 
 // replaceKeyedJSONValue replaces every occurrence of origJSON that follows
-// keyJSON + optional whitespace + ':' + optional whitespace. Restricts
-// substitution to value positions so a key's own redacted text is not
-// rewritten when it collides with another field's value.
-func replaceKeyedJSONValue(s, keyJSON, origJSON, replJSON string) string {
+// keyJSON + optional whitespace + ':' + optional whitespace, and reports how
+// many it replaced. Restricts substitution to value positions so a key's own
+// redacted text is not rewritten when it collides with another field's value.
+func replaceKeyedJSONValue(s, keyJSON, origJSON, replJSON string) (string, int) {
 	if !strings.Contains(s, keyJSON) {
-		return s
+		return s, 0
 	}
+	replaced := 0
 	var b strings.Builder
 	b.Grow(len(s))
 	i := 0
@@ -1467,11 +1495,12 @@ func replaceKeyedJSONValue(s, keyJSON, origJSON, replJSON string) string {
 			b.WriteString(s[keyEnd:p])
 			b.WriteString(replJSON)
 			i = p + len(origJSON)
+			replaced++
 			continue
 		}
 		i = keyEnd
 	}
-	return b.String()
+	return b.String(), replaced
 }
 
 func isJSONWhitespace(c byte) bool {
@@ -1646,12 +1675,16 @@ func collectJSONLReplacements(v any, redactor leafRedactor) []jsonReplacement {
 	seen := make(map[replKey]bool)
 	var repls []jsonReplacement
 	walkRedactableStrings(v, func(key string, credentialContext bool, val string) string {
+		before := redactor.replacements()
 		redacted := redactLeafValue(key, credentialContext, val, redactor)
 		if redacted != val {
 			k := replKey{key: key, original: val}
 			if !seen[k] {
 				seen[k] = true
-				repls = append(repls, jsonReplacement{key: key, original: val, redacted: redacted})
+				repls = append(repls, jsonReplacement{
+					key: key, original: val, redacted: redacted,
+					placeholders: redactor.replacements() - before,
+				})
 			}
 		}
 		// Collection only. The fast path splices the raw text, so the tree is
