@@ -45,6 +45,9 @@ func TestInstallHooks_FreshInstall(t *testing.T) {
 	if !strings.Contains(content, "hooks opencode") {
 		t.Error("plugin file does not contain 'hooks opencode'")
 	}
+	if !strings.Contains(content, "export const EntirePlugin") {
+		t.Error("plugin file does not contain 'EntirePlugin' export")
+	}
 	if !strings.Contains(content, `export default { id: "entire", server: EntirePlugin, setup: entireSetup }`) {
 		t.Error("plugin file does not export the OpenCode 1 and 2 entry points")
 	}
@@ -585,8 +588,8 @@ func TestPlugin_SpawnsHooksUnderNode(t *testing.T) {
 import { pathToFileURL } from "node:url"
 
 const pluginPath = process.argv[2]
-const { default: plugin } = await import(pathToFileURL(pluginPath).href)
-const handlers = await plugin.server({ directory: process.cwd() })
+const { EntirePlugin } = await import(pathToFileURL(pluginPath).href)
+const handlers = await EntirePlugin({ directory: process.cwd() })
 await handlers.event({
   event: {
     type: "session.created",

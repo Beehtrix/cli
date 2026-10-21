@@ -105,41 +105,66 @@ func TestReportsSessionNotFound(t *testing.T) {
 	}
 }
 
-// On OpenCode 2, resuming never deletes the session: the stored transcript
-// is in the 1.x shape, which OpenCode 2 cannot import back.
-func TestWriteSession_OpenCode2NeverDeletes(t *testing.T) {
+// On OpenCode 2, resuming never deletes the session: one OpenCode still has
+// resumes as it is, and a missing one is imported from the OpenCode 2
+// messages the stored transcript keeps.
+func TestWriteSession_OpenCode2(t *testing.T) {
 	// No t.Parallel: t.Setenv.
 	useOpenCodeCLI(t, false)
-	dir := t.TempDir()
-	log := filepath.Join(dir, "calls")
-	session := `{"info":{"id":"ses_r"},"messages":[]}`
-
-	t.Run("present", func(t *testing.T) {
-		stubOpenCode(t, `echo "$@" >> `+log+"\nprintf '%s' '"+session+"'\n")
-		ag := &OpenCodeAgent{}
-		err := ag.WriteSession(t.Context(), &agent.AgentSession{SessionID: "ses_r", NativeData: []byte(session)})
-		if err != nil {
-			t.Fatalf("WriteSession: %v", err)
-		}
-	})
-	t.Run("missing", func(t *testing.T) {
-		stubOpenCode(t, `echo "$@" >> `+log+"\necho 'Session not found: ses_r' >&2; exit 1\n")
-		ag := &OpenCodeAgent{}
-		err := ag.WriteSession(t.Context(), &agent.AgentSession{SessionID: "ses_r", NativeData: []byte(session)})
-		if err == nil || !strings.Contains(err.Error(), "cannot import") {
-			t.Fatalf("WriteSession error = %v, want a clear cannot-import error", err)
-		}
-	})
-
-	calls, err := os.ReadFile(log)
+	stored, err := normalizeOpenCodeExport(loadOpenCode2Fixture(t, "tools"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(calls)), "\n") {
-		if line != "session export --standalone ses_r" {
-			t.Errorf("unexpected opencode call %q (only exports are allowed on OpenCode 2)", line)
+	const sessionID = "ses_ea33499d4ffeLqgkWykI2UtQ0S"
+	write := func(t *testing.T, script string, data []byte) (string, []string) {
+		t.Helper()
+		dir := t.TempDir()
+		log := filepath.Join(dir, "calls")
+		imported := filepath.Join(dir, "imported.json")
+		stubOpenCode(t, `echo "$@" >> `+log+"\n"+`case "$2" in import) cp "$4" `+imported+`; pwd >> `+log+`;; esac`+"\n"+script)
+		repo := t.TempDir()
+		err := (&OpenCodeAgent{}).WriteSession(t.Context(), &agent.AgentSession{SessionID: sessionID, RepoPath: repo, NativeData: data})
+		calls, readErr := os.ReadFile(log)
+		if readErr != nil {
+			t.Fatal(readErr)
 		}
+		var errText string
+		if err != nil {
+			errText = err.Error()
+		}
+		lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "session delete") {
+				t.Errorf("OpenCode 2 session deleted: %q", line)
+			}
+		}
+		if body, readErr := os.ReadFile(imported); readErr == nil {
+			if !strings.Contains(string(body), `"directory":"`+repo+`"`) {
+				t.Errorf("import location is not the resuming worktree: %.300s", body)
+			}
+		}
+		return errText, lines
 	}
+
+	t.Run("present", func(t *testing.T) {
+		errText, calls := write(t, "printf '{}'\n", stored)
+		if errText != "" || len(calls) != 1 || calls[0] != "session export --standalone "+sessionID {
+			t.Fatalf("err %q, calls %q; want only the existence check", errText, calls)
+		}
+	})
+	t.Run("missing", func(t *testing.T) {
+		errText, calls := write(t, `if [ "$2" = export ]; then echo 'Session not found: x' >&2; exit 1; fi`+"\n", stored)
+		if errText != "" || len(calls) != 3 || !strings.HasPrefix(calls[1], "session import --standalone ") {
+			t.Fatalf("err %q, calls %q; want an existence check and an import", errText, calls)
+		}
+	})
+	t.Run("missing, captured from OpenCode 1", func(t *testing.T) {
+		v1 := []byte(`{"info":{"id":"` + sessionID + `"},"messages":[{"info":{"id":"m1","role":"user","time":{"created":1}},"parts":[]}]}`)
+		errText, calls := write(t, `if [ "$2" = export ]; then echo 'Session not found: x' >&2; exit 1; fi`+"\n", v1)
+		if !strings.Contains(errText, "captured with OpenCode 1") || len(calls) != 1 {
+			t.Fatalf("err %q, calls %q; want a clear OpenCode 1 error and no import", errText, calls)
+		}
+	})
 }
 
 // The capture stores an OpenCode 2 export in the 1.x shape the rest of Entire

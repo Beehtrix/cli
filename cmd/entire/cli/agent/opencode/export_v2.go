@@ -47,17 +47,28 @@ func isOpenCodeV2Export(data []byte) bool {
 	return false
 }
 
+// openCodeNativeKey is the message info key that keeps the OpenCode 2
+// messages a converted message came from, verbatim. Every reader ignores it;
+// resume uses it to give OpenCode 2 back the exact session it exported (see
+// openCodeV2ImportPayload), which the 1.x shape alone cannot reproduce.
+const openCodeNativeKey = "opencode2"
+
 // normalizeOpenCodeExport converts an OpenCode 2 export to the OpenCode 1
 // shape and returns other payloads unchanged. The conversion is
 // deterministic, so re-exporting the same session yields the same message
 // indices; transcript offsets stored between turns depend on that.
+//
+// Each converted message carries its source messages under
+// info[openCodeNativeKey]: the 2.x message itself, plus any that convert to
+// nothing (idle markers, kinds this version does not know) after it. Both
+// messages of a converted compaction carry the key, the summary with none.
 func normalizeOpenCodeExport(data []byte) ([]byte, error) {
 	if !isOpenCodeV2Export(data) {
 		return data, nil
 	}
 	var doc struct {
-		Info     map[string]any   `json:"info"`
-		Messages []map[string]any `json:"messages"`
+		Info     map[string]any    `json:"info"`
+		Messages []json.RawMessage `json:"messages"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse OpenCode 2 export: %w", err)
@@ -78,14 +89,47 @@ func normalizeOpenCodeExport(data []byte) ([]byte, error) {
 	}
 
 	messages := make([]map[string]any, 0, len(doc.Messages))
-	for _, msg := range doc.Messages {
-		messages = append(messages, convertOpenCodeV2Message(msg, sessionID, dir)...)
+	var unplaced []json.RawMessage // source messages before the first converted one
+	for _, raw := range doc.Messages {
+		var msg map[string]any
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			return nil, fmt.Errorf("parse OpenCode 2 export message: %w", err)
+		}
+		converted := convertOpenCodeV2Message(msg, sessionID, dir)
+		if len(converted) == 0 {
+			if len(messages) > 0 {
+				addNativeMessages(messages[len(messages)-1], raw)
+			} else {
+				unplaced = append(unplaced, raw)
+			}
+			continue
+		}
+		addNativeMessages(converted[0], append(unplaced, raw)...)
+		unplaced = nil
+		for _, extra := range converted[1:] {
+			addNativeMessages(extra)
+		}
+		messages = append(messages, converted...)
 	}
 	out, err := json.Marshal(map[string]any{"info": info, "messages": messages})
 	if err != nil {
 		return nil, fmt.Errorf("encode normalized OpenCode export: %w", err)
 	}
 	return out, nil
+}
+
+// addNativeMessages appends source messages to a converted message's
+// info[openCodeNativeKey], creating it (possibly empty).
+func addNativeMessages(msg map[string]any, raw ...json.RawMessage) {
+	info, ok := msg["info"].(map[string]any)
+	if !ok {
+		return
+	}
+	existing, ok := info[openCodeNativeKey].([]json.RawMessage)
+	if !ok {
+		existing = []json.RawMessage{}
+	}
+	info[openCodeNativeKey] = append(existing, raw...)
 }
 
 // convertOpenCodeV2Message returns the OpenCode 1 messages for one OpenCode 2

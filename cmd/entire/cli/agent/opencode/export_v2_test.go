@@ -3,6 +3,7 @@ package opencode
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -301,5 +302,121 @@ func TestNormalizeOpenCodeExport_LeavesV1Unchanged(t *testing.T) {
 		if string(got) != v1 {
 			t.Errorf("1.x export changed:\n got %s\nwant %s", got, v1)
 		}
+	}
+}
+
+// Resume gives OpenCode 2 back exactly the messages it exported, from the
+// stored (converted) transcript.
+func TestOpenCodeV2ImportPayload_RoundTrip(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"tools", "patch", "subagent", "background-subagent", "compaction", "tool-error", "migrated-from-v1"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			raw := loadOpenCode2Fixture(t, name)
+			_, stored := normalizeFixture(t, name)
+			payload, err := openCodeV2ImportPayload(stored, "/elsewhere")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want, got struct {
+				Info     map[string]any   `json:"info"`
+				Messages []map[string]any `json:"messages"`
+			}
+			if err := json.Unmarshal(raw, &want); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(payload, &got); err != nil {
+				t.Fatal(err)
+			}
+			wantMsgs, err := json.Marshal(want.Messages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotMsgs, err := json.Marshal(got.Messages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(wantMsgs, gotMsgs) {
+				t.Fatalf("messages differ after round trip:\n got %.400s\nwant %.400s", gotMsgs, wantMsgs)
+			}
+			if _, ok := got.Info["directory"]; ok {
+				t.Error("1.x-only info.directory sent to OpenCode 2")
+			}
+			loc, ok := got.Info["location"].(map[string]any)
+			if !ok || loc["directory"] != "/elsewhere" {
+				t.Errorf("info.location = %v, want the resuming worktree", got.Info["location"])
+			}
+			if got.Info["id"] != want.Info["id"] {
+				t.Errorf("session id = %v, want %v", got.Info["id"], want.Info["id"])
+			}
+		})
+	}
+}
+
+func TestOpenCodeV2ImportPayload_OpenCode1CaptureIsRejected(t *testing.T) {
+	t.Parallel()
+	v1 := `{"info":{"id":"ses_1"},"messages":[{"info":{"id":"m1","role":"user","time":{"created":1}},"parts":[{"type":"text","text":"hi"}]}]}`
+	if _, err := openCodeV2ImportPayload([]byte(v1), "/repo"); !errors.Is(err, errNotOpenCode2Capture) {
+		t.Fatalf("err = %v, want errNotOpenCode2Capture", err)
+	}
+}
+
+// OpenCode 2 rejects the whole import when one attachment's data is not
+// base64, which redaction or image externalization can cause.
+func TestOpenCodeV2ImportPayload_DropsChangedAttachments(t *testing.T) {
+	t.Parallel()
+	user := `{"id":"msg_u","type":"user","text":"see","time":{"created":1},"files":[` +
+		`{"data":"aGVsbG8=","mime":"text/plain","source":{"type":"uri","uri":"a"}},` +
+		`{"data":"[REDACTED]","mime":"image/png","source":{"type":"uri","uri":"b"}}]}`
+	tool := `{"id":"msg_a","type":"assistant","time":{"created":2,"completed":3},"content":[{"type":"tool","id":"c1","name":"read","state":{"status":"completed","content":[` +
+		`{"type":"text","text":"ok"},{"type":"media","media":{"source":{"type":"base64","data":"REDACTED_x","mediaType":"image/png"}}}]}}]}`
+	export := `{"info":{"id":"ses_x","location":{"directory":"/a"}},"messages":[` + user + `,` + tool + `]}`
+	stored, err := normalizeOpenCodeExport([]byte(export))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := openCodeV2ImportPayload(stored, "/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(payload)
+	if strings.Contains(s, "REDACTED") {
+		t.Errorf("payload keeps an attachment OpenCode would reject: %s", s)
+	}
+	if !strings.Contains(s, "aGVsbG8=") || !strings.Contains(s, `"text":"ok"`) {
+		t.Errorf("payload dropped a valid attachment or text: %s", s)
+	}
+	if !strings.Contains(s, "[attachment not restored]") {
+		t.Errorf("changed tool media not replaced with a placeholder: %s", s)
+	}
+}
+
+// Chunking a large transcript must keep the OpenCode 2 originals resume
+// imports, which the typed export structs do not model.
+func TestChunkTranscript_KeepsOpenCode2Originals(t *testing.T) {
+	t.Parallel()
+	_, stored := normalizeFixture(t, "background-subagent")
+	ag := &OpenCodeAgent{}
+	chunks, err := ag.ChunkTranscript(t.Context(), stored, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 2 {
+		t.Fatalf("got %d chunks, want the transcript split", len(chunks))
+	}
+	joined, err := ag.ReassembleTranscript(chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := openCodeV2ImportPayload(stored, "/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := openCodeV2ImportPayload(joined, "/repo")
+	if err != nil {
+		t.Fatalf("reassembled transcript lost its OpenCode 2 originals: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("reassembled transcript imports differently from the original")
 	}
 }

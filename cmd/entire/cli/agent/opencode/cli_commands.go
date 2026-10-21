@@ -233,3 +233,24 @@ func openCodeSessionExists(ctx context.Context, sessionID string) (bool, error) 
 	}
 	return true, nil
 }
+
+// runOpenCodeSessionImport runs OpenCode 2's `opencode session import
+// --standalone <file>` from dir, which becomes the session's location. A
+// session that already exists is left as it is (OpenCode reports it and
+// exits 0).
+func runOpenCodeSessionImport(ctx context.Context, exportFilePath, dir string) error {
+	ctx, cancel := context.WithTimeout(ctx, openCodeCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "opencode", "session", "import", "--standalone", exportFilePath)
+	execx.TerminateOnCancel(cmd)
+	cmd.Dir = dir
+	cmd.Env = gitrepo.EnvWithoutRepoOverrides()
+	if output, err := cmd.CombinedOutput(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("opencode session import timed out after %s", openCodeCommandTimeout)
+		}
+		return fmt.Errorf("opencode session import failed: %w (output: %s)", err, formatOpenCodeErrorDetail(string(output)))
+	}
+	return nil
+}

@@ -5,10 +5,10 @@
 // Uses node:child_process so hooks work under both Bun (OpenCode CLI/TUI)
 // and Node (OpenCode Desktop's Electron sidecar). See #2014.
 //
-// One file serves both plugin APIs: OpenCode 1 loads `server` (EntirePlugin),
-// OpenCode 2 loads `setup` (entireSetup). There is deliberately no named
-// export: OpenCode 1 loaders before v1.3.4 call every export, and would run
-// the plugin twice.
+// One file serves both plugin APIs. OpenCode 1 before v1.3.4 calls the named
+// EntirePlugin export; later OpenCode 1 loads the default export's `server`
+// (the same function) and ignores the named one; OpenCode 2 loads the
+// default export's `setup`. Each version loads the plugin once.
 import { spawn, spawnSync } from "node:child_process"
 import type { Plugin } from "@opencode-ai/plugin"
 
@@ -42,7 +42,7 @@ function parseInjectedContext(stdout: string): string | null {
 }
 
 // OpenCode 1 plugin.
-const EntirePlugin: Plugin = async ({ directory }) => {
+export const EntirePlugin: Plugin = async ({ directory }) => {
   // Track seen user messages to fire turn-start only once per message
   const seenUserMessages = new Set<string>()
   // Track current session ID for message events (which don't include sessionID)
