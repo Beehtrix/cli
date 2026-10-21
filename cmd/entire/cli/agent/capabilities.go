@@ -30,6 +30,7 @@ type CapabilityDeclarer interface {
 //   - HomeLayoutProvider
 //   - HomeScopedInventoryExtractor
 //   - HookConfigLocator
+//   - HookFinisher
 //   - HookFreshness
 //   - HookTimeoutRepairer
 //   - InventoryAwareExtractor
@@ -118,6 +119,20 @@ func nonDeclarerCapability[T any](ag Agent) (T, bool) {
 // interface and (for CapabilityDeclarer agents) has declared the capability.
 func AsHookSupport(ag Agent) (HookSupport, bool) {
 	return declaredCapability[HookSupport](ag, func(c DeclaredCaps) bool { return c.Hooks })
+}
+
+// HookFinisher is implemented by an agent whose ParseHookEvent holds
+// something for the length of the hook (OpenCode 2's hook ordering marker);
+// FinishHook releases it once the hook's dispatch is done.
+type HookFinisher interface {
+	FinishHook()
+}
+
+// AsHookFinisher returns the agent as HookFinisher if it implements the
+// interface. Built-in only: it releases per-process state the agent created
+// in ParseHookEvent.
+func AsHookFinisher(ag Agent) (HookFinisher, bool) {
+	return builtinCapability[HookFinisher](ag)
 }
 
 // AsHookFreshness returns the agent as HookFreshness if it implements the

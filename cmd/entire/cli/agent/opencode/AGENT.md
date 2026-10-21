@@ -112,10 +112,11 @@ stored in full once the call completes.
 
 OpenCode 2 (npm `@opencode/cli`, verified 2.1.1) changed the plugin API, the
 export command and the export format. One plugin file serves both versions:
-its default export is `{id, server, setup}`; OpenCode 1 (v1.3.4 and later)
-loads `server`, OpenCode 2 loads `setup`. OpenCode 1 also calls `setup` with a
-reduced context, which the plugin ignores. There is no named export, because
-OpenCode 1 loaders before v1.3.4 call every export and would run it twice.
+its default export is `{id, server, setup}` and the named `EntirePlugin` export is the
+same `server`. OpenCode 1 before v1.3.4 calls the named export, later 1.x
+loads the default's `server`, and OpenCode 2 loads `setup`; each loads the
+plugin once (verified on 1.3.3, 1.18.33 and 2.1.1). OpenCode 1 also calls
+`setup` with a reduced context, which the plugin ignores.
 
 - **Shared service.** OpenCode 2 runs plugins in a background service shared
   by every repository (`opencode run --standalone` runs a private one). Prompt,
@@ -133,11 +134,16 @@ OpenCode 1 loaders before v1.3.4 call every export and would run it twice.
   `session.compaction.ended`, `session-end` on `location.shutdown`.
 - **Exit and order.** `opencode run --standalone` kills plugin cleanup about
   3s after the turn. `turn-end`, `session-end`, compaction and held subagent
-  stops therefore run detached, each after the session's detached hooks still
-  running (it waits on their PIDs, for at most 120s), and the next
-  `turn-start` waits for them, so a session's hooks land in OpenCode 1 order.
-  Every subagent stop also waits for that call's `subagent-start`. Cleanup
-  waits up to 2.5s for the final hooks. Hooks run without the service's
+  stops therefore run detached. Each names the session's detached hooks still
+  running (`after_pids`); the CLI waits for those to exit (at most 60s) and
+  leaves a marker under `.entire/tmp/opencode-hooks` while it runs
+  (`hook_order.go`). `session-start`, the first hook of every plugin instance,
+  carries `wait_detached`: the CLI waits (at most 20s) until no marker of the
+  session belongs to a live process, so a new `opencode run` never overtakes
+  the previous run's hooks. In-process, the next `turn-start` also waits for
+  them, and every subagent stop waits for that call's `subagent-start`. A
+  marker whose process cannot be checked (Windows) holds for at most 2
+  minutes. Every step fails open. Hooks run without the service's
   `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_COMMON_DIR`: the service is
   shared, so a selector exported where it started would point every
   repository's hooks at one repository.
@@ -160,17 +166,18 @@ OpenCode 1 loaders before v1.3.4 call every export and would run it twice.
   synthetic user text, compaction becomes a 1.x marker plus a summary message,
   idle markers are dropped. Sessions migrated from a 1.x database keep 1.x
   tool names and input keys, so both are accepted.
-- **Resume.** OpenCode 2 cannot import the stored 1.x-shaped transcript
-  (`session import` rejects it), so on 2.x nothing is deleted: a session
-  OpenCode still has resumes as it is, and a missing one is an error.
+- **Resume.** Each converted message keeps the OpenCode 2 messages it came
+  from under `info.opencode2`, verbatim (an idle marker rides with the
+  message before it). Resuming where OpenCode does not have the session
+  imports exactly those (`openCodeV2ImportPayload`, `opencode session import
+  --standalone`, run from the worktree, which becomes the session's location);
+  attachments that redaction or image externalization changed are dropped,
+  since OpenCode validates them and rejects the whole import otherwise. A
+  session OpenCode still has is never deleted or replaced. A transcript
+  captured from OpenCode 1 has no OpenCode 2 messages and cannot be imported
+  into OpenCode 2.
 
 OpenCode 2 gaps:
 - Background subagents still running when `opencode run --standalone` exits
   are killed with it (as with 1.x `run`).
-- Ordering across `opencode run` processes holds only while the previous
-  run's final hooks finish within cleanup's 2.5s; a slower `turn-end` can
-  still be running when the next run's `turn-start` arrives.
-- Rewinding to an earlier checkpoint keeps OpenCode's later conversation on
-  2.x (1.x replaced it by re-importing).
-- The interactive TUI and OpenCode Desktop on 2.x were not verified live.
-
+- OpenCode Desktop and Windows on 2.x were not verified live.

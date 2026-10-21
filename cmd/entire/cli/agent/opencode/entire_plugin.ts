@@ -615,8 +615,6 @@ const v2HookTimeoutMs = 60_000
 // ~3s `opencode run --standalone` allows it, so a run's session-end lands
 // before the next run's turn-start. Hooks still running then finish detached.
 const v2CleanupWaitMs = 2_500
-// A detached hook waits at most this many 0.1s polls for the hooks before it.
-const v2DetachedWaitPolls = 1_200
 
 // The shared service may have been started from a shell with a repository
 // selected through the environment; hooks for this location must resolve
@@ -727,27 +725,25 @@ async function entireSetup(ctx: any) {
   }
 
   // runDetached starts a session's hook in its own process group so it
-  // survives OpenCode exiting, after the session's detached hooks still
-  // running (by PID, bounded). done settles if this process lives to see the
-  // hook finish.
+  // survives OpenCode exiting. The payload names the session's detached hooks
+  // still running (after_pids); the hook waits for them before it runs and
+  // marks itself running meanwhile, so the next `opencode run` waits for it
+  // too (see the CLI's opencode hook ordering). done settles if this process
+  // lives to see the hook finish.
   function runDetached(sessionID: string, hookName: string, payload: Record<string, unknown>): Promise<void> {
     const running = inflight.get(sessionID) ?? new Set()
     inflight.set(sessionID, running)
-    const pids = [...running].map((h) => h.pid).filter((pid): pid is number => typeof pid === "number")
+    const afterPIDs = [...running].map((h) => h.pid).filter((pid): pid is number => typeof pid === "number")
     const entry: { done: Promise<void>; pid?: number } = { done: Promise.resolve() }
     entry.done = new Promise<void>((resolve) => {
       try {
-        let [cmd, ...args] = hookCmd(hookName)
-        if (pids.length > 0) {
-          const wait = `for p in ${pids.join(" ")}; do i=0; while kill -0 $p 2>/dev/null && [ $i -lt ${v2DetachedWaitPolls} ]; do sleep 0.1; i=$((i+1)); done; done`
-          args = ["-c", `${wait}; ${args[1]}`]
-        }
+        const [cmd, ...args] = hookCmd(hookName)
         const proc = spawn(cmd, args, { cwd: directory, env: hookEnv, stdio: ["pipe", "ignore", "ignore"], detached: true })
         entry.pid = proc.pid
         proc.on("error", () => resolve())
         proc.on("close", () => resolve())
         proc.stdin?.on("error", () => {})
-        proc.stdin?.end(JSON.stringify(payload) + "\n")
+        proc.stdin?.end(JSON.stringify({ ...payload, after_pids: afterPIDs }) + "\n")
         proc.unref()
       } catch {
         resolve()
@@ -789,7 +785,9 @@ async function entireSetup(ctx: any) {
     await settled(sessionID)
     if (!startedSessions.has(sessionID)) {
       startedSessions.add(sessionID)
-      await runHook("session-start", { session_id: sessionID })
+      // The first hook of this plugin instance: the CLI waits for the
+      // previous instance's detached hooks of the session first.
+      await runHook("session-start", { session_id: sessionID, wait_detached: true })
     }
     const out = await runHook("turn-start", { session_id: sessionID, prompt, model: models.get(sessionID) ?? "" })
     const injected = parseInjectedContext(out)

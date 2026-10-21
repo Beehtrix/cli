@@ -27,6 +27,9 @@ func init() {
 type OpenCodeAgent struct {
 	// CommandRunner overrides text-generation subprocess creation when non-nil.
 	CommandRunner agent.TextCommandRunner
+
+	// finishHook ends the current hook's ordering marker (see orderHook).
+	finishHook func()
 }
 
 // NewOpenCodeAgent creates a new OpenCode agent instance.

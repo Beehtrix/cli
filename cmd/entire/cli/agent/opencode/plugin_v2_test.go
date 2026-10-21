@@ -135,9 +135,12 @@ func runPluginV2(t *testing.T, scenario map[string]any) []v2Hook {
 			t.Fatal(err)
 		}
 	}
-	// One line per hook: name, tab, payload. A short sleep makes ordering
-	// races between detached hooks visible.
-	script := "#!/bin/sh\nbody=$(cat)\nsleep 0.05\nprintf '%s\\t%s\\n' \"$3\" \"$body\" >> " + logPath + "\n"
+	// One line per hook: name, tab, payload. Like the CLI, a detached hook
+	// first waits for the processes in its after_pids. A short sleep makes
+	// ordering races between detached hooks visible.
+	script := "#!/bin/sh\nbody=$(cat)\n" +
+		"for p in $(printf '%s' \"$body\" | sed -n 's/.*\"after_pids\":\\[\\([0-9,]*\\)\\].*/\\1/p' | tr ',' ' '); do while kill -0 $p 2>/dev/null; do sleep 0.02; done; done\n" +
+		"sleep 0.05\nprintf '%s\\t%s\\n' \"$3\" \"$body\" >> " + logPath + "\n"
 	if err := os.WriteFile(filepath.Join(binDir, "entire"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

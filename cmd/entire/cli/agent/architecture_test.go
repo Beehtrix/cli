@@ -288,6 +288,10 @@ func TestAgentPackages_NoForbiddenImports(t *testing.T) {
 			// real binary as a child with inherited stdio, so killing the
 			// launcher alone leaves an export blocking past its deadline.
 			repoPrefix + "execx",
+			// Process identity for OpenCode 2's hook ordering: its plugin runs
+			// hooks detached so they outlive `opencode run`, and a new run's
+			// session-start waits only for those still alive.
+			repoPrefix + "proclive",
 		},
 	}
 
