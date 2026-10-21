@@ -557,7 +557,18 @@ commits. The same predicate feeds `shouldCondenseWithOverlapCheck`'s
 overlap-check bypass, so the trigger and the condensation trust share one
 rule. The trailer's content guarantee is the materializer itself: the
 commit's condensation stores each record's transcript-so-far under the
-checkpoint's `tasks/` subtree, so no separate commit-time capture is needed.
+checkpoint's `tasks/` subtree (where one is on disk; an agent whose live
+transcript needs a re-export, OpenCode, gets it once the task completes), so
+no separate commit-time capture is needed. When another session also claims
+the committed files and the session (IDLE, or ACTIVE while its background
+subagent runs) has none of its own, it condenses only if a live record
+modified a committed file (`liveTaskFilesInCommit`):
+per the transcript on disk, or, for an agent with none yet, its own report
+(`agent.LiveSubagentFileReporter`) within 10s for all of a commit's
+sessions together (condensation's re-exports keep their own 30s per
+session). The check reads the whole running call, so while it
+runs, a later commit of the same file by another session credits the session
+again even when the subagent added nothing since.
 Ordinary idle commits with no task records are unaffected — they stay exactly
 as before.
 

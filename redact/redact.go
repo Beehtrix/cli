@@ -29,9 +29,10 @@ import (
 var secretPattern = regexp.MustCompile(`[A-Za-z0-9+_=-]{10,}`)
 
 // pathSegmentPattern matches a path component that random base64 almost never
-// produces: a word ("refs", "Library") or a long lowercase hex name, as in
-// content-addressed caches.
-var pathSegmentPattern = regexp.MustCompile(`^(?:[A-Z]?[a-z]{3,}|[0-9a-f]{16,})$`)
+// produces: a word ("refs", "Library"), a long lowercase hex name, as in
+// content-addressed caches, or a version tail with a build suffix, as in Go's
+// v1.2.10+incompatible module directories.
+var pathSegmentPattern = regexp.MustCompile(`^(?:[A-Z]?[a-z]{3,}|[0-9a-f]{16,}|[0-9]+\+[a-z]{3,})$`)
 
 // credentialedURIPattern matches URLs that embed userinfo with a password, such
 // as postgres://user:pass@host/db or redis://:pass@host/0. These often have
@@ -509,7 +510,7 @@ func detectSlashedBase64(s string) []taggedRegion {
 		}
 		i = end
 		start = skipJSONEscapeLetter(s, start)
-		if end-start >= 20 && isSlashedBase64Secret(s, start, end) {
+		if end-start >= 20 && isSlashedBase64Secret(s[start:end]) {
 			regions = append(regions, taggedRegion{region: region{start, end}})
 		}
 	}
@@ -520,16 +521,12 @@ func isBase64Byte(c byte) bool {
 	return 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '+' || c == '/'
 }
 
-// isSlashedBase64Secret reports whether s[start:end], a base64 run, is a
-// high-entropy value rather than a path. A run glued to a preceding '.', '-',
-// '_', '~' or '@' continues a dotted name, an identifier, a home path or a
-// package scope.
-func isSlashedBase64Secret(s string, start, end int) bool {
-	run := s[start:end]
+// isSlashedBase64Secret reports whether run, a base64 run, is a
+// high-entropy value rather than a path. Only the run's own segments decide:
+// the text before it says nothing, since a secret often follows a flag, a key
+// prefix or a name (-p<secret>, token_<secret>, user@<secret>).
+func isSlashedBase64Secret(run string) bool {
 	if !strings.Contains(run, "/") {
-		return false
-	}
-	if start > 0 && strings.IndexByte(".-_~@", s[start-1]) >= 0 {
 		return false
 	}
 	for segment := range strings.SplitSeq(run, "/") {
@@ -737,6 +734,7 @@ func detectCredentialValues(s string) []taggedRegion {
 			regions = append(regions, taggedRegion{region: region{start, end}})
 		}
 	}
+	regions = append(regions, detectAuthorizationHeaders(s)...)
 	if strings.Contains(s, "sig=") {
 		for _, loc := range sasSignaturePattern.FindAllStringSubmatchIndex(s, -1) {
 			regions = append(regions, taggedRegion{region: region{loc[2], loc[3]}})
@@ -1520,7 +1518,12 @@ func isSingleJSONValue(dec *json.Decoder) bool {
 // walkRedactableStrings walks a parsed JSON value with the shared JSONL skip
 // rules (shouldSkipJSONLField, shouldSkipJSONLObject, credential context),
 // applying transform to each eligible string leaf. key is the leaf's object
-// key, empty inside arrays and at the root.
+// key, empty at the root. An array element takes the key of the array that
+// holds it, so {"Authorization":["Bearer <token>"]}, as json.Marshal writes an
+// http.Header, keeps the key context of {"Authorization":"Bearer <token>"}.
+// spliceKey is the key a raw-text splice can scope a replacement to: the
+// leaf's own key, but empty inside arrays and at the root, because
+// replaceKeyedJSONValue only finds a value written directly after its key.
 //
 // A skip key preserves its own string values, including the strings in its
 // arrays, but objects beneath it are walked with their own keys. The id rule
@@ -1533,9 +1536,9 @@ func isSingleJSONValue(dec *json.Decoder) bool {
 // collection pass, the post-splice verification, and the structural re-encode
 // fallback must all agree on which leaves are redactable, and a second copy of
 // the rules is how they would drift apart.
-func walkRedactableStrings(v any, transform func(key string, credentialContext bool, val string) string) (any, bool) {
-	var walk func(key string, credentialContext, skipStrings bool, v any) (any, bool)
-	walk = func(key string, credentialContext, skipStrings bool, v any) (any, bool) {
+func walkRedactableStrings(v any, transform func(key, spliceKey string, credentialContext bool, val string) string) (any, bool) {
+	var walk func(key, spliceKey string, credentialContext, skipStrings bool, v any) (any, bool)
+	walk = func(key, spliceKey string, credentialContext, skipStrings bool, v any) (any, bool) {
 		switch val := v.(type) {
 		case map[string]any:
 			if shouldSkipJSONLObject(val) {
@@ -1544,7 +1547,7 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 			childCredentialContext := credentialContext || isCredentialJSONObject(val)
 			var out map[string]any
 			for k, child := range val {
-				newChild, childChanged := walk(k, childCredentialContext, shouldSkipJSONLField(k), child)
+				newChild, childChanged := walk(k, k, childCredentialContext, shouldSkipJSONLField(k), child)
 				if !childChanged {
 					continue
 				}
@@ -1560,7 +1563,7 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 		case []any:
 			var out []any
 			for i, child := range val {
-				newChild, childChanged := walk("", credentialContext, skipStrings, child)
+				newChild, childChanged := walk(key, "", credentialContext, skipStrings, child)
 				if !childChanged {
 					continue
 				}
@@ -1578,7 +1581,7 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 			if skipStrings {
 				return v, false
 			}
-			redacted := transform(key, credentialContext, val)
+			redacted := transform(key, spliceKey, credentialContext, val)
 			if redacted == val {
 				return v, false
 			}
@@ -1587,7 +1590,7 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 			return v, false
 		}
 	}
-	return walk("", false, false, v)
+	return walk("", "", false, false, v)
 }
 
 // redactLeafValue is the per-leaf redaction rule shared by the splice
@@ -1674,15 +1677,15 @@ type replKey struct {
 func collectJSONLReplacements(v any, redactor leafRedactor) []jsonReplacement {
 	seen := make(map[replKey]bool)
 	var repls []jsonReplacement
-	walkRedactableStrings(v, func(key string, credentialContext bool, val string) string {
+	walkRedactableStrings(v, func(key, spliceKey string, credentialContext bool, val string) string {
 		before := redactor.replacements()
 		redacted := redactLeafValue(key, credentialContext, val, redactor)
 		if redacted != val {
-			k := replKey{key: key, original: val}
+			k := replKey{key: spliceKey, original: val}
 			if !seen[k] {
 				seen[k] = true
 				repls = append(repls, jsonReplacement{
-					key: key, original: val, redacted: redacted,
+					key: spliceKey, original: val, redacted: redacted,
 					placeholders: redactor.replacements() - before,
 				})
 			}
@@ -1835,7 +1838,7 @@ func spliceMissed(spliced string, repls []jsonReplacement) bool {
 	}
 
 	missed := false
-	walkRedactableStrings(parsed, func(key string, _ bool, val string) string {
+	walkRedactableStrings(parsed, func(_, spliceKey string, _ bool, val string) string {
 		if missed {
 			return val
 		}
@@ -1843,7 +1846,7 @@ func spliceMissed(spliced string, repls []jsonReplacement) bool {
 			missed = true
 			return val
 		}
-		if _, ok := originalsByKey[key][val]; ok {
+		if _, ok := originalsByKey[spliceKey][val]; ok {
 			missed = true
 		}
 		return val
@@ -1879,7 +1882,7 @@ func reencodeRedacted(content string, redactor leafRedactor) (string, error) {
 	if err := dec.Decode(&parsed); err != nil {
 		return "", fmt.Errorf("%w: re-parse content for structural redaction: %w", ErrRedactionIncomplete, err)
 	}
-	redactedTree, _ := walkRedactableStrings(parsed, func(key string, credentialContext bool, val string) string {
+	redactedTree, _ := walkRedactableStrings(parsed, func(key, _ string, credentialContext bool, val string) string {
 		return redactLeafValue(key, credentialContext, val, redactor)
 	})
 	var buf bytes.Buffer
