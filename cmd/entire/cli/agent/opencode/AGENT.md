@@ -8,7 +8,8 @@ generic task-record model is in
 
 ## Verdict: COMPATIBLE
 
-Verified against OpenCode 1.18.30 and 1.18.33. The plugin sees every signal Entire needs,
+Verified against OpenCode 1.18.30 and 1.18.33, and 2.1.1 (see
+[OpenCode 2](#opencode-2)). The plugin sees every signal Entire needs,
 and the child session ID is on the launch signal, the completion signal and
 the child's own export. Live verification was done during development with a
 probe script that is not kept in the repo.
@@ -106,3 +107,70 @@ stored in full once the call completes.
 - A reused-`callID` call has no live marker while it runs (its start finds the earlier call's record under the same key, and the Go start path does not re-key), so commit overlap checks and the SessionEnd sweep miss it; if the parent ends before its stop, the call is lost.
 - A reused-`callID` stop with no `started_at` (the plugin restarted between the call's before and after hooks) for a child already recorded under that `callID` is indistinguishable from a duplicate, so it is skipped and that call's work is not recorded; deliberate, to avoid double-counting a real duplicate.
 - entire.io joins task records to task calls on exact `tool_use_id`, so mapped or re-keyed records show as unmatched until its subagent view joins as above.
+
+## OpenCode 2
+
+OpenCode 2 (npm `@opencode/cli`, verified 2.1.1) changed the plugin API, the
+export command and the export format. One plugin file serves both versions:
+its default export is `{id, server, setup}`; OpenCode 1 (v1.3.4 and later)
+loads `server`, OpenCode 2 loads `setup`. OpenCode 1 also calls `setup` with a
+reduced context, which the plugin ignores. There is no named export, because
+OpenCode 1 loaders before v1.3.4 call every export and would run it twice.
+
+- **Shared service.** OpenCode 2 runs plugins in a background service shared
+  by every repository (`opencode run --standalone` runs a private one). Prompt,
+  context and tool hooks are per location; the event stream is process-wide and
+  `session.execution.*` carries no location. The plugin acts only on sessions
+  its own prompt hook saw, classified as top-level or child with
+  `ctx.session.get` (a child's prompt reaches the hook before any event names
+  its parent). Hooks never block: those that must finish first are awaited
+  asynchronous spawns with a timeout.
+- **Turns.** A turn is one execution. `turn-start` fires from the prompt hook
+  when the session has no active turn; a prompt sent mid-turn joins it and is
+  read from the transcript. An execution with no prompt (a background result
+  delivered to the parent) starts a turn with no prompt. `turn-end` fires on
+  `session.execution.{succeeded,failed,interrupted}`, compaction on
+  `session.compaction.ended`, `session-end` on `location.shutdown`.
+- **Exit and order.** `opencode run --standalone` kills plugin cleanup about
+  3s after the turn. `turn-end`, `session-end`, compaction and held subagent
+  stops therefore run detached, each after the session's detached hooks still
+  running (it waits on their PIDs, for at most 120s), and the next
+  `turn-start` waits for them, so a session's hooks land in OpenCode 1 order.
+  Every subagent stop also waits for that call's `subagent-start`. Cleanup
+  waits up to 2.5s for the final hooks. Hooks run without the service's
+  `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_COMMON_DIR`: the service is
+  shared, so a selector exported where it started would point every
+  repository's hooks at one repository.
+- **Subagents.** The tool is `subagent` (`{agent, description, prompt,
+  background?, sessionID?}`). The child ID is first on `session.tool.progress`
+  (`metadata.sessionID`, status `running`) → `subagent-start`;
+  `tool.execute.after` (`result.output.sessionID`) → `subagent-stop`. A
+  background call returns at launch (`result.output.status: "running"`), often
+  before its first progress update, so it is announced there and its stop is
+  held per child until the child's own execution ends (interrupt of the
+  launcher drains every held stop, as on 1.x).
+- **Export.** `opencode session export --standalone <id>` (without
+  `--standalone` it would start or attach to the shared service). The CLI
+  picks the command from `opencode --version`; only a readable 0.x/1.x version
+  selects 1.x commands. A 2.x export (flat, typed messages) is converted to
+  the 1.x shape at capture (`normalizeOpenCodeExport`), so every reader and
+  stored checkpoint sees one format: tool names map back (`subagent`→`task`,
+  `patch`→`apply_patch`, `shell`→`bash`), `path` inputs and patch `files[].file`
+  become absolute `filePath`s, synthetic and migration-notice messages become
+  synthetic user text, compaction becomes a 1.x marker plus a summary message,
+  idle markers are dropped. Sessions migrated from a 1.x database keep 1.x
+  tool names and input keys, so both are accepted.
+- **Resume.** OpenCode 2 cannot import the stored 1.x-shaped transcript
+  (`session import` rejects it), so on 2.x nothing is deleted: a session
+  OpenCode still has resumes as it is, and a missing one is an error.
+
+OpenCode 2 gaps:
+- Background subagents still running when `opencode run --standalone` exits
+  are killed with it (as with 1.x `run`).
+- Ordering across `opencode run` processes holds only while the previous
+  run's final hooks finish within cleanup's 2.5s; a slower `turn-end` can
+  still be running when the next run's `turn-start` arrives.
+- Rewinding to an earlier checkpoint keeps OpenCode's later conversation on
+  2.x (1.x replaced it by re-importing).
+- The interactive TUI and OpenCode Desktop on 2.x were not verified live.
+

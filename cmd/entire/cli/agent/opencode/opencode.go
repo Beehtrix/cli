@@ -231,7 +231,24 @@ func (a *OpenCodeAgent) WriteSession(ctx context.Context, session *agent.AgentSe
 // importSessionIntoOpenCode writes the export JSON to a temp file and runs
 // `opencode import` to restore the session into OpenCode's database.
 // An existing session is deleted first so the import replaces its messages.
+//
+// OpenCode 2 cannot import the stored transcript: checkpoints hold the 1.x
+// shape (see normalizeOpenCodeExport), which `session import` rejects. So on
+// 2.x nothing is deleted; a session OpenCode still has resumes as it is, and
+// a missing one is reported rather than replaced.
 func (a *OpenCodeAgent) importSessionIntoOpenCode(ctx context.Context, sessionID string, exportData []byte) error {
+	if !detectOpenCodeCLI(ctx).legacy {
+		exists, err := openCodeSessionExists(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("OpenCode session %s is not in OpenCode's local store, and OpenCode 2 cannot import a saved Entire transcript", sessionID)
+		}
+		logging.Debug(ctx, "opencode session already present; skipping import",
+			slog.String("session_id", sessionID))
+		return nil
+	}
 	// Delete existing session first so reimport replaces it cleanly.
 	// opencode import uses ON CONFLICT DO NOTHING, so existing messages
 	// would be skipped without this step.

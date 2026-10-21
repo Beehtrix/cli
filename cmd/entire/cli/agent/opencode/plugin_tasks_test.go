@@ -16,8 +16,8 @@ const pluginTaskDriver = `
 import { pathToFileURL } from "node:url"
 import { readFileSync } from "node:fs"
 
-const { EntirePlugin } = await import(pathToFileURL(process.argv[2]).href)
-const handlers = await EntirePlugin({ directory: process.cwd() })
+const { default: plugin } = await import(pathToFileURL(process.argv[2]).href)
+const handlers = await plugin.server({ directory: process.cwd() })
 for (const step of JSON.parse(readFileSync(process.argv[3], "utf8"))) {
   if (step.before) await handlers["tool.execute.before"](step.before, { args: {} })
   if (step.after) await handlers["tool.execute.after"](step.after.input, step.after.output ?? undefined)
