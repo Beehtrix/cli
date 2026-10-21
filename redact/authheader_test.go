@@ -304,3 +304,33 @@ func TestJSONLContent_ArrayElementsTakeTheirKey(t *testing.T) {
 		})
 	}
 }
+
+// TestJSONLContent_ArraySecretKeepsLayout checks that a secret in an array is
+// spliced in place. Array elements are judged under their array's key, but a
+// keyed splice only finds "key":"value", so scoping their replacement to that
+// key would miss and fall back to the re-encode, which sorts keys.
+func TestJSONLContent_ArraySecretKeepsLayout(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ input, want string }{
+		{
+			`{"z":1,"headers":{"Authorization":["Bearer ` + authUUIDToken + `"]},"a":2}`,
+			`{"z":1,"headers":{"Authorization":["REDACTED"]},"a":2}`,
+		},
+		{
+			`{"z":1,"api_keys":["` + authHexToken + `"],"a":2}`,
+			`{"z":1,"api_keys":["REDACTED"],"a":2}`,
+		},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			t.Parallel()
+			got, err := JSONLContent(tc.input)
+			if err != nil {
+				t.Fatalf("JSONLContent: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("JSONLContent(%s) = %s, want %s", tc.input, got, tc.want)
+			}
+		})
+	}
+}

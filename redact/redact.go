@@ -1425,6 +1425,9 @@ func isSingleJSONValue(dec *json.Decoder) bool {
 // key, empty at the root. An array element takes the key of the array that
 // holds it, so {"Authorization":["Bearer <token>"]}, as json.Marshal writes an
 // http.Header, keeps the key context of {"Authorization":"Bearer <token>"}.
+// spliceKey is the key a raw-text splice can scope a replacement to: the
+// leaf's own key, but empty inside arrays and at the root, because
+// replaceKeyedJSONValue only finds a value written directly after its key.
 //
 // A skip key preserves its own string values, including the strings in its
 // arrays, but objects beneath it are walked with their own keys. The id rule
@@ -1437,9 +1440,9 @@ func isSingleJSONValue(dec *json.Decoder) bool {
 // collection pass, the post-splice verification, and the structural re-encode
 // fallback must all agree on which leaves are redactable, and a second copy of
 // the rules is how they would drift apart.
-func walkRedactableStrings(v any, transform func(key string, credentialContext bool, val string) string) (any, bool) {
-	var walk func(key string, credentialContext, skipStrings bool, v any) (any, bool)
-	walk = func(key string, credentialContext, skipStrings bool, v any) (any, bool) {
+func walkRedactableStrings(v any, transform func(key, spliceKey string, credentialContext bool, val string) string) (any, bool) {
+	var walk func(key, spliceKey string, credentialContext, skipStrings bool, v any) (any, bool)
+	walk = func(key, spliceKey string, credentialContext, skipStrings bool, v any) (any, bool) {
 		switch val := v.(type) {
 		case map[string]any:
 			if shouldSkipJSONLObject(val) {
@@ -1448,7 +1451,7 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 			childCredentialContext := credentialContext || isCredentialJSONObject(val)
 			var out map[string]any
 			for k, child := range val {
-				newChild, childChanged := walk(k, childCredentialContext, shouldSkipJSONLField(k), child)
+				newChild, childChanged := walk(k, k, childCredentialContext, shouldSkipJSONLField(k), child)
 				if !childChanged {
 					continue
 				}
@@ -1464,7 +1467,7 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 		case []any:
 			var out []any
 			for i, child := range val {
-				newChild, childChanged := walk(key, credentialContext, skipStrings, child)
+				newChild, childChanged := walk(key, "", credentialContext, skipStrings, child)
 				if !childChanged {
 					continue
 				}
@@ -1482,7 +1485,7 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 			if skipStrings {
 				return v, false
 			}
-			redacted := transform(key, credentialContext, val)
+			redacted := transform(key, spliceKey, credentialContext, val)
 			if redacted == val {
 				return v, false
 			}
@@ -1491,7 +1494,7 @@ func walkRedactableStrings(v any, transform func(key string, credentialContext b
 			return v, false
 		}
 	}
-	return walk("", false, false, v)
+	return walk("", "", false, false, v)
 }
 
 // redactLeafValue is the per-leaf redaction rule shared by the splice
@@ -1576,13 +1579,13 @@ type replKey struct {
 func collectJSONLReplacements(v any, redactor func(string) string) []jsonReplacement {
 	seen := make(map[replKey]bool)
 	var repls []jsonReplacement
-	walkRedactableStrings(v, func(key string, credentialContext bool, val string) string {
+	walkRedactableStrings(v, func(key, spliceKey string, credentialContext bool, val string) string {
 		redacted := redactLeafValue(key, credentialContext, val, redactor)
 		if redacted != val {
-			k := replKey{key: key, original: val}
+			k := replKey{key: spliceKey, original: val}
 			if !seen[k] {
 				seen[k] = true
-				repls = append(repls, jsonReplacement{key: key, original: val, redacted: redacted})
+				repls = append(repls, jsonReplacement{key: spliceKey, original: val, redacted: redacted})
 			}
 		}
 		// Collection only. The fast path splices the raw text, so the tree is
@@ -1729,7 +1732,7 @@ func spliceMissed(spliced string, repls []jsonReplacement) bool {
 	}
 
 	missed := false
-	walkRedactableStrings(parsed, func(key string, _ bool, val string) string {
+	walkRedactableStrings(parsed, func(_, spliceKey string, _ bool, val string) string {
 		if missed {
 			return val
 		}
@@ -1737,7 +1740,7 @@ func spliceMissed(spliced string, repls []jsonReplacement) bool {
 			missed = true
 			return val
 		}
-		if _, ok := originalsByKey[key][val]; ok {
+		if _, ok := originalsByKey[spliceKey][val]; ok {
 			missed = true
 		}
 		return val
@@ -1773,7 +1776,7 @@ func reencodeRedacted(content string, redactor func(string) string) (string, err
 	if err := dec.Decode(&parsed); err != nil {
 		return "", fmt.Errorf("%w: re-parse content for structural redaction: %w", ErrRedactionIncomplete, err)
 	}
-	redactedTree, _ := walkRedactableStrings(parsed, func(key string, credentialContext bool, val string) string {
+	redactedTree, _ := walkRedactableStrings(parsed, func(key, _ string, credentialContext bool, val string) string {
 		return redactLeafValue(key, credentialContext, val, redactor)
 	})
 	var buf bytes.Buffer
