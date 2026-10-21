@@ -987,6 +987,9 @@ func JSONLBytes(b []byte) (RedactedBytes, error) {
 // use JSONLBytes.
 // Returns ErrScannerDegraded when the goredact scanner degraded while
 // betterleaks is disabled.
+//
+// The result carries no counts (Counts returns nil): the OPF passes do not
+// tally, so this output must not feed checkpoint metadata's redaction counts.
 func JSONLBytesWithPrivacyFilter(ctx context.Context, b []byte) (RedactedBytes, error) {
 	s := string(b)
 	redacted, err := JSONLContentWithPrivacyFilter(ctx, s)

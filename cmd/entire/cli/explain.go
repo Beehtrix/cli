@@ -2164,12 +2164,14 @@ func formatCheckpointHeader(
 		writeRow("tokens", tokensVal)
 	}
 
-	redaction := meta.Redaction
-	if redaction == nil && summary != nil {
-		redaction = summary.Redaction
+	// A session's counts cover its whole transcript up to this checkpoint, not
+	// just this checkpoint's turns, so the row says which counts it shows.
+	redaction, scope := meta.Redaction, "in this session so far"
+	if redaction == nil && summary != nil && summary.Redaction != nil {
+		redaction, scope = summary.Redaction, "across "+pluralCount(len(summary.Sessions), "session", "sessions")
 	}
 	if redaction != nil {
-		writeRow("redacted", formatRedactionCounts(redaction))
+		writeRow("redacted", formatRedactionCounts(redaction, scope))
 	}
 
 	switch {
@@ -2190,12 +2192,12 @@ func formatCheckpointHeader(
 	return sb.String()
 }
 
-// formatRedactionCounts renders what redaction replaced, then the matches of
-// each layer that found any, in detection order. Custom rules that ran are
-// always shown, so rules that matched nothing read differently from rules
-// that never loaded.
-func formatRedactionCounts(c *redact.Counts) string {
-	out := pluralCount(c.Replacements, "replacement", "replacements")
+// formatRedactionCounts renders what redaction replaced within scope, then
+// the matches of each layer that found any, in detection order. Custom rules
+// that ran are always shown, so rules that matched nothing read differently
+// from rules that never loaded.
+func formatRedactionCounts(c *redact.Counts, scope string) string {
+	out := pluralCount(c.Replacements, "replacement", "replacements") + " " + scope
 	var matches []string
 	for _, layer := range redact.LayerNames() {
 		n := c.Layers[layer]

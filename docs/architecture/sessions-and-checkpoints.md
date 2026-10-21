@@ -798,7 +798,7 @@ the compact transcript is regenerable from it.
 }
 ```
 
-`redaction` records what redaction replaced in the session's `full.jsonl`: placeholders written and matches per detection layer, never the values or custom rule names (see [Redaction counts in checkpoint metadata](../security-and-privacy.md#redaction-counts-in-checkpoint-metadata)). The example is abbreviated: every layer that ran is listed, with 0 when it found nothing. It is absent on checkpoints from older CLIs. The root `CheckpointSummary` carries the sum over its sessions under the same key, omitted when any session stored a transcript without counts.
+`redaction` records what redaction replaced in the session's `full.jsonl`: placeholders written and matches per detection layer, never the values or custom rule names (see [Redaction counts in checkpoint metadata](../security-and-privacy.md#redaction-counts-in-checkpoint-metadata)). `full.jsonl` holds the whole session up to this checkpoint, so the counts grow across a session's checkpoints; take each session's latest checkpoint instead of adding them up. The example is abbreviated: every layer that ran is listed, with 0 when it found nothing. It is absent on checkpoints from older CLIs. The root `CheckpointSummary` carries the sum over its sessions under the same key, omitted when any session stored a transcript without counts.
 
 In session metadata, `checkpoints_count` is the displayed prompt-window count for that session. `save_step_count` records the session's turn-end steps (`StepCount`) and is the conservative "real checkpoint work happened" signal; it is omitted when zero (for example, commit-only/fallback sessions). `save_step_count` is not aggregated into the root `CheckpointSummary`.
 

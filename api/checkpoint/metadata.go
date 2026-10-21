@@ -488,8 +488,9 @@ type Metadata struct {
 	TokenUsage *types.TokenUsage `json:"token_usage,omitempty"`
 
 	// Redaction is what redacting the stored full.jsonl replaced, never the
-	// values. Nil when unknown: no transcript was stored, or an older CLI or a
-	// caller without counts wrote it.
+	// values. full.jsonl holds the whole session so far, so the counts grow
+	// across a session's checkpoints. Nil when unknown: no transcript was
+	// stored, or an older CLI or a caller without counts wrote it.
 	Redaction *redact.Counts `json:"redaction,omitempty"`
 
 	// SkillEvents records explicit native skill signals observed in this session.

@@ -38,19 +38,19 @@ func TestFormatCheckpointHeader_RedactionRow(t *testing.T) {
 				Layers:            map[string]int{"pii": 3, "custom": 2, "betterleaks": 3, "entropy": 9, "provider_token": 0},
 				CustomRulesActive: 2,
 			},
-			want: "  redacted 14 replacements · matches: entropy 9, betterleaks 3, custom 2 (2 rules), pii 3\n",
+			want: "  redacted 14 replacements in this session so far · matches: entropy 9, betterleaks 3, custom 2 (2 rules), pii 3\n",
 		},
 		{
 			// Custom rules that ran and matched nothing stay visible, which is
 			// how a reader tells them apart from rules that never loaded.
 			name:   "custom rules that matched nothing",
 			counts: &redact.Counts{Replacements: 1, Layers: map[string]int{"entropy": 1, "custom": 0}, CustomRulesActive: 3},
-			want:   "  redacted 1 replacement · matches: entropy 1, custom 0 (3 rules)\n",
+			want:   "  redacted 1 replacement in this session so far · matches: entropy 1, custom 0 (3 rules)\n",
 		},
 		{
 			name:   "nothing redacted",
 			counts: &redact.Counts{Layers: map[string]int{"entropy": 0}},
-			want:   "  redacted 0 replacements\n",
+			want:   "  redacted 0 replacements in this session so far\n",
 		},
 	}
 	for _, tc := range cases {
@@ -66,10 +66,20 @@ func TestFormatCheckpointHeader_RedactionRowAbsentWithoutCounts(t *testing.T) {
 	require.NotContains(t, headerWithRedaction(nil, nil), "redacted")
 }
 
-func TestFormatCheckpointHeader_RedactionFallsBackToCheckpointTotal(t *testing.T) {
+// The row says whose counts it shows: the displayed session's, which cover the
+// whole session up to this checkpoint, or the checkpoint total when that
+// session stored no transcript.
+func TestFormatCheckpointHeader_RedactionRowNamesItsScope(t *testing.T) {
 	t.Parallel()
-	summary := &checkpoint.CheckpointSummary{Redaction: &redact.Counts{Replacements: 2, Layers: map[string]int{"entropy": 2}}}
-	require.Contains(t, headerWithRedaction(summary, nil), "  redacted 2 replacements · matches: entropy 2\n")
+	twoSessions := []checkpoint.SessionFilePaths{{}, {}}
+	total := &redact.Counts{Replacements: 5, Layers: map[string]int{"entropy": 5}}
+
+	session := &redact.Counts{Replacements: 2, Layers: map[string]int{"entropy": 2}}
+	got := headerWithRedaction(&checkpoint.CheckpointSummary{Sessions: twoSessions, Redaction: total}, session)
+	require.Contains(t, got, "  redacted 2 replacements in this session so far · matches: entropy 2\n")
+
+	got = headerWithRedaction(&checkpoint.CheckpointSummary{Sessions: twoSessions, Redaction: total}, nil)
+	require.Contains(t, got, "  redacted 5 replacements across 2 sessions · matches: entropy 5\n")
 }
 
 func TestBuildCheckpointJSONEnvelope_RedactionCounts(t *testing.T) {

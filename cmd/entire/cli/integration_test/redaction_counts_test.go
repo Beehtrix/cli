@@ -120,7 +120,7 @@ func TestRedactionCounts_FullHookFlow(t *testing.T) {
 
 	text := env.RunCLI("checkpoint", "explain", "--checkpoint", cpID)
 	t.Logf("explain:\n%s", text)
-	if !strings.Contains(text, "redacted") || !strings.Contains(text, "custom 2 (1 rule)") {
+	if !strings.Contains(text, "replacements in this session so far") || !strings.Contains(text, "custom 2 (1 rule)") {
 		t.Errorf("explain text must show the redaction row:\n%s", text)
 	}
 
