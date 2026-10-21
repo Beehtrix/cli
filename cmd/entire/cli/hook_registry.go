@@ -155,9 +155,6 @@ func executeAgentHook(cmd *cobra.Command, agentName types.AgentName, hookName st
 	if parseErr != nil {
 		return fmt.Errorf("failed to parse hook event: %w", parseErr)
 	}
-	if finisher, ok := agent.AsHookFinisher(ag); ok {
-		defer finisher.FinishHook()
-	}
 
 	if event != nil {
 		// Cross-agent guard: when Cursor IDE invokes a hook configured under

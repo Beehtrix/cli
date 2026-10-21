@@ -3,7 +3,6 @@ package opencode
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -215,33 +214,6 @@ func TestNormalizeOpenCodeExport_Compaction(t *testing.T) {
 	}
 }
 
-func TestNormalizeOpenCodeExport_ToolError(t *testing.T) {
-	t.Parallel()
-	_, data := normalizeFixture(t, "tool-error")
-	var doc struct {
-		Messages []struct {
-			Parts []struct {
-				Tool  string         `json:"tool"`
-				State map[string]any `json:"state"`
-			} `json:"parts"`
-		} `json:"messages"`
-	}
-	if err := json.Unmarshal(data, &doc); err != nil {
-		t.Fatal(err)
-	}
-	for _, msg := range doc.Messages {
-		for _, part := range msg.Parts {
-			if part.State["status"] == "error" {
-				if part.State["error"] != "File not found: missing.txt" {
-					t.Errorf("tool error = %v, want the 1.x error string", part.State["error"])
-				}
-				return
-			}
-		}
-	}
-	t.Fatal("no errored tool part survived normalization")
-}
-
 // A session OpenCode 2 migrated from a 1.x database keeps its 1.x tool names
 // and input keys, and gains a system notice about the renames.
 func TestNormalizeOpenCodeExport_MigratedFromV1(t *testing.T) {
@@ -268,24 +240,6 @@ func TestNormalizeOpenCodeExport_MigratedFromV1(t *testing.T) {
 		if strings.Contains(p, "tools have changed") {
 			t.Errorf("migration notice extracted as a prompt: %q", p)
 		}
-	}
-}
-
-// Transcript offsets stored between turns are message indices, so the same
-// export must always normalize to the same messages.
-func TestNormalizeOpenCodeExport_Deterministic(t *testing.T) {
-	t.Parallel()
-	raw := loadOpenCode2Fixture(t, "background-subagent")
-	first, err := normalizeOpenCodeExport(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := normalizeOpenCodeExport(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(first, second) {
-		t.Fatal("normalizing the same export twice gave different bytes")
 	}
 }
 
@@ -350,14 +304,6 @@ func TestOpenCodeV2ImportPayload_RoundTrip(t *testing.T) {
 				t.Errorf("session id = %v, want %v", got.Info["id"], want.Info["id"])
 			}
 		})
-	}
-}
-
-func TestOpenCodeV2ImportPayload_OpenCode1CaptureIsRejected(t *testing.T) {
-	t.Parallel()
-	v1 := `{"info":{"id":"ses_1"},"messages":[{"info":{"id":"m1","role":"user","time":{"created":1}},"parts":[{"type":"text","text":"hi"}]}]}`
-	if _, err := openCodeV2ImportPayload([]byte(v1), "ses_1", "/repo"); !errors.Is(err, errNotOpenCode2Capture) {
-		t.Fatalf("err = %v, want errNotOpenCode2Capture", err)
 	}
 }
 

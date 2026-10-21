@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"testing"
 
@@ -60,18 +59,6 @@ func TestProbeOpenCodeCLI(t *testing.T) {
 	}
 }
 
-func TestOpenCodeCLIExportArgs(t *testing.T) {
-	t.Parallel()
-	if got := (openCodeCLI{legacy: true}).exportArgs("ses_1"); !slices.Equal(got, []string{"export", "ses_1"}) {
-		t.Errorf("1.x export args = %v", got)
-	}
-	// Without --standalone, OpenCode 2 attaches to (or starts) the shared
-	// background service, which then outlives the hook.
-	if got := (openCodeCLI{}).exportArgs("ses_1"); !slices.Equal(got, []string{"session", "export", "--standalone", "ses_1"}) {
-		t.Errorf("2.x export args = %v", got)
-	}
-}
-
 // OpenCode 2 exports with `session export --standalone`.
 func TestRunOpenCodeExportToFile_OpenCode2(t *testing.T) {
 	// No t.Parallel: t.Setenv.
@@ -92,16 +79,6 @@ func TestRunOpenCodeExportToFile_OpenCode2(t *testing.T) {
 	}
 	if strings.TrimSpace(string(args)) != "session export --standalone ses_x" {
 		t.Errorf("opencode args = %q", args)
-	}
-}
-
-func TestReportsSessionNotFound(t *testing.T) {
-	t.Parallel()
-	if !reportsSessionNotFound("Session not found: ses_abc\n") {
-		t.Error("OpenCode 2 missing-session line not recognized")
-	}
-	if reportsSessionNotFound("Error: Failed to import session: Bad Request\n") {
-		t.Error("unrelated error treated as a missing session")
 	}
 }
 

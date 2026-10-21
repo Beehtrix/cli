@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
@@ -78,34 +77,8 @@ func (a *OpenCodeAgent) HookNames() []string {
 	}
 }
 
-// ParseHookEvent translates OpenCode hook calls into normalized lifecycle
-// events. An OpenCode 2 payload's ordering fields are applied before the
-// event is returned (see orderHook); FinishHook ends them.
+// ParseHookEvent translates OpenCode hook calls into normalized lifecycle events.
 func (a *OpenCodeAgent) ParseHookEvent(ctx context.Context, hookName string, stdin io.Reader) (*agent.Event, error) {
-	if !slices.Contains(a.HookNames(), hookName) {
-		return a.parseHookPayload(ctx, hookName, stdin)
-	}
-	payload, err := agent.ReadHookInputRaw(stdin)
-	if err != nil {
-		return nil, err //nolint:wrapcheck // same error each hook's own parse returned before
-	}
-	event, err := a.parseHookPayload(ctx, hookName, bytes.NewReader(payload))
-	if err != nil || event == nil {
-		return event, err
-	}
-	a.finishHook = orderHook(ctx, payload)
-	return event, nil
-}
-
-// FinishHook ends the hook's ordering marker, if it left one.
-func (a *OpenCodeAgent) FinishHook() {
-	if a.finishHook != nil {
-		a.finishHook()
-		a.finishHook = nil
-	}
-}
-
-func (a *OpenCodeAgent) parseHookPayload(ctx context.Context, hookName string, stdin io.Reader) (*agent.Event, error) {
 	switch hookName {
 	case HookNameSessionStart:
 		raw, err := agent.ReadAndParseHookInput[sessionInfoRaw](stdin)

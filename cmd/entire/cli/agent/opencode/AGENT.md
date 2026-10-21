@@ -147,19 +147,14 @@ installed. On 0.15.31 and 1.0.0 the plugin loads and its hooks fire
   `session.compaction.ended`, `session-end` on `location.shutdown`.
 - **Exit and order.** `opencode run --standalone` kills plugin cleanup about
   3s after the turn. `turn-end`, `session-end`, compaction and held subagent
-  stops therefore run detached. Each names the session's detached hooks still
-  running (`after_pids`); the CLI waits for those to exit (at most 60s) and
-  leaves a marker under `.entire/tmp/opencode-hooks` while it runs
-  (`hook_order.go`). `session-start`, the first hook of every plugin instance,
-  carries `wait_detached`: the CLI waits (at most 20s) until no marker of the
-  session belongs to a live process, so a new `opencode run` never overtakes
-  the previous run's hooks. In-process, the next `turn-start` also waits for
-  them, and every subagent stop waits for that call's `subagent-start`. A
-  marker whose process cannot be checked (Windows) holds for at most 2
-  minutes. Every step fails open. Hooks run without the service's
-  `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_COMMON_DIR`: the service is
-  shared, so a selector exported where it started would point every
-  repository's hooks at one repository.
+  stops therefore run detached, each after the session's detached hooks still
+  running (polling their PIDs, for at most 120s), and the next `turn-start`
+  waits for them, so a session's hooks land in OpenCode 1 order. Every
+  subagent stop also waits for that call's `subagent-start`. Cleanup waits up
+  to 2.5s for the final hooks; a slower `turn-end` can still be running when
+  the next `opencode run` starts. Events are queued per top-level session, so
+  one session's slow hook never delays another's. Hooks run without the
+  service's `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_COMMON_DIR`.
 - **Subagents.** The tool is `subagent` (`{agent, description, prompt,
   background?, sessionID?}`). The child ID is first on `session.tool.progress`
   (`metadata.sessionID`, status `running`) → `subagent-start`;

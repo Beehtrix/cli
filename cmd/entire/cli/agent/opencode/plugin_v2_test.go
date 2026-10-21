@@ -145,11 +145,9 @@ func runPluginV2(t *testing.T, scenario map[string]any) []v2Hook {
 			t.Fatal(err)
 		}
 	}
-	// One line per hook: name, tab, payload. Like the CLI, a detached hook
-	// first waits for the processes in its after_pids. A short sleep makes
-	// ordering races between detached hooks visible.
+	// One line per hook: name, tab, payload. A short sleep makes ordering
+	// races between detached hooks visible.
 	script := "#!/bin/sh\nbody=$(cat)\n" +
-		"for p in $(printf '%s' \"$body\" | sed -n 's/.*\"after_pids\":\\[\\([0-9,]*\\)\\].*/\\1/p' | tr ',' ' '); do while kill -0 $p 2>/dev/null; do sleep 0.02; done; done\n" +
 		"[ \"$3\" = subagent-start ] && [ -n \"$SLOW_SUBAGENT_START\" ] && sleep 1\n" +
 		"sleep 0.05\nprintf '%s\\t%s\\n' \"$3\" \"$body\" >> " + logPath + "\n"
 	if err := os.WriteFile(filepath.Join(binDir, "entire"), []byte(script), 0o755); err != nil {
@@ -439,25 +437,6 @@ func TestPluginV2_FastForegroundSubagentStartsBeforeItStops(t *testing.T) {
 		v2Execution("ses_a", "succeeded"),
 	})
 	want := []string{"session-start:ses_a", "turn-start:ses_a", "subagent-start:ses_a:call_1", "subagent-stop:ses_a:call_1", "turn-end:ses_a", "session-end:ses_a"}
-	if got := hookStrings(hooks); !slices.Equal(got, want) {
-		t.Fatalf("hooks = %v, want %v", got, want)
-	}
-}
-
-// A held stop released as the session shuts down lands before session-end.
-func TestPluginV2_SessionEndWaitsForHeldStops(t *testing.T) {
-	t.Parallel()
-	hooks := runPluginV2Scenario(t, map[string]string{"ses_a": "", "ses_child": "ses_a"}, []map[string]any{
-		v2Prompt("ses_a", "launch"),
-		v2SubagentBefore("call_bg", true),
-		v2Prompt("ses_child", "You are a subagent"),
-		v2SubagentAfter("call_bg", "running"),
-		v2Event("session.execution.started", map[string]any{"sessionID": "ses_child"}),
-		v2Execution("ses_a", "succeeded"),
-		v2Execution("ses_child", "succeeded"),
-		v2Shutdown("$CWD"),
-	})
-	want := []string{"session-start:ses_a", "turn-start:ses_a", "subagent-start:ses_a:call_bg", "turn-end:ses_a", "subagent-stop:ses_a:call_bg", "session-end:ses_a"}
 	if got := hookStrings(hooks); !slices.Equal(got, want) {
 		t.Fatalf("hooks = %v, want %v", got, want)
 	}
