@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-// jsonlAdapter turns a Claude Code, Cursor or Droid JSONL transcript into
+// JSONLAdapter turns a Claude Code, Cursor or Droid JSONL transcript into
 // transcript records. It is incremental: Feed accepts the transcript in
 // chunks split anywhere, and the records depend only on the bytes fed, not
 // on how they were chunked. Folding the records reproduces what compaction
@@ -26,9 +26,14 @@ import (
 // fed, including blank and dropped ones). A message ID the agent reuses for a
 // later, non-adjacent message gets "<id>@L<line>" as its key and keeps the
 // agent's ID as SourceID; messages without an ID, including all user
-// messages, get "@L<line>" and no SourceID. Keys are stable for a transcript
-// fed from its first line.
-type jsonlAdapter struct {
+// messages, get "@L<line>" and no SourceID. Keys are stable only for a
+// transcript fed from its first line, so a stream that resumes must replay
+// from line 1 rather than start a fresh adapter mid-file.
+//
+// Folding every record from Feed and a final Flush reproduces Convert's
+// output for the same bytes (with Options.StartLine 0). Records carry no
+// redaction: redact the transcript before feeding it, as checkpoints do.
+type JSONLAdapter struct {
 	preprocess linePreprocessor
 
 	pending []byte          // bytes after the last newline fed
@@ -45,14 +50,39 @@ type openAssistant struct {
 	isArray bool        // whether the merged content is a JSON array
 }
 
-func newJSONLAdapter(preprocess linePreprocessor) *jsonlAdapter {
-	return &jsonlAdapter{preprocess: preprocess, keys: make(map[string]bool)}
+// NewClaudeAdapter returns an adapter for a Claude Code JSONL transcript.
+func NewClaudeAdapter() *JSONLAdapter {
+	return newJSONLAdapter(nil)
+}
+
+// NewCursorAdapter returns an adapter for a Cursor JSONL transcript, which
+// shares Claude Code's line format.
+func NewCursorAdapter() *JSONLAdapter {
+	return newJSONLAdapter(nil)
+}
+
+// NewDroidAdapter returns an adapter for a Factory AI Droid JSONL transcript,
+// unwrapping each line's envelope first.
+func NewDroidAdapter() *JSONLAdapter {
+	return newJSONLAdapter(unwrapDroidEnvelope)
+}
+
+func newJSONLAdapter(preprocess linePreprocessor) *JSONLAdapter {
+	return &JSONLAdapter{preprocess: preprocess, keys: make(map[string]bool)}
+}
+
+// Lines returns the number of source lines consumed so far: every
+// newline-terminated line fed, including blank and dropped ones, plus a
+// partial line once Flush has consumed it. A held partial line is not
+// counted. Line-derived keys ("@L<n>") use the same numbering.
+func (a *JSONLAdapter) Lines() int {
+	return a.line
 }
 
 // Feed consumes the next chunk of the transcript and returns the records
 // implied by every line it completed. A trailing partial line is held until a
 // later chunk completes it, or until Flush.
-func (a *jsonlAdapter) Feed(chunk []byte) []Record {
+func (a *JSONLAdapter) Feed(chunk []byte) []Record {
 	var out []Record
 	for len(chunk) > 0 {
 		i := bytes.IndexByte(chunk, '\n')
@@ -75,7 +105,7 @@ func (a *jsonlAdapter) Feed(chunk []byte) []Record {
 // Flush treats a held partial line as complete. Call it only once the
 // transcript is final; while an agent is still writing, a partial line is
 // usually an unfinished write.
-func (a *jsonlAdapter) Flush() []Record {
+func (a *JSONLAdapter) Flush() []Record {
 	if len(a.pending) == 0 {
 		return nil
 	}
@@ -84,7 +114,7 @@ func (a *jsonlAdapter) Flush() []Record {
 	return a.consumeLine(lineBytes, nil)
 }
 
-func (a *jsonlAdapter) consumeLine(lineBytes []byte, out []Record) []Record {
+func (a *JSONLAdapter) consumeLine(lineBytes []byte, out []Record) []Record {
 	a.line++
 	if len(bytes.TrimSpace(lineBytes)) == 0 {
 		return out
@@ -102,7 +132,7 @@ func (a *jsonlAdapter) consumeLine(lineBytes []byte, out []Record) []Record {
 	return out
 }
 
-func (a *jsonlAdapter) assistant(e parsedEntry, out []Record) []Record {
+func (a *JSONLAdapter) assistant(e parsedEntry, out []Record) []Record {
 	o := a.open
 	if o == nil || o.entry.id != e.id {
 		o = &openAssistant{key: a.newKey(e.id), entry: e, isArray: isJSONArray(e.content)}
@@ -146,7 +176,7 @@ func (a *jsonlAdapter) assistant(e parsedEntry, out []Record) []Record {
 	})
 }
 
-func (a *jsonlAdapter) user(e parsedEntry, out []Record) []Record {
+func (a *JSONLAdapter) user(e parsedEntry, out []Record) []Record {
 	o := a.open
 	a.open = nil
 
@@ -182,7 +212,7 @@ func (a *jsonlAdapter) user(e parsedEntry, out []Record) []Record {
 
 // newKey returns an unused fold key for a message starting on the current
 // line, preferring the agent's own ID.
-func (a *jsonlAdapter) newKey(sourceID string) string {
+func (a *JSONLAdapter) newKey(sourceID string) string {
 	key := sourceID
 	if key == "" || a.keys[key] {
 		key = fmt.Sprintf("%s@L%d", sourceID, a.line)

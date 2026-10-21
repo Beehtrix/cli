@@ -120,11 +120,20 @@ once emitted, so they can be streamed and stored as plain appends. `Fold`
 applies records in order and returns the transcript lines.
 
 In this repository the fold is used by `Convert`: for Claude Code, Cursor and
-Droid, it runs an adapter that turns the native transcript into records and then
-folds them. The other converters still write lines directly. The fold is meant
-to be shared with a backend that folds the same records to show a live session,
-so that a live view and a checkpoint's `transcript.jsonl` match byte for byte;
-that integration does not exist yet.
+Droid, it runs a `JSONLAdapter` that turns the native transcript into records
+and then folds them. The other converters still write lines directly. The fold
+is meant to be shared with a backend that folds the same records to show a live
+session, so that a live view and a checkpoint's `transcript.jsonl` match byte
+for byte.
+
+A live producer uses the same adapter (`NewClaudeAdapter`, `NewCursorAdapter`,
+`NewDroidAdapter`). `Feed` accepts the transcript in chunks split anywhere and
+returns the records for the lines it completed; `Flush` consumes a trailing
+partial line and is called only once the transcript is final. Fold keys are
+stable only when the adapter is fed from the transcript's first line, so a
+producer that restarts replays from line 1. `Lines` reports how many source
+lines have been consumed. Records carry the transcript's bytes as fed: redact
+before feeding.
 
 ### Record wire format v1
 

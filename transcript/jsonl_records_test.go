@@ -197,6 +197,55 @@ func TestJSONLAdapter_FeedHoldsPartialLineUntilComplete(t *testing.T) {
 	}
 }
 
+// The exported constructors are what live streams use, so folding their
+// line-by-line records must match Convert on the same bytes.
+func TestJSONLAdapter_ExportedConstructorsMatchConvert(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		path    string
+		adapter func() *JSONLAdapter
+	}{
+		{"testdata/claude_full.jsonl", NewClaudeAdapter},
+		{"testdata/claude_full2.jsonl", NewClaudeAdapter},
+		{"testdata/claude_full.jsonl", NewCursorAdapter},
+		{"testdata/droid_full.jsonl", NewDroidAdapter},
+	} {
+		input, err := os.ReadFile(tc.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := Convert(input, defaultOpts)
+		if err != nil {
+			t.Fatalf("%s: Convert: %v", tc.path, err)
+		}
+		a := tc.adapter()
+		var recs []Record
+		for _, line := range bytes.SplitAfter(input, []byte("\n")) {
+			recs = append(recs, a.Feed(line)...)
+		}
+		recs = append(recs, a.Flush()...)
+		if got := foldRecords(t, recs); !bytes.Equal(got, want) {
+			t.Fatalf("%s: fold differs from Convert\ngot:\n%s\nwant:\n%s", tc.path, got, want)
+		}
+	}
+}
+
+func TestJSONLAdapter_LinesCountsConsumedLines(t *testing.T) {
+	t.Parallel()
+
+	a := NewClaudeAdapter()
+	line := `{"type":"user","timestamp":"t1","message":{"content":"hi"}}`
+	a.Feed([]byte(line + "\n\n" + `{"type":"progress"}` + "\n" + line[:20]))
+	if got := a.Lines(); got != 3 {
+		t.Fatalf("Lines after three complete lines and a partial one = %d, want 3", got)
+	}
+	a.Flush()
+	if got := a.Lines(); got != 4 {
+		t.Fatalf("Lines after Flush = %d, want 4", got)
+	}
+}
+
 func TestJSONLAdapter_ReusedMessageIDGetsDistinctKey(t *testing.T) {
 	t.Parallel()
 

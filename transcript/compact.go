@@ -192,7 +192,7 @@ func normalizeKind(raw map[string]json.RawMessage) string {
 type linePreprocessor func(map[string]json.RawMessage) map[string]json.RawMessage
 
 // parsedEntry is an intermediate representation of a JSONL line, consumed by
-// jsonlAdapter.
+// JSONLAdapter.
 type parsedEntry struct {
 	kind         string // "user" or "assistant"
 	ts           json.RawMessage
