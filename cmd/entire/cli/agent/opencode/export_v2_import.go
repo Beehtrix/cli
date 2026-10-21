@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
+
+	"github.com/entireio/cli/redact"
 )
 
 // errNotOpenCode2Capture reports a stored transcript that was not captured
@@ -13,8 +16,15 @@ var errNotOpenCode2Capture = errors.New("transcript was not captured from OpenCo
 
 // openCodeBase64 is OpenCode 2's Prompt.Base64 pattern. Its import rejects
 // the whole session when one attachment's data does not match, which a
-// redacted or externalized attachment no longer does.
+// redacted or externalized attachment may no longer do.
 var openCodeBase64 = regexp.MustCompile(`^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$`)
+
+// openCodeImportInfoKeys are the session info fields a resume gives back to
+// OpenCode 2. The rest are deliberately not restored from a checkpoint:
+// permissions, agent and metadata would let whoever can push checkpoint data
+// change how tools are approved in the resuming user's OpenCode, and
+// parentID, fork and revert point at state the resuming store may not have.
+var openCodeImportInfoKeys = []string{"id", "projectID", "model", "cost", "tokens", "outcome", "time", "title", "location", "subpath"}
 
 // openCodeV2ImportPayload rebuilds the OpenCode 2 export a stored transcript
 // was converted from (see normalizeOpenCodeExport), for `opencode session
@@ -49,11 +59,12 @@ func openCodeV2ImportPayload(data []byte, directory string) ([]byte, error) {
 		}
 	}
 
-	info := make(map[string]any, len(doc.Info))
-	for k, v := range doc.Info {
-		info[k] = v
+	info := make(map[string]any, len(openCodeImportInfoKeys))
+	for _, k := range openCodeImportInfoKeys {
+		if v, ok := doc.Info[k]; ok {
+			info[k] = v
+		}
 	}
-	delete(info, "directory") // added for 1.x readers; not an OpenCode 2 field
 	loc, ok := info["location"].(map[string]any)
 	if !ok {
 		loc = map[string]any{}
@@ -110,12 +121,14 @@ func dropInvalidAttachments(msg map[string]any) map[string]any {
 }
 
 // hasInvalidData reports whether v holds a "data" string, at any depth,
-// that is not valid base64.
+// that is not valid base64 or that redaction replaced. A redacted value is
+// usually "REDACTED", itself valid base64, which would import as a corrupt
+// attachment that the provider then rejects on every turn.
 func hasInvalidData(v any) bool {
 	switch val := v.(type) {
 	case map[string]any:
 		for k, inner := range val {
-			if s, ok := inner.(string); ok && k == "data" && !openCodeBase64.MatchString(s) {
+			if s, ok := inner.(string); ok && k == "data" && (!openCodeBase64.MatchString(s) || strings.Contains(s, redact.RedactedPlaceholder)) {
 				return true
 			}
 			if hasInvalidData(inner) {

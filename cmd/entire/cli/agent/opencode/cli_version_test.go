@@ -161,7 +161,7 @@ func TestWriteSession_OpenCode2(t *testing.T) {
 	t.Run("missing, captured from OpenCode 1", func(t *testing.T) {
 		v1 := []byte(`{"info":{"id":"` + sessionID + `"},"messages":[{"info":{"id":"m1","role":"user","time":{"created":1}},"parts":[]}]}`)
 		errText, calls := write(t, `if [ "$2" = export ]; then echo 'Session not found: x' >&2; exit 1; fi`+"\n", v1)
-		if !strings.Contains(errText, "captured with OpenCode 1") || len(calls) != 1 {
+		if !strings.Contains(errText, "no OpenCode 2 messages") || len(calls) != 1 {
 			t.Fatalf("err %q, calls %q; want a clear OpenCode 1 error and no import", errText, calls)
 		}
 	})

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/entiredir"
+	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
@@ -115,7 +116,7 @@ func writeMarker(ctx context.Context, root *os.Root, sessionID string) func() {
 		return func() {}
 	}
 	name := hookOrderDirName + "/" + sessionID + "." + strconv.Itoa(os.Getpid()) + "." + strconv.FormatInt(time.Now().UnixNano(), 36) + ".json"
-	if err := root.WriteFile(name, data, 0o600); err != nil {
+	if err := jsonutil.WriteFileAtomicIn(root, name, data, 0o600); err != nil {
 		logging.Debug(ctx, "opencode hook marker not written", slog.String("error", err.Error()))
 		return func() {}
 	}

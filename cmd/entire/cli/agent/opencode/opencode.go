@@ -255,7 +255,7 @@ func (a *OpenCodeAgent) importSessionIntoOpenCode(ctx context.Context, session *
 		}
 		payload, err := openCodeV2ImportPayload(session.NativeData, dir)
 		if errors.Is(err, errNotOpenCode2Capture) {
-			return fmt.Errorf("OpenCode session %s was captured with OpenCode 1 and is not in OpenCode's local store; OpenCode 2 cannot import an OpenCode 1 transcript", sessionID)
+			return fmt.Errorf("OpenCode session %s is not in OpenCode's local store, and its checkpoint has no OpenCode 2 messages to import (captured with OpenCode 1 or an older Entire)", sessionID)
 		}
 		if err != nil {
 			return err
