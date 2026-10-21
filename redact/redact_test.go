@@ -3254,3 +3254,21 @@ func TestString_PostMergeTrailFindings(t *testing.T) {
 		}
 	}
 }
+
+// Trail-finding regression: the AWS secret access key name is a credential
+// key shape in text and JSON, even for values below the entropy threshold.
+func TestString_AWSSecretAccessKeyNameRedacts(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{
+		`AWS_SECRET_ACCESS_KEY=correct-horse-battery`,
+		`aws_secret_access_key = correct-horse-battery`,
+		`secret_access_key=correct-horse-battery`,
+	} {
+		if out := String(in); strings.Contains(out, "correct-horse-battery") {
+			t.Errorf("String(%q) = %q, want the value redacted", in, out)
+		}
+	}
+	if out := mustJSONLContent(t, `{"aws_secret_access_key":"correct-horse-battery"}`); strings.Contains(out, "correct-horse-battery") {
+		t.Errorf("JSON aws_secret_access_key leaked: %s", out)
+	}
+}

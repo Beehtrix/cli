@@ -89,7 +89,7 @@ const dbPasswordKeyShape = `(?:db|database|pg|postgres|postgresql|mysql|mariadb|
 // only shape credentialCodeCallPattern accepts in callee and argument position.
 const codeIdentRef = `[A-Za-z_]+(?:\.[A-Za-z_]+)*`
 
-const secretValueKeyShape = `(?:(?:[a-z0-9]+[_-]+)*(?:api[_-]*key|auth[_-]*token|access[_-]*token|refresh[_-]*token|client[_-]*secret|consumer[_-]*secret|secret[_-]*key|private[_-]*key|ssh[_-]*key)|(?:[a-z0-9]+[_-]+)+(?:secret|token))` //nolint:gosec // regex literal, not a credential
+const secretValueKeyShape = `(?:(?:[a-z0-9]+[_-]+)*(?:api[_-]*key|auth[_-]*token|access[_-]*token|refresh[_-]*token|client[_-]*secret|consumer[_-]*secret|secret[_-]*key|secret[_-]*access[_-]*key|private[_-]*key|ssh[_-]*key)|(?:[a-z0-9]+[_-]+)+(?:secret|token))` //nolint:gosec // regex literal, not a credential
 
 // semicolonConnValue is one value of an ODBC or ADO.NET connection string.
 // Unquoted values run to the next ';' and may contain spaces, but never a
