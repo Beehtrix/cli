@@ -241,6 +241,26 @@ func TestCommitFetchBudgets_CoauthorshipGetsAShare(t *testing.T) {
 	require.Less(t, liveTaskFetchBudget, agent.SubagentFetchBudget)
 }
 
+// TestCommitFetchBudgets_PrepareCommitMsgIsBounded pins that prepare-commit-msg's
+// running-subagent check gets the co-authorship deadline when nothing set one,
+// and never extends a deadline post-commit already set.
+func TestCommitFetchBudgets_PrepareCommitMsgIsBounded(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	state := &SessionState{TaskRecords: []session.TaskRecord{{ToolUseID: "call_1", AgentID: "ses_child", StartedAt: now}}}
+
+	ag := &reportingAgent{}
+	liveTaskFilesInCommitFor(withLiveTaskFetchDeadline(ensureCoauthorshipFetchDeadline(context.Background(), now)), ag, state, nil)
+	require.Len(t, ag.deadlines, 1)
+	require.WithinDuration(t, now.Add(liveTaskFetchBudget), ag.deadlines[0], time.Second)
+
+	earlier := now.Add(-time.Minute)
+	ctx := ensureCoauthorshipFetchDeadline(withCoauthorshipFetchDeadline(context.Background(), earlier), now)
+	deadline, ok := ctx.Value(liveTaskFetchDeadlineKey{}).(time.Time)
+	require.True(t, ok)
+	require.Equal(t, earlier.Add(liveTaskFetchBudget), deadline, "an existing deadline is kept, not extended")
+}
+
 // TestCommitFetchBudgets_CondensationKeepsItsOwnBudget pins that the commit's
 // co-authorship deadline does not bound condensation: once it has passed, a
 // session's re-exports still get their own agent.SubagentFetchBudget, as

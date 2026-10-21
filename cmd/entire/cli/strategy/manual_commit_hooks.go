@@ -1197,6 +1197,15 @@ func withCoauthorshipFetchDeadline(ctx context.Context, now time.Time) context.C
 	return context.WithValue(ctx, liveTaskFetchDeadlineKey{}, now.Add(liveTaskFetchBudget))
 }
 
+// ensureCoauthorshipFetchDeadline is withCoauthorshipFetchDeadline unless ctx
+// already carries one, which it never extends.
+func ensureCoauthorshipFetchDeadline(ctx context.Context, now time.Time) context.Context {
+	if _, ok := ctx.Value(liveTaskFetchDeadlineKey{}).(time.Time); ok {
+		return ctx
+	}
+	return withCoauthorshipFetchDeadline(ctx, now)
+}
+
 // withLiveTaskFetchDeadline caps ctx's fetch budget at the commit's
 // co-authorship deadline, when one is set.
 func withLiveTaskFetchDeadline(ctx context.Context) context.Context {
@@ -2145,6 +2154,10 @@ func truncateHash(h string) string {
 // agent did not make, though a running subagent that wrote a staged file is.
 func (s *ManualCommitStrategy) filterSessionsWithNewContent(ctx context.Context, repo *git.Repository, sessions []*SessionState, redone redo, provenance commitProvenance) []*SessionState {
 	logCtx := logging.WithComponent(ctx, "manual-commit")
+	// A running subagent's evidence can mean an agent export per live task
+	// record; they share the commit's co-authorship deadline so a slow or hung
+	// export cannot hold up the user's git commit.
+	ctx = ensureCoauthorshipFetchDeadline(ctx, time.Now())
 	var result []*SessionState
 
 	// Compute staged files once for all sessions.
@@ -2180,7 +2193,7 @@ func (s *ManualCommitStrategy) filterSessionsWithNewContent(ctx context.Context,
 			}
 			// A running subagent's edit is staged-file overlap, as in
 			// post-commit's shouldCondenseWithOverlapCheck.
-			if hasFreshLiveTaskRecord(state, time.Now()) && s.liveTaskFilesInCommit(ctx, state, fileSet(stagedFiles)) {
+			if hasFreshLiveTaskRecord(state, time.Now()) && s.liveTaskFilesInCommit(withLiveTaskFetchDeadline(ctx), state, fileSet(stagedFiles)) {
 				result = append(result, state)
 				continue
 			}
