@@ -133,6 +133,16 @@ func TestString_Base64WithSlash(t *testing.T) {
 			input: `line1\n` + slashedSig,
 			want:  `line1\nREDACTED`,
 		},
+		{
+			name:  "after an underscore",
+			input: "token_" + slashedSig,
+			want:  "token_REDACTED",
+		},
+		{
+			name:  "attached to a command-line flag",
+			input: "mysql -uroot -p" + slashedSig + " app",
+			want:  "mysql -uroot -REDACTED app",
+		},
 	})
 }
 
@@ -146,6 +156,7 @@ func TestString_Base64WithSlashPathsPreserved(t *testing.T) {
 		"GeoPolygonDataAssets/5ef9811cd39380bb4462a15f124ce7505339b2e7",
 		"go/pkg/mod/github.com/foo/bar@v1.2.10+incompatible/CMake/DESCRIPTION",
 		"node_modules/@types/node/index.d.ts",
+		"go/pkg/mod/google.golang.org/genproto@v0.0.0-20260622175928-b703f567277d/googleapis/cloud/webrisk/v1beta1",
 		"https://github.com/entireio/cli/pull/2798",
 		"github.com/foo/bar v1.2.3 h1:wdMgn+sje1KNXdwFizIWjbf328fIUBxqEmJ/vYPo8yc=",
 		"commit a334cb6988d1e2f3a4b5c6d7e8f90a1b2c3d4e5f",

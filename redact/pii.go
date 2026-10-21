@@ -3,6 +3,7 @@ package redact
 import (
 	"log/slog"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -113,7 +114,16 @@ var emailAllowPatterns = []string{
 	"actions@",                  // GitHub Actions bot
 	"@users.noreply.github.com", // GitHub user noreply
 	"@noreply.github.com",       // GitHub noreply
-	"git@",                      // SSH user of git hosts (git@github.com:org/repo.git)
+}
+
+// gitSSHHosts are public git hosts whose SSH login is git@<host>, so the
+// address names the login even without remote syntax (ssh -T git@github.com).
+var gitSSHHosts = []string{
+	"github.com", "ssh.github.com",
+	"gitlab.com", "altssh.gitlab.com",
+	"bitbucket.org", "altssh.bitbucket.org",
+	"codeberg.org",
+	"ssh.dev.azure.com",
 }
 
 // isAllowlistedEmail returns true if the email matches a known non-sensitive pattern.
@@ -137,6 +147,28 @@ func isAllowlistedEmail(email string) bool {
 		}
 	}
 	return false
+}
+
+// isGitSSHUser reports whether the email-shaped match s[start:end] is the git
+// SSH login of a remote rather than a mailbox: URL userinfo (ssh://git@host),
+// an scp-style remote (git@host:path), or a known git host.
+func isGitSSHUser(s string, start, end int) bool {
+	user, host, _ := strings.Cut(s[start:end], "@")
+	if !strings.EqualFold(user, "git") {
+		return false
+	}
+	if strings.HasSuffix(s[:start], "://") {
+		return true
+	}
+	// A path must follow the colon, so "git@host: thanks" is still prose.
+	if end+1 < len(s) && s[end] == ':' && isSCPPathByte(s[end+1]) {
+		return true
+	}
+	return slices.Contains(gitSSHHosts, strings.ToLower(host))
+}
+
+func isSCPPathByte(c byte) bool {
+	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || strings.IndexByte("/~._-", c) >= 0
 }
 
 // builtinPIIPattern associates a compiled regex with a category and label.
@@ -167,8 +199,9 @@ func detectPII(cfg *PIIConfig, s string) []taggedRegion {
 	var regions []taggedRegion
 	for _, p := range patterns {
 		for _, loc := range p.regex.FindAllStringIndex(s, -1) {
-			// Skip allowlisted email addresses (noreply, bot accounts, etc.).
-			if p.label == labelEmail && isAllowlistedEmail(s[loc[0]:loc[1]]) {
+			// Skip allowlisted email addresses (noreply, bot accounts, etc.)
+			// and the git login of a remote.
+			if p.label == labelEmail && (isAllowlistedEmail(s[loc[0]:loc[1]]) || isGitSSHUser(s, loc[0], loc[1])) {
 				continue
 			}
 			// Skip phone-shaped digits that run on into a longer number.
