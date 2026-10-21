@@ -110,13 +110,17 @@ stored in full once the call completes.
 
 ## OpenCode 2
 
-OpenCode 2 (npm `@opencode/cli`, verified 2.1.1) changed the plugin API, the
-export command and the export format. One plugin file serves both versions:
-its default export is `{id, server, setup}` and the named `EntirePlugin` export is the
-same `server`. OpenCode 1 before v1.3.4 calls the named export, later 1.x
-loads the default's `server`, and OpenCode 2 loads `setup`; each loads the
-plugin once (verified on 1.3.3, 1.18.33 and 2.1.1). OpenCode 1 also calls
-`setup` with a reduced context, which the plugin ignores.
+OpenCode 2 (npm `@opencode/cli`) changed the plugin API, the export command
+and the export format. One plugin file serves both versions through its only
+export. OpenCode 1 before v1.3 calls every export as a function (an object
+export crashes it), while OpenCode 2 requires the default export to be an
+`{id, setup}` object, so the default export is chosen when the module loads:
+OpenCode 1 sets `OPENCODE=1` in its own environment and gets the plugin
+function; anything else gets `{id, server, setup}`. Verified live on 1.0.224,
+1.1.65, 1.2.27, 1.3.0, 1.3.3, 1.4.17, 1.14.51, 1.17.20, 1.18.33, 1.19.3 and
+2.0.0, 2.0.16, 2.0.32, 2.1.1, 2.1.2. OpenCode 1 also calls `setup` with a
+reduced context, which the plugin ignores. (0.15.x and 1.0.0 reject the
+`.opencode/plugins` directory name and fail to start, as they do on main.)
 
 - **Shared service.** OpenCode 2 runs plugins in a background service shared
   by every repository (`opencode run --standalone` runs a private one). Prompt,

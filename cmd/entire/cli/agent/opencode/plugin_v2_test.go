@@ -159,7 +159,9 @@ func runPluginV2(t *testing.T, scenario map[string]any) []v2Hook {
 	cmd := exec.CommandContext(t.Context(), "node", "--experimental-strip-types",
 		filepath.Join(dir, "driver.mjs"), pluginPath, filepath.Join(dir, "scenario.json"))
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// OpenCode 2 does not set OPENCODE; a test run from inside OpenCode 1
+	// would inherit it and load the OpenCode 1 plugin instead.
+	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "OPENCODE=")
 	if slow, _ := scenario["slowSubagentStart"].(bool); slow { //nolint:errcheck // absent means false
 		cmd.Env = append(cmd.Env, "SLOW_SUBAGENT_START=1")
 	}

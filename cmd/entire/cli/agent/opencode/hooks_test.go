@@ -45,11 +45,11 @@ func TestInstallHooks_FreshInstall(t *testing.T) {
 	if !strings.Contains(content, "hooks opencode") {
 		t.Error("plugin file does not contain 'hooks opencode'")
 	}
-	if !strings.Contains(content, "export const EntirePlugin") {
-		t.Error("plugin file does not contain 'EntirePlugin' export")
-	}
-	if !strings.Contains(content, `export default { id: "entire", server: EntirePlugin, setup: entireSetup }`) {
+	if !strings.Contains(content, `export default process.env.OPENCODE === "1" ? EntirePlugin : { id: "entire", server: EntirePlugin, setup: entireSetup }`) {
 		t.Error("plugin file does not export the OpenCode 1 and 2 entry points")
+	}
+	if strings.Contains(content, "export const") {
+		t.Error("plugin file has a named export; OpenCode 1 before v1.3 calls every export")
 	}
 	// Should use production command
 	if strings.Contains(content, "go run") {
@@ -588,7 +588,9 @@ func TestPlugin_SpawnsHooksUnderNode(t *testing.T) {
 import { pathToFileURL } from "node:url"
 
 const pluginPath = process.argv[2]
-const { EntirePlugin } = await import(pathToFileURL(pluginPath).href)
+// OPENCODE=1 is set as OpenCode 1 sets it, so the default export is the
+// OpenCode 1 plugin.
+const { default: EntirePlugin } = await import(pathToFileURL(pluginPath).href)
 const handlers = await EntirePlugin({ directory: process.cwd() })
 await handlers.event({
   event: {
@@ -609,7 +611,7 @@ await handlers.event({
 
 	cmd := exec.CommandContext(t.Context(), "node", "--experimental-strip-types", driverPath, pluginPath)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "OPENCODE=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("node canary failed: %v\n%s", err, out)

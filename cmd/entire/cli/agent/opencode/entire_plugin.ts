@@ -5,10 +5,13 @@
 // Uses node:child_process so hooks work under both Bun (OpenCode CLI/TUI)
 // and Node (OpenCode Desktop's Electron sidecar). See #2014.
 //
-// One file serves both plugin APIs. OpenCode 1 before v1.3.4 calls the named
-// EntirePlugin export; later OpenCode 1 loads the default export's `server`
-// (the same function) and ignores the named one; OpenCode 2 loads the
-// default export's `setup`. Each version loads the plugin once.
+// One file serves both plugin APIs, through its only export. The two
+// loaders cannot share a shape: OpenCode 1 before v1.3 calls every export as
+// a function (an object export crashes OpenCode), and OpenCode 2 requires the
+// default export to be an {id, setup} object. So the default export is chosen
+// when the module loads: OpenCode 1 sets OPENCODE=1 in its own environment
+// and gets the plugin function; anything else gets {id, server, setup}
+// (OpenCode 1.3+ also accepts that object, through `server`).
 import { spawn, spawnSync } from "node:child_process"
 import type { Plugin } from "@opencode-ai/plugin"
 
@@ -42,7 +45,7 @@ function parseInjectedContext(stdout: string): string | null {
 }
 
 // OpenCode 1 plugin.
-export const EntirePlugin: Plugin = async ({ directory }) => {
+const EntirePlugin: Plugin = async ({ directory }) => {
   // Track seen user messages to fire turn-start only once per message
   const seenUserMessages = new Set<string>()
   // Track current session ID for message events (which don't include sessionID)
@@ -1095,4 +1098,4 @@ async function entireSetup(ctx: any) {
   }
 }
 
-export default { id: "entire", server: EntirePlugin, setup: entireSetup }
+export default process.env.OPENCODE === "1" ? EntirePlugin : { id: "entire", server: EntirePlugin, setup: entireSetup }
