@@ -69,6 +69,23 @@ Selectors are project-local numbers or trail ULIDs, or `<repo>/<number>` for one
   creating a Change cannot extend scope without project management.
   `--no-branch` skips the Change. `--no-branch --project` without `--repo`
   instead creates unscoped intent, which requires project management.
+- Project intent has only `open` and `closed` lifecycle states. `draft` is
+  rejected locally by project create/update/link/list; legacy branch-work
+  lifecycle values are unchanged.
+- Assignee add/remove flags compare canonical account identities, not a login
+  against the `ulid:<account id>` references returned by project reads. GitHub
+  logins resolve through the active control plane before the conditional PATCH;
+  known account IDs need no lookup. A failed lookup aborts the entire write.
+  `--assignee=` still clears the list without resolving identities.
+- Project discussion write JSON includes only resources the server returned:
+  reply/edit can contain a message without a discussion. ETags remain internal.
+- Finding creation derives a bounded, deterministic review-start
+  `Idempotency-Key` from the finding client IDs. The server replays that review
+  for 24 hours; its review-local `client_id` checks then deduplicate the findings.
+  Retrying `finding add --client-id <key>` with the same fields reuses both
+  resources, including after a batch failure. A changed payload with the same
+  key conflicts; use a new key for new work. In-flight conflicts are returned
+  to the caller, never retried without the key.
 - Updates and linking require the resource's ETag; a 412 never triggers an
   unconditional retry. With a branch, `--idempotency-key` applies only to the
   Change, not to parent creation. If linking fails, the command reports the
