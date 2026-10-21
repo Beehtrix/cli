@@ -414,8 +414,13 @@ func TestOpenCodeSubagentRunningChildCoauthorsCommit(t *testing.T) {
 // while it keeps working after launching the background child.
 func TestOpenCodeSubagentRunningChildCoauthorsCommit_ActiveParent(t *testing.T) {
 	t.Parallel()
+	openCodeActiveParentCoauthorsCommit(t, NewFeatureBranchEnv(t), nil)
+}
 
-	env := NewFeatureBranchEnv(t)
+// openCodeActiveParentCoauthorsCommit runs the ACTIVE-parent scenario;
+// beforeCommit, when set, adjusts the parent just before the commit.
+func openCodeActiveParentCoauthorsCommit(t *testing.T, env *TestEnv, beforeCommit func(parentID string)) {
+	t.Helper()
 	env.InitEntireWithAgent(agent.AgentNameOpenCode)
 	const shared = "docs/shared.md"
 
@@ -445,6 +450,9 @@ func TestOpenCodeSubagentRunningChildCoauthorsCommit_ActiveParent(t *testing.T) 
 	require.NoError(t, err)
 	require.Empty(t, state.FilesTouched, "the parent has no files of its own before the child completes")
 
+	if beforeCommit != nil {
+		beforeCommit(parent.ID)
+	}
 	env.GitCommitWithHooks("Polish shared doc", shared)
 	cpID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
 	require.NotEmpty(t, cpID)
