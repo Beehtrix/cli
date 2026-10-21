@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
+	"math"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
@@ -116,9 +117,10 @@ func (f *FactoryAIDroidAgent) CalculateTokenUsageSince(ctx context.Context, sess
 }
 
 // transcriptLineCount returns the transcript's raw line count, 0 when it
-// cannot be read (a session whose transcript does not exist yet).
+// cannot be read (a session whose transcript does not exist yet). A start
+// past every line counts lines without decoding any of them.
 func transcriptLineCount(sessionRef string) int {
-	_, total, err := ParseDroidTranscript(sessionRef, 0)
+	_, total, err := ParseDroidTranscript(sessionRef, math.MaxInt)
 	if err != nil {
 		return 0
 	}
