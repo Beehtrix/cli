@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -81,7 +82,10 @@ func (a *OpenCodeAgent) openCodeNeedsStandalone(ctx context.Context, dir string)
 	}
 	cmd := runner(probeCtx, openCodeBinary, "--version")
 	cmd.Dir = dir
-	cmd.Env = agent.TextGenerationEnv(dir, os.Environ())
+	// --version reads no config; keep inline config (which may hold credentials) out of the probe.
+	cmd.Env = slices.DeleteFunc(agent.TextGenerationEnv(dir, os.Environ()), func(kv string) bool {
+		return strings.HasPrefix(kv, "OPENCODE_CONFIG_CONTENT=")
+	})
 	// --version starts no service, so no child can hold the pipe past this.
 	cmd.WaitDelay = time.Second
 	out, err := cmd.Output()

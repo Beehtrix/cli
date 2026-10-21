@@ -109,8 +109,8 @@ func TestOpenCodeGenerateStandaloneByVersion(t *testing.T) {
 				t.Fatalf("version probe must run in the generation directory: probe=%v run=%q", probe, run.Dir)
 			}
 			for _, entry := range probe.Env {
-				if strings.HasPrefix(entry, "GIT_") || strings.HasPrefix(entry, "OPENCODE_CONFIG_CONTENT=") {
-					t.Fatalf("version probe inherited %s", entry)
+				if name, _, _ := strings.Cut(entry, "="); strings.HasPrefix(name, "GIT_") || name == "OPENCODE_CONFIG_CONTENT" {
+					t.Fatalf("version probe inherited %s", name)
 				}
 			}
 			if args[0] != "run" {
@@ -120,6 +120,38 @@ func TestOpenCodeGenerateStandaloneByVersion(t *testing.T) {
 				t.Fatalf("--standalone at %d in %v, want present=%v right after run", got, args, tt.wantStandalone)
 			}
 		})
+	}
+}
+
+func TestOpenCodeVersionProbeOmitsInlineConfig(t *testing.T) {
+	// Seeds process env; cannot run in parallel.
+	t.Setenv("OPENCODE_CONFIG_CONTENT", `{"provider":{"openai":{"options":{"apiKey":"secret"}}}}`)
+	var probe, run *exec.Cmd
+	a := &OpenCodeAgent{CommandRunner: func(ctx context.Context, _ string, argv ...string) *exec.Cmd {
+		if slices.Equal(argv, []string{"--version"}) {
+			probe = exec.CommandContext(ctx, "echo", "opencode v2.1.1")
+			return probe
+		}
+		run = exec.CommandContext(ctx, "cat")
+		return run
+	}}
+	if _, err := a.GenerateText(t.Context(), `{"type":"text","part":{"text":"hello"}}`, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range probe.Env {
+		if strings.HasPrefix(entry, "OPENCODE_CONFIG_CONTENT=") {
+			t.Fatal("version probe inherited OPENCODE_CONFIG_CONTENT")
+		}
+	}
+	// Generation still merges the caller's inline config.
+	found := false
+	for _, entry := range run.Env {
+		if value, ok := strings.CutPrefix(entry, "OPENCODE_CONFIG_CONTENT="); ok && strings.Contains(value, `"provider"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("generation lost the inline OpenCode config")
 	}
 }
 
