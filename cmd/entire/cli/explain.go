@@ -2164,6 +2164,14 @@ func formatCheckpointHeader(
 		writeRow("tokens", tokensVal)
 	}
 
+	redaction := meta.Redaction
+	if redaction == nil && summary != nil {
+		redaction = summary.Redaction
+	}
+	if redaction != nil {
+		writeRow("redacted", formatRedactionCounts(redaction))
+	}
+
 	switch {
 	case commits == nil:
 	case len(commits) == 0:
@@ -2180,6 +2188,28 @@ func formatCheckpointHeader(
 	}
 
 	return sb.String()
+}
+
+// formatRedactionCounts renders what redaction replaced, then the matches of
+// each layer that found any, in detection order. Custom rules that ran are
+// always shown, so rules that matched nothing read differently from rules
+// that never loaded.
+func formatRedactionCounts(c *redact.Counts) string {
+	out := pluralCount(c.Replacements, "replacement", "replacements")
+	var matches []string
+	for _, layer := range redact.LayerNames() {
+		n := c.Layers[layer]
+		switch {
+		case layer == "custom" && c.CustomRulesActive > 0:
+			matches = append(matches, fmt.Sprintf("custom %d (%s)", n, pluralCount(c.CustomRulesActive, "rule", "rules")))
+		case n > 0:
+			matches = append(matches, fmt.Sprintf("%s %d", layer, n))
+		}
+	}
+	if len(matches) == 0 {
+		return out
+	}
+	return out + " · matches: " + strings.Join(matches, ", ")
 }
 
 // buildFilesMarkdown renders touched files as a markdown block for verbose
