@@ -403,11 +403,7 @@ type TokenCalculator interface {
 // opaque baseline in PrePromptState; at TurnEnd (when transcript-based
 // calculation yields nothing) it calls CalculateTokenUsageSince to get the
 // checkpoint-scoped delta — the same cumulative-totals-minus-baseline pattern
-// Codex uses, sourced out-of-band. The session state also stores the
-// position (set at TurnStart, moved on by each counted Stop), so a Stop with no
-// TurnStart before it (Droid stops again when a Worker's result returns)
-// counts from the previous Stop, and a Stop counts only while the position it
-// measured from is still the stored one.
+// Codex uses, sourced out-of-band.
 type OutOfBandTokenSource interface {
 	Agent
 

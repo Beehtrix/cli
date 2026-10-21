@@ -228,25 +228,18 @@ const unknownSessionID = "unknown"
 //
 // Works correctly from any subdirectory within the repository.
 func CapturePrePromptState(ctx context.Context, ag agent.Agent, sessionID, sessionRef string) error {
-	_, err := capturePrePromptState(ctx, ag, sessionID, sessionRef)
-	return err
-}
-
-// capturePrePromptState is CapturePrePromptState, also returning the
-// out-of-band token baseline it captured.
-func capturePrePromptState(ctx context.Context, ag agent.Agent, sessionID, sessionRef string) (json.RawMessage, error) {
 	if sessionID == "" {
 		sessionID = unknownSessionID
 	}
 
 	if err := validation.ValidateSessionID(sessionID); err != nil {
-		return nil, fmt.Errorf("invalid session ID for pre-prompt state: %w", err)
+		return fmt.Errorf("invalid session ID for pre-prompt state: %w", err)
 	}
 
 	// Open the shared .entire root and ensure tmp/ exists under it.
 	root, err := openTmpDir(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// Get list of untracked files (excluding .entire directory itself).
@@ -291,17 +284,17 @@ func capturePrePromptState(ctx context.Context, ag agent.Agent, sessionID, sessi
 
 	data, err := jsonutil.MarshalIndentWithNewline(state, "", "  ")
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal state: %w", err)
+		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
 	if err := entiredir.WriteFile(root, tmpFile("pre-prompt-%s.json", sessionID), data, 0o600); err != nil {
-		return nil, fmt.Errorf("failed to write state file: %w", err)
+		return fmt.Errorf("failed to write state file: %w", err)
 	}
 
 	logging.Debug(logging.WithComponent(ctx, "state"), "captured state before prompt",
 		slog.Int("untracked_files", len(untrackedFiles)),
 		slog.Int("transcript_offset", transcriptOffset))
-	return state.TokenBaseline, nil
+	return nil
 }
 
 // LoadPrePromptState loads previously captured state.

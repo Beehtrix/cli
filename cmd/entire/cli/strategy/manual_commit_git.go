@@ -120,13 +120,7 @@ func (s *ManualCommitStrategy) SaveStep(ctx context.Context, step StepContext) e
 		if state.StepCount == 1 {
 			state.TranscriptIdentifierAtStart = step.StepTranscriptIdentifier
 		}
-		// Claimed under this lock, so a concurrent Stop measured from the same
-		// position (with or without a step) counts it once, not twice.
-		usage := step.TokenUsage
-		if !ClaimOutOfBandTokenPosition(state, step.OutOfBandFrom, step.OutOfBandTo) && len(step.OutOfBandFrom) > 0 {
-			usage = nil
-		}
-		applyTurnTokenUsage(state, usage)
+		applyTurnTokenUsage(state, step.TokenUsage)
 
 		logCtx := logging.WithComponent(ctx, "checkpoint")
 		logging.Info(logCtx, "checkpoint saved",

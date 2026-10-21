@@ -4,7 +4,6 @@
 package strategy
 
 import (
-	"encoding/json"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
@@ -146,13 +145,6 @@ type StepContext struct {
 
 	// TokenUsage contains the token usage for this checkpoint
 	TokenUsage *agent.TokenUsage
-
-	// OutOfBandFrom is the stored out-of-band token position TokenUsage was
-	// measured from, and OutOfBandTo the position after it. When From is set,
-	// TokenUsage counts only if the session still stores From, which then
-	// moves to To (see ClaimOutOfBandTokenPosition).
-	OutOfBandFrom json.RawMessage
-	OutOfBandTo   json.RawMessage
 
 	// SubagentLedgerVersion is the authoritative inventory version observed
 	// while token evidence was extracted. nil means no inventory snapshot;

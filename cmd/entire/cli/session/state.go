@@ -394,14 +394,6 @@ type State struct {
 	// SubagentTokensBaselineComplete records whether the baseline is exact.
 	SubagentTokensBaselineComplete *bool `json:"subagent_tokens_baseline_complete,omitempty"`
 
-	// OutOfBandTokenBaseline is an out-of-band token source's position as of
-	// the last turn start or counted Stop (agent-opaque, as
-	// PrePromptState.TokenBaseline). A Stop counts usage measured from it only
-	// while it is still stored, then moves it on, so two Stops never count the
-	// same tokens. A Stop with no turn start of its own counts from it: Factory
-	// AI Droid ends a prompt that launches a Worker twice.
-	OutOfBandTokenBaseline json.RawMessage `json:"out_of_band_token_baseline,omitempty"`
-
 	// SkillEvents records explicit native skill signals observed during this session.
 	// Stored as sidecar metadata so consumers can collapse skill-related transcript events
 	// without mutating the raw agent transcript.
