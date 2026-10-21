@@ -143,6 +143,21 @@ func TestString_Base64WithSlash(t *testing.T) {
 			input: "mysql -uroot -p" + slashedSig + " app",
 			want:  "mysql -uroot -REDACTED app",
 		},
+		{
+			name:  "after an at sign",
+			input: "user@" + slashedSig,
+			want:  "user@REDACTED",
+		},
+		{
+			name:  "after a dot that follows a word",
+			input: "abc." + slashedSig,
+			want:  "abc.REDACTED",
+		},
+		{
+			name:  "after a tilde",
+			input: "~" + slashedSig,
+			want:  "~REDACTED",
+		},
 	})
 }
 

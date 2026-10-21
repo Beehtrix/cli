@@ -486,16 +486,16 @@ func isBase64Byte(c byte) bool {
 }
 
 // isSlashedBase64Secret reports whether s[start:end], a base64 run, is a
-// high-entropy value rather than a path. A run glued to a preceding '.', '~'
-// or '@' continues a dotted name, a home path or a package scope. A run after
-// '-' or '_' is still scored, since a secret often follows a flag or a key
-// prefix (-p<secret>, token_<secret>).
+// high-entropy value rather than a path. A run after a digit and '.' continues
+// a version number (v1.2.10+incompatible/CONTRIBUTING). Other glue is still
+// scored, since a secret often follows a flag, a key prefix or a name
+// (-p<secret>, token_<secret>, user@<secret>).
 func isSlashedBase64Secret(s string, start, end int) bool {
 	run := s[start:end]
 	if !strings.Contains(run, "/") {
 		return false
 	}
-	if start > 0 && strings.IndexByte(".~@", s[start-1]) >= 0 {
+	if start > 1 && s[start-1] == '.' && '0' <= s[start-2] && s[start-2] <= '9' {
 		return false
 	}
 	for segment := range strings.SplitSeq(run, "/") {

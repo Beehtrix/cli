@@ -464,6 +464,17 @@ func TestDetectPII_GitRemotesAreNotEmails(t *testing.T) {
 		{"email git@mycompany.com for access", "email [REDACTED_EMAIL] for access"},
 		{"Contact: git@mycompany.com.", "Contact: [REDACTED_EMAIL]."},
 		{"write to git@mycompany.com: they reply fast", "write to [REDACTED_EMAIL]: they reply fast"},
+		{"git@heroku.com:myapp.git", "git@heroku.com:myapp.git"},
+		{"Push to git@heroku.com:myapp.git.", "Push to git@heroku.com:myapp.git."},
+		{"git@gitea.mycompany.com:org/repo", "git@gitea.mycompany.com:org/repo"},
+		{"git@host.mycompany.com:~/repo.git", "git@host.mycompany.com:~/repo.git"},
+		{`origin git@git.example.com:repo.git\norigin`, `origin git@git.example.com:repo.git\norigin`},
+		{"git@mycompany.com:hello there", "[REDACTED_EMAIL]:hello there"},
+		{"Reply-To: git@mycompany.com:x", "Reply-To: [REDACTED_EMAIL]:x"},
+		{"git@mycompany.com:8080", "[REDACTED_EMAIL]:8080"},
+		// A remote path needs a '/' or a .git suffix, so a bare repository
+		// name such as gitolite's is not recognised.
+		{"git@gitserver.mycompany.com:testing", "[REDACTED_EMAIL]:testing"},
 		// Without remote syntax, only known git hosts identify the SSH user.
 		{"ssh -T git@gitlab.mycompany.com", "ssh -T [REDACTED_EMAIL]"},
 		{"contact alice@github.com", "contact [REDACTED_EMAIL]"},

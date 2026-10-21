@@ -160,15 +160,21 @@ func isGitSSHUser(s string, start, end int) bool {
 	if strings.HasSuffix(s[:start], "://") {
 		return true
 	}
-	// A path must follow the colon, so "git@host: thanks" is still prose.
-	if end+1 < len(s) && s[end] == ':' && isSCPPathByte(s[end+1]) {
+	if end < len(s) && s[end] == ':' && isSCPRemotePath(s[end+1:]) {
 		return true
 	}
 	return slices.Contains(gitSSHHosts, strings.ToLower(host))
 }
 
-func isSCPPathByte(c byte) bool {
-	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || strings.IndexByte("/~._-", c) >= 0
+// isSCPRemotePath reports whether rest, the text after git@host:, starts with
+// a repository path: one containing '/' or ending in .git. A word or a port
+// after the colon ("git@host: thanks", "git@host:8080") is not a remote.
+func isSCPRemotePath(rest string) bool {
+	if end := strings.IndexAny(rest, " \t\r\n\"'`\\"); end >= 0 {
+		rest = rest[:end]
+	}
+	path := strings.TrimRight(rest, ".,;:!?)]}>")
+	return strings.Contains(path, "/") || strings.HasSuffix(path, ".git")
 }
 
 // builtinPIIPattern associates a compiled regex with a category and label.
