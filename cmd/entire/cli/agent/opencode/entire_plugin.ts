@@ -643,6 +643,11 @@ async function entireSetup(ctx: any) {
   // by PID (it may outlive this process) and the next turn-start awaits them,
   // so a session's hooks land in the order OpenCode 1 sends them.
   const inflight = new Map<string, Set<{ done: Promise<void>; pid?: number }>>()
+  // Session -> held subagent stops released but still waiting for their
+  // call's subagent-start, before they become detached hooks. Counted from
+  // the moment they are released, so neither session-end nor the next
+  // turn-start can overtake them.
+  const pendingStops = new Map<string, Set<Promise<void>>>()
   // Child (subagent) sessions: child -> top-level session, child -> launcher.
   const rootOf = new Map<string, string>()
   const parentOf = new Map<string, string>()
@@ -669,6 +674,8 @@ async function entireSetup(ctx: any) {
   const busySessions = new Set<string>()
   const drainAtEnd = new Set<string>()
   const endedUnheld = new Set<string>()
+  // Top-level session -> its pending event handling (see enqueueEvent).
+  const eventQueues = new Map<string, Promise<void>>()
 
   function callKey(sessionID: string, callID: string): string {
     return sessionID + "\0" + callID
@@ -753,11 +760,13 @@ async function entireSetup(ctx: any) {
     return entry.done
   }
 
-  // settled resolves once the session's detached hooks have finished.
+  // settled resolves once the session's detached hooks, including held
+  // stops not yet started, have finished.
   function settled(sessionID: string): Promise<void> {
-    const running = inflight.get(sessionID)
-    if (!running || running.size === 0) return Promise.resolve()
-    return within(Promise.all([...running].map((h) => h.done)), v2HookTimeoutMs)
+    const waits = [...(pendingStops.get(sessionID) ?? [])]
+    for (const h of inflight.get(sessionID) ?? []) waits.push(h.done)
+    if (waits.length === 0) return Promise.resolve()
+    return within(Promise.all(waits), v2HookTimeoutMs)
   }
 
   // classify records whether a session is top-level or a child, asking
@@ -823,10 +832,20 @@ async function entireSetup(ctx: any) {
 
   // A held stop runs detached (the child can end as OpenCode exits), after
   // its call's start and the session's earlier detached hooks.
-  async function stopHeldTask(held: { key: string; payload: Record<string, unknown> }) {
-    const started = taskStarts.get(held.key)
-    if (started) await within(started, v2HookTimeoutMs)
-    await runDetached(held.payload.session_id as string, "subagent-stop", held.payload)
+  function stopHeldTask(held: { key: string; payload: Record<string, unknown> }) {
+    const sessionID = held.payload.session_id as string
+    const pending = pendingStops.get(sessionID) ?? new Set()
+    pendingStops.set(sessionID, pending)
+    const stop: Promise<void> = (async () => {
+      const started = taskStarts.get(held.key)
+      if (started) await within(started, v2HookTimeoutMs)
+      // Registered as a detached hook before leaving pendingStops, so there is
+      // no moment where neither set holds it.
+      const done = runDetached(sessionID, "subagent-stop", held.payload)
+      pending.delete(stop)
+      await done
+    })()
+    pending.add(stop)
   }
 
   function finishBackgroundTask(childID: string) {
@@ -837,7 +856,7 @@ async function entireSetup(ctx: any) {
       return
     }
     if (held!.length === 0) backgroundTasks.delete(childID)
-    void stopHeldTask(next)
+    stopHeldTask(next)
   }
 
   function drainBackgroundTasks(childID: string) {
@@ -847,7 +866,7 @@ async function entireSetup(ctx: any) {
       return
     }
     backgroundTasks.delete(childID)
-    for (const next of held) void stopHeldTask(next)
+    for (const next of held) stopHeldTask(next)
   }
 
   // An interrupted session ends the held calls of the children it launched:
@@ -860,9 +879,13 @@ async function entireSetup(ctx: any) {
     }
   }
 
-  function endSession(sessionID: string): Promise<void> {
+  // endSession ends the session after its held stops have become detached
+  // hooks, so session-end names them in after_pids.
+  async function endSession(sessionID: string): Promise<void> {
     endTurn(sessionID)
-    return runDetached(sessionID, "session-end", { session_id: sessionID })
+    const pending = pendingStops.get(sessionID)
+    if (pending && pending.size > 0) await within(Promise.all(pending), v2CleanupWaitMs - 500)
+    await runDetached(sessionID, "session-end", { session_id: sessionID })
   }
 
   function endSessions(): Promise<void> {
@@ -879,6 +902,10 @@ async function entireSetup(ctx: any) {
       const sessionID: string | undefined = e?.sessionID
       if (!sessionID) return
       if ((await classify(sessionID)) !== "top") return
+      // Events already received for the session (its last turn's end) are
+      // handled first, or a turn that has ended would still look active.
+      const queued = eventQueues.get(sessionID)
+      if (queued) await within(queued, v2CleanupWaitMs)
       if (activeTurns.has(sessionID)) return
       await startTurn(sessionID, typeof e?.prompt?.text === "string" ? e.prompt.text : "")
     } catch {
@@ -966,19 +993,40 @@ async function entireSetup(ctx: any) {
   ;(async () => {
     while (!abort.signal.aborted) {
       try {
-        for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
-          try {
-            await handleEvent(event)
-          } catch {
-            // Silently ignore — plugin failures must not crash OpenCode
-          }
-        }
+        for await (const event of ctx.event.subscribe({ signal: abort.signal })) enqueueEvent(event)
       } catch {
         // Subscription failed; retried below unless shutting down
       }
       if (!abort.signal.aborted) await new Promise((resolve) => setTimeout(resolve, 1_000))
     }
   })()
+
+  // Events are handled in order per top-level session (a child's events with
+  // its parent's), but one session's slow hook never holds up another's
+  // events: a turn end stuck behind it would make the next prompt skip its
+  // turn-start. location.shutdown waits for every session's queue.
+  function enqueueEvent(event: any) {
+    const sessionID: string | undefined = event?.data?.sessionID
+    if (event?.type === "location.shutdown") {
+      const all = Promise.all([...eventQueues.values()])
+      eventQueues.set("", all.then(() => runEvent(event)))
+      return
+    }
+    const key = sessionID ? topLevelSession(sessionID) : ""
+    const next = (eventQueues.get(key) ?? Promise.resolve()).then(() => runEvent(event))
+    eventQueues.set(key, next)
+    next.then(() => {
+      if (eventQueues.get(key) === next) eventQueues.delete(key)
+    })
+  }
+
+  async function runEvent(event: any) {
+    try {
+      await handleEvent(event)
+    } catch {
+      // Silently ignore — plugin failures must not crash OpenCode
+    }
+  }
 
   async function handleEvent(event: any) {
     const type: string = event?.type ?? ""

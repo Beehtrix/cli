@@ -60,7 +60,12 @@ for (const step of steps) {
   if (step.prompt) await hooks["session.prompt"](step.prompt)
   if (step.context) await hooks["session.context"](step.context)
   if (step.before) await hooks["tool.execute.before"](step.before)
-  if (step.after) await hooks["tool.execute.after"](step.after)
+  if (step.after) {
+    // noWait: OpenCode keeps delivering events while this hook runs.
+    const ran = hooks["tool.execute.after"](step.after)
+    if (step.noWait) await new Promise((resolve) => setTimeout(resolve, 10))
+    else await ran
+  }
   if (step.event?.location?.directory === "$CWD") step.event.location.directory = process.cwd()
   if (step.event) {
     const delivered = new Promise((resolve) => {
@@ -68,9 +73,14 @@ for (const step of steps) {
       if (waiting) { const w = waiting; waiting = null; w({ value: step.event, done: false }) }
       else pending.push(step.event)
     })
-    // progressNoWait: let the next step run while this event is handled.
+    // progressNoWait: OpenCode does not wait for a plugin to take an event,
+    // so the next step may overlap it. Otherwise the plugin, which queues
+    // events and handles them asynchronously, gets time to handle it first.
     if (step.progressNoWait) await new Promise((resolve) => setTimeout(resolve, 10))
-    else await delivered
+    else {
+      await delivered
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
   }
 }
 if (cleanup) await cleanup()
@@ -140,6 +150,7 @@ func runPluginV2(t *testing.T, scenario map[string]any) []v2Hook {
 	// ordering races between detached hooks visible.
 	script := "#!/bin/sh\nbody=$(cat)\n" +
 		"for p in $(printf '%s' \"$body\" | sed -n 's/.*\"after_pids\":\\[\\([0-9,]*\\)\\].*/\\1/p' | tr ',' ' '); do while kill -0 $p 2>/dev/null; do sleep 0.02; done; done\n" +
+		"[ \"$3\" = subagent-start ] && [ -n \"$SLOW_SUBAGENT_START\" ] && sleep 1\n" +
 		"sleep 0.05\nprintf '%s\\t%s\\n' \"$3\" \"$body\" >> " + logPath + "\n"
 	if err := os.WriteFile(filepath.Join(binDir, "entire"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -149,6 +160,9 @@ func runPluginV2(t *testing.T, scenario map[string]any) []v2Hook {
 		filepath.Join(dir, "driver.mjs"), pluginPath, filepath.Join(dir, "scenario.json"))
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if slow, _ := scenario["slowSubagentStart"].(bool); slow { //nolint:errcheck // absent means false
+		cmd.Env = append(cmd.Env, "SLOW_SUBAGENT_START=1")
+	}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("node driver failed: %v\n%s", err, out)
 	}
@@ -444,5 +458,60 @@ func TestPluginV2_SessionEndWaitsForHeldStops(t *testing.T) {
 	want := []string{"session-start:ses_a", "turn-start:ses_a", "subagent-start:ses_a:call_bg", "turn-end:ses_a", "subagent-stop:ses_a:call_bg", "session-end:ses_a"}
 	if got := hookStrings(hooks); !slices.Equal(got, want) {
 		t.Fatalf("hooks = %v, want %v", got, want)
+	}
+}
+
+// One session's slow hook must not hold up another session's events: B's
+// turn end has to be handled before B's next prompt, or that prompt would
+// find B's turn still active and skip its turn-start.
+func TestPluginV2_SlowHookDoesNotBlockOtherSessions(t *testing.T) {
+	t.Parallel()
+	hooks := runPluginV2(t, map[string]any{
+		"slowSubagentStart": true,
+		"parents":           parentsJSON(map[string]string{"ses_a": "", "ses_b": "", "ses_child": "ses_a"}),
+		"steps": []map[string]any{
+			v2Prompt("ses_a", "delegate"),
+			v2Prompt("ses_b", "first"),
+			v2SubagentBefore("call_1", false),
+			v2Prompt("ses_child", "You are a subagent"),
+			{"progressNoWait": true, "event": v2SubagentProgress("call_1")["event"]},
+			{"progressNoWait": true, "event": v2Execution("ses_b", "succeeded")["event"]},
+			v2Prompt("ses_b", "second"),
+		},
+	})
+	var b []string
+	for _, h := range hooks {
+		if h.Payload["session_id"] == "ses_b" {
+			b = append(b, h.Name)
+		}
+	}
+	want := []string{"session-start", "turn-start", "turn-end", "turn-start"}
+	if !slices.Equal(b[:min(len(b), len(want))], want) {
+		t.Fatalf("ses_b hooks = %v, want %v first", b, want)
+	}
+}
+
+// A held stop released while its call's subagent-start is still running
+// lands before session-end at shutdown.
+func TestPluginV2_ShutdownWaitsForHeldStopsBehindTheirStart(t *testing.T) {
+	t.Parallel()
+	hooks := runPluginV2(t, map[string]any{
+		"slowSubagentStart": true,
+		"parents":           parentsJSON(map[string]string{"ses_a": "", "ses_child": "ses_a"}),
+		"steps": []map[string]any{
+			v2Prompt("ses_a", "launch"),
+			v2SubagentBefore("call_bg", true),
+			v2Prompt("ses_child", "You are a subagent"),
+			{"noWait": true, "after": v2SubagentAfter("call_bg", "running")["after"]},
+			v2Event("session.execution.started", map[string]any{"sessionID": "ses_child"}),
+			v2Execution("ses_child", "succeeded"),
+			v2Execution("ses_a", "succeeded"),
+			v2Shutdown("$CWD"),
+		},
+	})
+	got := hookStrings(hooks)
+	stop, end := slices.Index(got, "subagent-stop:ses_a:call_bg"), slices.Index(got, "session-end:ses_a")
+	if stop < 0 || end < 0 || stop > end {
+		t.Fatalf("hooks = %v; want the held subagent-stop before session-end", got)
 	}
 }

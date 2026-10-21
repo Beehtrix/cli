@@ -463,7 +463,10 @@ func (a *OpenCodeAgent) fetchAndCacheExport(ctx context.Context, sessionID strin
 	}
 	if !bytes.Equal(normalized, data) {
 		if err := jsonutil.WriteFileAtomicIn(root, staged, normalized, 0o600); err != nil {
-			return "", fmt.Errorf("failed to write normalized export: %w", err)
+			// The staged export is intact and valid; keep it, as the rename
+			// failure below does.
+			keepStaged = true
+			return "", fmt.Errorf("failed to write normalized export (export saved at %s): %w", stagedAbs, err)
 		}
 	}
 
