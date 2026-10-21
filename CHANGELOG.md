@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Redaction no longer lets `git@company.com`-style mailboxes or base64 secrets that follow punctuation (`token_<secret>`, `-p<secret>`, `user@<secret>`) through; the `git@` exemption now applies only to git remotes ([#2846](https://github.com/entireio/cli/pull/2846))
 - Headless agents (`claude -p`, `codex exec`, `droid exec`) no longer lose earlier turns' tokens, or store them twice, after a turn that changes no files: an ended session's state is kept while it holds uncommitted tokens or transcript offsets ([#2822](https://github.com/entireio/cli/pull/2822))
 - OpenCode: a commit made while a background subagent is still running links to the parent session, because the subagent's edits so far count toward co-authorship. The check shares a 10s budget, so a hung export cannot hold up the commit ([#2807](https://github.com/entireio/cli/pull/2807))
+- OpenCode summaries and `entire runner setup` work with OpenCode 2, where they failed with `Unrecognized flag: --dir`. Generation now runs standalone so it no longer attaches to a running OpenCode service or leaves one behind. Note: OpenCode 2's plugin API and `opencode export` changes are not yet supported ([#2843](https://github.com/entireio/cli/pull/2843))
 
 ### Housekeeping
 
