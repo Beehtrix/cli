@@ -3272,3 +3272,38 @@ func TestString_AWSSecretAccessKeyNameRedacts(t *testing.T) {
 		t.Errorf("JSON aws_secret_access_key leaked: %s", out)
 	}
 }
+
+// Trail-finding regression: password keys get only the shared placeholder
+// rules, so a human-chosen password shaped like a doc fill-in still redacts.
+func TestPasswordKeysSkipKeyValuePlaceholderShapes(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{`{"password":"your-secret"}`, `{"db_password":"your_token"}`} {
+		if out := mustJSONLContent(t, in); !strings.Contains(out, RedactedPlaceholder) {
+			t.Errorf("JSONLContent(%s) = %s, want a redaction", in, out)
+		}
+	}
+	for _, in := range []string{`PASSWORD=your-secret`, `DB_PASSWORD=api-token-here`} {
+		if out := String(in); !strings.Contains(out, RedactedPlaceholder) {
+			t.Errorf("String(%q) = %q, want a redaction", in, out)
+		}
+	}
+	if out := mustJSONLContent(t, `{"api_key":"your_api_key_here"}`); out != `{"api_key":"your_api_key_here"}` {
+		t.Errorf("non-password doc fill-in redacted: %s", out)
+	}
+}
+
+// The default scanner's key-context pass hides the password-key gap above;
+// with goredact alone, only the placeholder scope keeps db_password redacted.
+func TestPasswordKeysSkipKeyValuePlaceholderShapes_GoredactOnly(t *testing.T) {
+	t.Cleanup(func() {
+		if err := ConfigureScanners(ScannersConfig{Betterleaks: true}); err != nil {
+			t.Fatalf("restore scanners: %v", err)
+		}
+	})
+	if err := ConfigureScanners(ScannersConfig{Goredact: true}); err != nil {
+		t.Fatalf("ConfigureScanners: %v", err)
+	}
+	if out := mustJSONLContent(t, `{"db_password":"your_token"}`); !strings.Contains(out, RedactedPlaceholder) {
+		t.Errorf("goredact-only db_password doc-fill-in value leaked: %s", out)
+	}
+}

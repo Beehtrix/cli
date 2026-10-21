@@ -834,7 +834,7 @@ func detectCredentialKeyCaptures(
 				continue
 			}
 		}
-		if captured, ok := nonPlaceholderCapture(s, match, valueGroup); ok {
+		if captured, ok := nonPlaceholderCapture(s, key, match, valueGroup); ok {
 			// Assignments get the same separator handling as the password
 			// pattern above: "ab;cd" is one value. Shell-stdin literals stop
 			// at the pipe syntax their pattern already bounds.
@@ -892,13 +892,13 @@ func isCredentialCodeReference(value string) bool {
 	return isCredentialJSONSecretKey(value[memberStart:], false)
 }
 
-func nonPlaceholderCapture(s string, match []int, captureGroup int) (taggedRegion, bool) {
+func nonPlaceholderCapture(s, key string, match []int, captureGroup int) (taggedRegion, bool) {
 	start, end, ok := captureRange(match, captureGroup)
 	if !ok {
 		return taggedRegion{}, false
 	}
 	start, end, singleQuoted := unquoteRangeQuoted(s, start, end)
-	if !hasNonPlaceholderQuotedPasswordValue(s[start:end], singleQuoted) {
+	if !hasNonPlaceholderKeyValue(key, s[start:end], singleQuoted) {
 		return taggedRegion{}, false
 	}
 	return taggedRegion{region: region{start, end}}, true
@@ -1005,13 +1005,34 @@ func isNonPasswordCodeLiteral(key, value string) bool {
 	if _, ok := codeLiteralPlaceholderValues[strings.ToLower(strings.TrimSpace(value))]; !ok {
 		return false
 	}
+	return !isPasswordKey(key)
+}
+
+// isPasswordKey reports whether key names a password (DB_PASSWORD, passwd,
+// admin_pwd), where a human-chosen value can look like a placeholder.
+func isPasswordKey(key string) bool {
 	for _, form := range credentialJSONKeyForms(key) {
 		if credentialJSONKeyRegex.MatchString(form) || genericPasswordKeyRegex.MatchString(form) ||
 			passwordWordInKeyRE.MatchString(form) {
-			return false
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+// hasNonPlaceholderKeyValue reports whether value under key is a real
+// credential. Password keys get only the shared placeholder rules (plus the
+// single-quote literal rule): `your-secret` or `api-token-here` can be a
+// human-chosen password. Other credential keys also accept the key/value
+// placeholder shapes in isPlaceholderSecretValueQuoted.
+func hasNonPlaceholderKeyValue(key, value string, singleQuoted bool) bool {
+	if isPasswordKey(key) {
+		if singleQuoted {
+			return hasNonPlaceholderQuotedPasswordValue(value, true)
+		}
+		return hasNonPlaceholderPasswordValue(value)
+	}
+	return hasNonPlaceholderQuotedPasswordValue(value, singleQuoted)
 }
 
 // passwordWordInKeyRE spots a password segment anywhere in a normalized key.
@@ -2006,7 +2027,7 @@ func redactLeafValue(key string, credentialContext bool, val string, redactor fu
 	}
 	redacted := redactor(val)
 	if redacted == val && isCredentialJSONSecretKey(key, credentialContext) &&
-		hasNonPlaceholderQuotedPasswordValue(val, false) && !isNonPasswordCodeLiteral(key, val) {
+		hasNonPlaceholderKeyValue(key, val, false) && !isNonPasswordCodeLiteral(key, val) {
 		redacted = RedactedPlaceholder
 	}
 	return redacted
