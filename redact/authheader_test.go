@@ -278,3 +278,29 @@ func TestJSONLContent_AuthorizationHeaderArray(t *testing.T) {
 		t.Fatalf("bearer token in a header array survived JSONL redaction: %s", got)
 	}
 }
+
+// TestJSONLContent_ArrayElementsTakeTheirKey pins that an array element is
+// judged like a single value under the same key: a secret in a one-element
+// array is redacted exactly when the bare value would be, and non-secret
+// arrays under credential-like keys are left alone.
+func TestJSONLContent_ArrayElementsTakeTheirKey(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ input, want string }{
+		{`{"api_keys":["` + authHexToken + `"]}`, `{"api_keys":["REDACTED"]}`},
+		{`{"db_password":["hunter2pass"]}`, `{"db_password":["REDACTED"]}`},
+		{`{"tokens":["read","write","admin"]}`, `{"tokens":["read","write","admin"]}`},
+		{`{"auth":{"methods":["oauth2","api_key_v2"]}}`, `{"auth":{"methods":["oauth2","api_key_v2"]}}`},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			t.Parallel()
+			got, err := JSONLContent(tc.input)
+			if err != nil {
+				t.Fatalf("JSONLContent: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("JSONLContent(%s) = %s, want %s", tc.input, got, tc.want)
+			}
+		})
+	}
+}
