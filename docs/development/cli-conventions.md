@@ -62,6 +62,10 @@ always runnable in every build.
   transcript; both read through `checkpoint.TaskReader`. The cell does not
   serve task records, so under `--repo` the `tasks` key is omitted (not
   reported empty) and `--task` fails with `ErrTaskRecordsUnsupported`.
+  `list --outgoing` lists what the next push sends, from local state only: the
+  git-refs push queue, minus refs missing locally, which pre-push drops
+  (`strategy.ListOutgoingCheckpoints`). It refuses the git-branch backend, whose
+  push sends `entire/checkpoints/v1` as one branch rather than per checkpoint.
 - `agent`: bare opens the interactive agent selector, plus `list`, `add`, `remove`
 - `configure`: bare prints help and a hint pointing at `entire agent`; flags
   manage non-agent settings (telemetry, git-hook installation mode, strategy
