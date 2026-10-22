@@ -273,9 +273,43 @@ func (a *OpenCodeAgent) importSessionIntoOpenCode(ctx context.Context, session *
 			slog.String("error", err.Error()),
 		)
 	}
-	return withTempExport(session.NativeData, func(path string) error {
+	data, err := withoutStoredPermissions(session.NativeData)
+	if err != nil {
+		return err
+	}
+	return withTempExport(data, func(path string) error {
 		return runOpenCodeImport(ctx, path)
 	})
+}
+
+// withoutStoredPermissions removes the session's permission rules from a
+// stored OpenCode 1 transcript before it is imported. They come from
+// checkpoint data, so restoring them would let whoever can push checkpoints
+// change how tools are approved in the resuming user's OpenCode; the session
+// then follows that user's own configuration.
+func withoutStoredPermissions(data []byte) ([]byte, error) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("parse stored OpenCode transcript: %w", err)
+	}
+	var info map[string]json.RawMessage
+	if err := json.Unmarshal(doc["info"], &info); err != nil {
+		return nil, fmt.Errorf("parse stored OpenCode session info: %w", err)
+	}
+	if _, ok := info["permission"]; !ok {
+		return data, nil
+	}
+	delete(info, "permission")
+	rawInfo, err := json.Marshal(info)
+	if err != nil {
+		return nil, fmt.Errorf("encode OpenCode session info: %w", err)
+	}
+	doc["info"] = rawInfo
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("encode OpenCode import: %w", err)
+	}
+	return out, nil
 }
 
 // withTempExport writes export JSON to a temp file for `opencode import`,

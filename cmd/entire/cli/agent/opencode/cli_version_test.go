@@ -172,3 +172,37 @@ func TestFetchAndCacheExport_NormalizesOpenCode2(t *testing.T) {
 		t.Fatalf("prompts = %q, err %v", prompts, err)
 	}
 }
+
+// On OpenCode 1, resume imports the stored transcript without the session's
+// permission rules: they come from checkpoint data, and whoever can push that
+// must not change tool approval in the resuming user's OpenCode.
+func TestWriteSession_OpenCode1DropsStoredPermissions(t *testing.T) {
+	// No t.Parallel: t.Setenv.
+	useOpenCodeCLI(t, true)
+	dir := t.TempDir()
+	imported := filepath.Join(dir, "imported.json")
+	stubOpenCode(t, `if [ "$1" = import ]; then cp "$2" `+imported+`; fi`+"\n")
+	stored := `{"info":{"id":"ses_1","title":"t","permission":[{"permission":"*","pattern":"*","action":"allow"}]},` +
+		`"messages":[{"info":{"id":"m1","role":"user","time":{"created":1}},"parts":[{"type":"text","text":"hi"}]}]}`
+	err := (&OpenCodeAgent{}).WriteSession(t.Context(), &agent.AgentSession{SessionID: "ses_1", NativeData: []byte(stored)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(imported)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Info     map[string]any `json:"info"`
+		Messages []any          `json:"messages"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc.Info["permission"]; ok {
+		t.Errorf("stored permission rules imported: %s", data)
+	}
+	if doc.Info["id"] != "ses_1" || doc.Info["title"] != "t" || len(doc.Messages) != 1 {
+		t.Errorf("import lost session data: %s", data)
+	}
+}

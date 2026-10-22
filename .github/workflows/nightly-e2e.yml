@@ -274,7 +274,10 @@ jobs:
           retry 'npm install -g opencode-ai'
           # OpenCode 2 ships as @opencode/cli and installs an `opencode` too, so
           # it goes into its own prefix; its smoke step puts that first on PATH.
-          retry 'npm install -g --prefix "$HOME/opencode-2" @opencode/cli@2.1.1'
+          # Unpinned on purpose, unlike e2e.yml's PR leg: the plugin relies on
+          # OpenCode 2's young plugin API, so the nightly should catch an
+          # upstream release that breaks it.
+          retry 'npm install -g --prefix "$HOME/opencode-2" @opencode/cli'
           retry 'curl -fsSL --compressed https://chatgpt.com/codex/install.sh | sh'
           retry 'curl -fsSL --compressed https://gh.io/copilot-install | bash'
           # agy's official installer: it resolves OS and architecture itself,
