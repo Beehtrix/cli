@@ -1018,7 +1018,7 @@ What it means for the domain model:
   none of a long session's content: any remaining checkpoint of that session
   can rebuild it. The command lists other local checkpoints of the same
   sessions (a local, capped scan) and deletes none of them; the session stays
-  visible on entire.io while any remain.
+  visible on entire.com while any remain.
 - **Token totals.** Each session entry stores the token delta since the previous
   condensation, so removing a checkpoint subtracts its delta from server-side
   session sums. Local `SessionState` token offsets, usage and baselines are
