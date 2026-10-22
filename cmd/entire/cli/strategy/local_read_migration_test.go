@@ -12,7 +12,7 @@ import (
 
 func TestLocalRefReads_StoreOverrideAndBare(t *testing.T) {
 	gitenv.IsolateRepository(t)
-	root, head := initCountTestRepo(t)
+	root, _, head := initCountTestRepo(t)
 	other := t.TempDir()
 	testutil.InitRepo(t, other)
 	testutil.RunGit(t, root, "update-ref", "refs/remotes/origin/topic", head)

@@ -4,7 +4,6 @@ package integration
 
 import (
 	"os/exec"
-	"slices"
 	"strings"
 	"testing"
 
@@ -100,14 +99,6 @@ func TestSHA256Repository_EnableAndFirstCheckpoint(t *testing.T) {
 	}
 	if _, found := env.ReadFileFromBranch(paths.MetadataBranchName, SessionMetadataPath(checkpointID)); !found {
 		t.Fatalf("expected session metadata for checkpoint %s on %s", checkpointID, paths.MetadataBranchName)
-	}
-
-	// The outgoing listing and the status count read refs in-process, so they
-	// must also work against this ref storage. An origin with no branches
-	// leaves every checkpoint outgoing.
-	env.SetupEmptyNamedBareRemote("origin")
-	if outgoing, _ := listOutgoing(t, env); !slices.Equal(outgoing.ids(), []string{checkpointID}) {
-		t.Fatalf("checkpoint list --outgoing = %v, want [%s]", outgoing.ids(), checkpointID)
 	}
 }
 

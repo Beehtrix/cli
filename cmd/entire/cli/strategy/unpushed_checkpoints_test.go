@@ -16,18 +16,20 @@ import (
 )
 
 // initCountTestRepo initializes an isolated repo with two commits and returns
-// the repo dir plus the HEAD (second) commit hash.
-func initCountTestRepo(t *testing.T) (dir, head string) {
+// the repo dir plus the two commit hashes (first, second).
+func initCountTestRepo(t *testing.T) (dir, first, second string) {
 	t.Helper()
 	dir = t.TempDir()
 	testutil.InitRepo(t, dir)
 	testutil.WriteFile(t, dir, "f.txt", "one")
 	testutil.GitAdd(t, dir, "f.txt")
 	testutil.GitCommit(t, dir, "first")
+	first = testutil.GetHeadHash(t, dir)
 	testutil.WriteFile(t, dir, "f.txt", "two")
 	testutil.GitAdd(t, dir, "f.txt")
 	testutil.GitCommit(t, dir, "second")
-	return dir, testutil.GetHeadHash(t, dir)
+	second = testutil.GetHeadHash(t, dir)
+	return dir, first, second
 }
 
 // writeGitRefsBackendSetting writes .entire/settings.json selecting the
@@ -39,16 +41,9 @@ func writeGitRefsBackendSetting(t *testing.T, dir string) {
 
 const v1LocalRef = "refs/heads/" + paths.MetadataBranchName
 
-// Checkpoint IDs for v1 fixtures. Status counts checkpoints, so fixtures write
-// some of them more than once to keep commit and checkpoint counts apart.
-const (
-	countCheckpointA = "a1b2c3d4e5f6"
-	countCheckpointB = "0123456789ab"
-)
-
 // Not parallel: uses t.Chdir()
 func TestCountUnpushedCheckpoints_GitBranch_NoV1Branch(t *testing.T) {
-	dir, _ := initCountTestRepo(t)
+	dir, _, _ := initCountTestRepo(t)
 	t.Chdir(dir)
 
 	got, err := CountUnpushedCheckpoints(context.Background(), "origin")
@@ -58,10 +53,9 @@ func TestCountUnpushedCheckpoints_GitBranch_NoV1Branch(t *testing.T) {
 
 // Not parallel: uses t.Chdir()
 func TestCountUnpushedCheckpoints_GitBranch_TrackingRefEqual(t *testing.T) {
-	dir, _ := initCountTestRepo(t)
-	tip := testutil.CommitV1Checkpoints(t, dir, "", countCheckpointA)
-	testutil.GitUpdateRef(t, dir, v1LocalRef, tip)
-	testutil.GitUpdateRef(t, dir, "refs/remotes/origin/"+paths.MetadataBranchName, tip)
+	dir, _, second := initCountTestRepo(t)
+	testutil.GitUpdateRef(t, dir, v1LocalRef, second)
+	testutil.GitUpdateRef(t, dir, "refs/remotes/origin/"+paths.MetadataBranchName, second)
 	t.Chdir(dir)
 
 	got, err := CountUnpushedCheckpoints(context.Background(), "origin")
@@ -71,36 +65,30 @@ func TestCountUnpushedCheckpoints_GitBranch_TrackingRefEqual(t *testing.T) {
 
 // Not parallel: uses t.Chdir()
 func TestCountUnpushedCheckpoints_GitBranch_LocalAhead(t *testing.T) {
-	dir, _ := initCountTestRepo(t)
-	pushed := testutil.CommitV1Checkpoints(t, dir, "", countCheckpointA)
-	first := testutil.CommitV1Checkpoints(t, dir, pushed, countCheckpointB)
-	tip := testutil.CommitV1Checkpoints(t, dir, first, countCheckpointB)
-	testutil.GitUpdateRef(t, dir, v1LocalRef, tip)
-	testutil.GitUpdateRef(t, dir, "refs/remotes/origin/"+paths.MetadataBranchName, pushed)
+	dir, first, second := initCountTestRepo(t)
+	testutil.GitUpdateRef(t, dir, v1LocalRef, second)
+	testutil.GitUpdateRef(t, dir, "refs/remotes/origin/"+paths.MetadataBranchName, first)
 	t.Chdir(dir)
 
 	got, err := CountUnpushedCheckpoints(context.Background(), "origin")
 	require.NoError(t, err)
-	assert.Equal(t, 1, got, "two v1 commits ahead, both writing one checkpoint")
+	assert.Equal(t, 1, got, "one v1 commit ahead of the tracking ref")
 }
 
 // Not parallel: uses t.Chdir()
 func TestCountUnpushedCheckpoints_GitBranch_TrackingRefAbsentCountsAll(t *testing.T) {
-	dir, _ := initCountTestRepo(t)
-	first := testutil.CommitV1Checkpoints(t, dir, "", countCheckpointA)
-	second := testutil.CommitV1Checkpoints(t, dir, first, countCheckpointB)
-	tip := testutil.CommitV1Checkpoints(t, dir, second, countCheckpointA)
-	testutil.GitUpdateRef(t, dir, v1LocalRef, tip)
+	dir, _, second := initCountTestRepo(t)
+	testutil.GitUpdateRef(t, dir, v1LocalRef, second)
 	t.Chdir(dir)
 
 	got, err := CountUnpushedCheckpoints(context.Background(), "origin")
 	require.NoError(t, err)
-	assert.Equal(t, 2, got, "absent tracking ref counts every checkpoint in v1 once, not every commit")
+	assert.Equal(t, 2, got, "absent tracking ref counts every v1 commit (deferred-publish reading)")
 }
 
 // Not parallel: uses t.Chdir()
 func TestCountUnpushedCheckpoints_GitRefs_EmptyQueue(t *testing.T) {
-	dir, _ := initCountTestRepo(t)
+	dir, _, _ := initCountTestRepo(t)
 	writeGitRefsBackendSetting(t, dir)
 	t.Chdir(dir)
 
@@ -111,12 +99,12 @@ func TestCountUnpushedCheckpoints_GitRefs_EmptyQueue(t *testing.T) {
 
 // Not parallel: uses t.Chdir()
 func TestCountUnpushedCheckpoints_GitRefs_CountsQueuedRefsThatExist(t *testing.T) {
-	dir, second := initCountTestRepo(t)
+	dir, _, second := initCountTestRepo(t)
 	writeGitRefsBackendSetting(t, dir)
 
 	// The v1 branch exists but must NOT be counted: the git-refs backend
-	// counts the push queue, not v1.
-	testutil.GitUpdateRef(t, dir, v1LocalRef, testutil.CommitV1Checkpoints(t, dir, "", countCheckpointA))
+	// counts the push queue, not v1 commits.
+	testutil.GitUpdateRef(t, dir, v1LocalRef, testutil.GetHeadHash(t, dir))
 
 	// A queued ref deleted locally is dropped by the push, not sent.
 	const kept = "refs/entire/checkpoints/aa/bb0000000001"

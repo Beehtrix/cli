@@ -12,7 +12,7 @@ import (
 
 func TestRemoteHasTrackingRefs_PrefixAndStorage(t *testing.T) {
 	gitenv.IsolateRepository(t)
-	root, head := initCountTestRepo(t)
+	root, _, head := initCountTestRepo(t)
 	t.Chdir(root)
 	testutil.RunGit(t, root, "update-ref", "refs/remotes/origin-other/main", head)
 	require.False(t, remoteHasTrackingRefs(t.Context(), "origin"), "do not match another remote's prefix")

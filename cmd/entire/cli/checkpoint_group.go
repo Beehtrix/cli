@@ -69,7 +69,8 @@ func newCheckpointSearchCmd() *cobra.Command {
 //	--pending --json     the same as a JSON array, in the shape the removed
 //	                     `rewind --list` produced
 //	--outgoing           checkpoints the next push sends to the checkpoint
-//	                     sync destination, read locally, human list
+//	                     sync destination (git-refs backend only), read
+//	                     locally, human list
 //	--outgoing --json    the same as one JSON object (outgoingCheckpointsJSON)
 //
 // The condensed dataset (entire/checkpoints/v1 for the branch) and the pending
@@ -100,13 +101,12 @@ current branch. Use --pending for work that is not a checkpoint yet:
   - Logs-only resume points recovered from commits whose logs are already
     condensed.
 
-Use --outgoing to see what your next 'git push' sends: the checkpoints not
-yet on the checkpoint sync remote, read from local state with no network
+Use --outgoing to see what your next 'git push' sends: the checkpoints
+queued for the checkpoint sync remote, read from local state with no network
 call. Each one shows its ID, age, agent, first prompt (or summary) and the
-files it touched. On the git-branch backend, a checkpoint marked "updated" is
-one the remote already holds an earlier version of. The git-refs backend keeps
-no local record of what a push delivered, so it marks none (updated is null
-in --json).
+files it touched. It needs the git-refs checkpoint backend, which pushes one
+ref per checkpoint; the git-branch backend pushes entire/checkpoints/v1 as one
+branch, so --outgoing reports an error there.
 
 Output modes:
   --json              Machine-readable JSON instead of the human view.
@@ -128,13 +128,12 @@ id, "is_next_checkpoint": true, and a "next_checkpoint" object:
 
 The arrays are always present, possibly empty.
 
-The --outgoing --json object has backend, checkpoint_push_disabled,
+The --outgoing --json object has checkpoint_push_disabled,
 checkpoint_sync_remote, checkpoint_sync_remote_source and
-checkpoint_sync_error (as in 'entire status --json'), complete,
-first_push_deferred, stale_queue_entries and a checkpoints array of
-{checkpoint_id, ref, created_at, agent, session_count, prompt, summary,
-files_touched, updated, error}. complete is false, with a reason and an empty
-checkpoints array, when local state cannot tell what the push sends.
+checkpoint_sync_error (as in 'entire status --json'), stale_queue_entries
+and a checkpoints array of {checkpoint_id, ref, created_at, agent,
+session_count, prompt, summary, files_touched, error}. The array is always
+present, possibly empty.
 
 Optionally filter condensed checkpoints by session ID with --session
 (not applicable with --pending or --outgoing).`,
@@ -160,9 +159,9 @@ Optionally filter condensed checkpoints by session ID with --session
 
 			switch {
 			case outgoingFlag && jsonFlag:
-				return runCheckpointOutgoingListJSON(ctx, w)
+				return runCheckpointOutgoingListJSON(ctx, w, errW)
 			case outgoingFlag:
-				return runCheckpointOutgoingListHuman(ctx, w)
+				return runCheckpointOutgoingListHuman(ctx, w, errW)
 			case pendingFlag && jsonFlag:
 				return runCheckpointPendingListJSON(ctx, w)
 			case pendingFlag:
@@ -179,6 +178,6 @@ Optionally filter condensed checkpoints by session ID with --session
 	cmd.Flags().BoolVar(&noPagerFlag, "no-pager", false, "Disable pager output")
 	cmd.Flags().BoolVar(&jsonFlag, "json", false, "Output as JSON instead of the human view")
 	cmd.Flags().BoolVar(&pendingFlag, "pending", false, "List pending work — a preview of the next checkpoint, uncondensed subagent task records, and logs-only resume points")
-	cmd.Flags().BoolVar(&outgoingFlag, "outgoing", false, "List the checkpoints your next git push sends, read locally with no network call")
+	cmd.Flags().BoolVar(&outgoingFlag, "outgoing", false, "List the checkpoints your next git push sends, read locally with no network call (git-refs backend)")
 	return cmd
 }

@@ -145,7 +145,7 @@ If your AI sessions will touch sensitive data:
 - **Review before pushing.** Checkpoints are written locally — at commit time, or when a session with no file changes is snapshotted with the hidden `entire checkpoint create` — and pushed separately, so there is always a window to inspect them:
 
   ```fish
-  # what your next git push sends, read locally with no network call
+  # git-refs: what your next git push sends, read locally with no network call
   entire checkpoint list --outgoing
   entire checkpoint explain <id>
 
@@ -158,7 +158,7 @@ If your AI sessions will touch sensitive data:
   git log --oneline entire/checkpoints/v1
   ```
 
-- **Know your push destination.** Checkpoint data syncs to exactly one elected remote; `entire status` names it and reports how many checkpoints are still unpushed, and `entire checkpoint list --outgoing` lists them.
+- **Know your push destination.** Checkpoint data syncs to exactly one elected remote; `entire status` names it and reports how many checkpoints are still unpushed, and on the git-refs backend `entire checkpoint list --outgoing` lists them.
 
 ## What Gets Redacted
 

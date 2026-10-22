@@ -17,17 +17,12 @@ import (
 
 // outgoingCheckpointsJSON is `entire checkpoint list --outgoing --json`. The
 // checkpoint_sync_* and checkpoint_push_disabled fields carry the same values
-// as in `entire status --json`. Checkpoints is never null; it is empty when
-// Complete is false, because local state cannot tell what the push sends.
+// as in `entire status --json`. Checkpoints is never null.
 type outgoingCheckpointsJSON struct {
-	Backend           string                   `json:"backend"`
 	SyncRemote        string                   `json:"checkpoint_sync_remote,omitempty"`
 	SyncRemoteSource  string                   `json:"checkpoint_sync_remote_source,omitempty"`
 	SyncError         string                   `json:"checkpoint_sync_error,omitempty"`
 	PushDisabled      bool                     `json:"checkpoint_push_disabled"`
-	Complete          bool                     `json:"complete"`
-	Reason            string                   `json:"reason,omitempty"`
-	FirstPushDeferred bool                     `json:"first_push_deferred,omitempty"`
 	StaleQueueEntries int                      `json:"stale_queue_entries,omitempty"`
 	Checkpoints       []outgoingCheckpointJSON `json:"checkpoints"`
 }
@@ -37,17 +32,14 @@ type outgoingCheckpointsJSON struct {
 // so it is listed with Error set instead of being dropped.
 type outgoingCheckpointJSON struct {
 	CheckpointID string   `json:"checkpoint_id,omitempty"`
-	Ref          string   `json:"ref,omitempty"`
+	Ref          string   `json:"ref"`
 	CreatedAt    string   `json:"created_at,omitempty"`
 	Agent        string   `json:"agent,omitempty"`
 	SessionCount int      `json:"session_count,omitempty"`
 	Prompt       string   `json:"prompt,omitempty"`
 	Summary      string   `json:"summary,omitempty"`
 	FilesTouched []string `json:"files_touched"`
-	// Updated is null on git-refs, which keeps no record of what a push
-	// delivered, so a rewrite before the first push looks the same as one after.
-	Updated *bool  `json:"updated"`
-	Error   string `json:"error,omitempty"`
+	Error        string   `json:"error,omitempty"`
 }
 
 // outgoingListing is the --outgoing dataset: where checkpoints sync to, what
@@ -55,7 +47,6 @@ type outgoingCheckpointJSON struct {
 type outgoingListing struct {
 	sync    checkpointSyncInfo
 	result  strategy.OutgoingCheckpoints
-	reason  string
 	entries []outgoingCheckpointRow
 }
 
@@ -71,28 +62,21 @@ type outgoingCheckpointRow struct {
 	err          error
 }
 
+// outgoingNeedsGitRefsMessage explains the git-branch refusal to the user.
+const outgoingNeedsGitRefsMessage = "entire checkpoint list --outgoing needs the git-refs checkpoint backend. " +
+	"This repository uses git-branch, whose push sends entire/checkpoints/v1 as one branch rather than one ref per checkpoint."
+
 func loadOutgoingListing(ctx context.Context) (outgoingListing, error) {
+	result, err := strategy.ListOutgoingCheckpoints(ctx)
+	if err != nil {
+		return outgoingListing{}, fmt.Errorf("list outgoing checkpoints: %w", err)
+	}
 	s, err := LoadEntireSettings(ctx)
 	if err != nil {
 		return outgoingListing{}, err
 	}
-	listing := outgoingListing{sync: computeCheckpointSyncInfo(ctx, s)}
-
-	// The tracking ref to compare against belongs to the elected remote. A
-	// dedicated checkpoint_remote is a URL with no tracking ref.
-	remoteName := listing.sync.Remote
-	if listing.sync.Source == checkpointSyncSourceDedicated {
-		remoteName = ""
-	}
-	listing.result, err = strategy.ListOutgoingCheckpoints(ctx, remoteName)
-	if err != nil {
-		return outgoingListing{}, fmt.Errorf("list outgoing checkpoints: %w", err)
-	}
-	if !listing.result.Known {
-		listing.reason = outgoingUnknownReason(listing.sync)
-		return listing, nil
-	}
-	if len(listing.result.Checkpoints) == 0 {
+	listing := outgoingListing{sync: computeCheckpointSyncInfo(ctx, s), result: result}
+	if len(result.Checkpoints) == 0 {
 		return listing, nil
 	}
 
@@ -101,12 +85,9 @@ func loadOutgoingListing(ctx context.Context) (outgoingListing, error) {
 		return outgoingListing{}, fmt.Errorf("not a git repository: %w", err)
 	}
 	defer repo.Close()
-	// No fetchers: every outgoing checkpoint was written here, and a read must
-	// never reach the remote. v1 reads stay on the local branch, which is what
-	// the push sends.
-	refs := checkpoint.ResolveRefs(ctx).PrimaryAsLocalRead()
+	// No fetchers: every queued checkpoint was written here, and a read must
+	// never reach the remote.
 	stores, err := checkpoint.Open(ctx, repo, checkpoint.OpenOptions{
-		Refs: &refs,
 		// Deliberately local: remote-tracking tiers hold what the remote
 		// already has, not what this push sends.
 		ReadRemotes: nil,
@@ -114,7 +95,7 @@ func loadOutgoingListing(ctx context.Context) (outgoingListing, error) {
 	if err != nil {
 		return outgoingListing{}, fmt.Errorf("open checkpoint store: %w", err)
 	}
-	for _, oc := range listing.result.Checkpoints {
+	for _, oc := range result.Checkpoints {
 		listing.entries = append(listing.entries, readOutgoingCheckpoint(ctx, stores.Persistent, oc))
 	}
 	// Oldest first; rows without a creation time (unreadable) go last.
@@ -132,15 +113,13 @@ func loadOutgoingListing(ctx context.Context) (outgoingListing, error) {
 	return listing, nil
 }
 
-func outgoingUnknownReason(info checkpointSyncInfo) string {
-	switch {
-	case info.Source == checkpointSyncSourceDedicated:
-		return fmt.Sprintf("Checkpoints sync to the dedicated checkpoint remote (%s). The git-branch backend keeps no local record of what that remote holds, so this cannot list what the next push sends without asking it.", info.Remote)
-	case info.Err != "":
-		return "No checkpoint sync remote is elected, so nothing local records what a push would send."
-	default:
-		return "No git remote is configured, so 'git push' has nowhere to send checkpoints."
+// reportOutgoingErr prints the git-branch refusal in place of the raw error.
+func reportOutgoingErr(errW io.Writer, err error) error {
+	if errors.Is(err, strategy.ErrOutgoingNeedsGitRefs) {
+		fmt.Fprintln(errW, outgoingNeedsGitRefsMessage)
+		return NewSilentError(err)
 	}
+	return err
 }
 
 // readOutgoingCheckpoint reads what the listing shows for one checkpoint. The
@@ -184,19 +163,12 @@ func readOutgoingCheckpoint(ctx context.Context, store checkpoint.PersistentStor
 
 func (l outgoingListing) json() outgoingCheckpointsJSON {
 	out := outgoingCheckpointsJSON{
-		Backend:           checkpoint.BackendTypeGitBranch,
 		SyncRemote:        l.sync.Remote,
 		SyncRemoteSource:  l.sync.Source,
 		SyncError:         l.sync.Err,
 		PushDisabled:      l.sync.PushDisabled,
-		Complete:          l.result.Known,
-		Reason:            l.reason,
-		FirstPushDeferred: l.result.FirstPushDeferred,
 		StaleQueueEntries: l.result.StaleQueueEntries,
 		Checkpoints:       make([]outgoingCheckpointJSON, 0, len(l.entries)),
-	}
-	if l.result.PrimaryIsRefs {
-		out.Backend = checkpoint.BackendTypeGitRefs
 	}
 	for _, row := range l.entries {
 		entry := outgoingCheckpointJSON{
@@ -207,9 +179,6 @@ func (l outgoingListing) json() outgoingCheckpointsJSON {
 			Prompt:       row.prompt,
 			Summary:      row.summary,
 			FilesTouched: row.files,
-		}
-		if l.result.UpdatedKnown {
-			entry.Updated = &row.Updated
 		}
 		if entry.FilesTouched == nil {
 			entry.FilesTouched = []string{}
@@ -225,10 +194,10 @@ func (l outgoingListing) json() outgoingCheckpointsJSON {
 	return out
 }
 
-func runCheckpointOutgoingListJSON(ctx context.Context, w io.Writer) error {
+func runCheckpointOutgoingListJSON(ctx context.Context, w, errW io.Writer) error {
 	listing, err := loadOutgoingListing(ctx)
 	if err != nil {
-		return err
+		return reportOutgoingErr(errW, err)
 	}
 	data, err := jsonutil.MarshalIndentWithNewline(listing.json(), "", "  ")
 	if err != nil {
@@ -238,10 +207,10 @@ func runCheckpointOutgoingListJSON(ctx context.Context, w io.Writer) error {
 	return nil
 }
 
-func runCheckpointOutgoingListHuman(ctx context.Context, w io.Writer) error {
+func runCheckpointOutgoingListHuman(ctx context.Context, w, errW io.Writer) error {
 	listing, err := loadOutgoingListing(ctx)
 	if err != nil {
-		return err
+		return reportOutgoingErr(errW, err)
 	}
 	renderOutgoingListing(w, listing)
 	return nil
@@ -267,11 +236,6 @@ func renderOutgoingListing(w io.Writer, l outgoingListing) {
 		}
 		fmt.Fprintln(w, label+tuiutil.SanitizeTerminalLabel(info.Err))
 	}
-	if !l.result.Known {
-		// The reason can quote the checkpoint_remote repo from committed settings.
-		fmt.Fprintln(w, tuiutil.SanitizeDisplayText(l.reason))
-		return
-	}
 	if info.PushDisabled {
 		if n > 0 {
 			fmt.Fprintln(w, "Automatic checkpoint pushing is off (push_sessions=false), so 'git push' sends none of these.")
@@ -292,26 +256,16 @@ func renderOutgoingListing(w io.Writer, l outgoingListing) {
 		return
 	}
 
-	fmt.Fprintln(w, outgoingHeadline(info, l.result, n, dest))
+	fmt.Fprintln(w, outgoingHeadline(info, n, dest))
 	fmt.Fprintln(w)
-	anyUpdated := false
 	for _, row := range l.entries {
 		renderOutgoingRow(w, row)
-		anyUpdated = anyUpdated || row.Updated
-	}
-
-	if anyUpdated {
-		where := dest
-		if where == "" {
-			where = "the remote"
-		}
-		fmt.Fprintf(w, "updated: %s already has an earlier version, and the push sends the changes.\n", where)
 	}
 	renderStaleQueueEntries(w, l.result.StaleQueueEntries)
 	fmt.Fprintln(w, "Details: entire checkpoint explain <id>")
 }
 
-func outgoingHeadline(info checkpointSyncInfo, result strategy.OutgoingCheckpoints, n int, dest string) string {
+func outgoingHeadline(info checkpointSyncInfo, n int, dest string) string {
 	count := pluralCount(n, nounCheckpoint, nounCheckpoints)
 	switch {
 	case info.PushDisabled && dest != "":
@@ -322,9 +276,6 @@ func outgoingHeadline(info checkpointSyncInfo, result strategy.OutgoingCheckpoin
 		return fmt.Sprintf("'git push' sends none of these until that is fixed. %s %s queued:", count, beVerb(n))
 	case dest == "":
 		return fmt.Sprintf("%s %s queued, but no git remote is configured to send them to:", count, beVerb(n))
-	case result.FirstPushDeferred:
-		return fmt.Sprintf("%s %s not on %s yet. %s has no branches yet, so your next 'git push %s' sends only your branch, and these follow on the push after it:",
-			count, beVerb(n), dest, dest, dest)
 	case info.Source == checkpointSyncSourceDedicated:
 		return fmt.Sprintf("%s %s to %s with your next 'git push':", count, goVerb(n), dest)
 	default:
@@ -361,9 +312,6 @@ func renderOutgoingRow(w io.Writer, row outgoingCheckpointRow) {
 	}
 	if row.agent != "" {
 		header += "  " + tuiutil.SanitizeTerminalLabel(row.agent)
-	}
-	if row.Updated {
-		header += "  updated"
 	}
 	fmt.Fprintln(w, header)
 	switch {

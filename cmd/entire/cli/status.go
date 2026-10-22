@@ -679,8 +679,14 @@ func writeCheckpointSyncLines(ctx context.Context, b *strings.Builder, s *Entire
 		}
 	}
 	if info.Unpushed > 0 {
+		line := formatUnpushedCheckpointsLine(info)
+		// --outgoing lists the git-refs push queue; git-branch has no
+		// per-checkpoint answer to point at.
+		if cpCfg, cfgErr := settings.LoadCheckpointsConfig(ctx); cfgErr == nil && checkpoint.PrimaryIsRefs(cpCfg) {
+			line += " · see 'entire checkpoint list --outgoing'"
+		}
 		b.WriteString("\n  ")
-		b.WriteString(sty.render(sty.dim, formatUnpushedCheckpointsLine(info)+" · see 'entire checkpoint list --outgoing'"))
+		b.WriteString(sty.render(sty.dim, line))
 	}
 }
 
