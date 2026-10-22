@@ -19,8 +19,10 @@ import (
 //   - Tool results in user entries become result records on the assistant
 //     message holding the tool_use with their tool_use_id, wherever they fall
 //     until the next user entry with text or images (whose own results still
-//     count): Claude Code writes the results of parallel tool calls one user
-//     entry each, sometimes after the next assistant message began. A result
+//     count), including text the agent injected (Claude's isMeta): Claude
+//     Code writes the results of parallel tool calls one user entry each,
+//     sometimes after the next assistant message began, but never after
+//     user text while a result is outstanding. A result
 //     without a tool_use_id targets the last assistant message. Other results
 //     are dropped, as is a user entry that held only such results.
 //   - The text and images of a user entry become a separate user message.

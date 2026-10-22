@@ -48,6 +48,11 @@ not json
 {"type":"assistant","timestamp":"t3","message":{"id":"m2","content":[{"type":"tool_use","id":"tu2","name":"mcp__slack__read","input":{}}]}}
 {"type":"user","timestamp":"t4","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"late"},{"type":"tool_result","content":"no id: last message"}]}}
 `,
+	"results only until injected text": `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"tool_use","id":"tu1","name":"Skill","input":{}},{"type":"tool_use","id":"tu2","name":"Bash","input":{}}]}}
+{"type":"user","timestamp":"t2","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"loaded"}]}}
+{"type":"user","isMeta":true,"timestamp":"t3","message":{"content":[{"type":"text","text":"Base directory for this skill"}]}}
+{"type":"user","timestamp":"t4","message":{"content":[{"type":"tool_result","tool_use_id":"tu2","content":"late"}]}}
+`,
 	"results only until the next prompt": `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{}}]}}
 {"type":"user","timestamp":"t2","message":{"content":"interrupt"}}
 {"type":"user","timestamp":"t3","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"late"}]}}

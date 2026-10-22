@@ -37,7 +37,7 @@ func convertResults(t *testing.T, input string, agent string) map[string]*ToolRe
 func TestJSONLAdapter_AttachesResultsByToolUseID(t *testing.T) {
 	t.Parallel()
 
-	for _, name := range []string{"parallel results in separate user entries", "result after the next assistant message began", "results only until the next prompt"} {
+	for _, name := range []string{"parallel results in separate user entries", "result after the next assistant message began", "results only until the next prompt", "results only until injected text"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			input := jsonlEdgeCases[name]
@@ -46,6 +46,7 @@ func TestJSONLAdapter_AttachesResultsByToolUseID(t *testing.T) {
 				"parallel results in separate user entries":     "tu1=first tu2=second",
 				"result after the next assistant message began": "tu1=late tu2=no id: last message",
 				"results only until the next prompt":            "tu1=-",
+				"results only until injected text":              "tu1=loaded tu2=-",
 			}[name]
 			var got []string
 			for _, id := range []string{"tu1", "tu2"} {
@@ -119,6 +120,12 @@ func TestToolResultAgent_PerConverter(t *testing.T) {
 			input:     `{"info":{"id":"ses_1"},"messages":[{"info":{"id":"a1","role":"assistant","time":{"created":1000}},"parts":[{"type":"tool","tool":"task","callID":"call_1","state":{"status":"completed","input":{"subagent_type":"explore"},"output":"done","metadata":{"sessionId":"ses_child"}}}]}]}`,
 			toolUseID: "call_1",
 			want:      "ses_child",
+		},
+		{
+			name:      "opencode non-task tool with a sessionId",
+			agent:     "opencode",
+			input:     `{"info":{"id":"ses_1"},"messages":[{"info":{"id":"a1","role":"assistant","time":{"created":1000}},"parts":[{"type":"tool","tool":"bash","callID":"call_2","state":{"status":"completed","input":{},"output":"ok","metadata":{"sessionId":"ses_other"}}}]}]}`,
+			toolUseID: "call_2",
 		},
 		{
 			name:  "copilot task",
