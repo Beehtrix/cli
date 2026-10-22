@@ -333,8 +333,8 @@ func TestEnableCheckpointPushRemote_Report(t *testing.T) {
 		uploadsTo    = "Checkpoints will be uploaded when you push to origin.\n"
 		privacy      = "  They contain your agent transcripts. If that repo is public, anyone can read them.\n" +
 			"  Secret redaction is best effort, not bulletproof. Review with `entire checkpoint explain`.\n" +
-			"  To stop uploads: `entire configure --skip-push-sessions`\n"
-		privateRepo = "  To use a separate private repo: `entire configure --checkpoint-remote github:<owner>/<repo>`\n"
+			"  To stop uploads: `entire configure --local --skip-push-sessions`\n"
+		privateRepo = "  To use a separate private repo: `entire configure --local --checkpoint-remote github:<owner>/<repo>`\n"
 		redaction   = "  Secret redaction is best effort, not bulletproof. Review with `entire checkpoint explain`.\n"
 	)
 	for _, tc := range []struct {

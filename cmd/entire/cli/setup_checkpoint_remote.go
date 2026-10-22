@@ -442,9 +442,12 @@ const checkpointRedactionNotice = "  Secret redaction is best effort, not bullet
 func printCheckpointPrivacyNotice(w io.Writer, offerPrivateRepo bool) {
 	fmt.Fprintln(w, "  They contain your agent transcripts. If that repo is public, anyone can read them.")
 	fmt.Fprintln(w, checkpointRedactionNotice)
-	fmt.Fprintf(w, "  To stop uploads: `entire configure --%s`\n", flagSkipPushSessions)
+	// Clone-local, because the project file can lose: a local push_sessions
+	// overrides it, and a checkpoint_remote there owned by someone other than
+	// origin's owner is ignored, leaving uploads on the public remote.
+	fmt.Fprintf(w, "  To stop uploads: `entire configure --local --%s`\n", flagSkipPushSessions)
 	if offerPrivateRepo {
-		fmt.Fprintf(w, "  To use a separate private repo: `entire configure --%s github:<owner>/<repo>`\n", flagCheckpointRemote)
+		fmt.Fprintf(w, "  To use a separate private repo: `entire configure --local --%s github:<owner>/<repo>`\n", flagCheckpointRemote)
 	}
 }
 

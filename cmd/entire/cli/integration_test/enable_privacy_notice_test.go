@@ -20,8 +20,8 @@ func TestEnable_PrivacyNotice(t *testing.T) {
 	const (
 		privacy = "  They contain your agent transcripts. If that repo is public, anyone can read them.\n" +
 			"  Secret redaction is best effort, not bulletproof. Review with `entire checkpoint explain`.\n" +
-			"  To stop uploads: `entire configure --skip-push-sessions`\n" +
-			"  To use a separate private repo: `entire configure --checkpoint-remote github:<owner>/<repo>`\n"
+			"  To stop uploads: `entire configure --local --skip-push-sessions`\n" +
+			"  To use a separate private repo: `entire configure --local --checkpoint-remote github:<owner>/<repo>`\n"
 		redaction = "  Secret redaction is best effort, not bulletproof. Review with `entire checkpoint explain`.\n"
 	)
 	enableAgent := []string{"enable", "--agent", agentClaudeCode, "--telemetry=false"}
@@ -65,7 +65,7 @@ func TestEnable_PrivacyNoticeWhileDedicatedUploadsContinue(t *testing.T) {
 	const notice = "Dedicated checkpoint uploads can still proceed.\n" +
 		"  They contain your agent transcripts. If that repo is public, anyone can read them.\n" +
 		"  Secret redaction is best effort, not bulletproof. Review with `entire checkpoint explain`.\n" +
-		"  To stop uploads: `entire configure --skip-push-sessions`\n"
+		"  To stop uploads: `entire configure --local --skip-push-sessions`\n"
 	ForEachBackend(t, func(t *testing.T, backend string) {
 		env := NewFeatureBranchEnv(t)
 		env.CheckpointStore = backend
