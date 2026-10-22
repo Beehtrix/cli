@@ -357,11 +357,13 @@ always runnable in every build.
   org fixes a GitHub-side block: the server probes GitHub first and answers
   409 with the reason at `errors[].location == "body.owner"` while the block
   holds, which `resyncError` renders with the same wording `repo view` uses.
-  That block (`Mirror.syncBlock`: an org IP allow list or a suspended
-  installation) is per GitHub installation and the `/repos` placements do not
-  carry it, so only `repo view` reads it, with one exact read scoped to the
-  repo (`lookupMirrorSyncBlock`: `GET /mirrors/{id}` by the entry's own
-  `RepoPlacement.ID`, which is the mirror ID — not `/mirrors/placements`,
+  That block (`Mirror.syncBlock`: an org IP allow list, or a suspension core
+  hit while minting a token — a suspension GitHub reports by webhook is NOT
+  a block, it is placement status `suspended`) is per GitHub installation
+  and the `/repos` placements do not carry it, so only `repo view` reads it,
+  with one exact read scoped to the repo (`lookupMirrorSyncBlock`:
+  `GET /mirrors/{id}` by the entry's own `id`, its canonical home-jurisdiction
+  placement, falling back to the first placement ID — not `/mirrors/placements`,
   which is pull-gated and would withhold the block from a metadata-only
   viewer), and prints a `Sync:` section with the fix and the resync command;
   `--json` adds `syncBlock` on the row, or `syncStatus: "unavailable"` when

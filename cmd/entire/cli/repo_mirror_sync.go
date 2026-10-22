@@ -47,15 +47,17 @@ type mirrorSyncBlock struct {
 // the repo without being able to clone it (a direct grant, a project member)
 // would otherwise have had the block silently withheld.
 //
+// The entry's own id is read first: core sets it to the canonical placement,
+// the caller's home-jurisdiction copy where one exists, so the read stays on
+// the home core instead of taking a cross-cell redirect to whichever copy
+// sorts first. The placements are the fallback for an entry without one.
+//
 // blocked is false for "not blocked, as far as the caller can see": no
-// placement with an ID, or a mirror carrying no block.
+// placement with an ID, or a mirror carrying no block. A block whose reason
+// cleans to nothing is still a block — the server stamped it — and renders
+// with the generic wording (see syncBlockProblem).
 func lookupMirrorSyncBlock(ctx context.Context, c mirrorStatusGetter, entry coreapi.RepoIndexEntry) (block mirrorSyncBlock, blocked bool, err error) {
-	id := ""
-	for _, p := range entry.Placements {
-		if id = strings.TrimSpace(p.ID); id != "" {
-			break
-		}
-	}
+	id := canonicalMirrorID(entry)
 	if id == "" {
 		return mirrorSyncBlock{}, false, nil
 	}
@@ -68,6 +70,21 @@ func lookupMirrorSyncBlock(ctx context.Context, c mirrorStatusGetter, entry core
 		return mirrorSyncBlock{}, false, nil
 	}
 	return mirrorSyncBlock{Reason: cleanSyncReason(b.Reason), ObservedAt: b.ObservedAt}, true, nil
+}
+
+// canonicalMirrorID is the mirror ID to read a GitHub entry's record by: the
+// entry's own id (its canonical placement), else the first placement carrying
+// one, else "" for an entry with nothing placed.
+func canonicalMirrorID(entry coreapi.RepoIndexEntry) string {
+	if id := strings.TrimSpace(entry.ID); id != "" {
+		return id
+	}
+	for _, p := range entry.Placements {
+		if id := strings.TrimSpace(p.ID); id != "" {
+			return id
+		}
+	}
+	return ""
 }
 
 // maxSyncReasonRunes bounds a reason on its way to the terminal. The known
@@ -119,13 +136,16 @@ func noteSyncStatusUnavailable(ctx context.Context, errW io.Writer, err error) (
 
 // syncBlockProblem says what is wrong, in terms the person who can fix it
 // recognises. Only an unknown reason shows Entire's enum, since there is
-// nothing else to say about it.
+// nothing else to say about it — and an empty one shows nothing at all,
+// rather than an empty pair of brackets.
 func syncBlockProblem(owner, reason string) string {
 	switch reason {
 	case syncBlockOrgIPAllowlist:
 		return "The GitHub IP allow list of the " + owner + " organization blocks Entire, so its mirrors cannot sync from GitHub."
 	case syncBlockInstallationSuspended:
 		return "The Entire GitHub App installation for " + owner + " is suspended, so its mirrors cannot sync from GitHub."
+	case "":
+		return "GitHub blocks the Entire app installation for " + owner + ", so its mirrors cannot sync from GitHub."
 	default:
 		return "GitHub blocks the Entire app installation for " + owner + " (" + reason + "), so its mirrors cannot sync from GitHub."
 	}
@@ -174,10 +194,10 @@ func newRepoMirrorResyncCmd() *cobra.Command {
 		Long: "Queue a fresh sync of a GitHub mirror on every cluster it is placed on, " +
 			"so a mirror that has fallen behind its upstream catches up without " +
 			"waiting for the next GitHub event.\n\n" +
-			"This is also the check after fixing a block. When GitHub blocks the " +
-			"Entire app installation for the repository's owner (an org IP " +
-			"allow list, or a suspended installation — `entire repo view` shows " +
-			"which), the server probes GitHub first: if the block has been lifted " +
+			"This is also the check after fixing a block. When GitHub refused the " +
+			"Entire app's access while syncing (an org IP allow list, or a " +
+			"suspension hit mid-sync — `entire repo view` shows which), the " +
+			"server probes GitHub first: if the block has been lifted " +
 			"it clears the block and queues the sync; if not, nothing is queued and " +
 			"the command reports what still needs fixing.\n\n" +
 			"Requires write access to the GitHub repository. Serves /gh/ references " +

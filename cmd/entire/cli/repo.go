@@ -456,9 +456,11 @@ func newRepoViewCmd() *cobra.Command {
 			"it is placed on, with that cluster's clone URL and status.\n\n" +
 			"With no repository argument, resolve the current clone's origin remote.\n" +
 			"--json includes repoId and apiUrl for the responsible API cell when resolvable.\n\n" +
-			"A GitHub mirror whose organization blocks the Entire app (an org IP allow " +
-			"list, or a suspended installation) shows a Sync section with the fix and " +
-			"the resync command; --json carries it as syncBlock. When that read fails " +
+			"A GitHub mirror whose owner refused the Entire app's access while syncing " +
+			"(an org IP allow list, or a suspension Entire hit mid-sync; a suspension " +
+			"GitHub reported directly shows as placement status suspended instead) " +
+			"shows a Sync section with the fix and the resync command; --json carries " +
+			"it as syncBlock. When that read fails " +
 			"the text view prints a note and --json sets syncStatus to \"unavailable\", " +
 			"so a missing syncBlock means not blocked only when syncStatus is absent.\n\n" +
 			"An explicit <repo> names its forge:\n\n" +

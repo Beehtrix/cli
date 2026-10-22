@@ -49,11 +49,11 @@ func mirrorOf(owner string) coreapi.Mirror {
 	return coreapi.Mirror{MirrorId: "m-" + owner, Owner: owner, Repo: "web", Provider: repoProviderGitHub, ClusterHost: defaultClusterHost}
 }
 
-// blockedMirrorOf is an owner's mirror stamped with the org IP-allow-list
+// blockedAcmeMirror is acme's mirror stamped with the org IP-allow-list
 // block at testBlockObservedAt — the one block every end-to-end case here
 // renders, so the fixtures read as what they are.
-func blockedMirrorOf(owner string) coreapi.Mirror {
-	m := mirrorOf(owner)
+func blockedAcmeMirror() coreapi.Mirror {
+	m := mirrorOf("acme")
 	m.SyncBlock = coreapi.NewOptMirrorSyncBlock(coreapi.MirrorSyncBlock{Reason: syncBlockOrgIPAllowlist, ObservedAt: testBlockObservedAt})
 	return m
 }
@@ -73,14 +73,40 @@ func TestLookupMirrorSyncBlock(t *testing.T) {
 	ctx := t.Context()
 	wantBlock := mirrorSyncBlock{Reason: syncBlockOrgIPAllowlist, ObservedAt: testBlockObservedAt}
 
-	t.Run("reads the entry's first placement by its mirror ID", func(t *testing.T) {
+	t.Run("reads the entry's canonical placement by its mirror ID", func(t *testing.T) {
 		t.Parallel()
-		f := &fakeMirrorGetterByID{mirrors: map[string]coreapi.Mirror{"m-eu": blockedMirrorOf("acme"), "m-us": blockedMirrorOf("acme")}}
-		block, blocked, err := lookupMirrorSyncBlock(ctx, f, entryWithMirrorIDs("acme/web", "m-eu", "m-us"))
+		// Core sorts placements by ULID and sets the entry's own id to the
+		// caller's home copy, so the read must go by the entry id, not the
+		// first placement, or it takes a cross-cell hop it never needed.
+		f := &fakeMirrorGetterByID{mirrors: map[string]coreapi.Mirror{"m-eu": blockedAcmeMirror(), "m-us": blockedAcmeMirror()}}
+		entry := entryWithMirrorIDs("acme/web", "m-eu", "m-us")
+		entry.ID = "m-us"
+		block, blocked, err := lookupMirrorSyncBlock(ctx, f, entry)
 		require.NoError(t, err)
 		require.True(t, blocked)
 		require.Equal(t, wantBlock, block)
-		require.Equal(t, []string{"m-eu"}, f.gets, "one placement answers for the whole installation")
+		require.Equal(t, []string{"m-us"}, f.gets, "the home copy answers for the whole installation")
+	})
+
+	t.Run("an entry without its own id falls back to the first placement with one", func(t *testing.T) {
+		t.Parallel()
+		f := &fakeMirrorGetterByID{mirrors: map[string]coreapi.Mirror{"m-eu": blockedAcmeMirror()}}
+		_, blocked, err := lookupMirrorSyncBlock(ctx, f, entryWithMirrorIDs("acme/web", "", "m-eu"))
+		require.NoError(t, err)
+		require.True(t, blocked)
+		require.Equal(t, []string{"m-eu"}, f.gets)
+	})
+
+	t.Run("a reason that cleans to nothing is still a block, with no enum to show", func(t *testing.T) {
+		t.Parallel()
+		m := mirrorOf("acme")
+		m.SyncBlock = coreapi.NewOptMirrorSyncBlock(coreapi.MirrorSyncBlock{Reason: "\x1b\x07", ObservedAt: testBlockObservedAt})
+		f := &fakeMirrorGetterByID{mirrors: map[string]coreapi.Mirror{"m": m}}
+		block, blocked, err := lookupMirrorSyncBlock(ctx, f, entryWithMirrorIDs("acme/web", "m"))
+		require.NoError(t, err)
+		require.True(t, blocked)
+		require.Empty(t, block.Reason)
+		require.Equal(t, "GitHub blocks the Entire app installation for acme, so its mirrors cannot sync from GitHub.", syncBlockProblem("acme", block.Reason))
 	})
 
 	t.Run("an entry whose placements carry no ID makes no read", func(t *testing.T) {
@@ -174,12 +200,14 @@ func TestSyncBlockWording(t *testing.T) {
 		{syncBlockOrgIPAllowlist, "IP allow list of the acme organization blocks Entire", "Ask an admin of the acme organization"},
 		{syncBlockInstallationSuspended, "is suspended", "Ask an admin of acme on GitHub to unsuspend"},
 		{"something_new", "(something_new)", "restore the Entire app's access"},
+		{"", "for acme, so", "restore the Entire app's access"},
 	} {
 		t.Run(tc.reason, func(t *testing.T) {
 			t.Parallel()
 			require.Contains(t, syncBlockProblem("acme", tc.reason), tc.problem)
 			require.Contains(t, syncBlockFix("acme", tc.reason), tc.fix)
-			if tc.reason != "something_new" {
+			require.NotContains(t, syncBlockProblem("acme", tc.reason), "()", "an empty reason shows no empty brackets")
+			if tc.reason != "something_new" && tc.reason != "" {
 				require.NotContains(t, syncBlockProblem("acme", tc.reason), tc.reason, "a known reason is spelled for the org admin, never as Entire's enum")
 			}
 		})
@@ -315,7 +343,7 @@ func (d *blockedDirectory) serve(t *testing.T) {
 			owner := strings.TrimPrefix(r.URL.Path, "/api/v1/mirrors/m-")
 			m := mirrorOf(owner)
 			if owner == "acme" {
-				m = blockedMirrorOf("acme")
+				m = blockedAcmeMirror()
 			}
 			writeJSONResponse(t, w, http.StatusOK, &m)
 		default:
