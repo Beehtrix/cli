@@ -99,6 +99,33 @@ func TestClaudeUsage_Convert(t *testing.T) {
 			},
 		},
 		{
+			name: "a call whose first fragment has no visible content counts its usage on the first visible line",
+			input: `{"type":"assistant","timestamp":"t1","message":{"id":"m1","model":"c","content":[{"type":"thinking","thinking":"hm"}],"usage":{"input_tokens":3,"output_tokens":5}}}
+{"type":"user","timestamp":"t2","message":{"content":[{"type":"tool_result","tool_use_id":"x","content":"ok"}]}}
+{"type":"assistant","timestamp":"t3","message":{"id":"m1","content":[{"type":"thinking","thinking":"hm"}]}}
+{"type":"user","timestamp":"t4","message":{"content":[{"type":"tool_result","tool_use_id":"y","content":"ok"}]}}
+{"type":"assistant","timestamp":"t5","message":{"id":"m1","content":[{"type":"text","text":"b"}],"usage":{"input_tokens":3,"output_tokens":4}}}
+{"type":"user","timestamp":"t6","message":{"content":[{"type":"tool_result","tool_use_id":"z","content":"ok"}]}}
+{"type":"assistant","timestamp":"t7","message":{"id":"m1","content":[{"type":"text","text":"c"}],"usage":{"input_tokens":3,"output_tokens":9}}}
+`,
+			want: []map[string]string{
+				{"ts": `"t5"`, "model": `"c"`, "input_tokens": "3", "output_tokens": "9"},
+				{"ts": `"t7"`},
+			},
+		},
+		{
+			name: "a first message that gains blocks after null content keeps the call's usage",
+			input: `{"type":"assistant","timestamp":"t1","message":{"id":"m1","model":"c","content":null,"usage":{"input_tokens":3,"output_tokens":5}}}
+{"type":"assistant","timestamp":"t2","message":{"id":"m1","content":[{"type":"tool_use","id":"x","name":"n","input":{}}]}}
+{"type":"user","timestamp":"t3","message":{"content":[{"type":"tool_result","tool_use_id":"x","content":"ok"}]}}
+{"type":"assistant","timestamp":"t4","message":{"id":"m1","content":[{"type":"text","text":"b"}],"usage":{"input_tokens":3,"output_tokens":9}}}
+`,
+			want: []map[string]string{
+				{"ts": `"t2"`, "model": `"c"`, "input_tokens": "3", "output_tokens": "9"},
+				{"ts": `"t4"`},
+			},
+		},
+		{
 			name: "reused message id on non-adjacent messages does not share usage",
 			input: `{"type":"assistant","timestamp":"t1","message":{"id":"m1","model":"c","content":[{"type":"text","text":"a"}],"usage":{"input_tokens":1,"output_tokens":4}}}
 {"type":"user","timestamp":"t2","message":{"content":"hi"}}

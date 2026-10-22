@@ -26,7 +26,9 @@ import (
 //     and the first fragment naming a model supplies its model. Tool-result
 //     lines between fragments of one message ID do not split the API call:
 //     later fragments become continuation messages that carry no usage, and
-//     any improved snapshot goes to the original message in a usage record.
+//     any improved snapshot goes to the call's first visible message in a
+//     usage record. A message whose content is empty has no line, so the
+//     next fragment takes over the call's usage instead of continuing it.
 //
 // Fold keys are the agent's message ID where it has one and it is unused,
 // otherwise derived from the source line number (1-based, counting every line
@@ -52,6 +54,7 @@ type openAssistant struct {
 	key     string
 	entry   parsedEntry // the message as last restated
 	isArray bool        // whether the merged content is a JSON array
+	visible bool        // whether the merged content gives the message a line
 
 	// owner holds the usage state of the API call this fragment belongs to:
 	// the message itself, or the earlier message of an interrupted call.
@@ -121,10 +124,14 @@ func (a *jsonlAdapter) consumeLine(lineBytes []byte, out []Record) []Record {
 func (a *jsonlAdapter) assistant(e parsedEntry, out []Record) []Record {
 	o := a.open
 	if o == nil || o.entry.id != e.id {
-		o = &openAssistant{key: a.newKey(e.id), entry: e, isArray: isJSONArray(e.content)}
+		o = &openAssistant{key: a.newKey(e.id), entry: e, isArray: isJSONArray(e.content), visible: !isEmptyContentArray(e.content)}
 		o.owner = o
 		if a.perCallUsage && e.id != "" && a.prev != nil && a.prev.entry.id == e.id {
-			o.owner = a.prev.owner
+			if call := a.prev.owner; call.visible {
+				o.owner = call
+			} else {
+				o.usage, o.model = call.usage, call.model
+			}
 		}
 		a.open, a.prev = o, o
 		usage, out := o.usageUpdate(e, a.perCallUsage, out)
@@ -149,9 +156,11 @@ func (a *jsonlAdapter) assistant(e parsedEntry, out []Record) []Record {
 			o.entry.content = e.content
 		}
 		o.isArray = add
+		o.visible = !isEmptyContentArray(o.entry.content)
 		return append(out, o.message(usage))
 	}
 	content := e.content
+	o.visible = o.visible || (add && !isEmptyContentArray(content))
 	if !add {
 		// A non-array fragment adds no blocks to array content but still
 		// carries the timestamp and usage. Restating the whole message
