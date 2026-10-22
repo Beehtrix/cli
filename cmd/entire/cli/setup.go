@@ -2421,6 +2421,8 @@ func setupAgentHooksNonInteractive(ctx context.Context, w io.Writer, ag agent.Ag
 		}
 	}
 
+	printSetupCheckpointDestinationNote(ctx, w)
+
 	return nil
 }
 

@@ -28,12 +28,16 @@ func TestEnable_PrivacyNotice(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		noRemote bool
+		fork     bool
 		before   []string
 		args     []string
 		// after is setup output the notice must follow.
 		after, notice string
 	}{
 		{name: "agent", args: enableAgent, after: "Ready.", notice: "Checkpoints will be uploaded when you push to origin.\n" + privacy},
+		// Nothing pins the destination, so the line naming it is only the
+		// current election and must come with the note that says so.
+		{name: "agent with two remotes", fork: true, args: enableAgent, after: "Note: this repo's remotes make the checkpoint destination ambiguous.", notice: "Checkpoints will be uploaded when you push to origin.\n" + privacy},
 		{name: "yes", args: []string{"enable", "--yes", "--telemetry=false"}, after: "Ready.", notice: "Checkpoints will be uploaded when you push to origin.\n" + privacy},
 		{name: "rerun", before: enableAgent, args: []string{"enable"}, after: "Entire is already enabled.", notice: "Checkpoints will be uploaded when you push to origin.\n" + privacy},
 		{name: "push disabled", args: append(enableAgent, "--skip-push-sessions"), after: "Ready.", notice: "Checkpoint uploads are off (push_sessions: false). Checkpoints stay in this clone.\n" + redaction},
@@ -44,6 +48,9 @@ func TestEnable_PrivacyNotice(t *testing.T) {
 			env := freshRepoEnv(t)
 			if !tc.noRemote {
 				env.SetupBareRemote()
+			}
+			if tc.fork {
+				env.SetupNamedBareRemote(forkRemote)
 			}
 			if tc.before != nil {
 				env.RunCLI(tc.before...)
