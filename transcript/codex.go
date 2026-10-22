@@ -83,7 +83,7 @@ type codexCall struct {
 	ts    string
 	text  string
 	tools []map[string]json.RawMessage
-	usage *codexCallUsage
+	usage *CallUsage
 }
 
 // codexEntry is one output line: a user line, or an assistant call rendered
@@ -322,10 +322,10 @@ func (c *codexConverter) renderEntries() [][]byte {
 		line.Content = codexBuildContent(call.text, call.tools)
 		if u := call.usage; u != nil {
 			line.Model = u.Model
-			line.InputTokens = u.Input
-			line.CacheReadTokens = u.CacheRead
-			line.OutputTokens = u.Output
-			line.ReasoningTokens = u.Reasoning
+			line.InputTokens = u.InputTokens
+			line.CacheReadTokens = u.CacheReadTokens
+			line.OutputTokens = u.OutputTokens
+			line.ReasoningTokens = u.ReasoningTokens
 		}
 		appendLine(&out[i], line)
 	}

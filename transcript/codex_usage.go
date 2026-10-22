@@ -11,16 +11,6 @@ type codexUsage struct {
 	Reasoning *int64
 }
 
-// codexCallUsage is the usage of one model call: the difference between two
-// cumulative snapshots. Input excludes cache reads.
-type codexCallUsage struct {
-	Model     string
-	Input     int64
-	CacheRead int64
-	Output    int64
-	Reasoning int64
-}
-
 type codexUsageTracker struct {
 	previous      codexUsage
 	lastReasoning int64
@@ -33,31 +23,32 @@ func newCodexUsageTracker() *codexUsageTracker {
 
 func (t *codexUsageTracker) stopped() bool { return t.halted }
 
-// next returns the usage of the call that ended at total. ok is false for a
+// next returns the usage of the call that ended at total, the difference
+// between two cumulative snapshots, without a model. ok is false for a
 // repeated snapshot (no model call; the baseline is kept) and once a counter
 // decrease has stopped collection.
-func (t *codexUsageTracker) next(total codexUsage) (d codexCallUsage, ok bool) {
+func (t *codexUsageTracker) next(total codexUsage) (d CallUsage, ok bool) {
 	if t.halted {
-		return codexCallUsage{}, false
+		return CallUsage{}, false
 	}
 	prev := t.previous
 	if total.Input < prev.Input || total.Cached < prev.Cached || total.Output < prev.Output ||
 		(total.Reasoning != nil && *total.Reasoning < t.lastReasoning) {
 		t.halted = true
-		return codexCallUsage{}, false
+		return CallUsage{}, false
 	}
 	// Rate-limit refreshes repeat totals without a model call.
 	if total.Input == prev.Input && total.Cached == prev.Cached && total.Output == prev.Output {
-		return codexCallUsage{}, false
+		return CallUsage{}, false
 	}
-	d = codexCallUsage{
-		Input:     max(int64(0), (total.Input-prev.Input)-(total.Cached-prev.Cached)),
-		CacheRead: total.Cached - prev.Cached,
-		Output:    total.Output - prev.Output,
+	d = CallUsage{
+		InputTokens:     max(int64(0), (total.Input-prev.Input)-(total.Cached-prev.Cached)),
+		CacheReadTokens: total.Cached - prev.Cached,
+		OutputTokens:    total.Output - prev.Output,
 	}
 	// Only adjacent snapshots can establish reasoning usage across a gap.
 	if total.Reasoning != nil && prev.Reasoning != nil {
-		d.Reasoning = *total.Reasoning - *prev.Reasoning
+		d.ReasoningTokens = *total.Reasoning - *prev.Reasoning
 	}
 	if total.Reasoning != nil {
 		t.lastReasoning = *total.Reasoning
