@@ -26,6 +26,9 @@ func TestDetectPII_IPRedacted(t *testing.T) {
 		{"ipv6 link-local short", "via fe80::1", "via [REDACTED_IP]"},
 		{"ipv6 bracketed URL host", "http://[fd00::5]:8080/x", "http://[[REDACTED_IP]]:8080/x"},
 		{"ipv4-mapped ipv6", "peer ::ffff:10.0.0.1", "peer [REDACTED_IP]"},
+		{"ipv6 before a colon", "connect to fe80::1: unreachable", "connect to [REDACTED_IP]: unreachable"},
+		{"ipv6 full before a colon", "fd12::1:2:3: timeout", "[REDACTED_IP]: timeout"},
+		{"ipv6 ending in ::", "allow 2606:4700:cf1::/48", "allow [REDACTED_IP]/48"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

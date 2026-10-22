@@ -224,9 +224,14 @@ func detectPII(cfg *PIIConfig, s string) []taggedRegion {
 			if p.label == labelPhone && loc[1] < len(s) && s[loc[1]] >= '0' && s[loc[1]] <= '9' {
 				continue
 			}
-			// IP candidates are only shapes; isRedactableIP validates them.
-			if p.label == labelIP && !isRedactableIP(s, loc[0], loc[1]) {
-				continue
+			// IP candidates are only shapes; redactableIPEnd validates them
+			// and may shorten the match.
+			if p.label == labelIP {
+				end, ok := redactableIPEnd(s, loc[0], loc[1])
+				if !ok {
+					continue
+				}
+				loc[1] = end
 			}
 			regions = append(regions, taggedRegion{
 				region: region{loc[0], loc[1]},

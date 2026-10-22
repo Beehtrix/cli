@@ -45,30 +45,37 @@ const (
 // networks such as Tailscale use; netip does not classify it as private.
 var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
-// isRedactableIP reports whether the candidate s[start:end] is an IP address
-// that should be redacted. It validates the address, rejects candidates that
-// are part of a longer token, skips addresses that identify nothing
-// (loopback, unspecified, 0.0.0.0/8, broadcast), and requires the context
-// described above.
-func isRedactableIP(s string, start, end int) bool {
+// redactableIPEnd reports whether the candidate s[start:end] is an IP address
+// that should be redacted, and where it ends. It validates the address,
+// rejects candidates that are part of a longer token, skips addresses that
+// identify nothing (loopback, unspecified, 0.0.0.0/8, broadcast), and
+// requires the context described above.
+func redactableIPEnd(s string, start, end int) (int, bool) {
 	addr, err := netip.ParseAddr(s[start:end])
+	// The IPv6 candidate regex also takes a colon that follows the address
+	// ("fe80::1: unreachable"); drop it and validate what precedes it. A
+	// trailing "::" is part of the address and parses as is.
+	if err != nil && end-start > 2 && s[end-1] == ':' && s[end-2] != ':' {
+		end--
+		addr, err = netip.ParseAddr(s[start:end])
+	}
 	if err != nil {
-		return false
+		return 0, false
 	}
 	addr = addr.Unmap()
 	if !ipStandsAlone(s, start, end, addr) {
-		return false
+		return 0, false
 	}
 	if addr.IsLoopback() || addr.IsUnspecified() {
-		return false
+		return 0, false
 	}
 	if addr.Is4() {
 		b := addr.As4()
 		if b[0] == 0 || b == [4]byte{255, 255, 255, 255} {
-			return false
+			return 0, false
 		}
 	}
-	return ipHasContext(s, start, end, addr)
+	return end, ipHasContext(s, start, end, addr)
 }
 
 // ipStandsAlone rejects a candidate that continues a longer token on either
