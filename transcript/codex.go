@@ -102,13 +102,14 @@ type codexToolSlot struct {
 type codexConverter struct {
 	base    transcriptLine
 	tracker *codexUsageTracker
-	model   string
-	entries []codexEntry
-	open    *codexCall
-	// awaiting is a call whose tools have returned but whose token_count has
-	// not arrived yet; Codex emits the usage event after the tool outputs.
-	awaiting *codexCall
-	tools    map[string]codexToolSlot
+	// snapshots is true when the transcript has a usable total_token_usage
+	// snapshot. Calls then end only at a snapshot or user line; otherwise a
+	// tool output also ends its call.
+	snapshots bool
+	model     string
+	entries   []codexEntry
+	open      *codexCall
+	tools     map[string]codexToolSlot
 }
 
 // compactCodex converts a Codex JSONL transcript into the compact format.
@@ -127,28 +128,48 @@ func compactCodex(content []byte, opts Options) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	c := &codexConverter{
-		base:    newTranscriptLine(opts),
-		tracker: newCodexUsageTracker(),
-		tools:   map[string]codexToolSlot{},
-	}
+	var prefix []codexLine
 	if opts.StartLine > 0 {
-		// Counters are cumulative for the whole session, so the skipped prefix
-		// sets the baseline for the first snapshot in the slice; its lines are not emitted.
-		prefix, err := parseCodexLines(full[:len(full)-len(content)])
-		if err != nil {
+		if prefix, err = parseCodexLines(full[:len(full)-len(content)]); err != nil {
 			return nil, err
 		}
-		for _, cl := range prefix {
-			c.consume(cl)
-		}
-		c.entries, c.open, c.awaiting = nil, nil, nil
 	}
+
+	c := &codexConverter{
+		base:      newTranscriptLine(opts),
+		tracker:   newCodexUsageTracker(),
+		snapshots: codexHasSnapshots(prefix) || codexHasSnapshots(lines),
+		tools:     map[string]codexToolSlot{},
+	}
+	// Counters are cumulative for the whole session, so the skipped prefix
+	// seeds the usage baseline. The call still open at StartLine is part of the
+	// slice when the slice adds its outputs or closing snapshot.
+	for _, cl := range prefix {
+		c.consume(cl)
+	}
+	before := c.renderEntries()
+	start := len(before)
+	openAtStart := c.open != nil
 	for _, cl := range lines {
 		c.consume(cl)
 	}
-	return c.render(), nil
+	after := c.renderEntries()
+	if openAtStart && !bytes.Equal(before[start-1], after[start-1]) {
+		start--
+	}
+	return bytes.Join(after[start:], nil), nil
+}
+
+func codexHasSnapshots(lines []codexLine) bool {
+	for _, cl := range lines {
+		if !isCodexTokenCountLine(cl) {
+			continue
+		}
+		if _, ok := codexTokenCountTotal(cl.Payload); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *codexConverter) consume(cl codexLine) {
@@ -175,7 +196,6 @@ func (c *codexConverter) noteModel(payload json.RawMessage) {
 // moves its timestamp to ts unless ts is empty.
 func (c *codexConverter) openCall(ts string) *codexCall {
 	if c.open == nil {
-		c.awaiting = nil
 		c.open = &codexCall{}
 		c.entries = append(c.entries, codexEntry{call: c.open})
 	}
@@ -186,9 +206,8 @@ func (c *codexConverter) openCall(ts string) *codexCall {
 }
 
 // tokenCount attaches the usage delta of a new snapshot to the open call, else
-// to the call awaiting it, else to a new empty call. Repeated snapshots change
-// nothing; once a counter decrease has halted usage, every snapshot just closes
-// the call.
+// to a new empty call, and closes it. Repeated snapshots change nothing; once a
+// counter decrease has halted usage, every snapshot closes the call without usage.
 func (c *codexConverter) tokenCount(cl codexLine) {
 	total, ok := codexTokenCountTotal(cl.Payload)
 	if !ok {
@@ -201,15 +220,15 @@ func (c *codexConverter) tokenCount(cl codexLine) {
 		if d.Model == "" {
 			d.Model = unknownModel
 		}
-		if c.open == nil {
-			c.open = c.awaiting
-		}
-		call := c.openCall(cl.ts())
-		call.usage = &d
-		c.open, c.awaiting = nil, nil
+		c.openCall(cl.ts()).usage = &d
 	case c.tracker.stopped():
-		c.open, c.awaiting = nil, nil
+		if c.open != nil {
+			c.openCall(cl.ts())
+		}
+	default:
+		return
 	}
+	c.open = nil
 }
 
 func (c *codexConverter) responseItem(cl codexLine) {
@@ -219,8 +238,8 @@ func (c *codexConverter) responseItem(cl codexLine) {
 		if slot, ok := c.tools[callID]; ok && slot.outputType == typ {
 			output := codexToolOutputText(cl.Payload, typ)
 			slot.block["result"] = buildToolResult(toolResultEntry{output: output})
-			if c.open == slot.call {
-				c.awaiting, c.open = slot.call, nil
+			if !c.snapshots && c.open == slot.call {
+				c.open = nil
 			}
 		}
 		return
@@ -280,15 +299,17 @@ func (c *codexConverter) user(ts, text string) {
 	line.Type = TypeUser
 	line.TS = codexTSJSON(ts)
 	line.Content = contentJSON
-	c.open, c.awaiting = nil, nil
+	c.open = nil
 	c.entries = append(c.entries, codexEntry{user: line})
 }
 
-func (c *codexConverter) render() []byte {
-	var result []byte
-	for _, e := range c.entries {
+// renderEntries renders each entry to its output line, or to nothing for an
+// empty call, so callers can compare entries before and after more input.
+func (c *codexConverter) renderEntries() [][]byte {
+	out := make([][]byte, len(c.entries))
+	for i, e := range c.entries {
 		if e.call == nil {
-			appendLine(&result, e.user)
+			appendLine(&out[i], e.user)
 			continue
 		}
 		call := e.call
@@ -306,9 +327,9 @@ func (c *codexConverter) render() []byte {
 			line.OutputTokens = u.Output
 			line.ReasoningTokens = u.Reasoning
 		}
-		appendLine(&result, line)
+		appendLine(&out[i], line)
 	}
-	return result
+	return out
 }
 
 // parseCodexLines reads all JSONL lines, keeping response_item,

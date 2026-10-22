@@ -171,8 +171,30 @@ func TestCompact_CodexInlineCases(t *testing.T) {
 			expected: []string{
 				cxPre + `"type":"user","ts":"t01","content":[{"text":"go"}]}`,
 				cxPre + `"type":"assistant","ts":"t03","model":"gpt-a","input_tokens":10,"output_tokens":4,"reasoning_tokens":2,"content":[{"type":"text","text":"one"}]}`,
-				cxPre + `"type":"assistant","ts":"t04","content":[{"type":"text","text":"two"}]}`,
-				cxPre + `"type":"assistant","ts":"t06","content":[{"type":"text","text":"three"}]}`,
+				cxPre + `"type":"assistant","ts":"t05","content":[{"type":"text","text":"two"}]}`,
+				cxPre + `"type":"assistant","ts":"t07","content":[{"type":"text","text":"three"}]}`,
+			},
+		},
+		{
+			name: "interleaved calls and outputs before one snapshot stay one call",
+			input: cxJoin(cxUser("t1", "go"), cxCall("t2", "c1"), cxOutput("t3", "c1", "ok"),
+				cxCall("t4", "c2"), cxOutput("t5", "c2", "ok"), cxTokens("t6", 10, 0, 4)),
+			expected: []string{
+				cxPre + `"type":"user","ts":"t1","content":[{"text":"go"}]}`,
+				cxPre + `"type":"assistant","ts":"t6","model":"unknown","input_tokens":10,"output_tokens":4,"content":[` + c1 + `,` + strings.Replace(c1, `"c1"`, `"c2"`, 1) + `]}`,
+			},
+		},
+		{
+			name: "a snapshot missing a counter neither closes a call nor moves the baseline",
+			input: cxJoin(cxUser("t1", "go"), cxMessage("t2", "a"), cxTokens("t3", 10, 0, 4),
+				cxMessage("t4", "b"),
+				`{"timestamp":"t5","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"output_tokens":8}}}}`,
+				`{"timestamp":"t6","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{}}}}`,
+				cxTokens("t7", 20, 2, 9)),
+			expected: []string{
+				cxPre + `"type":"user","ts":"t1","content":[{"text":"go"}]}`,
+				cxPre + `"type":"assistant","ts":"t3","model":"unknown","input_tokens":10,"output_tokens":4,"content":[{"type":"text","text":"a"}]}`,
+				cxPre + `"type":"assistant","ts":"t7","model":"unknown","input_tokens":8,"cache_read_tokens":2,"output_tokens":5,"content":[{"type":"text","text":"b"}]}`,
 			},
 		},
 		{
@@ -390,4 +412,62 @@ func TestCompact_CodexStartLine_SeedsUsageFromSkippedPrefix(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertJSONLines(t, result, expected)
+}
+
+func TestCompact_CodexStartLine_IncludesTheCallOpenAtTheBoundary(t *testing.T) {
+	t.Parallel()
+
+	tool := func(id string) string {
+		return `{"type":"tool_use","id":"` + id + `","name":"exec_command","input":{"cmd":"x"},"result":{"output":"ok","status":"success"}}`
+	}
+	tests := []struct {
+		name      string
+		input     []byte
+		startLine int
+		want      []string
+	}{
+		{
+			name: "outputs and closing snapshot for the open call",
+			input: cxJoin(cxUser("t1", "go"), cxCall("t2", "c1"), cxCall("t3", "c2"), cxOutput("t4", "c1", "ok"),
+				cxOutput("t5", "c2", "ok"), cxTokens("t6", 10, 0, 4)),
+			startLine: 4,
+			want: []string{
+				cxPre + `"type":"assistant","ts":"t6","model":"unknown","input_tokens":10,"output_tokens":4,"content":[` + tool("c1") + `,` + tool("c2") + `]}`,
+			},
+		},
+		{
+			name:      "closing snapshot for the open call",
+			input:     cxJoin(cxUser("t1", "go"), cxCall("t2", "c1"), cxOutput("t3", "c1", "ok"), cxTokens("t4", 10, 0, 4)),
+			startLine: 3,
+			want: []string{
+				cxPre + `"type":"assistant","ts":"t4","model":"unknown","input_tokens":10,"output_tokens":4,"content":[` + tool("c1") + `]}`,
+			},
+		},
+		{
+			name: "calls closed before the boundary are not repeated",
+			input: cxJoin(cxUser("t1", "go"), cxCall("t2", "c1"), cxTokens("t3", 10, 0, 4),
+				cxUser("t4", "next"), cxMessage("t5", "b"), cxTokens("t6", 20, 0, 8),
+				cxOutput("t7", "c1", "ok")),
+			startLine: 6,
+			want:      nil,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			opts := Options{Agent: "codex", CLIVersion: "0.5.1", StartLine: tc.startLine}
+
+			delta, err := Convert(tc.input, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertJSONLines(t, delta, tc.want)
+
+			full, boundary, err := ConvertWithBoundary(tc.input, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertJSONLines(t, []byte(strings.Join(nonEmptyLines(full)[boundary:], "\n")+"\n"), tc.want)
+		})
+	}
 }
