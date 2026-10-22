@@ -317,7 +317,20 @@ func candidateEntry(fullName, visibility string, access coreapi.RepoCandidateAcc
 const (
 	testClustersPath = "/api/v1/clusters"
 	testReposPath    = "/api/v1/repos"
+	testMirrorsPath  = "/api/v1/mirrors"
 )
+
+// serveNoSyncBlocks answers the sync-block walk `list` and `view` make over
+// GET /mirrors with an empty, final page — no mirror visible, so no block —
+// so a fake that is about something else never has to know the walk exists.
+// A test about the block itself serves the endpoint on its own (see
+// repo_mirror_sync_test.go).
+func serveNoSyncBlocks(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	assert.Equal(t, repoProviderGitHub, r.URL.Query().Get("provider"))
+	assert.Empty(t, r.URL.Query().Get("owner"), "the walk is unfiltered: the server filters after cutting the page")
+	writeJSONResponse(t, w, http.StatusOK, &coreapi.ListMirrorsOutputBody{})
+}
 
 // bulkEntries builds n onboarded /repos entries named <prefix>/repo-0000…,
 // for tests that need to cross the fetch budget.
@@ -353,6 +366,8 @@ func serveRepoList(t *testing.T, repos []coreapi.RepoIndexEntry, clusters []core
 				t.Errorf("encode repos response: %v", err)
 			}
 			recCh <- recordedRequest{method: r.Method, path: r.URL.Path, query: r.URL.Query()}
+		case testMirrorsPath:
+			serveNoSyncBlocks(t, w, r)
 		default:
 			t.Errorf("unexpected path %q", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -428,6 +443,8 @@ func serveRepoListPaged(t *testing.T, pages []coreapi.ListReposOutputBody, clust
 				t.Errorf("encode repos response: %v", err)
 			}
 			recCh <- recordedRequest{method: r.Method, path: r.URL.Path, query: r.URL.Query()}
+		case testMirrorsPath:
+			serveNoSyncBlocks(t, w, r)
 		default:
 			t.Errorf("unexpected path %q", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -458,6 +475,8 @@ func serveRepoListClustersError(t *testing.T, repos []coreapi.RepoIndexEntry) {
 			if err := printJSON(w, &coreapi.ListReposOutputBody{Repos: repos}); err != nil {
 				t.Errorf("encode repos response: %v", err)
 			}
+		case testMirrorsPath:
+			serveNoSyncBlocks(t, w, r)
 		default:
 			t.Errorf("unexpected path %q", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -1252,6 +1271,8 @@ func TestRepoView_Routing(t *testing.T) {
 			case testReposPath:
 				gotFilter = r.URL.Query().Get("filter")
 				assert.NoError(t, printJSON(w, &coreapi.ListReposOutputBody{Repos: repos}))
+			case testMirrorsPath:
+				serveNoSyncBlocks(t, w, r)
 			default:
 				t.Errorf("unexpected path %q", r.URL.Path)
 				w.WriteHeader(http.StatusNotFound)
@@ -1347,6 +1368,8 @@ func TestRepoView_Routing(t *testing.T) {
 						{ClusterSlug: "us", Status: coreapi.RepoPlacementStatusReady, Mirror: true},
 					}},
 				}}))
+			case testMirrorsPath:
+				serveNoSyncBlocks(t, w, r)
 			default:
 				t.Errorf("unexpected path %q", r.URL.Path)
 				w.WriteHeader(http.StatusNotFound)

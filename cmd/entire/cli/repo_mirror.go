@@ -189,6 +189,12 @@ type repoDirRow struct {
 	State           string             `json:"state,omitempty"`
 	ProvisionReason string             `json:"provisionReason,omitempty"`
 	Placements      []repoDirPlacement `json:"placements,omitempty"`
+	// SyncBlock is set when GitHub blocks the Entire installation serving this
+	// repo's owner, so no placement is being kept current. It sits on the row
+	// rather than on a placement because the block is per installation (see
+	// lookupOwnerSyncBlock). Read from /mirrors, not the directory: the /repos
+	// placements do not carry it. Absent for candidates and native repos.
+	SyncBlock *mirrorSyncBlock `json:"syncBlock,omitempty"`
 }
 
 // visibilityOf renders a wire visibility string as the tri-state Private field:
@@ -244,7 +250,13 @@ func repoDirClusters(r repoDirRow) string {
 }
 
 func repoDirCells(r repoDirRow) []string {
-	return []string{r.Repo, orDash(repoDirClusters(r)), visibilityDisplay(r.Private), r.Status, orDash(r.Access)}
+	// The qualifier rides on the cell, not on Status: --status keeps matching
+	// the lifecycle word, and --json carries the block as its own field.
+	status := r.Status
+	if r.SyncBlock != nil {
+		status += syncBlockQualifier
+	}
+	return []string{r.Repo, orDash(repoDirClusters(r)), visibilityDisplay(r.Private), status, orDash(r.Access)}
 }
 
 // repoDirCellsStyled wraps repoDirCells with trail-list-style cell coloring:
@@ -265,9 +277,17 @@ func repoDirCellsStyled(st statusStyles) func(repoDirRow) []string {
 			cells[1] = st.render(st.cyan, cells[1])
 		}
 		cells[2] = st.render(visibilityColor(st, r.Private), cells[2])
+		// The lifecycle word keeps its lifecycle colour; the qualifier is
+		// red on its own, so a blocked `ready` row does not read as healthy
+		// green from across the room.
+		status := r.Status
 		if style, ok := repoStatusColor(st, r.Status); ok {
-			cells[3] = st.render(style, cells[3])
+			status = st.render(style, status)
 		}
+		if r.SyncBlock != nil {
+			status += st.render(st.red, syncBlockQualifier)
+		}
+		cells[3] = status
 		if cells[4] != "-" {
 			cells[4] = st.render(st.cyan, cells[4])
 		}
@@ -650,6 +670,7 @@ func newRepoMirrorCmd() *cobra.Command {
 	cmd.AddCommand(newRepoMirrorAddCmd())
 	cmd.AddCommand(newRepoMirrorListCmd())
 	cmd.AddCommand(newRepoMirrorRemoveCmd())
+	cmd.AddCommand(newRepoMirrorResyncCmd())
 	cmd.AddCommand(newRepoMirrorDetachCmd())
 	return requireSubcommand(cmd)
 }
@@ -1154,6 +1175,9 @@ func runRepoMirrorListPage(cmd *cobra.Command, o repoMirrorListOpts, headers []s
 		if err != nil {
 			return err
 		}
+		if err := noteSyncStatusUnavailable(ctx, cmd.ErrOrStderr(), annotateSyncBlocks(ctx, c, rows)); err != nil {
+			return err
+		}
 		return renderCoreListPage(cmd, "No repos found.", headers, cells, rows, next)
 	})
 }
@@ -1221,6 +1245,13 @@ func runRepoMirrorListWalk(cmd *cobra.Command, o repoMirrorListOpts, headers []s
 		// "the first N rows of the table you would have seen".
 		if o.limit > 0 && len(rows) > o.limit {
 			rows = rows[:o.limit]
+		}
+		// After the cap, so the walk stops as soon as the owners of the rows
+		// shown are seen, not the whole fetched window's. A failed lookup is
+		// a note, not a failure: the directory is still right about
+		// everything else — unless the failure is the user interrupting.
+		if err := noteSyncStatusUnavailable(ctx, cmd.ErrOrStderr(), annotateSyncBlocks(ctx, c, rows)); err != nil {
+			return nil, err
 		}
 		return rows, nil
 	})
@@ -1345,7 +1376,14 @@ func runRepoMirrorViewByName(cmd *cobra.Command, ref, clusterHost string) error 
 		if err != nil {
 			return err
 		}
-		row := mirrorRepoDetailRow(entry, clusterHostBySlug(clusters.Clusters))
+		rows := []repoDirRow{mirrorRepoDetailRow(entry, clusterHostBySlug(clusters.Clusters))}
+		// One row, same annotation the directory gets, so the two views
+		// never disagree about a block. A failed lookup is a note: the
+		// record is still right about everything else it shows.
+		if err := noteSyncStatusUnavailable(ctx, cmd.ErrOrStderr(), annotateSyncBlocks(ctx, c, rows)); err != nil {
+			return err
+		}
+		row := rows[0]
 		if jsonRequested(cmd) {
 			view := mirrorRepoViewJSON{repoDirRow: row}
 			view.RepoID, view.APIURL, err = repoViewCoords(entry, clusters.Clusters)
@@ -1433,6 +1471,9 @@ func renderRepoDetail(w io.Writer, row repoDirRow) {
 	// for (reportNativeMirrorNotes).
 	if row.Access != "" {
 		section("Access", row.Access)
+	}
+	if row.SyncBlock != nil {
+		renderSyncBlock(w, st, row.Repo, row.SyncBlock)
 	}
 	fmt.Fprintln(w)
 
