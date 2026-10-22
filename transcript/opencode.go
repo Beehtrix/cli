@@ -196,6 +196,13 @@ func openCodeToolResult(state map[string]json.RawMessage) json.RawMessage {
 	if s := unquote(state["status"]); s != "" && s != "completed" {
 		r.Status = ToolStatusError
 	}
+	// The task tool records the subagent's session once it starts.
+	var metadata struct {
+		SessionID string `json:"sessionId"`
+	}
+	if json.Unmarshal(state["metadata"], &metadata) == nil && metadata.SessionID != "" {
+		r.Agent = &ToolResultAgent{ID: metadata.SessionID}
+	}
 	b, err := json.Marshal(r)
 	if err != nil {
 		return nil

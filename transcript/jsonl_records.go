@@ -16,10 +16,14 @@ import (
 // targets:
 //   - Consecutive assistant entries with the same message ID are fragments of
 //     one message: the first opens it, the rest append to it.
-//   - Tool results in the user entry immediately after an assistant entry
-//     become result records on that assistant message. Results elsewhere are
-//     dropped, as is a user entry that held only such results.
-//   - The text and images of that user entry become a separate user message.
+//   - Tool results in user entries become result records on the assistant
+//     message holding the tool_use with their tool_use_id, wherever they fall
+//     until the next user entry with text or images (whose own results still
+//     count): Claude Code writes the results of parallel tool calls one user
+//     entry each, sometimes after the next assistant message began. A result
+//     without a tool_use_id targets the last assistant message. Other results
+//     are dropped, as is a user entry that held only such results.
+//   - The text and images of a user entry become a separate user message.
 //
 // Fold keys are the agent's message ID where it has one and it is unused,
 // otherwise derived from the source line number (1-based, counting every line
@@ -40,6 +44,12 @@ type JSONLAdapter struct {
 	line    int             // source lines consumed so far
 	keys    map[string]bool // fold keys handed out
 	open    *openAssistant  // set while the last parsed entry is an assistant
+	// results is the key of the last assistant message, which a result
+	// without a tool_use_id attaches to, or "" after a prompt.
+	results string
+	// toolUses maps the tool_use IDs seen since the last prompt to the key of
+	// the message holding each.
+	toolUses map[string]string
 }
 
 // openAssistant is the assistant message that further fragments, or the next
@@ -125,7 +135,15 @@ func (a *JSONLAdapter) consumeLine(lineBytes []byte, out []Record) []Record {
 	}
 	switch e.kind {
 	case TypeAssistant:
-		return a.assistant(e, out)
+		out = a.assistant(e, out)
+		a.results = a.open.key
+		for _, id := range e.toolUseIDs {
+			if a.toolUses == nil {
+				a.toolUses = make(map[string]string)
+			}
+			a.toolUses[id] = a.results
+		}
+		return out
 	case TypeUser:
 		return a.user(e, out)
 	}
@@ -177,25 +195,28 @@ func (a *JSONLAdapter) assistant(e parsedEntry, out []Record) []Record {
 }
 
 func (a *JSONLAdapter) user(e parsedEntry, out []Record) []Record {
-	o := a.open
 	a.open = nil
 
 	hasContent := e.userText != "" || len(e.userImages) > 0
-	if hasToolResults(e) {
-		if o != nil {
-			for _, tr := range e.toolResults {
-				out = append(out, Record{
-					Op:        OpResult,
-					ID:        o.key,
-					ToolUseID: tr.toolUseID,
-					Result:    toolResult(tr),
-				})
-			}
+	for _, tr := range e.toolResults {
+		target := a.results
+		if tr.toolUseID != "" {
+			target = a.toolUses[tr.toolUseID]
 		}
-		if !hasContent {
-			return out
+		if target == "" {
+			continue
 		}
+		out = append(out, Record{
+			Op:        OpResult,
+			ID:        target,
+			ToolUseID: tr.toolUseID,
+			Result:    toolResult(tr),
+		})
 	}
+	if hasToolResults(e) && !hasContent {
+		return out
+	}
+	a.results, a.toolUses = "", nil
 
 	content, err := userContentBlocks(e)
 	if err != nil {

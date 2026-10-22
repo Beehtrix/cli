@@ -37,7 +37,18 @@ not json
 {"type":"user","timestamp":"t2","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"ok"}]}}
 {"type":"assistant","timestamp":"t3","message":{"id":"m1","content":[{"type":"text","text":"done"}]}}
 `,
-	"result only from the immediately following user entry": `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{}}]}}
+	"parallel results in separate user entries": `{"type":"assistant","timestamp":"t1","message":{"id":"m1","stop_reason":"tool_use","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{}}]}}
+{"type":"assistant","timestamp":"t1","message":{"id":"m1","stop_reason":"tool_use","content":[{"type":"tool_use","id":"tu2","name":"Read","input":{}}]}}
+{"type":"user","timestamp":"t2","message":{"content":[{"type":"tool_result","tool_use_id":"tu2","content":"second"}]},"toolUseResult":{"file":{"filePath":"/a","numLines":2}}}
+{"type":"user","timestamp":"t3","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"first"}]},"toolUseResult":{"stdout":"first"}}
+{"type":"assistant","timestamp":"t4","message":{"id":"m2","content":[{"type":"text","text":"done"}]}}
+`,
+	"result after the next assistant message began": `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"tool_use","id":"tu1","name":"mcp__slack__read","input":{}}]}}
+{"type":"user","timestamp":"t2","message":{"content":[{"type":"tool_result","tool_use_id":"tu0","content":"earlier"}]}}
+{"type":"assistant","timestamp":"t3","message":{"id":"m2","content":[{"type":"tool_use","id":"tu2","name":"mcp__slack__read","input":{}}]}}
+{"type":"user","timestamp":"t4","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"late"},{"type":"tool_result","content":"no id: last message"}]}}
+`,
+	"results only until the next prompt": `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{}}]}}
 {"type":"user","timestamp":"t2","message":{"content":"interrupt"}}
 {"type":"user","timestamp":"t3","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"late"}]}}
 {"type":"user","timestamp":"t4","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"late"},{"type":"text","text":"kept"}]}}

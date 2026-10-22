@@ -46,6 +46,29 @@ type ToolResult struct {
 	Status     string          `json:"status"` // ToolStatusSuccess or ToolStatusError
 	File       *ToolResultFile `json:"file,omitempty"`
 	MatchCount int             `json:"matchCount,omitempty"`
+	// Agent identifies the subagent this tool call launched, when the agent
+	// records one in the parent transcript.
+	Agent *ToolResultAgent `json:"agent,omitempty"`
+}
+
+// ToolResultAgent identifies a subagent launched by a tool call.
+type ToolResultAgent struct {
+	// ID is the agent's own ID for the child session or thread, never the
+	// tool call ID (that is the tool_use block's id).
+	ID string `json:"id"`
+}
+
+// UnmarshalJSON reads an agent object, ignoring a value of another shape so
+// that it does not invalidate the tool result around it.
+func (a *ToolResultAgent) UnmarshalJSON(b []byte) error { //nolint:unparam // json.Unmarshaler
+	var w struct {
+		ID json.RawMessage `json:"id"`
+	}
+	*a = ToolResultAgent{}
+	if json.Unmarshal(b, &w) == nil {
+		_ = json.Unmarshal(w.ID, &a.ID) //nolint:errcheck // a non-string id is ignored
+	}
+	return nil
 }
 
 // ToolResultFile carries file metadata from Read/Edit tool results.

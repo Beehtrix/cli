@@ -31,8 +31,16 @@ One JSON object per line, each line terminated by `\n`.
 
 - User text: `{"id"?: string, "text": string}`. There is no `type` field (a v1 quirk).
 - Assistant text: `{"type": "text", "text": string}`.
-- Tool use: `{"type": "tool_use", "id"?: string, "name": string, "input": any, "result"?: {"output": string, "status": "success"|"error", "file"?: {"filePath": string, "numLines"?: int}, "matchCount"?: int}}`.
-  Tool results are inlined into the `tool_use` block that requested them.
+- Tool use: `{"type": "tool_use", "id"?: string, "name": string, "input": any, "result"?: {"output": string, "status": "success"|"error", "file"?: {"filePath": string, "numLines"?: int}, "matchCount"?: int, "agent"?: {"id": string}}}`.
+  Tool results are inlined into the `tool_use` block that requested them,
+  matched by tool call ID where the agent records one, including the results
+  of parallel calls that the agent writes separately.
+  `agent.id` is the agent's own ID for the subagent session or thread the call
+  launched (never the tool call ID, which is the block's `id`), when the parent
+  transcript records one: Claude Code's `toolUseResult.agentId` (Agent, and
+  forked Skill calls), Codex's `SubAgentActivity` thread for a `spawn_agent`
+  call, OpenCode's `task` session (`state.metadata.sessionId`), and Copilot's
+  `subagent.started` agent for a task call.
 - Image: passed through from the source verbatim. The image source is either
   inline base64 or an `entire-asset:assets/…` placeholder left by image
   externalization.
