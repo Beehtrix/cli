@@ -18,7 +18,7 @@ func TestLocalRefReads_ReftableProcessCount(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			gitenv.IsolateRepository(t)
-			root, _, head := initCountTestRepo(t)
+			root, head := initCountTestRepo(t)
 			testutil.RunGit(t, root, "update-ref", "refs/remotes/origin/topic", head)
 			testutil.MigrateToReftable(t, root)
 			if linked {

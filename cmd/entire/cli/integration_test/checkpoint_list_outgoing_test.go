@@ -89,11 +89,17 @@ func cliStdout(t *testing.T, env *TestEnv, args ...string) string {
 	return stdout.String()
 }
 
+// listOutgoing also checks that `entire status` counts what the listing
+// lists, whenever local state can tell.
 func listOutgoing(t *testing.T, env *TestEnv) (outgoingListing, string) {
 	t.Helper()
 	raw := cliStdout(t, env, "checkpoint", "list", "--outgoing", "--json")
 	var listing outgoingListing
 	require.NoError(t, json.Unmarshal([]byte(raw), &listing), "outgoing --json must be valid JSON, got: %s", raw)
+	if listing.Complete {
+		require.Equal(t, len(listing.Checkpoints), statusSyncJSONOutput(t, env).UnpushedCheckpoints,
+			"entire status must count what checkpoint list --outgoing lists")
+	}
 	return listing, raw
 }
 

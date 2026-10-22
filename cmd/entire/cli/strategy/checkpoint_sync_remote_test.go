@@ -687,7 +687,11 @@ func TestAdvanceSyncRemoteTrackingRef(t *testing.T) {
 	})
 
 	t.Run("status count drops to zero after the advance", func(t *testing.T) {
-		dir, older, newer := initRepo(t, mirrorURL)
+		dir, _, _ := initRepo(t, mirrorURL)
+		// The count is of checkpoints, so v1 needs real checkpoint folders.
+		older := testutil.CommitV1Checkpoints(t, dir, "", "a1b2c3d4e5f6")
+		newer := testutil.CommitV1Checkpoints(t, dir, older, "0123456789ab")
+		testutil.RunGit(t, dir, "update-ref", pushedRef, newer)
 		testutil.RunGit(t, dir, "update-ref", v1.String(), newer)
 		testutil.RunGit(t, dir, "update-ref", electedRef, older)
 		t.Chdir(dir)
@@ -753,10 +757,10 @@ func TestHintGatedCheckpointSync(t *testing.T) {
 	// The hint only speaks for a remote the branch actually pushes to, so the
 	// declaration is part of the fixture rather than incidental.
 	initHintRepo := func(t *testing.T, declared bool) string {
-		dir, _, second := initCountTestRepo(t)
+		dir, _ := initCountTestRepo(t)
 		testutil.AddRemote(t, dir, "origin", "https://example.com/origin.git")
 		testutil.AddRemote(t, dir, "publish", "https://example.com/publish.git")
-		testutil.GitUpdateRef(t, dir, v1LocalRef, second)
+		testutil.GitUpdateRef(t, dir, v1LocalRef, testutil.CommitV1Checkpoints(t, dir, "", countCheckpointA))
 		if declared {
 			setGitConfig(t, dir, "remote.pushDefault", "publish")
 		}
@@ -801,7 +805,8 @@ func TestHintGatedCheckpointSync(t *testing.T) {
 		// counting against "publish" would report every v1 commit and nag on
 		// every gated push forever after checkpoints already synced.
 		dir := initHintRepo(t, true)
-		testutil.GitUpdateRef(t, dir, "refs/remotes/origin/"+paths.MetadataBranchName, testutil.GetHeadHash(t, dir))
+		v1Tip := strings.TrimSpace(testutil.RunGit(t, dir, "rev-parse", v1LocalRef))
+		testutil.GitUpdateRef(t, dir, "refs/remotes/origin/"+paths.MetadataBranchName, v1Tip)
 		t.Chdir(dir)
 		buf := captureStderrWriter(t)
 
@@ -822,7 +827,7 @@ func TestHintGatedCheckpointSync(t *testing.T) {
 	})
 
 	t.Run("nothing waiting stays silent", func(t *testing.T) {
-		dir, _, _ := initCountTestRepo(t)
+		dir, _ := initCountTestRepo(t)
 		testutil.AddRemote(t, dir, "origin", "https://example.com/origin.git")
 		testutil.AddRemote(t, dir, "publish", "https://example.com/publish.git")
 		t.Chdir(dir)

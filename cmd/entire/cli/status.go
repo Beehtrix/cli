@@ -680,7 +680,7 @@ func writeCheckpointSyncLines(ctx context.Context, b *strings.Builder, s *Entire
 	}
 	if info.Unpushed > 0 {
 		b.WriteString("\n  ")
-		b.WriteString(sty.render(sty.dim, formatUnpushedCheckpointsLine(info)))
+		b.WriteString(sty.render(sty.dim, formatUnpushedCheckpointsLine(info)+" · see 'entire checkpoint list --outgoing'"))
 	}
 }
 

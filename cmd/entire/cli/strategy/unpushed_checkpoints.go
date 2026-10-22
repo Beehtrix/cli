@@ -4,48 +4,26 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
-	"strconv"
-	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
-	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
-// CountUnpushedCheckpoints approximates how many checkpoints exist locally
-// but not on the checkpoint sync remote. Fully local — no network.
-// git-refs primary: push-queue length. git-branch primary: v1 commits ahead
-// of refs/remotes/<remote>/<v1>; an absent tracking ref with a local v1
-// branch counts every v1 commit (correct for the deferred-publish case; a
-// stale tracking ref overcounts — acceptable for a local, no-network
-// heuristic).
+// CountUnpushedCheckpoints counts the checkpoints the next push to remoteName
+// sends: exactly what ListOutgoingCheckpoints lists, so `entire status` and
+// `entire checkpoint list --outgoing` always agree. Fully local, no network.
+// It is 0 when local state cannot tell (ListOutgoingCheckpoints' Known is
+// false), and a tracking ref behind the remote overcounts.
 func CountUnpushedCheckpoints(ctx context.Context, remoteName string) (int, error) {
-	if cpCfg, _ := settings.LoadCheckpointsConfig(ctx); checkpoint.PrimaryIsRefs(cpCfg) { //nolint:errcheck // fail-soft like prePush: a bad checkpoints block defaults to the git-branch backend
-		return countQueuedCheckpointRefs(ctx)
-	}
-	return countUnpushedV1Commits(ctx, remoteName)
-}
-
-// countQueuedCheckpointRefs returns the push-discovery queue length (git-refs
-// backend): every queued ref is a checkpoint written locally but not yet
-// confirmed pushed.
-func countQueuedCheckpointRefs(ctx context.Context) (int, error) {
-	repo, err := OpenRepository(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("open repository: %w", err)
-	}
-	defer repo.Close()
-
-	refs, err := peekCheckpointQueue(ctx, repo)
+	outgoing, err := ListOutgoingCheckpoints(ctx, remoteName)
 	if err != nil {
 		return 0, err
 	}
-	return len(refs), nil
+	return len(outgoing.Checkpoints), nil
 }
 
 // peekCheckpointQueue reads the push-discovery queue without compacting or
@@ -60,37 +38,6 @@ func peekCheckpointQueue(ctx context.Context, repo *git.Repository) ([]plumbing.
 		return nil, fmt.Errorf("read push queue: %w", err)
 	}
 	return refs, nil
-}
-
-// countUnpushedV1Commits counts v1-branch commits not on the remote-tracking
-// ref (git-branch backend). No local v1 branch means nothing to push (0).
-func countUnpushedV1Commits(ctx context.Context, remoteName string) (int, error) {
-	local := checkpoint.ResolveRefs(ctx).Primary
-	if !gitCommitRefExists(ctx, local.String()) {
-		return 0, nil
-	}
-	rangeSpec := local.String()
-	if remoteName != "" {
-		tracking := "refs/remotes/" + remoteName + "/" + local.Short()
-		if gitCommitRefExists(ctx, tracking) {
-			rangeSpec = tracking + ".." + local.String()
-		}
-	}
-	out, err := exec.CommandContext(ctx, "git", "rev-list", "--count", rangeSpec).Output()
-	if err != nil {
-		return 0, fmt.Errorf("count unpushed v1 commits: %w", err)
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil {
-		return 0, fmt.Errorf("parse rev-list count: %w", err)
-	}
-	return n, nil
-}
-
-// gitCommitRefExists reports whether ref resolves to a commit in the current
-// repo. Local and best-effort: any error reads as "absent".
-func gitCommitRefExists(ctx context.Context, ref string) bool {
-	return exec.CommandContext(ctx, "git", "rev-parse", "--verify", "--quiet", ref+"^{commit}").Run() == nil
 }
 
 // OutgoingCheckpoint is one checkpoint the next push to the checkpoint sync

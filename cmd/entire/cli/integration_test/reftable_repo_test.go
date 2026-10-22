@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -119,6 +120,14 @@ func TestReftableRepository_EnableAndFirstCheckpoint(t *testing.T) {
 	listOut := env.RunCLI("checkpoint", "list")
 	if !strings.Contains(listOut, checkpointID) {
 		t.Fatalf("checkpoint list missing checkpoint %s:\n%s", checkpointID, listOut)
+	}
+
+	// The outgoing listing and the status count read refs in-process, so they
+	// must also work against this ref storage. An origin with no branches
+	// leaves every checkpoint outgoing.
+	env.SetupEmptyNamedBareRemote("origin")
+	if outgoing, _ := listOutgoing(t, env); !slices.Equal(outgoing.ids(), []string{checkpointID}) {
+		t.Fatalf("checkpoint list --outgoing = %v, want [%s]", outgoing.ids(), checkpointID)
 	}
 }
 
@@ -240,6 +249,14 @@ func TestReftableRepository_GitRefsBackend(t *testing.T) {
 	// checkpoint list must work against the reftable repo (read path).
 	if listOut := env.RunCLI("checkpoint", "list"); !strings.Contains(listOut, checkpointID) {
 		t.Fatalf("checkpoint list missing checkpoint %s:\n%s", checkpointID, listOut)
+	}
+
+	// The outgoing listing and the status count read refs in-process, so they
+	// must also work against this ref storage. An origin with no branches
+	// leaves every checkpoint outgoing.
+	env.SetupEmptyNamedBareRemote("origin")
+	if outgoing, _ := listOutgoing(t, env); !slices.Equal(outgoing.ids(), []string{checkpointID}) {
+		t.Fatalf("checkpoint list --outgoing = %v, want [%s]", outgoing.ids(), checkpointID)
 	}
 }
 

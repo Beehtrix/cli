@@ -2435,8 +2435,8 @@ func testCheckpointPushDisabledFork(t *testing.T, jsonOutput bool) {
 	writeSettings(t, `{"enabled":true,"strategy_options":{"push_sessions":false,"checkpoint_push_remote":"fork"}}`)
 	testutil.AddRemote(t, ".", originRemoteName, "https://github.com/org/repo.git")
 	testutil.AddRemote(t, ".", "fork", "https://github.com/user/repo.git")
-	head := checkpointSyncTestCommit(t, "a.txt", "one")
-	testutil.GitUpdateRef(t, ".", "refs/heads/"+paths.MetadataBranchName, head)
+	checkpointSyncTestCommit(t)
+	checkpointSyncTestV1(t, statusCheckpointA)
 	assertCheckpointPushDisabledStatus(t, jsonOutput, false, "fork", "")
 }
 
@@ -2667,8 +2667,8 @@ func TestRunStatus_CheckpointPushDisabledDestinations(t *testing.T) {
 						testutil.RunGit(t, ".", "remote", "set-url", "--push", "fork", tc.forkPush)
 					}
 				}
-				head := checkpointSyncTestCommit(t, "a.txt", "one")
-				testutil.GitUpdateRef(t, ".", "refs/heads/"+paths.MetadataBranchName, head)
+				head := checkpointSyncTestCommit(t)
+				checkpointSyncTestV1(t, statusCheckpointA)
 				cwd, err := os.Getwd()
 				if err != nil {
 					t.Fatal(err)
@@ -2676,6 +2676,8 @@ func TestRunStatus_CheckpointPushDisabledDestinations(t *testing.T) {
 				queue := checkpoint.NewPushQueue(filepath.Join(cwd, ".git"))
 				if backend == "git-refs" {
 					for _, ref := range []string{"refs/entire/checkpoints/aa/bb0000000001", "refs/entire/checkpoints/aa/bb0000000002"} {
+						// Only refs that exist locally count: the push drops the rest.
+						testutil.GitUpdateRef(t, ".", ref, head)
 						if err := queue.Enqueue(plumbing.ReferenceName(ref)); err != nil {
 							t.Fatal(err)
 						}
@@ -2837,8 +2839,8 @@ func TestRunStatus_CheckpointPushDisabledSettingsPrecedence(t *testing.T) {
 				testutil.WriteFile(t, ".", ".entire/settings.local.json", tc.local)
 			}
 			testutil.AddRemote(t, ".", originRemoteName, "https://github.com/org/repo.git")
-			head := checkpointSyncTestCommit(t, "a.txt", "one")
-			testutil.GitUpdateRef(t, ".", "refs/heads/"+paths.MetadataBranchName, head)
+			checkpointSyncTestCommit(t)
+			checkpointSyncTestV1(t, statusCheckpointA)
 			for _, jsonOutput := range []bool{false, true} {
 				if tc.disabled {
 					// --detailed and --json are mutually exclusive: only text
@@ -2903,14 +2905,33 @@ func TestRunStatus_CheckpointPushDisabledAbsentWithoutEnabledEntire(t *testing.T
 }
 
 // checkpointSyncTestCommit creates a commit in the cwd test repo and returns
-// its hash. setupTestRepo leaves the repo without commits, and both the v1
-// counter and ref updates need at least one.
-func checkpointSyncTestCommit(t *testing.T, name, content string) string {
+// its hash. setupTestRepo leaves the repo without commits, and ref updates
+// need at least one.
+func checkpointSyncTestCommit(t *testing.T) string {
 	t.Helper()
-	testutil.WriteFile(t, ".", name, content)
-	testutil.GitAdd(t, ".", name)
-	testutil.GitCommit(t, ".", "commit "+name)
+	testutil.WriteFile(t, ".", "a.txt", "one")
+	testutil.GitAdd(t, ".", "a.txt")
+	testutil.GitCommit(t, ".", "commit a.txt")
 	return testutil.GetHeadHash(t, ".")
+}
+
+// Checkpoint IDs for v1 fixtures; the unpushed counter counts checkpoints.
+const (
+	statusCheckpointA = "a1b2c3d4e5f6"
+	statusCheckpointB = "0123456789ab"
+)
+
+// checkpointSyncTestV1 points entire/checkpoints/v1 in the cwd test repo at a
+// chain of v1 commits, one per ID in order (a repeated ID is written again),
+// and returns the tip.
+func checkpointSyncTestV1(t *testing.T, checkpointIDs ...string) string {
+	t.Helper()
+	tip := ""
+	for _, cid := range checkpointIDs {
+		tip = testutil.CommitV1Checkpoints(t, ".", tip, cid)
+	}
+	testutil.GitUpdateRef(t, ".", "refs/heads/"+paths.MetadataBranchName, tip)
+	return tip
 }
 
 func TestRunStatus_CheckpointSyncDestination_Origin(t *testing.T) {
@@ -3061,11 +3082,10 @@ func TestRunStatus_CheckpointSyncCounter_GitBranchAhead(t *testing.T) {
 	setupTestRepo(t)
 	writeSettings(t, testSettingsEnabled)
 	testutil.AddRemote(t, ".", "origin", "https://example.com/origin.git")
-	checkpointSyncTestCommit(t, "a.txt", "one")
-	second := checkpointSyncTestCommit(t, "b.txt", "two")
-	// Local v1 with no origin-tracking ref: every v1 commit counts as unpushed
-	// (the deferred-publish reading).
-	testutil.GitUpdateRef(t, ".", "refs/heads/"+paths.MetadataBranchName, second)
+	checkpointSyncTestCommit(t)
+	// Local v1 with no origin-tracking ref: every checkpoint in it counts as
+	// unpushed (the deferred-publish reading), once however many commits wrote it.
+	checkpointSyncTestV1(t, statusCheckpointA, statusCheckpointB, statusCheckpointA)
 
 	var stdout bytes.Buffer
 	if err := runStatus(context.Background(), &stdout, false, false); err != nil {
@@ -3073,8 +3093,8 @@ func TestRunStatus_CheckpointSyncCounter_GitBranchAhead(t *testing.T) {
 	}
 
 	out := stdout.String()
-	if !strings.Contains(out, "2 checkpoints not yet on origin — they sync with your next 'git push origin'") {
-		t.Errorf("expected unpushed counter line, got:\n%s", out)
+	if !strings.Contains(out, "2 checkpoints not yet on origin — they sync with your next 'git push origin' · see 'entire checkpoint list --outgoing'") {
+		t.Errorf("expected unpushed counter line with the listing hint, got:\n%s", out)
 	}
 }
 
@@ -3083,8 +3103,8 @@ func TestRunStatus_CheckpointSyncCounterOmitted_WhenSynced(t *testing.T) {
 	setupTestRepo(t)
 	writeSettings(t, testSettingsEnabled)
 	testutil.AddRemote(t, ".", "origin", "https://example.com/origin.git")
-	head := checkpointSyncTestCommit(t, "a.txt", "one")
-	testutil.GitUpdateRef(t, ".", "refs/heads/"+paths.MetadataBranchName, head)
+	checkpointSyncTestCommit(t)
+	head := checkpointSyncTestV1(t, statusCheckpointA)
 	testutil.GitUpdateRef(t, ".", "refs/remotes/origin/"+paths.MetadataBranchName, head)
 
 	var stdout bytes.Buffer
@@ -3096,8 +3116,8 @@ func TestRunStatus_CheckpointSyncCounterOmitted_WhenSynced(t *testing.T) {
 	if !strings.Contains(out, "Checkpoints sync to: origin") {
 		t.Errorf("expected destination line, got:\n%s", out)
 	}
-	if strings.Contains(out, "not yet on") {
-		t.Errorf("tracking ref equals local v1: counter must be omitted, got:\n%s", out)
+	if strings.Contains(out, "not yet on") || strings.Contains(out, "checkpoint list --outgoing") {
+		t.Errorf("tracking ref equals local v1: counter and its listing hint must be omitted, got:\n%s", out)
 	}
 }
 
@@ -3108,11 +3128,11 @@ func TestRunStatus_CheckpointSyncDedicated_GitBranch_NoCounter(t *testing.T) {
 	// Same owner ("org") as checkpoint_remote and a parseable GitHub URL, so
 	// PushURL derivation succeeds locally and dedicated mode is verified.
 	testutil.AddRemote(t, ".", originRemoteName, "https://github.com/org/repo.git")
-	head := checkpointSyncTestCommit(t, "a.txt", "one")
+	checkpointSyncTestCommit(t)
 	// A local v1 branch exists, but in dedicated URL mode on the git-branch
 	// backend the tracking-ref comparison would permanently read "all
 	// unpushed" — the counter must be suppressed.
-	testutil.GitUpdateRef(t, ".", "refs/heads/"+paths.MetadataBranchName, head)
+	checkpointSyncTestV1(t, statusCheckpointA)
 
 	var stdout bytes.Buffer
 	if err := runStatus(context.Background(), &stdout, false, false); err != nil {
@@ -3133,7 +3153,9 @@ func TestRunStatus_CheckpointSyncDedicated_GitRefs_QueueCounter(t *testing.T) {
 	setupTestRepo(t)
 	writeSettings(t, `{"enabled": true, "strategy_options": {"checkpoint_remote": {"provider": "github", "repo": "org/checkpoints"}}, "checkpoints": {"primary": {"type": "git-refs"}}}`)
 	testutil.AddRemote(t, ".", originRemoteName, "https://github.com/org/repo.git")
-	checkpointSyncTestCommit(t, "a.txt", "one")
+	head := checkpointSyncTestCommit(t)
+	testutil.GitUpdateRef(t, ".", "refs/entire/checkpoints/aa/bb0000000001", head)
+	testutil.GitUpdateRef(t, ".", "refs/entire/checkpoints/aa/bb0000000002", head)
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -3170,9 +3192,8 @@ func TestRunStatusJSON_CheckpointSync_Elected(t *testing.T) {
 	setupTestRepo(t)
 	writeSettings(t, testSettingsEnabled)
 	testutil.AddRemote(t, ".", "origin", "https://example.com/origin.git")
-	checkpointSyncTestCommit(t, "a.txt", "one")
-	second := checkpointSyncTestCommit(t, "b.txt", "two")
-	testutil.GitUpdateRef(t, ".", "refs/heads/"+paths.MetadataBranchName, second)
+	checkpointSyncTestCommit(t)
+	checkpointSyncTestV1(t, statusCheckpointA, statusCheckpointB)
 
 	var stdout bytes.Buffer
 	if err := runStatus(context.Background(), &stdout, false, true); err != nil {
@@ -3260,9 +3281,8 @@ func TestRunStatus_CheckpointSyncDedicated_IneligibleFallsBackToElected(t *testi
 	// Remote owner "other" != checkpoint_remote owner "org": fork detection
 	// rejects the dedicated store at push time.
 	testutil.AddRemote(t, ".", originRemoteName, "https://github.com/other/repo.git")
-	checkpointSyncTestCommit(t, "a.txt", "one")
-	second := checkpointSyncTestCommit(t, "b.txt", "two")
-	testutil.GitUpdateRef(t, ".", "refs/heads/"+paths.MetadataBranchName, second)
+	checkpointSyncTestCommit(t)
+	checkpointSyncTestV1(t, statusCheckpointA, statusCheckpointB)
 
 	var stdout bytes.Buffer
 	if err := runStatus(context.Background(), &stdout, false, false); err != nil {
