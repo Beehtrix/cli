@@ -116,8 +116,8 @@ func TestRepoView_JSONCoordinates(t *testing.T) {
 				case "/api/v1/repos/" + testDeleteULID + "/native-mirrors":
 					w.Header().Set("Content-Type", "application/json")
 					fmt.Fprint(w, `{"nativeMirrors":[]}`)
-				case testMirrorsPath:
-					serveNoSyncBlocks(t, w, r)
+				case testMirrorPlacementsPath:
+					serveNoSyncBlocks(t, w)
 				default:
 					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
 					http.NotFound(w, r)

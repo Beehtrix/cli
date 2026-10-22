@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
@@ -33,93 +32,61 @@ type mirrorSyncBlock struct {
 	ObservedAt time.Time `json:"observedAt"`
 }
 
-// syncBlockPageSize is the most GET /mirrors returns per page (the spec's
-// maximum). The walk wants as few round-trips as the server allows: its cost
-// is per page, not per row.
-const syncBlockPageSize = 500
+// mirrorSyncReader is what the block lookup reads: the repo's placements and
+// one mirror record. *coreapi.Client satisfies it.
+type mirrorSyncReader interface {
+	ResolveMirrorPlacements(ctx context.Context, params coreapi.ResolveMirrorPlacementsParams) (*coreapi.ResolvePlacementsOutputBody, error)
+	GetMirror(ctx context.Context, params coreapi.GetMirrorParams) (*coreapi.Mirror, error)
+}
 
-// lookupSyncBlocks answers, for each owner asked about, whether GitHub
-// currently blocks the Entire installation serving it. The block is stamped
-// per installation and an installation is per GitHub account, so the first
-// mirror of an owner the caller can see answers for every repo of that owner.
+// lookupMirrorSyncBlock answers whether GitHub currently blocks the Entire
+// installation serving one upstream, by reading that upstream's own mirror
+// record: the pull-gated placement lookup names the mirror IDs, and the
+// mirror read carries the block. Two exact reads, scoped to this repo —
+// nothing is walked. Any one placement answers, since the block is per
+// installation and every placement of the upstream carries the same value;
+// GET /mirrors/{id} follows core's cross-cell redirect, so the first one
+// listed is read wherever it lives.
 //
-// It is one walk of GET /mirrors for all owners at once, deliberately with no
-// owner filter: the server applies its filters AFTER cutting each page from
-// the caller's whole visible set, so a filtered request still walks every
-// page and merely returns most of them empty — and a one-entry page filtered
-// to one owner is usually empty, which read as "not blocked". The walk stops
-// as soon as every wanted owner has been seen, blocked or not; an owner never
-// seen has no mirror visible to the caller and is reported unblocked.
-//
-// Keys of the result are the owners as asked; matching against the wire is
-// case-insensitive, as the server's own owner filter is.
-func lookupSyncBlocks(ctx context.Context, c mirrorLister, owners []string) (map[string]*mirrorSyncBlock, error) {
-	blocks := make(map[string]*mirrorSyncBlock, len(owners))
-	if len(owners) == 0 {
-		return blocks, nil
+// ref is the owner/repo as the user named it; the server matches the pair
+// case-insensitively. blocked is false for "not blocked, as far as the caller
+// can see": no placement the caller may pull, or a mirror carrying no block.
+func lookupMirrorSyncBlock(ctx context.Context, c mirrorSyncReader, ref string) (block mirrorSyncBlock, blocked bool, err error) {
+	owner, repo := mirrorRefOwner(ref), mirrorRefRepo(ref)
+	placements, err := c.ResolveMirrorPlacements(ctx, coreapi.ResolveMirrorPlacementsParams{
+		Provider: coreapi.ResolveMirrorPlacementsProviderGithub,
+		Owner:    owner,
+		Repo:     repo,
+	})
+	if err != nil {
+		return mirrorSyncBlock{}, false, fmt.Errorf("resolve mirror placements: %w", err)
 	}
-	pending := slices.Clone(owners)
-	cursor := ""
-	for len(pending) > 0 {
-		params := coreapi.ListMirrorsParams{
-			Provider: coreapi.NewOptString(repoProviderGitHub),
-			PageSize: coreapi.NewOptInt32(syncBlockPageSize),
-		}
-		if cursor != "" {
-			params.PageToken = coreapi.NewOptString(cursor)
-		}
-		out, err := c.ListMirrors(ctx, params)
-		if err != nil {
-			return nil, fmt.Errorf("read mirrors: %w", err)
-		}
-		for _, m := range out.Mirrors {
-			i := slices.IndexFunc(pending, func(o string) bool { return strings.EqualFold(o, m.Owner) })
-			if i < 0 {
-				continue
-			}
-			if b, ok := m.SyncBlock.Get(); ok {
-				blocks[pending[i]] = &mirrorSyncBlock{Reason: b.Reason, ObservedAt: b.ObservedAt}
-			}
-			pending = slices.Delete(pending, i, i+1)
-		}
-		cursor = out.NextPageToken.Or("")
-		if cursor == "" {
+	if len(placements.Placements) == 0 {
+		return mirrorSyncBlock{}, false, nil
+	}
+	m, err := c.GetMirror(ctx, coreapi.GetMirrorParams{MirrorId: placements.Placements[0].MirrorId})
+	if err != nil {
+		return mirrorSyncBlock{}, false, fmt.Errorf("read mirror: %w", err)
+	}
+	b, ok := m.SyncBlock.Get()
+	if !ok {
+		return mirrorSyncBlock{}, false, nil
+	}
+	return mirrorSyncBlock{Reason: b.Reason, ObservedAt: b.ObservedAt}, true, nil
+}
+
+// mirrorRefRepo is the repo half of a /<forge>/<owner>/<repo> ref, the
+// counterpart of mirrorRefOwner.
+func mirrorRefRepo(ref string) string {
+	trimmed := trimRefPrefix(ref)
+	for _, forge := range []string{mirrorCloneForge, nativeCloneForge} {
+		if rest, ok := strings.CutPrefix(trimmed, forge+"/"); ok {
+			trimmed = rest
 			break
 		}
 	}
-	return blocks, nil
-}
-
-// annotateSyncBlocks stamps each GitHub-mirror row with its owner's
-// installation block. Candidate rows (not yet mirrored, so nothing to sync)
-// and native rows (no GitHub installation) are skipped, and a set with no
-// row to stamp costs no request at all.
-func annotateSyncBlocks(ctx context.Context, c mirrorLister, rows []repoDirRow) error {
-	var owners []string
-	for _, r := range rows {
-		if !syncBlockApplies(r) {
-			continue
-		}
-		if owner := mirrorRefOwner(r.Repo); owner != "" && !slices.Contains(owners, owner) {
-			owners = append(owners, owner)
-		}
-	}
-	blocks, err := lookupSyncBlocks(ctx, c, owners)
-	if err != nil {
-		return err
-	}
-	for i := range rows {
-		if syncBlockApplies(rows[i]) {
-			rows[i].SyncBlock = blocks[mirrorRefOwner(rows[i].Repo)]
-		}
-	}
-	return nil
-}
-
-// syncBlockApplies says whether a row can carry a block at all: a mirrored
-// GitHub repo, and nothing else.
-func syncBlockApplies(r repoDirRow) bool {
-	return len(r.Placements) > 0 && declaresForge(r.Repo, mirrorCloneForge)
+	_, repo, _ := strings.Cut(trimmed, "/")
+	return repo
 }
 
 // noteSyncStatusUnavailable decides what a failed block lookup means for the
@@ -140,12 +107,6 @@ func noteSyncStatusUnavailable(ctx context.Context, errW io.Writer, err error) e
 	fmt.Fprintf(errW, "Note: GitHub sync status unavailable: %v\n", renderCoreError(err))
 	return nil
 }
-
-// syncBlockQualifier is appended to the STATUS cell of a row whose owner's
-// installation is blocked. The placement status stays the clone lifecycle
-// (the server's choice, and what --status filters on); the qualifier says the
-// clone is not being kept current, which that lifecycle cannot.
-const syncBlockQualifier = " (sync blocked)"
 
 // syncBlockProblem says what is wrong, in terms the person who can fix it
 // recognises. Only an unknown reason shows Entire's enum, since there is

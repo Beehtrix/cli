@@ -358,19 +358,18 @@ always runnable in every build.
   409 with the reason at `errors[].location == "body.owner"` while the block
   holds, which `resyncError` renders with the same wording `repo view` uses.
   That block (`Mirror.syncBlock`: an org IP allow list or a suspended
-  installation) is per GitHub installation, and the `/repos` placements do not
-  carry it, so `lookupSyncBlocks` reads it from `GET /mirrors` in one
-  **unfiltered** walk for every owner on screen, stopping once each owner has
-  been seen. Unfiltered on purpose: core applies `owner`/`provider` *after*
-  cutting the page from the caller's whole visible set, so a filtered page is
-  usually empty with a cursor, and a one-entry filtered read answered "not
-  blocked" for a blocked owner. `annotateSyncBlocks` stamps the directory rows
-  after filters and `--limit`; `list` qualifies the STATUS cell
-  (`ready (sync blocked)`, qualifier red, with `--status` still matching the
-  lifecycle word) and `view` prints a `Sync:` section with the fix and the
-  resync command. A failed lookup is a stderr note, never a failed listing —
-  except a cancelled context, which `noteSyncStatusUnavailable` returns so an
-  interrupted command still exits as interrupted.
+  installation) is per GitHub installation and the `/repos` placements do not
+  carry it, so only `repo view` reads it, with two exact reads scoped to the
+  repo (`lookupMirrorSyncBlock`: `/mirrors/placements` for a mirror ID, then
+  `GET /mirrors/{id}`), and prints a `Sync:` section with the fix and the
+  resync command; `--json` adds `syncBlock` on the row. `mirror list` shows
+  no block: a per-repo read per row is too much for a directory, and
+  `GET /mirrors` cannot answer "mirrors of owner X" cheaply (core applies its
+  owner filter *after* cutting the page from the caller's whole visible set).
+  Revisit when core puts `syncBlock` on `RepoPlacement`. A failed read is a
+  stderr note, never a failed view — except a cancelled context, which
+  `noteSyncStatusUnavailable` returns so an interrupted command still exits as
+  interrupted.
   `mirror detach <repo> --into /et/<project>/<repo>` serves
   `/gh/` refs only and is the one mirror verb that converts rather than places:
   it turns the mirror's sole placement into the native repo `--into` names

@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,55 +19,44 @@ import (
 	"github.com/entireio/cli/internal/coreapi"
 )
 
-// fakeMirrorLister serves GET /mirrors the way Core does: the caller's whole
-// visible set in a fixed order, cut into pages of pageSize BEFORE any filter
-// is applied, so a page can come back short or empty with a cursor that says
-// more remain. It records every call so a test can count pages and inspect
-// the parameters sent.
-type fakeMirrorLister struct {
-	mu       sync.Mutex
-	mirrors  []coreapi.Mirror
-	err      error
-	calls    []coreapi.ListMirrorsParams
-	pageSize int // what the server caps a page at; 0 means honour the request
+// fakeMirrorSyncReader scripts the two reads the block lookup makes: the
+// placement lookup (mirror IDs, or none) and the mirror record behind the
+// first one. It records what was asked so a test can count the reads.
+type fakeMirrorSyncReader struct {
+	mu         sync.Mutex
+	placements []string                  // mirror IDs the placement lookup returns
+	mirrors    map[string]coreapi.Mirror // by mirror ID
+	err        error
+	resolves   []coreapi.ResolveMirrorPlacementsParams
+	gets       []string
 }
 
-func (f *fakeMirrorLister) ListMirrors(_ context.Context, p coreapi.ListMirrorsParams) (*coreapi.ListMirrorsOutputBody, error) {
+func (f *fakeMirrorSyncReader) ResolveMirrorPlacements(_ context.Context, p coreapi.ResolveMirrorPlacementsParams) (*coreapi.ResolvePlacementsOutputBody, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, p)
+	f.resolves = append(f.resolves, p)
 	if f.err != nil {
 		return nil, f.err
 	}
-	size := int(p.PageSize.Or(500))
-	if f.pageSize > 0 && f.pageSize < size {
-		size = f.pageSize
-	}
-	start := 0
-	if tok := p.PageToken.Or(""); tok != "" {
-		var err error
-		if start, err = strconv.Atoi(tok); err != nil {
-			return nil, fmt.Errorf("bad cursor %q", tok)
-		}
-	}
-	end := min(start+size, len(f.mirrors))
-	out := &coreapi.ListMirrorsOutputBody{}
-	for _, m := range f.mirrors[start:end] {
-		if o := p.Owner.Or(""); o != "" && !strings.EqualFold(o, m.Owner) {
-			continue // filtered after the cut, as the server does
-		}
-		out.Mirrors = append(out.Mirrors, m)
-	}
-	if end < len(f.mirrors) {
-		out.NextPageToken = coreapi.NewOptString(strconv.Itoa(end))
+	out := &coreapi.ResolvePlacementsOutputBody{}
+	for _, id := range f.placements {
+		out.Placements = append(out.Placements, coreapi.ResolvedPlacement{MirrorId: id, ClusterHost: defaultClusterHost})
 	}
 	return out, nil
 }
 
-func (f *fakeMirrorLister) pages() int {
+func (f *fakeMirrorSyncReader) GetMirror(_ context.Context, p coreapi.GetMirrorParams) (*coreapi.Mirror, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.calls)
+	f.gets = append(f.gets, p.MirrorId)
+	if f.err != nil {
+		return nil, f.err
+	}
+	m, ok := f.mirrors[p.MirrorId]
+	if !ok {
+		return nil, errors.New("no such mirror")
+	}
+	return &m, nil
 }
 
 var testBlockObservedAt = time.Date(2026, 10, 10, 17, 48, 0, 0, time.UTC)
@@ -86,121 +74,55 @@ func blockedMirrorOf(owner string) coreapi.Mirror {
 	return m
 }
 
-func TestLookupSyncBlocks(t *testing.T) {
+func TestLookupMirrorSyncBlock(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	wantBlock := &mirrorSyncBlock{Reason: syncBlockOrgIPAllowlist, ObservedAt: testBlockObservedAt}
+	wantBlock := mirrorSyncBlock{Reason: syncBlockOrgIPAllowlist, ObservedAt: testBlockObservedAt}
 
-	t.Run("a blocked owner behind another owner's mirrors is still found", func(t *testing.T) {
+	t.Run("reads the first placement's mirror record for the block", func(t *testing.T) {
 		t.Parallel()
-		// The reviewer's reproduction: the caller's lowest-id mirror belongs
-		// to someone else, so a one-entry page filtered to acme is empty.
-		f := &fakeMirrorLister{mirrors: []coreapi.Mirror{
-			mirrorOf("zzz-other", "x"),
-			blockedMirrorOf("acme"),
-		}, pageSize: 1}
-		blocks, err := lookupSyncBlocks(ctx, f, []string{"acme"})
+		f := &fakeMirrorSyncReader{
+			placements: []string{"m-eu", "m-us"},
+			mirrors:    map[string]coreapi.Mirror{"m-eu": blockedMirrorOf("acme"), "m-us": blockedMirrorOf("acme")},
+		}
+		block, blocked, err := lookupMirrorSyncBlock(ctx, f, "/gh/acme/web")
 		require.NoError(t, err)
-		require.Equal(t, wantBlock, blocks["acme"])
-		require.Empty(t, f.calls[0].Owner.Or(""), "the walk sends no owner filter: the server filters after the cut")
-		require.Equal(t, int32(syncBlockPageSize), f.calls[0].PageSize.Or(0), "ask for the biggest page the server allows")
+		require.True(t, blocked)
+		require.Equal(t, wantBlock, block)
+		require.Len(t, f.resolves, 1)
+		require.Equal(t, "acme", f.resolves[0].Owner)
+		require.Equal(t, "web", f.resolves[0].Repo)
+		require.Equal(t, []string{"m-eu"}, f.gets, "one placement answers for the whole installation")
 	})
 
-	t.Run("the walk stops as soon as every wanted owner has been seen", func(t *testing.T) {
+	t.Run("an unblocked mirror and a repo with nothing pullable both read as not blocked", func(t *testing.T) {
 		t.Parallel()
-		f := &fakeMirrorLister{mirrors: []coreapi.Mirror{
-			mirrorOf("other", "a"),
-			blockedMirrorOf("acme"),
-			mirrorOf("acme", "api"), // same installation; never needs reading
-			mirrorOf("third", "z"),
-		}, pageSize: 1}
-		blocks, err := lookupSyncBlocks(ctx, f, []string{"acme", "other"})
+		f := &fakeMirrorSyncReader{placements: []string{"m"}, mirrors: map[string]coreapi.Mirror{"m": mirrorOf("acme", "web")}}
+		_, blocked, err := lookupMirrorSyncBlock(ctx, f, "/gh/acme/web")
 		require.NoError(t, err)
-		require.Equal(t, wantBlock, blocks["acme"])
-		require.Nil(t, blocks["other"])
-		require.Equal(t, 2, f.pages(), "two pages see both owners; the rest of the set is never fetched")
-	})
+		require.False(t, blocked)
 
-	t.Run("an owner with no visible mirror walks to the end and reads unblocked", func(t *testing.T) {
-		t.Parallel()
-		f := &fakeMirrorLister{mirrors: []coreapi.Mirror{mirrorOf("other", "a"), mirrorOf("other", "b")}, pageSize: 1}
-		blocks, err := lookupSyncBlocks(ctx, f, []string{"ghost"})
+		f = &fakeMirrorSyncReader{}
+		_, blocked, err = lookupMirrorSyncBlock(ctx, f, "/gh/acme/web")
 		require.NoError(t, err)
-		require.Nil(t, blocks["ghost"])
-		require.Equal(t, 2, f.pages())
-	})
-
-	t.Run("owner matching is case-insensitive, keyed as asked", func(t *testing.T) {
-		t.Parallel()
-		f := &fakeMirrorLister{mirrors: []coreapi.Mirror{blockedMirrorOf("Acme")}}
-		blocks, err := lookupSyncBlocks(ctx, f, []string{"acme"})
-		require.NoError(t, err)
-		require.Equal(t, wantBlock, blocks["acme"])
-	})
-
-	t.Run("no owners means no request", func(t *testing.T) {
-		t.Parallel()
-		f := &fakeMirrorLister{err: errors.New("must not be called")}
-		blocks, err := lookupSyncBlocks(ctx, f, nil)
-		require.NoError(t, err)
-		require.Empty(t, blocks)
-		require.Zero(t, f.pages())
+		require.False(t, blocked)
+		require.Empty(t, f.gets, "no placement, so no mirror read")
 	})
 
 	t.Run("a failed read is an error, not an absent block", func(t *testing.T) {
 		t.Parallel()
-		f := &fakeMirrorLister{err: errors.New("boom")}
-		_, err := lookupSyncBlocks(ctx, f, []string{"acme"})
-		require.EqualError(t, err, "read mirrors: boom")
+		f := &fakeMirrorSyncReader{err: errors.New("boom")}
+		_, _, err := lookupMirrorSyncBlock(ctx, f, "/gh/acme/web")
+		require.EqualError(t, err, "resolve mirror placements: boom")
 	})
 }
 
-func TestAnnotateSyncBlocks(t *testing.T) {
+func TestMirrorRefRepo(t *testing.T) {
 	t.Parallel()
-	ctx := t.Context()
-	placed := []repoDirPlacement{{Cluster: defaultClusterHost, Status: "ready"}}
-
-	t.Run("every mirrored row of a blocked owner is stamped; candidates and native rows are not", func(t *testing.T) {
-		t.Parallel()
-		f := &fakeMirrorLister{mirrors: []coreapi.Mirror{
-			blockedMirrorOf("acme"),
-			mirrorOf("other", "tool"),
-		}}
-		rows := []repoDirRow{
-			{Repo: "/gh/acme/web", Status: "ready", Placements: placed},
-			{Repo: "/gh/acme/api", Status: "ready", Placements: placed},
-			{Repo: "/gh/other/tool", Status: "ready", Placements: placed},
-			{Repo: "/gh/acme/marketing", Status: "available", Access: "admin"}, // candidate: nothing to sync
-			{Repo: "/et/acme/native", Status: "ready", Placements: placed},     // native: no installation
-		}
-		require.NoError(t, annotateSyncBlocks(ctx, f, rows))
-		require.Equal(t, 1, f.pages(), "one walk serves every owner")
-		require.NotNil(t, rows[0].SyncBlock)
-		require.NotNil(t, rows[1].SyncBlock)
-		require.Equal(t, syncBlockOrgIPAllowlist, rows[1].SyncBlock.Reason)
-		require.Nil(t, rows[2].SyncBlock)
-		require.Nil(t, rows[3].SyncBlock)
-		require.Nil(t, rows[4].SyncBlock)
-	})
-
-	t.Run("no mirrored GitHub rows means no request at all", func(t *testing.T) {
-		t.Parallel()
-		f := &fakeMirrorLister{err: errors.New("must not be called")}
-		rows := []repoDirRow{
-			{Repo: "/gh/acme/marketing", Status: "available"},
-			{Repo: "/et/acme/native", Status: "ready", Placements: placed},
-		}
-		require.NoError(t, annotateSyncBlocks(ctx, f, rows))
-		require.Zero(t, f.pages())
-	})
-
-	t.Run("a failed lookup leaves the rows unstamped", func(t *testing.T) {
-		t.Parallel()
-		f := &fakeMirrorLister{err: errors.New("boom")}
-		rows := []repoDirRow{{Repo: "/gh/acme/web", Status: "ready", Placements: placed}}
-		require.Error(t, annotateSyncBlocks(ctx, f, rows))
-		require.Nil(t, rows[0].SyncBlock)
-	})
+	require.Equal(t, "web", mirrorRefRepo("/gh/acme/web"))
+	require.Equal(t, "web", mirrorRefRepo("gh/acme/web"))
+	require.Equal(t, "web", mirrorRefRepo("/et/acme/web"))
+	require.Empty(t, mirrorRefRepo("/gh/acme"))
 }
 
 func TestNoteSyncStatusUnavailable(t *testing.T) {
@@ -351,59 +273,56 @@ func TestRepoMirrorResync(t *testing.T) {
 }
 
 // blockedDirectory is a fake control plane for a GitHub directory whose owner
-// acme is blocked. It serves /repos, /clusters and /mirrors — the last with
-// Core's filter-after-cut paging over a set whose first mirror belongs to
-// someone else, so a lookup that did not walk would miss the block.
+// acme is blocked. It serves /repos, /clusters, the placement lookup and the
+// mirror record behind it — the two reads `view` makes for the block.
 type blockedDirectory struct {
-	repos         []coreapi.RepoIndexEntry
-	mirrorsStatus int // >= 400 fails the lookup with a problem
-	onMirrors     func()
-	mirrorReads   int
-	mu            sync.Mutex
+	repos      []coreapi.RepoIndexEntry
+	syncStatus int // >= 400 fails the placement lookup with a problem
+	onSync     func()
+	syncReads  int
+	mu         sync.Mutex
 }
 
 func (d *blockedDirectory) serve(t *testing.T) {
 	t.Helper()
 	clusters := []coreapi.Cluster{{Slug: "us", PublicUrl: "https://" + defaultClusterHost}}
-	lister := &fakeMirrorLister{mirrors: []coreapi.Mirror{
-		mirrorOf("zzz-other", "x"),
-		blockedMirrorOf("acme"),
-		mirrorOf("other", "tool"),
-	}, pageSize: 1}
+	reader := &fakeMirrorSyncReader{
+		placements: []string{"m-acme"},
+		mirrors:    map[string]coreapi.Mirror{"m-acme": blockedMirrorOf("acme"), "m-other": mirrorOf("other", "tool")},
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case testClustersPath:
+		switch {
+		case r.URL.Path == testClustersPath:
 			writeJSONResponse(t, w, http.StatusOK, &coreapi.ListClustersOutputBody{Clusters: clusters})
-		case testReposPath:
-			out := &coreapi.ListReposOutputBody{Repos: d.repos}
-			if size := r.URL.Query().Get("pageSize"); size != "" {
-				out.NextPageToken = coreapi.NewOptString("more")
-			}
-			writeJSONResponse(t, w, http.StatusOK, out)
-		case testMirrorsPath:
+		case r.URL.Path == testReposPath:
+			writeJSONResponse(t, w, http.StatusOK, &coreapi.ListReposOutputBody{Repos: d.repos})
+		case r.URL.Path == testMirrorPlacementsPath:
 			d.mu.Lock()
-			d.mirrorReads++
+			d.syncReads++
 			d.mu.Unlock()
-			if d.onMirrors != nil {
-				d.onMirrors()
+			if d.onSync != nil {
+				d.onSync()
 			}
-			if d.mirrorsStatus >= 400 {
-				writeCoreProblem(t, w, d.mirrorsStatus, "mirrors unavailable")
+			if d.syncStatus >= 400 {
+				writeCoreProblem(t, w, d.syncStatus, "placements unavailable")
 				return
 			}
-			var params coreapi.ListMirrorsParams
-			params.Owner = coreapi.NewOptString(r.URL.Query().Get("owner"))
-			if tok := r.URL.Query().Get("pageToken"); tok != "" {
-				params.PageToken = coreapi.NewOptString(tok)
+			owner, repo := r.URL.Query().Get("owner"), r.URL.Query().Get("repo")
+			ids := reader.placements
+			if owner != "acme" {
+				ids = []string{"m-" + owner} // other owners: one unblocked mirror
 			}
-			if size := r.URL.Query().Get("pageSize"); size != "" {
-				n, err := strconv.Atoi(size)
-				assert.NoError(t, err)
-				params.PageSize = coreapi.NewOptInt32(int32(n))
-			}
-			out, err := lister.ListMirrors(r.Context(), params)
+			out, err := (&fakeMirrorSyncReader{placements: ids}).ResolveMirrorPlacements(r.Context(), coreapi.ResolveMirrorPlacementsParams{Owner: owner, Repo: repo})
 			assert.NoError(t, err)
 			writeJSONResponse(t, w, http.StatusOK, out)
+		case strings.HasPrefix(r.URL.Path, "/api/v1/mirrors/"):
+			id := strings.TrimPrefix(r.URL.Path, "/api/v1/mirrors/")
+			m, err := reader.GetMirror(r.Context(), coreapi.GetMirrorParams{MirrorId: id})
+			if err != nil {
+				writeCoreProblem(t, w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeJSONResponse(t, w, http.StatusOK, m)
 		default:
 			t.Errorf("unexpected path %q", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -418,7 +337,7 @@ func (d *blockedDirectory) serve(t *testing.T) {
 func (d *blockedDirectory) reads() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.mirrorReads
+	return d.syncReads
 }
 
 // Not parallel: swaps the package-level activeCoreClient seam.
@@ -462,7 +381,7 @@ func TestRepoView_SyncBlock(t *testing.T) {
 	})
 
 	t.Run("a failed lookup is a note on stderr, not a failed view", func(t *testing.T) {
-		(&blockedDirectory{repos: web, mirrorsStatus: http.StatusServiceUnavailable}).serve(t)
+		(&blockedDirectory{repos: web, syncStatus: http.StatusServiceUnavailable}).serve(t)
 		cmd := newRepoCmd()
 		var out, errW strings.Builder
 		cmd.SetOut(&out)
@@ -471,12 +390,12 @@ func TestRepoView_SyncBlock(t *testing.T) {
 		require.NoError(t, cmd.ExecuteContext(t.Context()))
 		require.Contains(t, out.String(), "ready")
 		require.NotContains(t, out.String(), "Sync:")
-		require.Equal(t, "Note: GitHub sync status unavailable: mirrors unavailable\n", errW.String())
+		require.Equal(t, "Note: GitHub sync status unavailable: placements unavailable\n", errW.String())
 	})
 
 	t.Run("an interruption during the lookup fails the view", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
-		(&blockedDirectory{repos: web, onMirrors: cancel}).serve(t)
+		(&blockedDirectory{repos: web, onSync: cancel}).serve(t)
 		cmd := newRepoCmd()
 		var out, errW strings.Builder
 		cmd.SetOut(&out)
@@ -490,83 +409,16 @@ func TestRepoView_SyncBlock(t *testing.T) {
 }
 
 // Not parallel: swaps the package-level activeCoreClient seam.
-func TestRepoMirrorList_SyncBlock(t *testing.T) {
-	repos := []coreapi.RepoIndexEntry{
-		onboardedEntry("acme/web", "private", "us"),
-		onboardedEntry("other/tool", "private", "us"),
-		candidateEntry("acme/marketing", "public", coreapi.RepoCandidateAccessAdmin, true),
-	}
-
-	t.Run("a blocked owner's rows qualify the STATUS cell; --status still matches the lifecycle word", func(t *testing.T) {
-		d := &blockedDirectory{repos: repos}
-		d.serve(t)
-		stdout, _ := runMirrorList(t)
-		require.Regexp(t, `acme/web\s+`+defaultClusterHost+`\s+Private\s+ready \(sync blocked\)`, stdout)
-		require.Regexp(t, `other/tool\s+`+defaultClusterHost+`\s+Private\s+ready\s`, stdout)
-		require.NotRegexp(t, `acme/marketing[^\n]*sync blocked`, stdout, "a candidate has nothing to sync")
-		require.Equal(t, 3, d.reads(), "one walk; other is the third mirror, so three pages see both owners")
-
-		stdout, _ = runMirrorList(t, "--status", "ready")
-		require.Contains(t, stdout, "acme/web")
-	})
-
-	t.Run("--json carries the block as its own field, status untouched", func(t *testing.T) {
-		(&blockedDirectory{repos: repos}).serve(t)
-		stdout, _ := runMirrorList(t, "--json")
-		var rows []repoDirRow
-		require.NoError(t, json.Unmarshal([]byte(stdout), &rows))
-		byRepo := make(map[string]repoDirRow, len(rows))
-		for _, r := range rows {
-			byRepo[r.Repo] = r
-		}
-		require.Equal(t, "ready", byRepo["/gh/acme/web"].Status)
-		require.Equal(t, &mirrorSyncBlock{Reason: syncBlockOrgIPAllowlist, ObservedAt: testBlockObservedAt}, byRepo["/gh/acme/web"].SyncBlock)
-		require.Nil(t, byRepo["/gh/other/tool"].SyncBlock)
-		require.Nil(t, byRepo["/gh/acme/marketing"].SyncBlock)
-	})
-
-	t.Run("--limit annotates only the rows shown", func(t *testing.T) {
-		d := &blockedDirectory{repos: repos}
-		d.serve(t)
-		stdout, _ := runMirrorList(t, "--limit", "1", "--sort", "-name")
-		require.Contains(t, stdout, "other/tool")
-		require.NotContains(t, stdout, "acme/web")
-		require.Equal(t, 3, d.reads(), "other sits last in the mirror set, so its walk runs to the end — but acme was never asked about")
-	})
-
-	t.Run("page mode annotates the page it shows", func(t *testing.T) {
-		(&blockedDirectory{repos: repos}).serve(t)
-		stdout, _ := runMirrorList(t, "--page-size", "10")
-		require.Regexp(t, `acme/web[^\n]*ready \(sync blocked\)`, stdout)
-	})
-
-	t.Run("--forge et makes no lookup", func(t *testing.T) {
-		d := &blockedDirectory{repos: []coreapi.RepoIndexEntry{nativeEntry("acme/native", "private", "us")}}
-		d.serve(t)
-		stdout, _ := runMirrorList(t, "--forge", nativeCloneForge)
-		require.Contains(t, stdout, "/et/acme/native")
-		require.Zero(t, d.reads())
-	})
-
-	t.Run("a failed lookup is a note, and the table still lists", func(t *testing.T) {
-		(&blockedDirectory{repos: repos, mirrorsStatus: http.StatusServiceUnavailable}).serve(t)
-		stdout, stderr := runMirrorList(t)
-		require.Contains(t, stdout, "acme/web")
-		require.NotContains(t, stdout, "sync blocked")
-		require.Contains(t, stderr, "Note: GitHub sync status unavailable: mirrors unavailable")
-	})
-
-	t.Run("an interruption during the lookup fails the listing", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(t.Context())
-		(&blockedDirectory{repos: repos, onMirrors: cancel}).serve(t)
-		parent := newRepoMirrorCmd()
-		addControlPlaneFlags(parent)
-		var out, errW strings.Builder
-		parent.SetOut(&out)
-		parent.SetErr(&errW)
-		parent.SetArgs([]string{"list", "--no-pager"})
-		err := parent.ExecuteContext(ctx)
-		require.ErrorIs(t, err, context.Canceled)
-		require.NotContains(t, errW.String(), "sync status unavailable")
-	})
+func TestRepoMirrorList_NoSyncBlock(t *testing.T) {
+	// The directory never reads the block: it would cost a mirror read per
+	// repo, and the view is the record the block belongs on. Pins that a
+	// blocked owner lists like any other and that --json omits the key.
+	d := &blockedDirectory{repos: []coreapi.RepoIndexEntry{onboardedEntry("acme/web", "private", "us")}}
+	d.serve(t)
+	stdout, _ := runMirrorList(t)
+	require.Regexp(t, `acme/web\s+`+defaultClusterHost+`\s+Private\s+ready\s`, stdout)
+	require.NotContains(t, stdout, "blocked")
+	stdout, _ = runMirrorList(t, "--json")
+	require.NotContains(t, stdout, "syncBlock")
+	require.Zero(t, d.reads())
 }
