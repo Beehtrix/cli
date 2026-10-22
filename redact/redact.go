@@ -2016,7 +2016,8 @@ func walkRedactableStrings(v any, transform func(key, spliceKey string, credenti
 // redactLeafValue is the per-leaf redaction rule shared by the splice
 // collection pass and the structural re-encode fallback: the placeholder for
 // a value whose key reveals a secret the value alone does not, otherwise the
-// redactor, then the credential-key placeholder for values it left alone.
+// redactor, then the credential-key placeholder for values it left alone,
+// then IP addresses under a key that names one.
 //
 // The redactor always sees the unchanged value. Rewriting part of it first
 // would stop a rule that needs the whole value, such as an anchored custom
@@ -2028,9 +2029,9 @@ func redactLeafValue(key string, credentialContext bool, val string, redactor fu
 	redacted := redactor(val)
 	if redacted == val && isCredentialJSONSecretKey(key, credentialContext) &&
 		hasNonPlaceholderKeyValue(key, val, false) && !isNonPasswordCodeLiteral(key, val) {
-		redacted = RedactedPlaceholder
+		return RedactedPlaceholder
 	}
-	return redacted
+	return redactIPsUnderNetworkKey(key, redacted)
 }
 
 // credentialKeyWords are stems of the keywords of betterleaks' generic-api-key

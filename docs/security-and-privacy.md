@@ -112,7 +112,7 @@ IP addresses are redacted when they look like an address in use, because version
 
 - it is private, link-local, or shared address space (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `fc00::/7`, `fe80::/10`);
 - network syntax surrounds it: a scheme (`https://203.0.113.9`), userinfo (`deploy@203.0.113.9`), a port (`203.0.113.9:443`, which stays visible as `[REDACTED_IP]:443`), a CIDR prefix (`/32`), or a connection arrow (`->`);
-- a network word (such as `ip`, `host`, `server`, `ssh`, `tcp`, `dns`, `connect`) appears shortly before or after it.
+- a network word (such as `ip`, `host`, `server`, `ssh`, `tcp`, `dns`, `connect`) appears shortly before or after it, or it is the value of a JSON key that names an address (`{"host":"203.0.113.9"}`, `remote_addr`, `peerIP`).
 
 Loopback (`127.0.0.1`, `::1`), unspecified (`0.0.0.0`, `::`), `0.0.0.0/8`, and `255.255.255.255` are never redacted, and neither is an address that continues a longer token (`v1.2.3.4`, `go1.2.3.4`, `1.2.3.4-rc1`, an OID such as `1.3.6.1.4.1`, or code such as `u64::from` and `a[1::2]`). A public address printed bare with no such context, such as one line in a plain list, is not redacted; add a `custom_patterns` entry if you need every address. A version number that happens to sit next to a network word can be redacted.
 

@@ -224,14 +224,15 @@ func detectPII(cfg *PIIConfig, s string) []taggedRegion {
 			if p.label == labelPhone && loc[1] < len(s) && s[loc[1]] >= '0' && s[loc[1]] <= '9' {
 				continue
 			}
-			// IP candidates are only shapes; redactableIPEnd validates them
-			// and may shorten the match.
-			if p.label == labelIP {
-				end, ok := redactableIPEnd(s, loc[0], loc[1])
+			// The built-in IP candidates are only shapes; redactableIP
+			// validates them and may trim the match. Matched by regex, not
+			// label, so a custom pattern named "ip" is left as written.
+			if p.regex == ipv4CandidateRegex || p.regex == ipv6CandidateRegex {
+				start, end, ok := redactableIP(s, loc[0], loc[1])
 				if !ok {
 					continue
 				}
-				loc[1] = end
+				loc[0], loc[1] = start, end
 			}
 			regions = append(regions, taggedRegion{
 				region: region{loc[0], loc[1]},
