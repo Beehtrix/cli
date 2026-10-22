@@ -298,7 +298,8 @@ func (c *enableCheckpointRemoteChoice) report(ctx context.Context, w io.Writer, 
 	// Every successful run ends by naming where checkpoints go and what that
 	// exposes: enable is the last step before transcripts start travelling with
 	// the user's pushes. A destination that cannot be resolved or confirmed is
-	// reported in place of that notice, on every run.
+	// reported in place of that notice, on every run, unless a dedicated
+	// checkpoint_remote still receives uploads.
 	fmt.Fprintln(w)
 	if c.changed {
 		fmt.Fprintf(w, "Checkpoint destination set to: %s\n", c.name)
@@ -346,6 +347,7 @@ func (c *enableCheckpointRemoteChoice) report(ctx context.Context, w io.Writer, 
 		}
 		if dedicated {
 			fmt.Fprintf(w, "Cannot resolve checkpoint remote selection: %v. Dedicated checkpoint uploads can still proceed.\n", err)
+			printCheckpointPrivacyNotice(w, false)
 			c.reportUnchangedDestination(w)
 			return
 		}

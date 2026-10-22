@@ -638,7 +638,9 @@ successful enable, with or without a terminal. It names the destination and
 follows it with a privacy notice: checkpoints contain the agent transcripts, a
 public destination makes them public, redaction is best effort, and how to stop
 uploads or move them to a private repository. An unusable destination is
-reported instead of the notice. How the destination was chosen, fan-out, and
+reported instead of the notice, unless pushes still upload to a dedicated
+`checkpoint_remote`, which the remote election does not gate; the notice then
+follows the report. How the destination was chosen, fan-out, and
 alternatives are reported only when the destination was touched (explicit flag,
 picker shown, or `--checkpoint-remote`); the multi-remote ambiguity note covers
 the rest.

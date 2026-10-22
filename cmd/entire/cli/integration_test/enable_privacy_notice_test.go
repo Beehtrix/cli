@@ -3,9 +3,12 @@
 package integration
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,4 +54,45 @@ func TestEnable_PrivacyNotice(t *testing.T) {
 			require.Less(t, strings.Index(out, tc.after), strings.LastIndex(out, tc.notice), "notice should follow %q; got:\n%s", tc.after, out)
 		})
 	}
+}
+
+// A checkpoint_push_remote naming a missing remote stops ordinary checkpoint
+// sync, but pushes still upload to a dedicated checkpoint_remote, so enable
+// must keep the notice there. The push half pins why: if this state ever
+// stops uploading, the notice should go too.
+func TestEnable_PrivacyNoticeWhileDedicatedUploadsContinue(t *testing.T) {
+	t.Parallel()
+	const notice = "Dedicated checkpoint uploads can still proceed.\n" +
+		"  They contain your agent transcripts. If that repo is public, anyone can read them.\n" +
+		"  Secret redaction is best effort, not bulletproof. Review with `entire checkpoint explain`.\n" +
+		"  To stop uploads: `entire configure --skip-push-sessions`\n"
+	ForEachBackend(t, func(t *testing.T, backend string) {
+		env := NewFeatureBranchEnv(t)
+		env.CheckpointStore = backend
+		origin := env.SetupBareRemote()
+		// The dedicated URL is derived from origin's protocol, which a bare
+		// path does not have.
+		testutil.RunGit(t, env.RepoDir, "remote", "set-url", "origin", "file://"+origin)
+		dedicated := t.TempDir()
+		testutil.RunGit(t, dedicated, "init", "--bare")
+		for _, derived := range []string{
+			"https://github.com/" + checkpointRemoteRepoSlug + ".git",
+			"git@github.com:" + checkpointRemoteRepoSlug + ".git",
+		} {
+			testutil.RunGit(t, env.RepoDir, "config", "--add", "url.file://"+dedicated+".insteadOf", derived)
+		}
+		env.setGitConfigBaseline()
+		// The local layer vouches for the store, which a file:// origin cannot.
+		require.NoError(t, os.WriteFile(filepath.Join(env.RepoDir, ".entire", "settings.local.json"),
+			[]byte(`{"strategy_options":{"checkpoint_push_remote":"missing","checkpoint_remote":{"provider":"github","repo":"`+checkpointRemoteRepoSlug+`"}}}`), 0o644))
+
+		out := env.RunCLI("enable")
+		require.Contains(t, out, "Cannot resolve checkpoint remote selection")
+		require.True(t, strings.HasSuffix(out, notice), "notice should end the output; got:\n%s", out)
+
+		createCheckpointedCommit(t, env, "Add module", "mod.go", "package mod", "Add module")
+		env.RunPrePush("origin")
+		require.True(t, env.CheckpointsPresentOnRemote(dedicated), "pushes should still upload to the dedicated store")
+		require.False(t, env.CheckpointsPresentOnRemote(origin))
+	})
 }

@@ -322,11 +322,11 @@ func TestEnableCheckpointPushRemote_ExplicitSameLocalDoesNotWrite(t *testing.T) 
 }
 
 // Every successful enable ends by naming where checkpoints go, then saying
-// what they contain and that redaction is best effort, because nothing else
-// tells a first-time user that transcripts travel with their pushes. A broken
-// destination is reported instead, with no notice: nothing is uploaded until it
-// is fixed. "No checkpoint destination settings changed." appears only when a
-// change was asked for and turned out to be a no-op.
+// what they contain and that redaction is best effort. A destination that
+// cannot be resolved is reported instead, and the notice follows only when a
+// dedicated checkpoint_remote still receives uploads. "No checkpoint
+// destination settings changed." appears only when a change was asked for and
+// turned out to be a no-op.
 func TestEnableCheckpointPushRemote_Report(t *testing.T) {
 	const (
 		dedicatedURL = "https://github.com/org/checkpoints.git"
@@ -355,7 +355,9 @@ func TestEnableCheckpointPushRemote_Report(t *testing.T) {
 		{name: "invalid", config: `{"strategy_options":{"checkpoint_push_remote":"missing"}}`, want: "Checkpoint sync remains disabled:"},
 		{name: "dedicated untouched", config: `{"strategy_options":{"checkpoint_remote":{"provider":"github","repo":"org/checkpoints"}}}`, exact: true, want: "\nCheckpoint uploads use the dedicated destination: " + dedicatedURL + ".\n" + privacy},
 		{name: "dedicated requested", config: `{"strategy_options":{"checkpoint_remote":{"provider":"github","repo":"org/checkpoints"}}}`, choice: enableCheckpointRemoteChoice{dedicatedRequested: true}, want: dedicatedURL, notice: "Checkpoint uploads use the dedicated destination: " + dedicatedURL + ".\n" + privacy},
-		{name: "invalid with dedicated", config: `{"strategy_options":{"checkpoint_push_remote":"missing","checkpoint_remote":{"provider":"github","repo":"org/checkpoints"}}}`, want: "Dedicated checkpoint destination for pushes to origin: " + dedicatedURL},
+		// The broken selection stops ordinary checkpoint sync, but pushes to
+		// origin still upload to the dedicated store, so the notice stays.
+		{name: "invalid with dedicated", config: `{"strategy_options":{"checkpoint_push_remote":"missing","checkpoint_remote":{"provider":"github","repo":"org/checkpoints"}}}`, want: "Dedicated checkpoint destination for pushes to origin: " + dedicatedURL, notice: "Dedicated checkpoint uploads can still proceed.\n" + privacy},
 		{name: "push disabled untouched", config: `{"enabled":true,"strategy_options":{"push_sessions":false}}`, exact: true, want: "\nCheckpoint uploads are off (push_sessions: false). Checkpoints stay in this clone.\n" + redaction},
 		{name: "push disabled requested", config: `{"enabled":true,"strategy_options":{"push_sessions":false,"checkpoint_push_remote":"origin"}}`, choice: enableCheckpointRemoteChoice{name: "origin"}, want: "Checkpoint pushing remains disabled.\n" + redaction, notice: redaction, wantUnchangedLine: true},
 		{name: "no remotes", config: `{"enabled":true}`, noRemote: true, exact: true, want: "\nNo Git remotes configured. Checkpoints stay local until a remote is configured.\n" + privacy + privateRepo},
