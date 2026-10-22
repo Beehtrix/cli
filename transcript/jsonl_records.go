@@ -16,15 +16,14 @@ import (
 // targets:
 //   - Consecutive assistant entries with the same message ID are fragments of
 //     one message: the first opens it, the rest append to it.
-//   - Tool results in user entries become result records on the assistant
-//     message holding the tool_use with their tool_use_id, wherever they fall
-//     until the next user entry with text or images (whose own results still
-//     count), including text the agent injected (Claude's isMeta): Claude
-//     Code writes the results of parallel tool calls one user entry each,
-//     sometimes after the next assistant message began, but never after
-//     user text while a result is outstanding. A result
-//     without a tool_use_id targets the last assistant message. Other results
-//     are dropped, as is a user entry that held only such results.
+//   - A tool result in a user entry becomes a result record on the assistant
+//     message holding the tool_use with its tool_use_id, wherever the result
+//     falls. Claude Code writes the results of parallel tool calls one user
+//     entry each, sometimes after the next assistant message began or after
+//     text it injected (isMeta). A result without a tool_use_id targets the
+//     last assistant message, until a user entry with text or images (whose
+//     own results still count). Other results are dropped, as is a user entry
+//     that held only such results.
 //   - The text and images of a user entry become a separate user message.
 //
 // Fold keys are the agent's message ID where it has one and it is unused,
@@ -47,10 +46,10 @@ type JSONLAdapter struct {
 	keys    map[string]bool // fold keys handed out
 	open    *openAssistant  // set while the last parsed entry is an assistant
 	// results is the key of the last assistant message, which a result
-	// without a tool_use_id attaches to, or "" after a prompt.
+	// without a tool_use_id attaches to, or "" after a user message.
 	results string
-	// toolUses maps the tool_use IDs seen since the last prompt to the key of
-	// the message holding each.
+	// toolUses maps each tool_use ID seen to the key of the last message
+	// holding it.
 	toolUses map[string]string
 }
 
@@ -218,7 +217,7 @@ func (a *JSONLAdapter) user(e parsedEntry, out []Record) []Record {
 	if hasToolResults(e) && !hasContent {
 		return out
 	}
-	a.results, a.toolUses = "", nil
+	a.results = ""
 
 	content, err := userContentBlocks(e)
 	if err != nil {

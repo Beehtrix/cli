@@ -27,16 +27,17 @@ func legacyCompactJSONLWith(content []byte, opts Options, preprocess linePreproc
 	// Intentional divergence: the original inlined only the results in the
 	// user entry immediately after an assistant. That dropped the results of
 	// parallel tool calls, which Claude Code writes one user entry each, so
-	// results now attach by tool_use_id to the assistant holding that
-	// tool_use, until the next user entry with text or images. Output is
-	// collected first because a result can land after a later assistant.
+	// results now attach by tool_use_id to the last assistant holding that
+	// tool_use, wherever they fall; a result without one attaches to the
+	// last assistant until the next user entry with text or images. Output
+	// is collected first because a result can land after a later assistant.
 	type legacyOut struct {
 		entry     parsedEntry
 		assistant bool
 	}
 	var outs []legacyOut
-	owners := make(map[string]int) // tool_use ID → index in outs, since the last prompt
-	last := -1                     // index of the last assistant in outs, since the last prompt
+	owners := make(map[string]int) // tool_use ID → index in outs of the last assistant holding it
+	last := -1                     // index of the last assistant in outs, since the last user line
 	for i := 0; i < len(entries); i++ {
 		e := entries[i]
 
@@ -73,7 +74,7 @@ func legacyCompactJSONLWith(content []byte, opts Options, preprocess linePreproc
 				continue
 			}
 			outs = append(outs, legacyOut{entry: e})
-			owners, last = make(map[string]int), -1
+			last = -1
 		}
 	}
 

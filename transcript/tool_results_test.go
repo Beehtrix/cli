@@ -37,16 +37,17 @@ func convertResults(t *testing.T, input string, agent string) map[string]*ToolRe
 func TestJSONLAdapter_AttachesResultsByToolUseID(t *testing.T) {
 	t.Parallel()
 
-	for _, name := range []string{"parallel results in separate user entries", "result after the next assistant message began", "results only until the next prompt", "results only until injected text"} {
+	for _, name := range []string{"parallel results in separate user entries", "result after the next assistant message began", "results by ID attach after a prompt", "results by ID attach after injected text", "results without an ID only until the next prompt"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			input := jsonlEdgeCases[name]
 			results := convertResults(t, input, "claude-code")
 			want := map[string]string{
-				"parallel results in separate user entries":     "tu1=first tu2=second",
-				"result after the next assistant message began": "tu1=late tu2=no id: last message",
-				"results only until the next prompt":            "tu1=-",
-				"results only until injected text":              "tu1=loaded tu2=-",
+				"parallel results in separate user entries":        "tu1=first tu2=second",
+				"result after the next assistant message began":    "tu1=late tu2=no id: last message",
+				"results by ID attach after a prompt":              "tu1=later",
+				"results by ID attach after injected text":         "tu1=loaded tu2=late",
+				"results without an ID only until the next prompt": "tu1=-",
 			}[name]
 			var got []string
 			for _, id := range []string{"tu1", "tu2"} {

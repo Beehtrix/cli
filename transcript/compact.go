@@ -122,6 +122,11 @@ func Convert(content []byte, opts Options) ([]byte, error) {
 // up to one merged line that began in the previous checkpoint. Downstream
 // segmenters must tolerate this bounded head overlap. See the straddle case in
 // TestFullWithBoundary_StraddlingAssistantFragments_RoundsToInclusion.
+//
+// Likewise, a tool result can arrive after StartLine for a call made before
+// it, even after a later prompt. The full conversion inlines it into that
+// earlier line, which is before the boundary; the delta, which lacks the
+// call, drops it.
 func ConvertWithBoundary(content []byte, opts Options) (full []byte, boundary int, err error) {
 	fullOpts := opts
 	fullOpts.StartLine = 0

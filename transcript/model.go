@@ -1,6 +1,10 @@
 package transcript
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
 
 // Block types. Other values pass through verbatim; see Block.Raw.
 const (
@@ -58,15 +62,30 @@ type ToolResultAgent struct {
 	ID string `json:"id"`
 }
 
-// UnmarshalJSON reads an agent object, ignoring a value of another shape so
-// that it does not invalidate the tool result around it.
-func (a *ToolResultAgent) UnmarshalJSON(b []byte) error { //nolint:unparam // json.Unmarshaler
+// UnmarshalJSON decodes a tool result. An "agent" that is not an object with
+// a non-empty string "id" decodes as absent rather than failing the result,
+// so a malformed one neither drops the block around it nor folds into an
+// empty agent.
+func (r *ToolResult) UnmarshalJSON(b []byte) error {
+	if string(bytes.TrimSpace(b)) == "null" {
+		return nil // as encoding/json leaves a struct on null
+	}
+	type plain ToolResult
 	var w struct {
+		plain
+
+		Agent json.RawMessage `json:"agent"` // shadows plain.Agent
+	}
+	if err := json.Unmarshal(b, &w); err != nil {
+		return fmt.Errorf("decoding tool result: %w", err)
+	}
+	*r = ToolResult(w.plain)
+	var agent struct {
 		ID json.RawMessage `json:"id"`
 	}
-	*a = ToolResultAgent{}
-	if json.Unmarshal(b, &w) == nil {
-		_ = json.Unmarshal(w.ID, &a.ID) //nolint:errcheck // a non-string id is ignored
+	var id string
+	if json.Unmarshal(w.Agent, &agent) == nil && json.Unmarshal(agent.ID, &id) == nil && id != "" {
+		r.Agent = &ToolResultAgent{ID: id}
 	}
 	return nil
 }

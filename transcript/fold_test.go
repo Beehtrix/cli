@@ -501,3 +501,34 @@ func TestRecord_JSONRoundTrip(t *testing.T) {
 		t.Errorf("agent result record encoding = %s (%v), want %s", result, err, wantAgent)
 	}
 }
+
+func TestRecord_MalformedResultAgentDecodesAsAbsent(t *testing.T) {
+	t.Parallel()
+
+	for _, agent := range []string{`"a17"`, `{"id":""}`, `{"id":7}`, `null`, `[]`} {
+		var r Record
+		in := `{"op":"result","id":"a","toolUseId":"tu1","result":{"output":"x","status":"success","agent":` + agent + `}}`
+		if err := json.Unmarshal([]byte(in), &r); err != nil {
+			t.Fatalf("agent %s: %v", agent, err)
+		}
+		if r.Result.Agent != nil {
+			t.Errorf("agent %s decoded as %+v, want absent", agent, r.Result.Agent)
+		}
+		got := foldLines(t, assistantRecord("a", "a", `[{"type":"tool_use","id":"tu1","name":"Agent","input":{}}]`), r)
+		assertLines(t, got,
+			linePrefix+`"type":"assistant","ts":"t1","id":"a","content":[{"id":"tu1","input":{},"name":"Agent","result":{"output":"x","status":"success"},"type":"tool_use"}]}`,
+		)
+	}
+
+	var r ToolResult
+	if err := json.Unmarshal([]byte(`{"output":"x","status":"success","agent":{"id":"a17"}}`), &r); err != nil || r.Agent == nil || r.Agent.ID != "a17" {
+		t.Errorf("well-formed agent decoded as %+v (%v)", r.Agent, err)
+	}
+	if err := json.Unmarshal([]byte(`{"output":7}`), &r); err == nil {
+		t.Error("a mistyped output decoded without error")
+	}
+	r = ToolResult{Output: "prev"}
+	if err := json.Unmarshal([]byte(`null`), &r); err != nil || r.Output != "prev" {
+		t.Errorf("null changed the result to %+v (%v)", r, err)
+	}
+}

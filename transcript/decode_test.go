@@ -64,7 +64,7 @@ func TestDecode_Blocks(t *testing.T) {
 				Version: 1, Type: TypeAssistant,
 				Blocks: []Block{{
 					Type: BlockToolUse, ID: "tu-1", Name: "Agent", Input: json.RawMessage(`{}`),
-					Result: &ToolResult{Output: "x", Status: ToolStatusSuccess, Agent: &ToolResultAgent{}},
+					Result: &ToolResult{Output: "x", Status: ToolStatusSuccess},
 					Raw:    json.RawMessage(`{"type":"tool_use","id":"tu-1","name":"Agent","input":{},"result":{"output":"x","status":"success","agent":"a17"}}`),
 				}},
 			},
