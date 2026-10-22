@@ -120,6 +120,25 @@ func TestJSONLBytesCounts_OverlapsCountInEachLayerButReplaceOnce(t *testing.T) {
 	require.Equal(t, 2, got.Layers["entropy"])
 }
 
+// IP matches count in their own bucket, including the ones found through a
+// JSON key that names an address, which bypass the text scan.
+func TestJSONLBytesCounts_IP(t *testing.T) {
+	ConfigurePII(PIIConfig{Enabled: true, Categories: map[PIICategory]bool{PIIIP: true}})
+	t.Cleanup(resetPIIConfig)
+
+	for _, tc := range []struct{ name, content string }{
+		{"address in text", textLine(t, "ssh deploy@10.24.3.17 failed")},
+		{"address under a network key", `{"host":"34.117.59.81"}` + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := countsOf(t, tc.content)
+			require.Equal(t, 1, got.Replacements)
+			require.Equal(t, 1, got.Layers["pii"])
+			require.Equal(t, map[string]int{"IP": 1}, got.PII)
+		})
+	}
+}
+
 // A layer that did not run is absent, which is different from a layer that ran
 // and found nothing.
 func TestJSONLBytesCounts_AbsentInactiveAndZeroAreDistinct(t *testing.T) {

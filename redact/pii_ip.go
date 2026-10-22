@@ -313,8 +313,9 @@ func isHexByte(c byte) bool {
 // redactIPsUnderNetworkKey redacts the addresses in a JSON string value whose
 // key names one ({"host":"34.117.59.81"}, {"remote_addr":...}). The JSONL path
 // scans each value without its key, so the key is the only context such a
-// public address has. It runs on the already-redacted value.
-func redactIPsUnderNetworkKey(key, val string) string {
+// public address has. It runs on the already-redacted value and counts its
+// matches in t, like the PII layer.
+func redactIPsUnderNetworkKey(key, val string, t *tally) string {
 	cfg := getPIIConfig()
 	if cfg == nil || !cfg.Enabled || !cfg.Categories[PIIIP] || !isNetworkKey(key) {
 		return val
@@ -323,14 +324,11 @@ func redactIPsUnderNetworkKey(key, val string) string {
 	for _, re := range []*regexp.Regexp{ipv4CandidateRegex, ipv6CandidateRegex} {
 		for _, loc := range re.FindAllStringIndex(val, -1) {
 			if start, end, _, ok := ipCandidate(val, loc[0], loc[1]); ok {
-				regions = append(regions, taggedRegion{region: region{start, end}, label: labelIP})
+				regions = append(regions, taggedRegion{region: region{start, end}, label: labelIP, layer: layerPII})
 			}
 		}
 	}
-	if len(regions) == 0 {
-		return val
-	}
-	return applyRegions(val, regions)
+	return redactRegions(val, regions, t)
 }
 
 // isNetworkKey reports whether a JSON key names an address. The key is split

@@ -2136,7 +2136,7 @@ func redactLeafValue(key string, credentialContext bool, val string, redactor le
 		redactor.counts.addPlaceholder(layerCredentialKey)
 		return RedactedPlaceholder
 	}
-	return redactIPsUnderNetworkKey(key, redacted)
+	return redactIPsUnderNetworkKey(key, redacted, redactor.counts)
 }
 
 // credentialKeyWords are stems of the keywords of betterleaks' generic-api-key

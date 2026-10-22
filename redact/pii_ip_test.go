@@ -198,7 +198,7 @@ func TestRedactIPsUnderNetworkKey_IPCategoryOff(t *testing.T) {
 	})
 	t.Cleanup(resetPIIConfig)
 
-	if got := redactIPsUnderNetworkKey("host", "34.117.59.81"); got != "34.117.59.81" {
+	if got := redactIPsUnderNetworkKey("host", "34.117.59.81", nil); got != "34.117.59.81" {
 		t.Errorf("redactIPsUnderNetworkKey = %q, want unchanged with ip off", got)
 	}
 }
