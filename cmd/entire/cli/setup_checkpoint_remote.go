@@ -347,9 +347,9 @@ func (c *enableCheckpointRemoteChoice) report(ctx context.Context, w io.Writer, 
 			}
 		}
 		if dedicated {
+			c.reportUnchangedDestination(w)
 			fmt.Fprintf(w, "Cannot resolve checkpoint remote selection: %v. Dedicated checkpoint uploads can still proceed.\n", err)
 			printCheckpointPrivacyNotice(w, false)
-			c.reportUnchangedDestination(w)
 			return
 		}
 		fmt.Fprintf(w, "Checkpoint sync remains disabled: %v\n", err)
@@ -358,9 +358,9 @@ func (c *enableCheckpointRemoteChoice) report(ctx context.Context, w io.Writer, 
 		return
 	}
 	if resolved.Name == "" {
-		fmt.Fprintln(w, "No Git remotes configured. Checkpoints stay local until a remote is configured.")
-		printCheckpointPrivacyNotice(w, true)
 		c.reportUnchangedDestination(w)
+		fmt.Fprintln(w, "No Git remotes configured. Once you add one, checkpoints will be uploaded when you push to it.")
+		printCheckpointPrivacyNotice(w, true)
 		return
 	}
 	// Resolve a possible local claim before computing the destination summary.

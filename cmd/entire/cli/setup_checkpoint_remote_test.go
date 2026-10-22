@@ -371,7 +371,11 @@ func TestEnableCheckpointPushRemote_Report(t *testing.T) {
 		{name: "invalid with dedicated", config: `{"strategy_options":{"checkpoint_push_remote":"missing","checkpoint_remote":{"provider":"github","repo":"org/checkpoints"}}}`, want: "Dedicated checkpoint destination for pushes to origin: " + dedicatedURL, notice: "Dedicated checkpoint uploads can still proceed.\n" + privacy},
 		{name: "push disabled untouched", config: `{"enabled":true,"strategy_options":{"push_sessions":false}}`, exact: true, want: "\nCheckpoint uploads are off (push_sessions: false). Checkpoints stay in this clone.\n" + redaction},
 		{name: "push disabled requested", config: `{"enabled":true,"strategy_options":{"push_sessions":false,"checkpoint_push_remote":"origin"}}`, choice: enableCheckpointRemoteChoice{name: "origin"}, want: "Checkpoint pushing remains disabled.\n" + redaction, notice: redaction, wantUnchangedLine: true},
-		{name: "no remotes", config: `{"enabled":true}`, noRemote: true, exact: true, want: "\nNo Git remotes configured. Checkpoints stay local until a remote is configured.\n" + privacy + privateRepo},
+		{name: "no remotes", config: `{"enabled":true}`, noRemote: true, exact: true, want: "\nNo Git remotes configured. Once you add one, checkpoints will be uploaded when you push to it.\n" + privacy + privateRepo},
+		// A named choice cannot reach either branch below today, but if one
+		// does, its unchanged line must not land after the notice.
+		{name: "no remotes with a named choice", config: `{"enabled":true}`, noRemote: true, choice: enableCheckpointRemoteChoice{name: "origin"}, want: "No checkpoint destination settings changed.", notice: "No Git remotes configured. Once you add one, checkpoints will be uploaded when you push to it.\n" + privacy + privateRepo, wantUnchangedLine: true},
+		{name: "invalid with dedicated and a named choice", config: `{"strategy_options":{"checkpoint_push_remote":"missing","checkpoint_remote":{"provider":"github","repo":"org/checkpoints"}}}`, choice: enableCheckpointRemoteChoice{name: "origin"}, want: "Dedicated checkpoint destination for pushes to origin: " + dedicatedURL, notice: "Dedicated checkpoint uploads can still proceed.\n" + privacy, wantUnchangedLine: true},
 		{name: "setup failed", config: `{"enabled":true}`, setupErr: errors.New("hooks failed"), exact: true, want: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

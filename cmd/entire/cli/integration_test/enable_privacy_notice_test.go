@@ -41,7 +41,7 @@ func TestEnable_PrivacyNotice(t *testing.T) {
 		{name: "yes", args: []string{"enable", "--yes", "--telemetry=false"}, after: "Ready.", notice: "Checkpoints will be uploaded when you push to origin.\n" + privacy},
 		{name: "rerun", before: enableAgent, args: []string{"enable"}, after: "Entire is already enabled.", notice: "Checkpoints will be uploaded when you push to origin.\n" + privacy},
 		{name: "push disabled", args: append(enableAgent, "--skip-push-sessions"), after: "Ready.", notice: "Checkpoint uploads are off (push_sessions: false). Checkpoints stay in this clone.\n" + redaction},
-		{name: "no remote", noRemote: true, args: enableAgent, after: "Ready.", notice: "No Git remotes configured. Checkpoints stay local until a remote is configured.\n" + privacy},
+		{name: "no remote", noRemote: true, args: enableAgent, after: "Ready.", notice: "No Git remotes configured. Once you add one, checkpoints will be uploaded when you push to it.\n" + privacy},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
