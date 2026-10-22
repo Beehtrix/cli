@@ -98,11 +98,16 @@ const (
 	// stays under the server's per-batch limit, so a capped review posts in
 	// one request.
 	maxPostedReviewFindings = 50
-	// maxPostedReviewFindingRunes bounds a posted finding body, counted in
-	// runes as the server counts them. It stays under the server's body
-	// limit, which rejects the whole batch when one body exceeds it.
+	// maxPostedReviewFindingRunes bounds a posted finding's body and its
+	// selected text, counted in runes as the server counts body length. The
+	// body stays under the server's body limit, which rejects the whole batch
+	// when one body exceeds it; the server sets no limit on selected text.
 	maxPostedReviewFindingRunes = 16384
 )
+
+func withinPostedFindingCap(text string) bool {
+	return utf8.RuneCountInString(text) <= maxPostedReviewFindingRunes
+}
 
 // capReviewTrailFindingInputs keeps at most maxPostedReviewFindings findings,
 // most severe first, in their original order, and shortens bodies longer than
@@ -156,7 +161,7 @@ func reviewTrailSeverityRank(severity *string) int {
 // that, with a note saying so, it fits maxPostedReviewFindingRunes. A code
 // fence the cut leaves open is closed first, or the note would render as code.
 func shortenReviewTrailFindingBody(body string) (string, bool) {
-	if utf8.RuneCountInString(body) <= maxPostedReviewFindingRunes {
+	if withinPostedFindingCap(body) {
 		return body, false
 	}
 	note := fmt.Sprintf("\n\n[Shortened: this finding was longer than %d characters.]", maxPostedReviewFindingRunes)

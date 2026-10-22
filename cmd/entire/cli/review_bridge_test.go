@@ -629,3 +629,41 @@ func TestShortenReviewTrailFindingBodyClosesOpenCodeFence(t *testing.T) {
 		})
 	}
 }
+
+// selected_text has no server limit, so an oversized one would leave a
+// finding's request unbounded. A reviewer-supplied one over the cap gives way
+// to the worktree span, and a span over the cap posts at file granularity.
+func TestPostReviewToTrailCapsSelectedText(t *testing.T) {
+	fake := setupReviewPostTrail(t)
+	long := strings.Repeat("x", wantMaxPostedBodyRunes+100)
+	// Changing the committed app.go keeps it part of the reviewed change.
+	testutil.WriteFile(t, ".", "app.go", long+"\nfunc main() {}\nvar three = 3\n")
+
+	comments := []cliReview.TrailComment{
+		{Severity: "low", Body: "range over a huge line", Location: cliReview.TrailLocation{Granularity: reviewTrailGranularityRange, FilePath: "app.go", StartLine: 1, EndLine: 2}},
+		{Severity: "low", Body: "oversized supplied text", Location: cliReview.TrailLocation{Granularity: reviewTrailGranularityLine, FilePath: "app.go", StartLine: 3, SelectedText: long}},
+	}
+	var out bytes.Buffer
+	if err := postReviewToTrail(t.Context(), &out, "default", cliReview.TrailReport{Comments: comments}); err != nil {
+		t.Fatalf("postReviewToTrail: %v\noutput:\n%s", err, out.String())
+	}
+
+	var posted []api.TrailReviewCommentInput
+	for _, batch := range fake.postedBatches() {
+		posted = append(posted, batch.Comments...)
+	}
+	if len(posted) != 2 {
+		t.Fatalf("posted %d findings, want 2", len(posted))
+	}
+	for i, c := range posted {
+		if c.Location.SelectedText != nil && utf8.RuneCountInString(*c.Location.SelectedText) > wantMaxPostedBodyRunes {
+			t.Errorf("finding %d selected_text is %d characters, want at most %d", i, utf8.RuneCountInString(*c.Location.SelectedText), wantMaxPostedBodyRunes)
+		}
+	}
+	if loc := posted[0].Location; loc.Granularity != reviewTrailGranularityFile || loc.FilePath == nil || *loc.FilePath != "app.go" || loc.SelectedText != nil || loc.StartLine != nil {
+		t.Errorf("range over a huge span = %+v, want file granularity on app.go with no selected_text", loc)
+	}
+	if loc := posted[1].Location; loc.Granularity != reviewTrailGranularityLine || loc.SelectedText == nil || *loc.SelectedText != "var three = 3" {
+		t.Errorf("oversized supplied selected_text = granularity %q, want line 3 with its worktree text", loc.Granularity)
+	}
+}
