@@ -171,7 +171,7 @@ func (s *ManualCommitStrategy) listAllSessionStates(ctx context.Context) ([]*Ses
 // checkpoint would store the earlier turns a second time.
 func isOrphanedSessionState(state *SessionState) bool {
 	return isEndedWithoutContent(state) &&
-		!hasTokenUsageData(state.CheckpointTokenUsage) && !hasTokenUsageData(state.SubagentTokensBaseline) &&
+		!HasTokenUsageData(state.CheckpointTokenUsage) && !HasTokenUsageData(state.SubagentTokensBaseline) &&
 		state.TokenStart() == 0 && state.CheckpointTranscriptStart == 0
 }
 
