@@ -2243,8 +2243,15 @@ func subagentTranscriptAndFiles(
 // reported, nor for Codex: a Codex child's usage comes from its rollout
 // inventory, which leaves it nil on purpose for a forked child whose rollout
 // carries the parent's history, and recounting that rollout from its start
-// would add the parent's tokens.
+// would add the parent's tokens. Nor for a child session
+// (agent.ChildSessionSubagents): its usage is credited to the parent's total at
+// completion, and the task entry must show the same figure. A child that stops
+// only at true completion has its full usage by then; one whose export failed
+// keeps no usage in either place.
 func taskUsageRecountable(ag agent.Agent, event *agent.Event) bool {
+	if _, childSession := agent.AsChildSessionSubagents(ag); childSession {
+		return false
+	}
 	return event.TokenUsage == nil && ag.Type() != agent.AgentTypeCodex
 }
 
@@ -2420,8 +2427,12 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 		return nil
 	}
 	var completed bool
-	if event.SubagentUsageOutsideParent {
-		completed, err = strategy.CompleteChildSessionTaskRecord(logCtx, event.SessionID, rec, event.SubagentStartedAt)
+	if _, ok := agent.AsChildSessionSubagents(ag); ok {
+		callStartedAt := event.SubagentStartedAt
+		if event.SessionEndSweep {
+			callStartedAt = time.Time{}
+		}
+		completed, err = strategy.CompleteChildSessionTaskRecord(logCtx, event.SessionID, rec, callStartedAt)
 	} else {
 		completed, err = strategy.CompleteTaskRecord(logCtx, event.SessionID, rec)
 	}
@@ -2549,6 +2560,7 @@ func captureInFlightTaskFinal(logCtx context.Context, ag agent.Agent, sessionID,
 		// The record's start scopes a re-export to this call (OpenCode).
 		SubagentStartedAt: task.StartedAt,
 		Final:             true,
+		SessionEndSweep:   true,
 		Timestamp:         time.Now(),
 	}
 	if err := handleSubagentStopFinal(logCtx, ag, event); err != nil {

@@ -536,3 +536,57 @@ func openCodeActiveParentCoauthorsCommit(t *testing.T, env *TestEnv, beforeCommi
 	require.NoError(t, json.Unmarshal([]byte(summaryContent), &summary))
 	require.Len(t, summary.Sessions, 2, "the parent co-authored the commit through its running child")
 }
+
+// TestOpenCodeSessionEndCreditsRunningChildOnce covers a background child
+// still running when its parent session ends. The SessionEnd sweep completes
+// its task and credits the usage its export holds by then (a child that keeps
+// working afterwards is undercounted, never counted twice). A later stop for
+// the same call, carrying the agent's start, must not credit it again, even
+// when the launch had no start and the sweep used the hook's own clock.
+func TestOpenCodeSessionEndCreditsRunningChildOnce(t *testing.T) {
+	t.Parallel()
+
+	for _, launchHasStart := range []bool{true, false} {
+		t.Run(map[bool]string{true: "launch with start", false: "launch without start"}[launchHasStart], func(t *testing.T) {
+			t.Parallel()
+
+			env := NewFeatureBranchEnv(t)
+			env.InitEntireWithAgent(agent.AgentNameOpenCode)
+			parent := env.NewOpenCodeSession()
+			child := env.NewOpenCodeSession()
+			child.TimeBase = time.Now().UnixMilli()
+			launchStart := int64(0)
+			if launchHasStart {
+				launchStart = child.TimeBase
+			}
+
+			require.NoError(t, env.SimulateOpenCodeSessionStart(parent.ID, parent.TranscriptPath))
+			require.NoError(t, env.SimulateOpenCodeTurnStart(parent.ID, parent.TranscriptPath, "review in the background"))
+			require.NoError(t, env.SimulateOpenCodeSubagentStartAt(parent.ID, "call_bg", child.ID, "general", "Review", launchStart))
+			if !launchHasStart {
+				// The record's start is the hook's clock; the child works after it.
+				child.TimeBase = time.Now().UnixMilli() + 1
+			}
+			parent.CreateOpenCodeTranscript("review in the background", nil)
+			require.NoError(t, env.SimulateOpenCodeTurnEnd(parent.ID, parent.TranscriptPath))
+			env.CopyTranscriptToEntireTmp(child.ID, child.CreateOpenCodeTranscript("Review", nil))
+
+			childInput := func() int {
+				t.Helper()
+				state, err := env.GetSessionState(parent.ID)
+				require.NoError(t, err)
+				total := state.TotalTokenUsage()
+				if total == nil || total.SubagentTokens == nil {
+					return 0
+				}
+				return total.SubagentTokens.InputTokens
+			}
+
+			require.NoError(t, env.SimulateOpenCodeSessionEnd(parent.ID, parent.TranscriptPath))
+			require.Equal(t, 150, childInput(), "the sweep credits the running child")
+
+			require.NoError(t, env.SimulateOpenCodeSubagentStopAt(parent.ID, "call_bg", child.ID, "general", "Review", child.TimeBase))
+			require.Equal(t, 150, childInput(), "the late stop is not credited again")
+		})
+	}
+}

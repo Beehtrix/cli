@@ -183,11 +183,8 @@ func (a *OpenCodeAgent) ParseHookEvent(ctx context.Context, hookName string, std
 			// Final: the plugin sends this at true completion — tool.execute.after
 			// for a foreground task, the child's own idle for a background one.
 			// CompletionWithoutLaunch: a plugin restarted mid-task never saw the start.
-			// SubagentUsageOutsideParent: a child is a session of its own; the
-			// parent's messages never include its usage.
-			Final:                      true,
-			CompletionWithoutLaunch:    true,
-			SubagentUsageOutsideParent: true,
+			Final:                   true,
+			CompletionWithoutLaunch: true,
 		}
 		// No export here: the capture exports the child through
 		// FetchSubagentTranscript, after the checks that can still discard

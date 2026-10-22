@@ -1124,14 +1124,14 @@ type CreditedChildCall struct {
 
 // matches reports whether a stop for call repeats this credited call. It
 // mirrors the CLI's completion-record keying: the same child under the same
-// call ID (or a key minted from it), with the same start. A stop with no start
-// cannot tell a repeat from a new call on the child, so it matches, as
-// completion-record keying skips it rather than double count.
+// call ID (or a key minted from it), with the same start. An unknown start on
+// either side cannot tell a repeat from a new call on the child, so it
+// matches, as completion-record keying skips it rather than double count.
 func (c CreditedChildCall) matches(call CreditedChildCall) bool {
 	if c.AgentID != call.AgentID || !sameCallKey(c.ToolUseID, call.ToolUseID) {
 		return false
 	}
-	return call.StartedAtMs == 0 || c.StartedAtMs == call.StartedAtMs
+	return c.StartedAtMs == 0 || call.StartedAtMs == 0 || c.StartedAtMs == call.StartedAtMs
 }
 
 func sameCallKey(a, b string) bool {

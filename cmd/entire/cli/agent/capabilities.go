@@ -239,6 +239,12 @@ func AsLiveSubagentFileReporter(ag Agent) (LiveSubagentFileReporter, bool) {
 	return builtinCapability[LiveSubagentFileReporter](ag)
 }
 
+// AsChildSessionSubagents returns the agent as ChildSessionSubagents if it
+// implements the interface. Built-in only, like LiveSubagentFileReporter.
+func AsChildSessionSubagents(ag Agent) (ChildSessionSubagents, bool) {
+	return builtinCapability[ChildSessionSubagents](ag)
+}
+
 // AsTokenCalculator returns the agent as TokenCalculator if it both
 // implements the interface and (for CapabilityDeclarer agents) has declared the capability.
 func AsTokenCalculator(ag Agent) (TokenCalculator, bool) {

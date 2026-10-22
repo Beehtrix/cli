@@ -119,7 +119,7 @@ func TestFactoryDroidWorkerTokensComeFromItsOwnSettings(t *testing.T) {
 	require.NotNil(t, rec, "the Worker's turn must be a task on the parent")
 	require.Equal(t, &agent.TokenUsage{InputTokens: 8612, OutputTokens: 109, CacheReadTokens: 8026, APICallCount: 1}, rec.TokenUsage)
 
-	// The parent's own total excludes the Worker, which counts in the task.
+	// The parent's own TokenUsage excludes the Worker, which counts in the task.
 	appendLines(t, parent.TranscriptPath,
 		`{"type":"message","id":"p1","message":{"role":"assistant","content":[{"type":"text","text":"The Worker is done."}]}}`)
 	writeDroidSettings(t, parent.TranscriptPath, 56099, 1276, 139199)
