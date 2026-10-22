@@ -40,15 +40,16 @@ type Block struct {
 }
 
 // ToolResult is the result inlined into the tool_use block that requested it.
+// Its JSON encoding is the stored "result" object.
 type ToolResult struct {
-	Output     string
-	Status     string // ToolStatusSuccess or ToolStatusError
-	File       *ToolResultFile
-	MatchCount int
+	Output     string          `json:"output"`
+	Status     string          `json:"status"` // ToolStatusSuccess or ToolStatusError
+	File       *ToolResultFile `json:"file,omitempty"`
+	MatchCount int             `json:"matchCount,omitempty"`
 }
 
 // ToolResultFile carries file metadata from Read/Edit tool results.
 type ToolResultFile struct {
-	FilePath string
-	NumLines int
+	FilePath string `json:"filePath"`
+	NumLines int    `json:"numLines,omitempty"`
 }

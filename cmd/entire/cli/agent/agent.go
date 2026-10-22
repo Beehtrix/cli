@@ -327,6 +327,40 @@ type TranscriptFetcher interface {
 	FetchTranscript(ctx context.Context, sessionID string) (string, error)
 }
 
+// SubagentTranscriptFetcher is implemented by agents whose subagents are
+// sessions the agent can still export after the fact, keyed by the task
+// record's AgentID (OpenCode: the child session ID). Condensation calls it for
+// a completed task record whose transcript was never declared or can no
+// longer be read (a subagent-stop whose export failed), so a transcript that
+// still exists in the agent's store is not recorded as unavailable. Callers go
+// through FetchSubagentTranscript, which honours WithSubagentFetchBudget. Agents whose AgentID is not a fetchable session
+// (Claude Code's agent IDs) must not implement it.
+type SubagentTranscriptFetcher interface {
+	Agent
+
+	// FetchSubagentTranscript writes the transcript of the task call
+	// toolUseID, run by subagent agentID between startedAt and completedAt
+	// (either zero when unknown or still running), to the agent's cache
+	// location and returns its path. The window matters when one subagent
+	// backs several calls: a re-export after a later call must not carry it.
+	FetchSubagentTranscript(ctx context.Context, agentID, toolUseID string, startedAt, completedAt time.Time) (string, error)
+}
+
+// LiveSubagentFileReporter is implemented by agents that can report what a
+// still-running subagent call has modified so far (OpenCode: by exporting the
+// child session). The co-authorship check in post-commit uses it for a live
+// task record, which has no transcript on disk until its stop hook runs. It
+// must not write anything a task record declares or a later capture reads: a
+// report that lands after the call's stop must not replace its transcript.
+type LiveSubagentFileReporter interface {
+	Agent
+
+	// LiveSubagentModifiedFiles returns the files the task call toolUseID,
+	// run by subagent agentID since startedAt (zero when unknown), has
+	// modified so far.
+	LiveSubagentModifiedFiles(ctx context.Context, agentID, toolUseID string, startedAt time.Time) ([]string, error)
+}
+
 // SidecarImageProvider is implemented by agents that keep images OUTSIDE the
 // transcript Entire condenses — e.g. Cursor stores pasted images in a per-session
 // SQLite blob store, not the JSONL transcript. The strategy layer calls this

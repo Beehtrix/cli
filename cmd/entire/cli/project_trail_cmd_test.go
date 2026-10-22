@@ -152,7 +152,34 @@ func TestProjectTrailMissingParentDoesNotFallBack(t *testing.T) {
 	require.Empty(t, out)
 }
 
+func TestProjectTrailShowPrintsServerURL(t *testing.T) {
+	setupProjectTrailTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		item := projectTrailTestResource()
+		item.URL = "https://entire.io/gh/acme/-/trails/42"
+		assert.NoError(t, json.NewEncoder(w).Encode(item))
+	})
+	out, _, err := executeProjectTrailTest(t, "show", "42", "--project", "gh/acme")
+	require.NoError(t, err)
+	require.Contains(t, out, "Trail #42: Project intent\nURL: https://entire.io/gh/acme/-/trails/42\nID: ")
+}
+
+func TestProjectTrailShowOmitsURLWithoutOne(t *testing.T) {
+	for name, url := range map[string]string{"absent": "", "whitespace": "  "} {
+		t.Run(name, func(t *testing.T) {
+			setupProjectTrailTest(t, func(w http.ResponseWriter, _ *http.Request) {
+				item := projectTrailTestResource()
+				item.URL = url
+				assert.NoError(t, json.NewEncoder(w).Encode(item))
+			})
+			out, _, err := executeProjectTrailTest(t, "show", "42", "--project", "gh/acme")
+			require.NoError(t, err)
+			require.NotContains(t, out, "URL:")
+		})
+	}
+}
+
 func TestProjectTrailUpdateAtomicConditionalPatch(t *testing.T) {
+	setupProjectAssigneeCore(t, map[string]string{"alice": projectAssigneeAliceID, "bob": projectAssigneeBobID})
 	var methods []string
 	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
 		methods = append(methods, r.Method)
@@ -161,7 +188,7 @@ func TestProjectTrailUpdateAtomicConditionalPatch(t *testing.T) {
 			assert.Equal(t, `W/"precise-parent-version"`, r.Header.Get("If-Match"))
 			var body map[string]any
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-			assert.Equal(t, map[string]any{"title": "New intent", "body": "", "assignees": []any{"bob"}}, body)
+			assert.Equal(t, map[string]any{"title": "New intent", "body": "", "assignees": []any{"ulid:" + projectAssigneeBobID}}, body)
 		}
 		w.Header().Set("ETag", `W/"precise-parent-version"`)
 		assert.NoError(t, json.NewEncoder(w).Encode(projectTrailTestResource()))

@@ -34,6 +34,7 @@ type CapabilityDeclarer interface {
 //   - HookTimeoutRepairer
 //   - InventoryAwareExtractor
 //   - LateTranscriptWriter (refuses CapabilityDeclarer agents)
+//   - LiveSubagentFileReporter
 //   - ModelExtractor
 //   - ModelLister
 //   - OutOfBandTokenSource (refuses CapabilityDeclarer agents)
@@ -48,6 +49,7 @@ type CapabilityDeclarer interface {
 //   - SkillEventExtractor
 //   - StaleHookReporter
 //   - SubagentSessionResolver
+//   - SubagentTranscriptFetcher
 //   - TaskTranscriptMatcher
 //   - ToolInvocationScanner
 //   - TranscriptFetcher
@@ -223,6 +225,18 @@ func SanitizeTranscriptForStorage(ag Agent, data []byte) []byte {
 // assertion alone with no DeclaredCaps gate.
 func AsTranscriptFetcher(ag Agent) (TranscriptFetcher, bool) {
 	return builtinCapability[TranscriptFetcher](ag)
+}
+
+// AsSubagentTranscriptFetcher returns the agent as SubagentTranscriptFetcher if
+// it implements the interface. Built-in only, like TranscriptFetcher.
+func AsSubagentTranscriptFetcher(ag Agent) (SubagentTranscriptFetcher, bool) {
+	return builtinCapability[SubagentTranscriptFetcher](ag)
+}
+
+// AsLiveSubagentFileReporter returns the agent as LiveSubagentFileReporter if
+// it implements the interface. Built-in only, like SubagentTranscriptFetcher.
+func AsLiveSubagentFileReporter(ag Agent) (LiveSubagentFileReporter, bool) {
+	return builtinCapability[LiveSubagentFileReporter](ag)
 }
 
 // AsTokenCalculator returns the agent as TokenCalculator if it both
