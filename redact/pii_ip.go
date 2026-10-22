@@ -27,7 +27,10 @@ import (
 // redacted; custom_patterns covers teams that need every address.
 // testdata/ip_lines.txt measures the rule's precision and recall.
 var (
-	ipv4CandidateRegex = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
+	// ipv4CandidateRegex has no leading \b, which would never match after the
+	// letter of an escape left in the text (\n10.0.0.5); ipStandsAlone rejects
+	// a candidate that continues a word on the left instead.
+	ipv4CandidateRegex = regexp.MustCompile(`\d{1,3}(?:\.\d{1,3}){3}\b`)
 	// ipv6CandidateRegex needs at least two colons, so a single key:value
 	// colon never becomes a candidate. The optional dotted tail admits
 	// IPv4-embedded forms (::ffff:10.0.0.1). netip.ParseAddr does the actual
@@ -164,7 +167,7 @@ func followsVersionLabel(s string, start int) bool {
 func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 	if start > 0 {
 		prev := s[start-1]
-		if isIPWordByte(prev) || prev == '.' {
+		if (isIPWordByte(prev) && !followsJSONEscape(s, start)) || prev == '.' {
 			return false
 		}
 		// In raw JSON a letter after a backslash belongs to an escape (\f, \b),
@@ -185,6 +188,11 @@ func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 		if isIPWordByte(next) {
 			return false
 		}
+		// A longer colon run, such as a key fingerprint (MD5:12:f8:...), is
+		// not an address even when eight of its groups parse as one.
+		if next == ':' && addr.Is6() && isHexGroup(wordAt(s, end+1)) {
+			return false
+		}
 		if (next == '.' || next == '-') && end+1 < len(s) && isIPWordByte(s[end+1]) {
 			return false
 		}
@@ -199,7 +207,7 @@ func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 	if !strings.ContainsAny(candidate, "0123456789") && !isInternalIP(addr) {
 		return false
 	}
-	if ipv6Groups(candidate) >= 3 || start == 0 {
+	if ipv6Groups(candidate) >= 3 || start == 0 || followsJSONEscape(s, start) {
 		return true
 	}
 	switch s[start-1] {
@@ -216,6 +224,13 @@ func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 		return !isIPWordByte(before) && before != ']' && before != ')'
 	}
 	return false
+}
+
+// followsJSONEscape reports whether the byte before s[start] is the letter of
+// a JSON escape (\n, \t) left in a string decoded only once, such as Codex
+// function_call.arguments. That letter ends the escape, not a word.
+func followsJSONEscape(s string, start int) bool {
+	return start > 1 && isLetterByte(s[start-1]) && skipJSONEscapeLetter(s, start-1) == start
 }
 
 // isSeparatorColon reports whether the colon at s[i] ends a word rather than
@@ -238,7 +253,7 @@ func isSeparatorColon(s string, i int) bool {
 // that word. A group joined by "::" is kept, so code paths (u64::from) stay
 // whole and are rejected.
 func trimGluedWords(s string, start, end int) (int, int) {
-	if start > 0 && isIPWordByte(s[start-1]) {
+	if start > 0 && isIPWordByte(s[start-1]) && !followsJSONEscape(s, start) {
 		if i := strings.IndexByte(s[start:end], ':'); i > 0 && start+i+1 < end && s[start+i+1] != ':' && isSeparatorColon(s, start+i) {
 			start += i + 1
 		}
@@ -313,23 +328,58 @@ func ipHasContext(s string, start, end int, addr netip.Addr) bool {
 // ipContextWindow returns the text searched for a network word on each side
 // of s[start:end]. It stays on the address's own line, because one transcript
 // string holds a whole command output, and it drops a word the window cuts,
-// because \b would match at the cut ("ghost" seen as "host").
+// because \b would match at the cut ("ghost" seen as "host"). Text decoded
+// only once keeps its escapes, so a literal \n or \r also ends the line and a
+// literal \t separates words.
 func ipContextWindow(s string, start, end int) (string, string) {
 	lo := max(start-ipContextBefore, 0)
-	if i := strings.LastIndexByte(s[lo:start], '\n'); i >= 0 {
-		lo += i + 1
-	}
-	for lo > 0 && lo < start && isIPWordByte(s[lo-1]) {
-		lo++
+	if i := pastLastLineBreak(s[lo:start]); i > 0 {
+		lo += i
+	} else {
+		for lo > 0 && lo < start && isIPWordByte(s[lo-1]) {
+			lo++
+		}
 	}
 	hi := min(end+ipContextAfter, len(s))
-	if i := strings.IndexByte(s[end:hi], '\n'); i >= 0 {
+	if i := firstLineBreak(s[end:hi]); i >= 0 {
 		hi = end + i
+	} else {
+		for hi < len(s) && hi > end && isIPWordByte(s[hi]) {
+			hi--
+		}
 	}
-	for hi < len(s) && hi > end && isIPWordByte(s[hi]) {
-		hi--
+	return escapedTabsAsSpaces(s[lo:start]), escapedTabsAsSpaces(s[end:hi])
+}
+
+// pastLastLineBreak returns the offset just past the last line break in w (a
+// newline, or a literal \n or \r), or 0 when it has none.
+func pastLastLineBreak(w string) int {
+	i := strings.LastIndexByte(w, '\n') + 1
+	for _, esc := range []string{`\n`, `\r`} {
+		if j := strings.LastIndex(w, esc); j >= 0 {
+			i = max(i, j+len(esc))
+		}
 	}
-	return s[lo:start], s[end:hi]
+	return i
+}
+
+// firstLineBreak returns the offset of the first line break in w (a newline,
+// or a literal \n or \r), or -1 when it has none.
+func firstLineBreak(w string) int {
+	i := strings.IndexByte(w, '\n')
+	for _, esc := range []string{`\n`, `\r`} {
+		if j := strings.Index(w, esc); j >= 0 && (i < 0 || j < i) {
+			i = j
+		}
+	}
+	return i
+}
+
+func escapedTabsAsSpaces(w string) string {
+	if !strings.Contains(w, `\t`) {
+		return w
+	}
+	return strings.ReplaceAll(w, `\t`, "  ")
 }
 
 // mayContainIPv4 reports whether s has a digit-dot-digit sequence, which
@@ -389,6 +439,34 @@ func redactIPsUnderNetworkKey(key, val string, t *tally) string {
 	return redactRegions(val, dropNestedIPRegions(regions), t)
 }
 
+// isVersionValue reports whether val is the value of a version key (version,
+// assemblyVersion, api_version) and is nothing but an address-shaped
+// version ({"version":"10.1.2.3"}). The JSONL walk scans a value without its
+// key, so this is the version-label rule for JSON.
+func isVersionValue(key, val string) bool {
+	k := normalizeCredentialJSONKey(key)
+	if k != "version" && !strings.HasSuffix(k, "_version") {
+		return false
+	}
+	_, err := netip.ParseAddr(strings.TrimSpace(val))
+	return err == nil
+}
+
+// withoutIPs returns r with IP matches dropped.
+func (r leafRedactor) withoutIPs() leafRedactor {
+	detect := r.detect
+	r.detect = func(s string) []taggedRegion {
+		var kept []taggedRegion
+		for _, t := range detect(s) {
+			if t.label != labelIP {
+				kept = append(kept, t)
+			}
+		}
+		return kept
+	}
+	return r
+}
+
 // dropNestedIPRegions removes an IP region that lies inside another one, so
 // an address counts once: both IP rules match an IPv4-mapped address, the
 // IPv4 rule only its dotted tail (::ffff:10.0.0.1).
@@ -416,14 +494,18 @@ func dropNestedIPRegions(regions []taggedRegion) []taggedRegion {
 // isNetworkKey reports whether a JSON key names an address. The key is split
 // into words first (HOST_IP, clientIP and IPAddress become host ip, client
 // ip and ip address), since \b does not separate snake_case or camelCase.
-// camelCase splitting cuts IPv6 into i_pv6, so a key with a digit is also
-// read lowercased and broken after each digit (IPv4Address: ipv4 address).
+// camelCase splitting would cut the IP acronym before a lowercase letter
+// (IPs: i_ps, IPv6: i_pv6), so those are marked as words first, and a key
+// with a digit is also read broken after each digit (IPv4Address: ipv4
+// address).
 func isNetworkKey(key string) bool {
-	if ipContextWordRegex.MatchString(strings.ReplaceAll(normalizeCredentialJSONKey(key), "_", " ")) {
+	if ipContextWordRegex.MatchString(strings.ReplaceAll(normalizeCredentialJSONKey(ipAcronymWords.Replace(key)), "_", " ")) {
 		return true
 	}
 	return strings.ContainsAny(key, "0123456789") && ipContextWordRegex.MatchString(splitAfterDigits(key))
 }
+
+var ipAcronymWords = strings.NewReplacer("IPs", "_ips_", "IPv", "_ipv")
 
 func splitAfterDigits(key string) string {
 	var b strings.Builder

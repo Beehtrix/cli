@@ -50,6 +50,13 @@ func TestDetectPII_IPRedacted(t *testing.T) {
 		{"ipv6 before a word", "connect to fe80::1:could not reach", "connect to [REDACTED_IP]:could not reach"},
 		{"UNC path", `\\192.168.1.40\share`, `\\[REDACTED_IP]\share`},
 		{"net use", `net use Z: \\10.24.3.17\c$`, `net use Z: \\[REDACTED_IP]\c$`},
+		// Escapes left in a string decoded once, such as Codex function_call.arguments.
+		{"address after a literal newline escape", `cat >> /etc/hosts << 'EOF'\n10.0.0.5 db`, `cat >> /etc/hosts << 'EOF'\n[REDACTED_IP] db`},
+		{"ipv6 after a literal newline escape", `ping\n2600:1f18:4c2:9300::7 connection refused`, `ping\n[REDACTED_IP] connection refused`},
+		{"short ipv6 after a literal tab escape", `printf 'a\tfd12::5'`, `printf 'a\t[REDACTED_IP]'`},
+		{"network word after a literal newline escape", `cat <<EOF\nssh 34.117.59.81\nEOF`, `cat <<EOF\nssh [REDACTED_IP]\nEOF`},
+		{"short network word after a literal newline escape", `x\nnc 34.117.59.81 22`, `x\nnc [REDACTED_IP] 22`},
+		{"network word after a literal tab escape", `printf 'a\tssh 34.117.59.81'`, `printf 'a\tssh [REDACTED_IP]'`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -87,6 +94,9 @@ func TestDetectPII_IPNotRedacted(t *testing.T) {
 		{"slice after call", "f()[1::2] and x[0][1::2]"},
 		{"hex-letter code path", "c::d and dead::beef"},
 		{"code paths after words", "Vec::default and Self::Abc and code::fd12"},
+		{"escape letter that starts the candidate", `\fe80::1`},
+		{"md5 key fingerprint", "Server host key: ecdsa-sha2-nistp256 MD5:12:f8:7e:78:61:b4:bf:e2:de:24:15:96:4e:d4:72:53"},
+		{"sha1 key fingerprint", "server fingerprint SHA1:AB:CD:12:34:56:78:9A:BC:DE:F0:12:34:56:78:9A:BC:DE:F0:12:34"},
 		{"hex word before colon", "ab:fe80::1"},
 		{"time", "at 12:30:45 today"},
 		{"file line col", "main.go:12:34: error"},
@@ -105,6 +115,7 @@ func TestDetectPII_IPNotRedacted(t *testing.T) {
 		{"documentation ipv4", "curl https://203.0.113.9/health; ssh deploy@198.51.100.7; host 192.0.2.10"},
 		{"documentation ipv6", "server 2001:db8::8a2e:370:7334 and 3fff::1"},
 		{"context word on another line", "git remote -v\nbumped protobuf to 3.21.12.1"},
+		{"context word before a literal newline escape", `ssh build\nbump to 3.21.12.1`},
 		{"context word cut at the left edge", "ghost " + strings.Repeat("b", 54) + " 1.17.2.3"},
 		{"context word cut at the right edge", "1.17.2.3 " + strings.Repeat("a", 26) + " ipsum"},
 	}
@@ -181,6 +192,13 @@ func TestPIIIntegration_IPUnderNetworkKey(t *testing.T) {
 		{`{"GlobalIPv6Address":"2600:1f18::7"}`, `{"GlobalIPv6Address":"[REDACTED_IP]"}`},
 		// A key with a credential stem still gets the IP token, not a whole-value placeholder.
 		{`{"api-host":"34.117.59.81"}`, `{"api-host":"[REDACTED_IP]"}`},
+		{`{"api-IPs":"34.117.59.81"}`, `{"api-IPs":"[REDACTED_IP]"}`},
+		{`{"externalIPs":["34.117.59.81"]}`, `{"externalIPs":["[REDACTED_IP]"]}`},
+		// A version key keeps its value even in a private range.
+		{`{"version":"10.1.2.3"}`, `{"version":"10.1.2.3"}`},
+		{`{"assemblyVersion":"10.1.2.3"}`, `{"assemblyVersion":"10.1.2.3"}`},
+		// Only a value that is the version is exempt.
+		{`{"version":"build 7 on 10.0.0.5"}`, `{"version":"build 7 on [REDACTED_IP]"}`},
 		// No network key: a bare public address in prose is the documented gap.
 		{`{"content":"34.117.59.81"}`, `{"content":"34.117.59.81"}`},
 		// The key does not override the token checks.
@@ -195,6 +213,65 @@ func TestPIIIntegration_IPUnderNetworkKey(t *testing.T) {
 		}
 		if got != tt.want {
 			t.Errorf("JSONLContent(%s) = %s, want %s", tt.in, got, tt.want)
+		}
+	}
+}
+
+// The same text in two arrays is spliced with one result, and only the copy
+// under a network key redacts the bare address. Map order decides which copy
+// is visited first, so the test repeats to cover both orders.
+//
+// Not parallel: sets the package-global PII config.
+func TestPIIIntegration_IPSameTextUnderTwoKeys(t *testing.T) {
+	ConfigurePII(PIIConfig{Enabled: true, Categories: map[PIICategory]bool{PIIIP: true}})
+	t.Cleanup(resetPIIConfig)
+
+	text := "dial 34.117.59.81 " + strings.Repeat("x", 70) + " 52.66.93.46"
+	redacted := "dial [REDACTED_IP] " + strings.Repeat("x", 70) + " [REDACTED_IP]"
+	tests := []struct{ in, want string }{
+		{`{"notes":["` + text + `"],"hosts":["` + text + `"]}`, `{"notes":["` + redacted + `"],"hosts":["` + redacted + `"]}`},
+		// A whole-value placeholder under a credential key hides more than IP
+		// tokens, however many there are.
+		{
+			`{"db_password":["Hunter2pass 34.117.59.81 52.66.93.46"],"hosts":["Hunter2pass 34.117.59.81 52.66.93.46"]}`,
+			`{"db_password":["REDACTED"],"hosts":["REDACTED"]}`,
+		},
+		{`{"password":["hunter2 34.117.59.81"],"hosts":["hunter2 34.117.59.81"]}`, `{"password":["REDACTED"],"hosts":["REDACTED"]}`},
+	}
+	for _, tt := range tests {
+		for range 20 {
+			got, err := JSONLContent(tt.in)
+			if err != nil {
+				t.Fatalf("JSONLContent: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("JSONLContent(%s) = %s, want %s", tt.in, got, tt.want)
+			}
+		}
+	}
+}
+
+// PII inside a value under a credential key does not make the rest of the
+// value safe to keep, so the whole-value placeholder still applies.
+//
+// Not parallel: sets the package-global PII config.
+func TestPIIIntegration_CredentialValueWithPII(t *testing.T) {
+	ConfigurePII(PIIConfig{Enabled: true, Categories: map[PIICategory]bool{PIIIP: true, PIIEmail: true}})
+	t.Cleanup(resetPIIConfig)
+
+	for _, in := range []string{
+		`{"client_secret":"Hunter2pass for 10.0.0.5"}`,
+		`{"auth_token":"10.0.0.5:Hunter2pass"}`,
+		`{"api_key":"Hunter2pass via ssh 34.117.59.81"}`,
+		`{"client_secret":"Hunter2pass for a@corp.com"}`,
+	} {
+		got, err := JSONLContent(in)
+		if err != nil {
+			t.Fatalf("JSONLContent(%s): %v", in, err)
+		}
+		key, _, _ := strings.Cut(in[2:], `"`)
+		if want := `{"` + key + `":"REDACTED"}`; got != want {
+			t.Errorf("JSONLContent(%s) = %s, want %s", in, got, want)
 		}
 	}
 }
@@ -219,6 +296,8 @@ func TestIsNetworkKey(t *testing.T) {
 		"IP": true, "HOST_IP": true, "DB_HOST": true, "SERVER_ADDR": true, "clientIP": true,
 		"podIP": true, "IPAddress": true, "hostName": true,
 		"IPv4": true, "IPv6": true, "IPv4Address": true, "GlobalIPv6Address": true, "Ipv6Address": true,
+		"IPs": true, "externalIPs": true, "publicIPs": true, "SecondaryIPs": true, "GlobalIPv6": true, "api-IPs": true,
+		"ZIPCode": false,
 		"content": false, "version": false, "description": false, "shipping": false,
 		"tooltip": false, "zipCode": false,
 	} {

@@ -87,6 +87,7 @@ dial tcp [«2600:1f18:4c2:9300::7»]:443: connect: connection refused
 
 ## SSH and Git
 ssh: connect to host «52.66.93.46» port 22: Connection timed out
+debug1: Server host key: ecdsa-sha2-nistp256 MD5:12:f8:7e:78:61:b4:bf:e2:de:24:15:96:4e:d4:72:53
 limit: Warning: Permanently added '«52.66.93.46»' (ED25519) to the list of known hosts.
 To ssh://git@«10.0.8.4»:2222/platform/api.git
 

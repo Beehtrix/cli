@@ -142,6 +142,19 @@ func TestJSONLBytesCounts_IP(t *testing.T) {
 	}
 }
 
+// A credential value replaced whole counts its placeholder, not the PII
+// matches inside it, which are not written.
+func TestJSONLBytesCounts_CredentialValueWithIP(t *testing.T) {
+	ConfigurePII(PIIConfig{Enabled: true, Categories: map[PIICategory]bool{PIIIP: true}})
+	t.Cleanup(resetPIIConfig)
+
+	got := countsOf(t, `{"client_secret":"Hunter2pass for 10.0.0.5"}`+"\n")
+	require.Equal(t, 1, got.Replacements)
+	require.Equal(t, 1, got.Layers["credential_key"])
+	require.Equal(t, 0, got.Layers["pii"])
+	require.Equal(t, map[string]int{"IP": 0}, got.PII)
+}
+
 // A layer that did not run is absent, which is different from a layer that ran
 // and found nothing.
 func TestJSONLBytesCounts_AbsentInactiveAndZeroAreDistinct(t *testing.T) {

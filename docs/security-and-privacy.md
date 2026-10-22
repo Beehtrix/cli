@@ -122,7 +122,7 @@ These are never redacted:
 - the value of a version label, even in a private range (`Version=10.0.0.0`, `AssemblyVersion("10.1.2.3")`, `"version": "10.1.2.3"`);
 - an address that continues a longer token (`v1.2.3.4`, `go1.2.3.4`, `1.2.3.4-rc1`, an OID such as `1.3.6.1.4.1`, or code such as `u64::from` and `a[1::2]`).
 
-A public address printed bare with no such context, such as one line in a plain list, is not redacted; add a `custom_patterns` entry if you need every address. A version number that sits next to a network word on the same line, or in a private range without a version label (`from 10.2.0.0 to 10.3.0.0`), can be redacted.
+A public address printed bare with no such context, such as one line in a plain list, is not redacted; add a `custom_patterns` entry if you need every address. Path fields in transcripts (`cwd`, `file_path`, `path`) are not scanned by any redaction layer, so an address in a Windows share path there (`\\10.0.0.5\share`) stays. A version number that sits next to a network word on the same line, or in a private range without a version label (`from 10.2.0.0 to 10.3.0.0`), can be redacted.
 
 Older CLI versions reject unknown `pii` keys, so set `"ip": false` in a committed `.entire/settings.json` only after everyone on the team has upgraded. Turning on `enabled` is enough to get IP redaction.
 
