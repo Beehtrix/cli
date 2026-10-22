@@ -12,7 +12,8 @@ type Counts struct {
 	// Replacements is the number of placeholders written.
 	Replacements int `json:"replacements"`
 	// Layers maps each layer that ran to the matches it found in the values
-	// it scanned. The sum can differ from Replacements either way: overlapping
+	// it scanned, counting each span a layer flags once however many of its
+	// rules match there. The sum can differ from Replacements either way: overlapping
 	// matches count in every layer that found them but are replaced once, and
 	// a JSON line's splice also replaces copies of a found value in fields the
 	// scan skips, such as IDs.
@@ -72,6 +73,7 @@ const (
 	layerCredentialedURI
 	layerConnectionString
 	layerCustom
+	layerShellStdin
 	layerCredentialValue
 	layerPII
 	layerKeyContext
@@ -91,6 +93,7 @@ var layerNames = [layerCount]string{
 	layerCredentialedURI:  "credentialed_uri",
 	layerConnectionString: "connection_string",
 	layerCustom:           "custom",
+	layerShellStdin:       "shell_stdin",
 	layerCredentialValue:  "credential_value",
 	layerPII:              "pii",
 	layerKeyContext:       "key_context",
@@ -146,18 +149,36 @@ type tally struct {
 }
 
 // addRegions counts the non-empty regions found in one string, merged into
-// replaced placeholders.
+// replaced placeholders. A layer that flags the same span more than once, as
+// when two of its rules match one value, counts it once.
+//
+// regions must be sorted by span, as redactRegions sorts them, so identical
+// spans are adjacent.
 func (t *tally) addRegions(regions []taggedRegion, replaced int) {
 	if t == nil {
 		return
 	}
 	t.replacements += replaced
-	for _, r := range regions {
+	for i, r := range regions {
+		if layerFlaggedSpanBefore(regions, i) {
+			continue
+		}
 		t.layers[r.layer]++
 		if r.layer == layerPII {
 			t.pii[piiBucket(r.label)]++
 		}
 	}
+}
+
+// layerFlaggedSpanBefore reports whether an earlier region of the same layer
+// has the same span as regions[i].
+func layerFlaggedSpanBefore(regions []taggedRegion, i int) bool {
+	for j := i - 1; j >= 0 && regions[j].region == regions[i].region; j-- {
+		if regions[j].layer == regions[i].layer {
+			return true
+		}
+	}
+	return false
 }
 
 // addPlaceholder counts a value replaced whole by l.
@@ -196,7 +217,7 @@ func (t *tally) counts() *Counts {
 		var active bool
 		switch l {
 		case layerEntropy, layerProviderToken, layerCredentialedURI, layerConnectionString,
-			layerCredentialValue, layerKeyContext, layerCredentialKey:
+			layerShellStdin, layerCredentialValue, layerKeyContext, layerCredentialKey:
 			active = true
 		case layerBetterleaks:
 			active = scanners.betterleaks && getDetector() != nil

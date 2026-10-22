@@ -22,7 +22,7 @@ const (
 // alwaysOnLayers run for every transcript whatever the settings say.
 var alwaysOnLayers = []string{
 	"entropy", "provider_token", "credentialed_uri", "connection_string",
-	"credential_value", "key_context", "credential_key",
+	"shell_stdin", "credential_value", "key_context", "credential_key",
 }
 
 // textLine is a transcript line carrying text as a JSON string leaf.
@@ -70,10 +70,11 @@ func TestJSONLBytesCounts_CreditsEachLayer(t *testing.T) {
 		{name: "entropy", content: textLine(t, "the value "+countsEntropySample+" appeared"), layers: map[string]int{"entropy": 1}},
 		{name: "betterleaks", content: textLine(t, "token "+githubPATFixture+" here"), layers: map[string]int{"betterleaks": 1}},
 		{name: "provider token", content: textLine(t, "export SUPABASE="+countsSupabaseSample), layers: map[string]int{"provider_token": 1}},
-		{name: "credentialed uri", content: textLine(t, "cache at redis://:hunter2pass@10.0.0.5:6379/0"), layers: map[string]int{"credentialed_uri": 2, "betterleaks": 1}},
+		{name: "credentialed uri", content: textLine(t, "cache at redis://:hunter2pass@10.0.0.5:6379/0"), layers: map[string]int{"credentialed_uri": 1, "betterleaks": 1}},
 		{name: "connection string", content: textLine(t, "Server=db;User Id=sa;Password=hunter2secret;Database=app"), layers: map[string]int{"connection_string": 1, "betterleaks": 1}},
 		{name: "credential value", content: textLine(t, "DB_PASSWORD=hunter2secret"), layers: map[string]int{"credential_value": 1, "betterleaks": 1}},
 		{name: "custom rule", content: textLine(t, "ticket ACME-12345678 filed"), layers: map[string]int{"custom": 1}},
+		{name: "shell stdin", content: textLine(t, "printf 'hunter2secret' | gh secret set DB_PASSWORD"), layers: map[string]int{"shell_stdin": 1}},
 		{name: "pii email", content: textLine(t, "mail alice@corp-mail.org now"), layers: map[string]int{"pii": 1}, pii: map[string]int{"EMAIL": 1, "custom": 0}},
 		{name: "custom pii pattern", content: textLine(t, "badge EMP-123456 ok"), layers: map[string]int{"pii": 1}, pii: map[string]int{"EMAIL": 0, "custom": 1}},
 		// The key-context rule scans the value together with its key to decide

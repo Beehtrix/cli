@@ -480,6 +480,7 @@ func detectAllLayers(s string) []taggedRegion {
 	// 7. Shell stdin literals piped into secret-management commands
 	// (secrets — always on).
 	regions = append(regions, detectShellStdinSecrets(s)...)
+	next = tagFrom(regions, next, layerShellStdin)
 
 	// 8. Bounded credential key/value detection (secrets — always on).
 	regions = append(regions, detectCredentialValues(s)...)
