@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/spf13/cobra"
 
@@ -32,39 +33,33 @@ type mirrorSyncBlock struct {
 	ObservedAt time.Time `json:"observedAt"`
 }
 
-// mirrorSyncReader is what the block lookup reads: the repo's placements and
-// one mirror record. *coreapi.Client satisfies it.
-type mirrorSyncReader interface {
-	ResolveMirrorPlacements(ctx context.Context, params coreapi.ResolveMirrorPlacementsParams) (*coreapi.ResolvePlacementsOutputBody, error)
-	GetMirror(ctx context.Context, params coreapi.GetMirrorParams) (*coreapi.Mirror, error)
-}
-
 // lookupMirrorSyncBlock answers whether GitHub currently blocks the Entire
 // installation serving one upstream, by reading that upstream's own mirror
-// record: the pull-gated placement lookup names the mirror IDs, and the
-// mirror read carries the block. Two exact reads, scoped to this repo —
-// nothing is walked. Any one placement answers, since the block is per
-// installation and every placement of the upstream carries the same value;
-// GET /mirrors/{id} follows core's cross-cell redirect, so the first one
-// listed is read wherever it lives.
+// record. The /repos entry already names it: RepoPlacement.ID is the mirror
+// ID (see repoCellPlacement), so this is one exact read, GET /mirrors/{id},
+// which follows core's cross-cell redirect wherever the placement lives. Any
+// one placement answers, since the block is per installation and every
+// placement of the upstream carries the same value.
 //
-// ref is the owner/repo as the user named it; the server matches the pair
-// case-insensitively. blocked is false for "not blocked, as far as the caller
-// can see": no placement the caller may pull, or a mirror carrying no block.
-func lookupMirrorSyncBlock(ctx context.Context, c mirrorSyncReader, ref string) (block mirrorSyncBlock, blocked bool, err error) {
-	owner, repo := mirrorRefOwner(ref), mirrorRefRepo(ref)
-	placements, err := c.ResolveMirrorPlacements(ctx, coreapi.ResolveMirrorPlacementsParams{
-		Provider: coreapi.ResolveMirrorPlacementsProviderGithub,
-		Owner:    owner,
-		Repo:     repo,
-	})
-	if err != nil {
-		return mirrorSyncBlock{}, false, fmt.Errorf("resolve mirror placements: %w", err)
+// Reading the entry's own ID rather than resolving placements matters for
+// who sees the block: /mirrors/placements is pull-gated, while /repos and
+// GET /mirrors/{id} are gated on viewing metadata, so a caller who can see
+// the repo without being able to clone it (a direct grant, a project member)
+// would otherwise have had the block silently withheld.
+//
+// blocked is false for "not blocked, as far as the caller can see": no
+// placement with an ID, or a mirror carrying no block.
+func lookupMirrorSyncBlock(ctx context.Context, c mirrorStatusGetter, entry coreapi.RepoIndexEntry) (block mirrorSyncBlock, blocked bool, err error) {
+	id := ""
+	for _, p := range entry.Placements {
+		if id = strings.TrimSpace(p.ID); id != "" {
+			break
+		}
 	}
-	if len(placements.Placements) == 0 {
+	if id == "" {
 		return mirrorSyncBlock{}, false, nil
 	}
-	m, err := c.GetMirror(ctx, coreapi.GetMirrorParams{MirrorId: placements.Placements[0].MirrorId})
+	m, err := c.GetMirror(ctx, coreapi.GetMirrorParams{MirrorId: id})
 	if err != nil {
 		return mirrorSyncBlock{}, false, fmt.Errorf("read mirror: %w", err)
 	}
@@ -72,22 +67,33 @@ func lookupMirrorSyncBlock(ctx context.Context, c mirrorSyncReader, ref string) 
 	if !ok {
 		return mirrorSyncBlock{}, false, nil
 	}
-	return mirrorSyncBlock{Reason: b.Reason, ObservedAt: b.ObservedAt}, true, nil
+	return mirrorSyncBlock{Reason: cleanSyncReason(b.Reason), ObservedAt: b.ObservedAt}, true, nil
 }
 
-// mirrorRefRepo is the repo half of a /<forge>/<owner>/<repo> ref, the
-// counterpart of mirrorRefOwner.
-func mirrorRefRepo(ref string) string {
-	trimmed := trimRefPrefix(ref)
-	for _, forge := range []string{mirrorCloneForge, nativeCloneForge} {
-		if rest, ok := strings.CutPrefix(trimmed, forge+"/"); ok {
-			trimmed = rest
-			break
-		}
+// maxSyncReasonRunes bounds a reason on its way to the terminal. The known
+// values are short tokens; anything longer is not one the CLI can explain.
+const maxSyncReasonRunes = 64
+
+// cleanSyncReason strips control and format characters from a reason before
+// it is printed. The value is server-controlled and the known ones are plain
+// tokens, but it is echoed into a terminal, so an escape sequence must not
+// reach it whatever the server sends.
+func cleanSyncReason(raw string) string {
+	if runes := []rune(raw); len(runes) > maxSyncReasonRunes {
+		raw = string(runes[:maxSyncReasonRunes])
 	}
-	_, repo, _ := strings.Cut(trimmed, "/")
-	return repo
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, raw))
 }
+
+// syncStatusUnavailable is the --json marker for a view whose block read
+// failed: an absent syncBlock alone would read as "not blocked", which the
+// stderr note says it is not, and a script reads neither stderr nor notes.
+const syncStatusUnavailable = "unavailable"
 
 // noteSyncStatusUnavailable decides what a failed block lookup means for the
 // view it was made for. An interruption (the context cancelled or expired) is
@@ -97,15 +103,18 @@ func mirrorRefRepo(ref string) string {
 // right about what it shows, so the command does not fail — but a reader
 // checking why a mirror is stale must not take the absence of a block for
 // its presence being ruled out.
-func noteSyncStatusUnavailable(ctx context.Context, errW io.Writer, err error) error {
+//
+// noted reports that the failure was downgraded to a note, so the caller can
+// mark its --json output the same way.
+func noteSyncStatusUnavailable(ctx context.Context, errW io.Writer, err error) (noted bool, fatal error) {
 	if err == nil {
-		return nil
+		return false, nil
 	}
 	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
+		return false, err
 	}
 	fmt.Fprintf(errW, "Note: GitHub sync status unavailable: %v\n", renderCoreError(err))
-	return nil
+	return true, nil
 }
 
 // syncBlockProblem says what is wrong, in terms the person who can fix it
@@ -146,7 +155,9 @@ func renderSyncBlock(w io.Writer, st statusStyles, ref string, block *mirrorSync
 	fmt.Fprintln(w, st.render(st.yellow, "Sync:"))
 	label := "Blocked"
 	if !block.ObservedAt.IsZero() {
-		label += " (observed " + timeAgo(block.ObservedAt) + ")"
+		// A server clock ahead of this one must not render "observed in 2m":
+		// the block was seen, and the nearest true thing is "just now".
+		label += " (observed " + formatRelativeDuration(max(time.Since(block.ObservedAt), 0)) + ")"
 	}
 	fmt.Fprintf(w, "  %s %s\n", st.render(st.red, label+":"), syncBlockProblem(owner, block.Reason))
 	fmt.Fprintf(w, "  %s Then run `entire repo mirror resync %s` to confirm the fix and catch the mirror up.\n", syncBlockFix(owner, block.Reason), ref)
@@ -222,7 +233,10 @@ func resyncError(ref mirrorRepoRef, err error) error {
 		return err
 	}
 	var reason string
-	if jerr := json.Unmarshal(detail.Value, &reason); jerr != nil || strings.TrimSpace(reason) == "" {
+	if jerr := json.Unmarshal(detail.Value, &reason); jerr != nil {
+		return err
+	}
+	if reason = cleanSyncReason(reason); reason == "" {
 		return err
 	}
 	return errors.New(syncBlockProblem(ref.owner, reason) + " Nothing was queued.\n" +

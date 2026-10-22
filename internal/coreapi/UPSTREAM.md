@@ -162,8 +162,8 @@ the ENT-3417 contract spliced in from the live spec: `MirrorSyncBlock`,
 The next full refresh carries them on its own, and this entry goes.
 
 **Workaround:** none in `normalize.go` beyond the `ResyncMirrorOutputBody.status`
-enum loosening. A refresh from a core that predates entiredb#4961 drops the
-three schemas and the route, and `entire repo mirror resync` stops compiling.
+enum loosening. entiredb#4961 is on main and in prod, so any refresh from a
+current core keeps the three schemas and the route.
 
 <!-- Resolved upstream and removed:
   - Nullable arrays (`"type": ["array","null"]`) — entiredb now emits

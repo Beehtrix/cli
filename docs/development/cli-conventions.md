@@ -359,10 +359,13 @@ always runnable in every build.
   holds, which `resyncError` renders with the same wording `repo view` uses.
   That block (`Mirror.syncBlock`: an org IP allow list or a suspended
   installation) is per GitHub installation and the `/repos` placements do not
-  carry it, so only `repo view` reads it, with two exact reads scoped to the
-  repo (`lookupMirrorSyncBlock`: `/mirrors/placements` for a mirror ID, then
-  `GET /mirrors/{id}`), and prints a `Sync:` section with the fix and the
-  resync command; `--json` adds `syncBlock` on the row. `mirror list` shows
+  carry it, so only `repo view` reads it, with one exact read scoped to the
+  repo (`lookupMirrorSyncBlock`: `GET /mirrors/{id}` by the entry's own
+  `RepoPlacement.ID`, which is the mirror ID — not `/mirrors/placements`,
+  which is pull-gated and would withhold the block from a metadata-only
+  viewer), and prints a `Sync:` section with the fix and the resync command;
+  `--json` adds `syncBlock` on the row, or `syncStatus: "unavailable"` when
+  the read failed. `mirror list` shows
   no block: a per-repo read per row is too much for a directory, and
   `GET /mirrors` cannot answer "mirrors of owner X" cheaply (core applies its
   owner filter *after* cutting the page from the caller's whole visible set).

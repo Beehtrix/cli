@@ -317,19 +317,7 @@ func candidateEntry(fullName, visibility string, access coreapi.RepoCandidateAcc
 const (
 	testClustersPath = "/api/v1/clusters"
 	testReposPath    = "/api/v1/repos"
-	// testMirrorPlacementsPath is the first of the two reads `view` makes for
-	// the sync block; with no placement returned the mirror read never
-	// happens, so a fake about something else answers this one alone.
-	testMirrorPlacementsPath = "/api/v1/mirrors/placements"
 )
-
-// serveNoSyncBlocks answers `view`'s placement lookup with nothing pullable,
-// so no mirror record is read and no block shown. A test about the block
-// itself serves both reads on its own (see repo_mirror_sync_test.go).
-func serveNoSyncBlocks(t *testing.T, w http.ResponseWriter) {
-	t.Helper()
-	writeJSONResponse(t, w, http.StatusOK, &coreapi.ResolvePlacementsOutputBody{})
-}
 
 // bulkEntries builds n onboarded /repos entries named <prefix>/repo-0000…,
 // for tests that need to cross the fetch budget.
@@ -1264,8 +1252,6 @@ func TestRepoView_Routing(t *testing.T) {
 			case testReposPath:
 				gotFilter = r.URL.Query().Get("filter")
 				assert.NoError(t, printJSON(w, &coreapi.ListReposOutputBody{Repos: repos}))
-			case testMirrorPlacementsPath:
-				serveNoSyncBlocks(t, w)
 			default:
 				t.Errorf("unexpected path %q", r.URL.Path)
 				w.WriteHeader(http.StatusNotFound)
@@ -1361,8 +1347,6 @@ func TestRepoView_Routing(t *testing.T) {
 						{ClusterSlug: "us", Status: coreapi.RepoPlacementStatusReady, Mirror: true},
 					}},
 				}}))
-			case testMirrorPlacementsPath:
-				serveNoSyncBlocks(t, w)
 			default:
 				t.Errorf("unexpected path %q", r.URL.Path)
 				w.WriteHeader(http.StatusNotFound)
