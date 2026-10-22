@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"reflect"
 )
 
 // jsonlAdapter turns a Claude Code, Cursor or Droid JSONL transcript into
@@ -279,11 +278,32 @@ func (o *openAssistant) changedUsage() *CallUsage {
 	}
 	snapshot := cloneCallUsage(o.usage)
 	snapshot.Model = o.model
-	if reflect.DeepEqual(snapshot, o.sent) {
+	if sameUsage(snapshot, o.sent) {
 		return nil
 	}
 	o.sent = snapshot
 	return snapshot
+}
+
+func sameUsage(a, b *CallUsage) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Model == b.Model &&
+		a.InputTokens == b.InputTokens &&
+		a.OutputTokens == b.OutputTokens &&
+		a.CacheReadTokens == b.CacheReadTokens &&
+		a.CacheWriteTokens == b.CacheWriteTokens &&
+		a.ReasoningTokens == b.ReasoningTokens &&
+		sameCount(a.CacheWrite5mTokens, b.CacheWrite5mTokens) &&
+		sameCount(a.CacheWrite1hTokens, b.CacheWrite1hTokens)
+}
+
+func sameCount(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // isJSONArray reports whether raw is a JSON array (not null).

@@ -225,7 +225,7 @@ func compactJSONL(content []byte, opts Options) ([]byte, error) {
 // folds the records, so checkpoints and live streams share one fold.
 func compactJSONLWith(content []byte, opts Options, preprocess linePreprocessor) ([]byte, error) {
 	a := newJSONLAdapter(preprocess)
-	a.perCallUsage = opts.Agent == "claude-code"
+	a.perCallUsage = opts.Agent == agentClaudeCode
 	records := a.Feed(content)
 	records = append(records, a.Flush()...)
 	out, err := Fold(records, opts)

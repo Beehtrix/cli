@@ -301,7 +301,7 @@ func assertMatchesLegacy(t *testing.T, input []byte, preprocess linePreprocessor
 		t.Fatalf("output differs from legacy compactor\ninput:\n%s\ngot:\n%s\nwant:\n%s", input, got, want)
 	}
 
-	opts.Agent = "claude-code"
+	opts.Agent = agentClaudeCode
 	want, err = legacyCompactJSONLWith(input, opts, preprocess)
 	if err != nil {
 		t.Fatalf("legacy: %v", err)

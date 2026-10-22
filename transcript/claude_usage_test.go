@@ -262,3 +262,41 @@ func TestFold_UsageSnapshotIsCopied(t *testing.T) {
 		t.Errorf("snapshot aliased caller data: %s", line)
 	}
 }
+
+func TestSameUsage(t *testing.T) {
+	t.Parallel()
+
+	n := func(v int64) *int64 { return &v }
+	base := CallUsage{
+		Model: "m", InputTokens: 1, OutputTokens: 2, CacheReadTokens: 3, CacheWriteTokens: 4,
+		CacheWrite5mTokens: n(0), CacheWrite1hTokens: n(4), ReasoningTokens: 1,
+	}
+	differing := map[string]func(u *CallUsage){
+		"model":         func(u *CallUsage) { u.Model = "x" },
+		"input":         func(u *CallUsage) { u.InputTokens++ },
+		"output":        func(u *CallUsage) { u.OutputTokens++ },
+		"cache read":    func(u *CallUsage) { u.CacheReadTokens++ },
+		"cache write":   func(u *CallUsage) { u.CacheWriteTokens++ },
+		"reasoning":     func(u *CallUsage) { u.ReasoningTokens++ },
+		"5m value":      func(u *CallUsage) { u.CacheWrite5mTokens = n(1) },
+		"5m unreported": func(u *CallUsage) { u.CacheWrite5mTokens = nil },
+		"1h value":      func(u *CallUsage) { u.CacheWrite1hTokens = n(5) },
+		"1h unreported": func(u *CallUsage) { u.CacheWrite1hTokens = nil },
+	}
+	for name, change := range differing {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			other := *cloneCallUsage(&base)
+			change(&other)
+			if sameUsage(&base, &other) || sameUsage(&other, &base) {
+				t.Errorf("%+v and %+v reported equal", base, other)
+			}
+		})
+	}
+	if !sameUsage(&base, cloneCallUsage(&base)) {
+		t.Error("a copy is not equal")
+	}
+	if !sameUsage(nil, nil) || sameUsage(&base, nil) || sameUsage(nil, &base) {
+		t.Error("nil handling")
+	}
+}
