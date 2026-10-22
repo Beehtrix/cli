@@ -341,17 +341,28 @@ func TestEnableCheckpointPushRemote_Report(t *testing.T) {
 		name, config string
 		choice       enableCheckpointRemoteChoice
 		noRemote     bool
+		git          [][]string
 		setupErr     error
-		// exact makes want the whole expected output. Otherwise want and
-		// notice are substrings, and an empty notice means no privacy notice
-		// may be printed at all.
+		// exact makes want the whole expected output. Otherwise want is a
+		// substring, notice must end the output, an empty notice means no
+		// privacy notice may be printed at all, and each before line must
+		// print ahead of the destination line.
 		exact             bool
 		want, notice      string
+		before            []string
 		wantUnchangedLine bool
 	}{
 		{name: "ordinary untouched", config: `{"enabled":true}`, exact: true, want: "\n" + uploadsTo + privacy + privateRepo},
 		{name: "ordinary offered", config: `{"enabled":true}`, choice: enableCheckpointRemoteChoice{offered: true}, want: "Keeping checkpoint destination: origin (automatic)", notice: uploadsTo + privacy + privateRepo},
 		{name: "explicit already set", config: `{"enabled":true,"strategy_options":{"checkpoint_push_remote":"origin"}}`, choice: enableCheckpointRemoteChoice{name: "origin"}, want: "Keeping checkpoint destination: origin (configured)", notice: uploadsTo + privacy + privateRepo, wantUnchangedLine: true},
+		{name: "offered with fan-out and an alternative", config: `{"enabled":true}`, choice: enableCheckpointRemoteChoice{offered: true},
+			git: [][]string{
+				{"remote", "set-url", "--add", "--push", "origin", "https://github.com/org/repo.git"},
+				{"remote", "set-url", "--add", "--push", "origin", "https://github.com/org/mirror.git"},
+				{"remote", "add", "fork", "https://github.com/me/repo.git"},
+			},
+			want: "Keeping checkpoint destination: origin (automatic)", notice: uploadsTo + privacy + privateRepo,
+			before: []string{`Remote "origin" pushes to 2 URLs:`, "To choose another destination for this clone"}},
 		{name: "invalid", config: `{"strategy_options":{"checkpoint_push_remote":"missing"}}`, want: "Checkpoint sync remains disabled:"},
 		{name: "dedicated untouched", config: `{"strategy_options":{"checkpoint_remote":{"provider":"github","repo":"org/checkpoints"}}}`, exact: true, want: "\nCheckpoint uploads use the dedicated destination: " + dedicatedURL + ".\n" + privacy},
 		{name: "dedicated requested", config: `{"strategy_options":{"checkpoint_remote":{"provider":"github","repo":"org/checkpoints"}}}`, choice: enableCheckpointRemoteChoice{dedicatedRequested: true}, want: dedicatedURL, notice: "Checkpoint uploads use the dedicated destination: " + dedicatedURL + ".\n" + privacy},
@@ -368,6 +379,9 @@ func TestEnableCheckpointPushRemote_Report(t *testing.T) {
 			if !tc.noRemote {
 				testutil.RunGit(t, dir, "remote", "add", "origin", "https://github.com/org/repo.git")
 			}
+			for _, args := range tc.git {
+				testutil.RunGit(t, dir, args...)
+			}
 			writeSettings(t, tc.config)
 			var output bytes.Buffer
 			choice := tc.choice
@@ -381,7 +395,11 @@ func TestEnableCheckpointPushRemote_Report(t *testing.T) {
 			if tc.notice == "" {
 				require.NotContains(t, output.String(), "best effort")
 			} else {
-				require.Contains(t, output.String(), tc.notice)
+				require.True(t, strings.HasSuffix(output.String(), tc.notice), "notice should end the output; got:\n%s", output.String())
+			}
+			for _, line := range tc.before {
+				require.Contains(t, output.String(), line)
+				require.Less(t, strings.Index(output.String(), line), strings.Index(output.String(), uploadsTo), "%q should precede the destination line; got:\n%s", line, output.String())
 			}
 			if strings.Contains(tc.name, "dedicated") || strings.Contains(tc.name, "push disabled") {
 				require.NotContains(t, output.String(), "--checkpoint-remote")

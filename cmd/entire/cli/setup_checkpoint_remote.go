@@ -306,7 +306,8 @@ func (c *enableCheckpointRemoteChoice) report(ctx context.Context, w io.Writer, 
 		fmt.Fprintln(w, "Saved to .entire/settings.local.json for this clone.")
 	}
 	// How the destination was chosen, and the alternatives, are reported only
-	// when the user touched it; the multi-remote note covers ambiguous repos.
+	// when the user touched it, and ahead of the destination line so the
+	// notice stays last; the multi-remote note covers ambiguous repos.
 	touched := c.name != "" || c.offered || c.dedicatedRequested
 	s, err := settings.Load(ctx)
 	if err != nil {
@@ -394,36 +395,35 @@ func (c *enableCheckpointRemoteChoice) report(ctx context.Context, w io.Writer, 
 		fmt.Fprintf(w, "Keeping checkpoint destination: %s (%s)\n", destination, checkpointRemoteSourceLabel(resolved.Source))
 	}
 	c.reportUnchangedDestination(w)
+	if touched {
+		topology := inspectRemoteTopology(ctx)
+		for _, d := range topology.destinations {
+			if !dedicated && d.pinned {
+				url, effective, err := remote.PushURL(ctx, d.name)
+				if err == nil && effective {
+					fmt.Fprintf(w, "Pushes to %s still upload checkpoints to the dedicated destination: %s\n", d.name, gitremote.RedactURLOrPath(url))
+				}
+			}
+			if d.name != resolved.Name || !d.fansOut() {
+				continue
+			}
+			remoteTopology{destinations: []remoteDestination{d}, primaryIsRefs: topology.primaryIsRefs}.describeFanout(w)
+		}
+		if !dedicated && c.name == "" && resolved.Source != strategy.SyncRemoteSourceConfig {
+			for _, d := range topology.destinations {
+				if d.name != resolved.Name && !d.pinned && validateCheckpointPushRemote(ctx, root, d.name) == nil {
+					fmt.Fprintf(w, "To choose another destination for this clone, run `entire enable --%s <name>`.\n", flagCheckpointPushRemote)
+					break
+				}
+			}
+		}
+	}
 	if dedicated {
 		fmt.Fprintf(w, "Checkpoint uploads use the dedicated destination: %s.\n", destination)
 	} else {
 		fmt.Fprintf(w, "Checkpoints will be uploaded when you push to %s.\n", resolved.Name)
 	}
 	printCheckpointPrivacyNotice(w, !dedicated)
-	if !touched {
-		return
-	}
-	topology := inspectRemoteTopology(ctx)
-	for _, d := range topology.destinations {
-		if !dedicated && d.pinned {
-			url, effective, err := remote.PushURL(ctx, d.name)
-			if err == nil && effective {
-				fmt.Fprintf(w, "Pushes to %s still upload checkpoints to the dedicated destination: %s\n", d.name, gitremote.RedactURLOrPath(url))
-			}
-		}
-		if d.name != resolved.Name || !d.fansOut() {
-			continue
-		}
-		remoteTopology{destinations: []remoteDestination{d}, primaryIsRefs: topology.primaryIsRefs}.describeFanout(w)
-	}
-	if !dedicated && c.name == "" && resolved.Source != strategy.SyncRemoteSourceConfig {
-		for _, d := range topology.destinations {
-			if d.name != resolved.Name && !d.pinned && validateCheckpointPushRemote(ctx, root, d.name) == nil {
-				fmt.Fprintf(w, "To choose another destination for this clone, run `entire enable --%s <name>`.\n", flagCheckpointPushRemote)
-				break
-			}
-		}
-	}
 }
 
 // reportUnchangedDestination announces the absence of a change only when one
