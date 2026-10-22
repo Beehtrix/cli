@@ -414,7 +414,7 @@ func TestCompact_CodexStartLine_SeedsUsageFromSkippedPrefix(t *testing.T) {
 	assertJSONLines(t, result, expected)
 }
 
-func TestCompact_CodexStartLine_IncludesTheCallOpenAtTheBoundary(t *testing.T) {
+func TestCompact_CodexStartLine_IncludesTheLastCallTheSliceChanges(t *testing.T) {
 	t.Parallel()
 
 	tool := func(id string) string {
@@ -441,6 +441,14 @@ func TestCompact_CodexStartLine_IncludesTheCallOpenAtTheBoundary(t *testing.T) {
 			startLine: 3,
 			want: []string{
 				cxPre + `"type":"assistant","ts":"t4","model":"unknown","input_tokens":10,"output_tokens":4,"content":[` + tool("c1") + `]}`,
+			},
+		},
+		{
+			name:      "late output for the last call, closed at the boundary",
+			input:     cxJoin(cxUser("t1", "go"), cxCall("t2", "c1"), cxTokens("t3", 10, 0, 4), cxOutput("t4", "c1", "ok")),
+			startLine: 3,
+			want: []string{
+				cxPre + `"type":"assistant","ts":"t3","model":"unknown","input_tokens":10,"output_tokens":4,"content":[` + tool("c1") + `]}`,
 			},
 		},
 		{

@@ -142,19 +142,19 @@ func compactCodex(content []byte, opts Options) ([]byte, error) {
 		tools:     map[string]codexToolSlot{},
 	}
 	// Counters are cumulative for the whole session, so the skipped prefix
-	// seeds the usage baseline. The call still open at StartLine is part of the
-	// slice when the slice adds its outputs or closing snapshot.
+	// seeds the usage baseline. The last line before StartLine is part of the
+	// slice when the slice adds its outputs or closing snapshot; reaching
+	// further back would repeat earlier calls and their usage.
 	for _, cl := range prefix {
 		c.consume(cl)
 	}
 	before := c.renderEntries()
 	start := len(before)
-	openAtStart := c.open != nil
 	for _, cl := range lines {
 		c.consume(cl)
 	}
 	after := c.renderEntries()
-	if openAtStart && !bytes.Equal(before[start-1], after[start-1]) {
+	if start > 0 && !bytes.Equal(before[start-1], after[start-1]) {
 		start--
 	}
 	return bytes.Join(after[start:], nil), nil
