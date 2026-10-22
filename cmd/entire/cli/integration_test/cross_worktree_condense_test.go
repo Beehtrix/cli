@@ -20,14 +20,16 @@ import (
 // Uses t.Chdir to exercise the strategy entry point shared by sweep and doctor.
 func TestCrossWorktreeCondenseSessionByID(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		removed    bool
-		detached   bool
-		wantBranch string
+		name         string
+		removed      bool
+		detached     bool
+		switchBranch bool
+		wantBranch   string
 	}{
 		{name: "existing worktree", wantBranch: "wt/session-a"},
 		{name: "removed worktree", removed: true, wantBranch: "wt/session-a"},
 		{name: "detached session", detached: true},
+		{name: "branch switched during turn", switchBranch: true, wantBranch: "wt/during-turn"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			caller := NewFeatureBranchEnv(t)
@@ -35,8 +37,18 @@ func TestCrossWorktreeCondenseSessionByID(t *testing.T) {
 			if tc.detached {
 				testutil.RunGit(t, home.RepoDir, "checkout", "--detach")
 			}
+			if tc.switchBranch {
+				home.GitCheckoutNewBranch("main")
+			}
 			sess := home.NewSession()
 			require.NoError(t, home.SimulateUserPromptSubmit(sess.ID))
+			if tc.switchBranch {
+				started, err := caller.GetSessionState(sess.ID)
+				require.NoError(t, err)
+				require.NotNil(t, started)
+				require.Equal(t, "main", started.Branch)
+				home.GitCheckoutNewBranch(tc.wantBranch)
+			}
 			home.WriteFile("pending.go", "package pending\n")
 			sess.CreateTranscript("Create pending work", []FileChange{{Path: "pending.go", Content: "package pending\n"}})
 			require.NoError(t, home.SimulateStop(sess.ID, sess.TranscriptPath))
@@ -46,7 +58,7 @@ func TestCrossWorktreeCondenseSessionByID(t *testing.T) {
 			state, err := caller.GetSessionState(sess.ID)
 			require.NoError(t, err)
 			require.NotNil(t, state)
-			require.Equal(t, tc.wantBranch, state.Branch)
+			assert.Equal(t, tc.wantBranch, state.Branch)
 			require.Equal(t, home.RepoDir, state.WorktreePath)
 			require.True(t, state.HasPendingWork())
 			endedAt := time.Now().UTC()

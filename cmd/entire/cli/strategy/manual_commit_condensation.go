@@ -2103,36 +2103,24 @@ func openSessionCondensationRepository(ctx context.Context, state *SessionState)
 		return nil, fmt.Errorf("resolve current worktree: %w", err)
 	}
 	if filepath.IsAbs(state.WorktreePath) && filepath.Clean(state.WorktreePath) != filepath.Clean(current) {
-		registered, err := gitrepo.ListWorktreePaths(ctx, current)
+		currentMetadata, err := gitrepo.ResolveWorktreeMetadata(current)
 		if err != nil {
-			return nil, fmt.Errorf("list session worktrees: %w", err)
+			return nil, fmt.Errorf("resolve current repository metadata: %w", err)
 		}
-		for _, root := range registered {
-			if !filepath.IsAbs(root) || filepath.Clean(root) != filepath.Clean(state.WorktreePath) {
-				continue
+		sessionMetadata, err := gitrepo.ResolveWorktreeMetadata(state.WorktreePath)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, gitrepo.ErrWorktreeMetadataNotFound) {
+			return nil, fmt.Errorf("resolve session repository metadata: %w", err)
+		}
+		// The metadata resolver validates linked-worktree registration. Compare
+		// the validated common directories without spawning git under the lock.
+		if err == nil && sameDir(currentMetadata.CommonDir, sessionMetadata.CommonDir) {
+			repo, err := gitrepo.OpenPath(state.WorktreePath)
+			if err == nil {
+				return repo, nil
 			}
-			currentCommon, err := gitCommonDirForWorktree(ctx, current)
-			if err != nil {
-				return nil, fmt.Errorf("resolve current repository identity: %w", err)
-			}
-			repo, err := gitrepo.OpenPath(root)
-			if errors.Is(err, fs.ErrNotExist) {
-				break // Removed without pruning its git worktree registration.
-			}
-			if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
 				return nil, fmt.Errorf("open session worktree repository: %w", err)
 			}
-			sessionCommon, err := gitCommonDirForWorktree(ctx, root)
-			if err != nil {
-				return nil, errors.Join(fmt.Errorf("resolve session repository identity: %w", err), repo.Close())
-			}
-			if sessionCommon != currentCommon {
-				if err := repo.Close(); err != nil {
-					return nil, fmt.Errorf("close replaced session repository: %w", err)
-				}
-				break // Stale registration now points to an unrelated repository.
-			}
-			return repo, nil
 		}
 	}
 	return gitrepo.OpenPath(current) //nolint:wrapcheck // OpenPath provides repository context
