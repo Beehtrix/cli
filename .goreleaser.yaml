@@ -34,10 +34,6 @@ builds:
       - -X github.com/entireio/cli/cmd/entire/cli/versioninfo.Commit={{.ShortCommit}}
       - -X github.com/entireio/cli/cmd/entire/cli/telemetry.PostHogAPIKey={{.Env.POSTHOG_API_KEY}}
       - -X github.com/entireio/cli/cmd/entire/cli/telemetry.PostHogEndpoint={{.Env.POSTHOG_ENDPOINT}}
-      # Experimental-command visibility needs no stamp of its own: the
-      # experimental package hides them whenever versioninfo.Version is a
-      # stable release (no prerelease, no build metadata), so a stable tag
-      # (vX.Y.Z) hides them and a nightly tag (vX.Y.Z-nightly.*) shows them.
 
   # git-remote-entire is the git remote helper for entire:// URLs (see
   # cmd/git-remote-entire). A small, dedicated binary shipped alongside
