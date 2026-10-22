@@ -111,10 +111,18 @@ Phone and address matches must stand on their own: digits that are part of a lon
 IP addresses are redacted when they look like an address in use, because version numbers (`1.17.2.3`) and user agents (`Chrome/154.0.0.0`) share the dotted-quad shape. An address is redacted when any of these hold:
 
 - it is private, link-local, or shared address space (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `fc00::/7`, `fe80::/10`);
-- network syntax surrounds it: a scheme (`https://203.0.113.9`), userinfo (`deploy@203.0.113.9`), a port (`203.0.113.9:443`, which stays visible as `[REDACTED_IP]:443`), a CIDR prefix (`/32`), or a connection arrow (`->`);
-- a network word (such as `ip`, `host`, `server`, `ssh`, `tcp`, `dns`, `connect`) appears shortly before or after it, or it is the value of a JSON key that names an address (`{"host":"203.0.113.9"}`, `remote_addr`, `peerIP`).
+- network syntax surrounds it: a scheme (`https://<ip>`), userinfo (`deploy@<ip>`), a port (`<ip>:443`, which stays visible as `[REDACTED_IP]:443`), a CIDR prefix (`<ip>/32`), or a connection arrow (`->`);
+- a network word (such as `ip`, `host`, `server`, `ssh`, `tcp`, `dns`, `connect`) appears shortly before or after it on the same line, or it is the value of a JSON key that names an address (`host`, `remote_addr`, `peerIP`, `HOST_IP`).
 
-Loopback (`127.0.0.1`, `::1`), unspecified (`0.0.0.0`, `::`), `0.0.0.0/8`, and `255.255.255.255` are never redacted, and neither is an address that continues a longer token (`v1.2.3.4`, `go1.2.3.4`, `1.2.3.4-rc1`, an OID such as `1.3.6.1.4.1`, or code such as `u64::from` and `a[1::2]`). A public address printed bare with no such context, such as one line in a plain list, is not redacted; add a `custom_patterns` entry if you need every address. A version number that happens to sit next to a network word can be redacted.
+These are never redacted:
+
+- loopback (`127.0.0.1`, `::1`), unspecified (`0.0.0.0`, `::`), `0.0.0.0/8`, and `255.255.255.255`;
+- documentation addresses, which no network uses (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32`, `3fff::/20`);
+- the first address of each private block, as written in code that handles those ranges (`10.0.0.0/8`, `172.16.0.0/12`, `fe80::/10`), and any `N.0.0.0`;
+- the value of a version label, even in a private range (`Version=10.0.0.0`, `AssemblyVersion("10.1.2.3")`, `"version": "10.1.2.3"`);
+- an address that continues a longer token (`v1.2.3.4`, `go1.2.3.4`, `1.2.3.4-rc1`, an OID such as `1.3.6.1.4.1`, or code such as `u64::from` and `a[1::2]`).
+
+A public address printed bare with no such context, such as one line in a plain list, is not redacted; add a `custom_patterns` entry if you need every address. A version number that sits next to a network word on the same line, or in a private range without a version label (`from 10.2.0.0 to 10.3.0.0`), can be redacted.
 
 Older CLI versions reject unknown `pii` keys, so set `"ip": false` in a committed `.entire/settings.json` only after everyone on the team has upgraded. Turning on `enabled` is enough to get IP redaction.
 

@@ -1,6 +1,12 @@
 package redact
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+)
 
 func ipOnlyConfig() *PIIConfig {
 	return &PIIConfig{Enabled: true, Categories: map[PIICategory]bool{PIIIP: true}}
@@ -14,14 +20,14 @@ func TestDetectPII_IPRedacted(t *testing.T) {
 		{"cgnat", "tailscale peer 100.96.0.4", "tailscale peer [REDACTED_IP]"},
 		{"link-local metadata", "curl http://169.254.169.254/latest", "curl http://[REDACTED_IP]/latest"},
 		{"port kept", "listening on 10.0.0.5:8080", "listening on [REDACTED_IP]:8080"},
-		{"public with port", "203.0.113.9:443 timed out", "[REDACTED_IP]:443 timed out"},
-		{"public in URL", "GET https://198.51.100.7/health", "GET https://[REDACTED_IP]/health"},
-		{"public after userinfo", "ssh deploy@203.0.113.9", "ssh deploy@[REDACTED_IP]"},
+		{"public with port", "34.117.59.81:443 timed out", "[REDACTED_IP]:443 timed out"},
+		{"public in URL", "GET https://34.117.59.81/health", "GET https://[REDACTED_IP]/health"},
+		{"public after userinfo", "ssh deploy@13.234.90.180", "ssh deploy@[REDACTED_IP]"},
 		{"public with context word", "dial tcp 52.66.93.46: i/o timeout", "dial tcp [REDACTED_IP]: i/o timeout"},
 		{"public cidr", "allow 50.219.144.234/32", "allow [REDACTED_IP]/32"},
 		{"lsof arrow", "TCP 192.168.26.92:59027->140.82.113.25:443", "TCP [REDACTED_IP]:59027->[REDACTED_IP]:443"},
-		{"ipv6 full", "server 2001:0db8:85a3:0000:0000:8a2e:0370:7334 up", "server [REDACTED_IP] up"},
-		{"ipv6 compressed with context", "ping 2001:db8::8a2e:370:7334", "ping [REDACTED_IP]"},
+		{"ipv6 full", "server 2600:1f18:04c2:9300:0000:8a2e:0370:7334 up", "server [REDACTED_IP] up"},
+		{"ipv6 compressed with context", "ping 2600:1f18::8a2e:370:7334", "ping [REDACTED_IP]"},
 		{"ipv6 unique local short", "addr fd12::1", "addr [REDACTED_IP]"},
 		{"ipv6 link-local short", "via fe80::1", "via [REDACTED_IP]"},
 		{"ipv6 bracketed URL host", "http://[fd00::5]:8080/x", "http://[[REDACTED_IP]]:8080/x"},
@@ -32,9 +38,13 @@ func TestDetectPII_IPRedacted(t *testing.T) {
 		{"bracketed ipv6 endpoint", "connect [fd00::5]:8080", "connect [[REDACTED_IP]]:8080"},
 		{"bracketed link-local endpoint", "dial tcp [fe80::1]:443", "dial tcp [[REDACTED_IP]]:443"},
 		{"ipv6 after separator colon", "host:fe80::1", "host:[REDACTED_IP]"},
-		{"ipv6 with eight colons", "server 2001:db8:1:2:3:4:5::", "server [REDACTED_IP]"},
+		{"ipv6 with eight colons", "server 2600:1f18:1:2:3:4:5::", "server [REDACTED_IP]"},
 		{"all-letter unique local", "host fdab::abcd", "host [REDACTED_IP]"},
 		{"all-letter unique local three groups", "host fdab::dead:beef", "host [REDACTED_IP]"},
+		{"host beside a block constant", "allow 10.0.0.0/8, deny 10.0.0.5", "allow 10.0.0.0/8, deny [REDACTED_IP]"},
+		{"subnet inside a private block", `cidr_block = "10.24.0.0/16"`, `cidr_block = "[REDACTED_IP]/16"`},
+		{"word that only ends in version", "dns conversion 52.66.93.46", "dns conversion [REDACTED_IP]"},
+		{"context word on the address's line", "bumped lib to 3.21.12.1\nssh 52.66.93.46", "bumped lib to 3.21.12.1\nssh [REDACTED_IP]"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -77,6 +87,20 @@ func TestDetectPII_IPNotRedacted(t *testing.T) {
 		{"mac address", "ether aa:bb:cc:dd:ee:ff"},
 		{"json escape before ipv6", `"\bdead::1:2"`},
 		{"uuid", "id 123e4567-e89b-12d3-a456-426614174000"},
+		{".NET assembly version", "System.Runtime, Version=10.0.0.0, Culture=neutral"},
+		{"version attribute", `<PackageReference Include="Foo" Version="10.0.0.1" />`},
+		{"assembly version attribute", `[assembly: AssemblyVersion("10.1.2.3")]`},
+		{"version key in JSON text", `"version": "10.1.2.3"`},
+		{"version label beside a network word", "server version 4.12.1.3"},
+		{"major version shaped like a network", "upgraded to 10.0.0.0"},
+		{"private block constants", `"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"`},
+		{"shared and link-local block constants", "100.64.0.0/10 and 169.254.0.0/16"},
+		{"ipv6 block constants", "fc00::/7, fd00::/8 and fe80::/10"},
+		{"documentation ipv4", "curl https://203.0.113.9/health; ssh deploy@198.51.100.7; host 192.0.2.10"},
+		{"documentation ipv6", "server 2001:db8::8a2e:370:7334 and 3fff::1"},
+		{"context word on another line", "git remote -v\nbumped protobuf to 3.21.12.1"},
+		{"context word cut at the left edge", "ghost " + strings.Repeat("b", 54) + " 1.17.2.3"},
+		{"context word cut at the right edge", "1.17.2.3 " + strings.Repeat("a", 26) + " ipsum"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -143,13 +167,16 @@ func TestPIIIntegration_IPUnderNetworkKey(t *testing.T) {
 	t.Cleanup(resetPIIConfig)
 
 	tests := []struct{ in, want string }{
-		{`{"host":"203.0.113.9"}`, `{"host":"[REDACTED_IP]"}`},
-		{`{"remote_addr":"203.0.113.9:443"}`, `{"remote_addr":"[REDACTED_IP]:443"}`},
-		{`{"peerIP":"2001:db8::7"}`, `{"peerIP":"[REDACTED_IP]"}`},
+		{`{"host":"34.117.59.81"}`, `{"host":"[REDACTED_IP]"}`},
+		{`{"remote_addr":"34.117.59.81:443"}`, `{"remote_addr":"[REDACTED_IP]:443"}`},
+		{`{"peerIP":"2600:1f18::7"}`, `{"peerIP":"[REDACTED_IP]"}`},
+		{`{"clientIP":"34.117.59.81"}`, `{"clientIP":"[REDACTED_IP]"}`},
+		{`{"HOST_IP":"34.117.59.81"}`, `{"HOST_IP":"[REDACTED_IP]"}`},
 		// No network key: a bare public address in prose is the documented gap.
-		{`{"content":"203.0.113.9"}`, `{"content":"203.0.113.9"}`},
+		{`{"content":"34.117.59.81"}`, `{"content":"34.117.59.81"}`},
 		// The key does not override the token checks.
 		{`{"host":"127.0.0.1"}`, `{"host":"127.0.0.1"}`},
+		{`{"host":"203.0.113.9"}`, `{"host":"203.0.113.9"}`},
 		{`{"version":"1.17.2.3"}`, `{"version":"1.17.2.3"}`},
 	}
 	for _, tt := range tests {
@@ -171,7 +198,7 @@ func TestRedactIPsUnderNetworkKey_IPCategoryOff(t *testing.T) {
 	})
 	t.Cleanup(resetPIIConfig)
 
-	if got := redactIPsUnderNetworkKey("host", "203.0.113.9"); got != "203.0.113.9" {
+	if got := redactIPsUnderNetworkKey("host", "34.117.59.81"); got != "34.117.59.81" {
 		t.Errorf("redactIPsUnderNetworkKey = %q, want unchanged with ip off", got)
 	}
 }
@@ -180,10 +207,112 @@ func TestIsNetworkKey(t *testing.T) {
 	t.Parallel()
 	for key, want := range map[string]bool{
 		"host": true, "hostname": true, "remote_addr": true, "peerIP": true, "server-address": true,
+		"IP": true, "HOST_IP": true, "DB_HOST": true, "SERVER_ADDR": true, "clientIP": true,
+		"podIP": true, "IPAddress": true, "hostName": true,
 		"content": false, "version": false, "description": false, "shipping": false,
+		"tooltip": false, "zipCode": false,
 	} {
 		if got := isNetworkKey(key); got != want {
 			t.Errorf("isNetworkKey(%q) = %v, want %v", key, got, want)
 		}
 	}
+}
+
+// TestIPLines runs the detector over testdata/ip_lines.txt and logs its
+// precision and recall there; the file header describes the format. Run with
+// -v to see the rates.
+func TestIPLines(t *testing.T) {
+	t.Parallel()
+	data, err := os.ReadFile(filepath.Join("testdata", "ip_lines.txt"))
+	if err != nil {
+		t.Fatalf("read table: %v", err)
+	}
+	var lines, limits, hits, misses, falsePositives int
+	for i, line := range strings.Split(string(data), "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line, limit := strings.CutPrefix(line, "limit: ")
+		input, marked, ok := parseIPLine(strings.ReplaceAll(line, `\n`, "\n"))
+		if !ok {
+			t.Fatalf("line %d has an unclosed «: %s", i+1, line)
+		}
+		found := detectPII(ipOnlyConfig(), input)
+		hit, miss, extra := scoreIPLine(marked, found)
+		lines++
+		hits += hit
+		misses += miss
+		falsePositives += extra
+		wrong := miss+extra > 0
+		switch {
+		case limit && !wrong:
+			t.Errorf("line %d is tagged as a limit but is now handled; drop the tag: %s", i+1, line)
+		case limit:
+			limits++
+		case wrong:
+			t.Errorf("line %d: %d missed, %d false positives\n input: %q\n   got: %q", i+1, miss, extra, input, applyRegions(input, found))
+		}
+	}
+	t.Logf("%d lines (%d known limits): %d addresses redacted, %d missed, %d false positives; precision %.1f%%, recall %.1f%%",
+		lines, limits, hits, misses, falsePositives,
+		percent(hits, hits+falsePositives), percent(hits, hits+misses))
+}
+
+// parseIPLine strips the «» markers from line and returns the marked spans
+// as offsets into the stripped text.
+func parseIPLine(line string) (string, []region, bool) {
+	var b strings.Builder
+	var marked []region
+	for {
+		open := strings.Index(line, "«")
+		if open < 0 {
+			break
+		}
+		closeAt := strings.Index(line[open:], "»")
+		if closeAt < 0 {
+			return "", nil, false
+		}
+		b.WriteString(line[:open])
+		start := b.Len()
+		b.WriteString(line[open+len("«") : open+closeAt])
+		marked = append(marked, region{start, b.Len()})
+		line = line[open+closeAt+len("»"):]
+	}
+	b.WriteString(line)
+	return b.String(), marked, true
+}
+
+// scoreIPLine counts marked spans the detector redacted exactly (hit), marked
+// spans it did not (miss), and redactions no span marks (extra). Overlapping
+// detections, such as the IPv4 tail of ::ffff:10.0.0.1, count as one.
+func scoreIPLine(marked []region, found []taggedRegion) (hit, miss, extra int) {
+	slices.SortFunc(found, func(a, b taggedRegion) int { return a.start - b.start })
+	var merged []region
+	for _, r := range found {
+		if n := len(merged); n > 0 && r.start < merged[n-1].end {
+			merged[n-1].end = max(merged[n-1].end, r.end)
+			continue
+		}
+		merged = append(merged, r.region)
+	}
+	got := map[region]bool{}
+	for _, r := range merged {
+		got[r] = true
+	}
+	for _, m := range marked {
+		if got[m] {
+			hit++
+			delete(got, m)
+		} else {
+			miss++
+		}
+	}
+	return hit, miss, len(got)
+}
+
+func percent(n, total int) float64 {
+	if total == 0 {
+		return 100
+	}
+	return 100 * float64(n) / float64(total)
 }

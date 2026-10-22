@@ -16,13 +16,15 @@ import (
 // Presidio and Cloud DLP take with context words:
 //
 //   - a private, link-local, or shared (CGNAT) address — internal network
-//     layout, and almost never a version number; or
+//     layout (a version label before it, as in Version=10.1.2.3, still
+//     rules it out); or
 //   - network syntax around it: scheme (://), userinfo (@), port (:443),
 //     CIDR prefix (/24), or a connection arrow (->); or
 //   - a network word nearby (ip, host, server, ssh, tcp, dns, ...).
 //
 // A public address printed bare in a list with no such context is not
 // redacted; custom_patterns covers teams that need every address.
+// testdata/ip_lines.txt measures the rule's precision and recall.
 var (
 	ipv4CandidateRegex = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
 	// ipv6CandidateRegex needs at least two colons, so a single key:value
@@ -58,8 +60,10 @@ func redactableIP(s string, start, end int) (int, int, bool) {
 
 // ipCandidate validates the regex candidate s[start:end] as an address worth
 // redacting, without the context rule: it parses the address, rejects
-// candidates that are part of a longer token, and skips addresses that
-// identify nothing (loopback, unspecified, 0.0.0.0/8, broadcast).
+// candidates that are part of a longer token or the value of a version label,
+// and skips addresses that identify nothing (loopback, unspecified,
+// 0.0.0.0/8, broadcast, N.0.0.0, documentation ranges, and the first address
+// of each private block).
 func ipCandidate(s string, start, end int) (int, int, netip.Addr, bool) {
 	// The IPv6 candidate regex also takes a separator colon on either side
 	// ("host:fe80::1", "fe80::1: unreachable"); validate the address between
@@ -84,11 +88,71 @@ func ipCandidate(s string, start, end int) (int, int, netip.Addr, bool) {
 	}
 	if addr.Is4() {
 		b := addr.As4()
-		if b[0] == 0 || b == [4]byte{255, 255, 255, 255} {
+		// N.0.0.0 is a /8 network address, never a host; written bare it is
+		// a major version, such as .NET's Version=10.0.0.0.
+		if b[0] == 0 || b == [4]byte{255, 255, 255, 255} || b[1]|b[2]|b[3] == 0 {
 			return 0, 0, netip.Addr{}, false
 		}
 	}
+	if isExampleOrBlockStart(addr) || followsVersionLabel(s, start) {
+		return 0, 0, netip.Addr{}, false
+	}
 	return start, end, addr, true
+}
+
+// ipDocumentationPrefixes are reserved for examples (RFC 5737, RFC 3849,
+// RFC 9637), so no network uses them.
+var ipDocumentationPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("3fff::/20"),
+}
+
+// ipBlockStarts are the first addresses of the private, shared, link-local
+// and unique local blocks. Code and docs that handle those ranges write them
+// (10.0.0.0/8, fe80::/10), and they name a category, not a network.
+var ipBlockStarts = map[netip.Addr]bool{
+	netip.MustParseAddr("10.0.0.0"):    true,
+	netip.MustParseAddr("172.16.0.0"):  true,
+	netip.MustParseAddr("192.168.0.0"): true,
+	netip.MustParseAddr("100.64.0.0"):  true,
+	netip.MustParseAddr("169.254.0.0"): true,
+	netip.MustParseAddr("fc00::"):      true,
+	netip.MustParseAddr("fd00::"):      true,
+	netip.MustParseAddr("fe80::"):      true,
+}
+
+func isExampleOrBlockStart(addr netip.Addr) bool {
+	if ipBlockStarts[addr] {
+		return true
+	}
+	for _, p := range ipDocumentationPrefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// followsVersionLabel reports whether the candidate at s[start] is the value
+// of a version label (Version=10.0.0.0, AssemblyVersion("10.1.2.3"),
+// "version": "10.1.2.3"). A private range does not make such a value an
+// address, so this check runs before the context rule.
+func followsVersionLabel(s string, start int) bool {
+	const label = "version"
+	i := start
+	for i > 0 && start-i < 4 && strings.IndexByte(" \t=:\"'(", s[i-1]) >= 0 {
+		i--
+	}
+	w := i - len(label)
+	if w < 0 || !strings.EqualFold(s[w:i], label) {
+		return false
+	}
+	// A whole word (version, api_version) or a camelCase suffix
+	// (AssemblyVersion), but not the tail of conversion or subversion.
+	return w == 0 || !isLetterByte(s[w-1]) || s[w] == 'V'
 }
 
 // ipStandsAlone rejects a candidate that continues a longer token on either
@@ -184,9 +248,30 @@ func ipHasContext(s string, start, end int, addr netip.Addr) bool {
 	if len(after) >= 2 && (after[0] == ':' || after[0] == '/') && isDigit(after[1]) {
 		return true
 	}
+	before, after = ipContextWindow(s, start, end)
+	return ipContextWordRegex.MatchString(before) || ipContextWordRegex.MatchString(after)
+}
+
+// ipContextWindow returns the text searched for a network word on each side
+// of s[start:end]. It stays on the address's own line, because one transcript
+// string holds a whole command output, and it drops a word the window cuts,
+// because \b would match at the cut ("ghost" seen as "host").
+func ipContextWindow(s string, start, end int) (string, string) {
 	lo := max(start-ipContextBefore, 0)
+	if i := strings.LastIndexByte(s[lo:start], '\n'); i >= 0 {
+		lo += i + 1
+	}
+	for lo > 0 && lo < start && isIPWordByte(s[lo-1]) {
+		lo++
+	}
 	hi := min(end+ipContextAfter, len(s))
-	return ipContextWordRegex.MatchString(s[lo:start]) || ipContextWordRegex.MatchString(s[end:hi])
+	if i := strings.IndexByte(s[end:hi], '\n'); i >= 0 {
+		hi = end + i
+	}
+	for hi < len(s) && hi > end && isIPWordByte(s[hi]) {
+		hi--
+	}
+	return s[lo:start], s[end:hi]
 }
 
 // mayContainIPv4 reports whether s has a digit-dot-digit sequence, which
@@ -226,7 +311,7 @@ func isHexByte(c byte) bool {
 }
 
 // redactIPsUnderNetworkKey redacts the addresses in a JSON string value whose
-// key names one ({"host":"203.0.113.9"}, {"remote_addr":...}). The JSONL path
+// key names one ({"host":"34.117.59.81"}, {"remote_addr":...}). The JSONL path
 // scans each value without its key, so the key is the only context such a
 // public address has. It runs on the already-redacted value.
 func redactIPsUnderNetworkKey(key, val string) string {
@@ -248,27 +333,17 @@ func redactIPsUnderNetworkKey(key, val string) string {
 	return applyRegions(val, regions)
 }
 
-// isNetworkKey reports whether a JSON key names an address, splitting
-// snake_case, kebab-case and camelCase keys into words first.
+// isNetworkKey reports whether a JSON key names an address. The key is split
+// into words first (HOST_IP, clientIP and IPAddress become host ip, client
+// ip and ip address), since \b does not separate snake_case or camelCase.
 func isNetworkKey(key string) bool {
-	var b strings.Builder
-	for i := range len(key) {
-		c := key[i]
-		switch {
-		case c >= 'A' && c <= 'Z':
-			b.WriteByte(' ')
-			b.WriteByte(c | 0x20)
-		case c|0x20 >= 'a' && c|0x20 <= 'z':
-			b.WriteByte(c)
-		default:
-			b.WriteByte(' ')
-		}
-	}
-	return ipContextWordRegex.MatchString(b.String())
+	return ipContextWordRegex.MatchString(strings.ReplaceAll(normalizeCredentialJSONKey(key), "_", " "))
 }
 
 func isIPWordByte(c byte) bool {
-	return isDigit(c) || c == '_' || (c|0x20 >= 'a' && c|0x20 <= 'z')
+	return isDigit(c) || c == '_' || isLetterByte(c)
 }
+
+func isLetterByte(c byte) bool { return c|0x20 >= 'a' && c|0x20 <= 'z' }
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
