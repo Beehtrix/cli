@@ -161,7 +161,7 @@ Optionally filter condensed checkpoints by session ID with --session
 			case outgoingFlag && jsonFlag:
 				return runCheckpointOutgoingListJSON(ctx, w, errW)
 			case outgoingFlag:
-				return runCheckpointOutgoingListHuman(ctx, w, errW)
+				return runCheckpointOutgoingListHuman(ctx, w, errW, noPagerFlag)
 			case pendingFlag && jsonFlag:
 				return runCheckpointPendingListJSON(ctx, w)
 			case pendingFlag:

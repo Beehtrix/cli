@@ -137,7 +137,7 @@ func TestCheckpointListOutgoing_EmptyBeforeAnyCheckpoint(t *testing.T) {
 	require.Equal(t, "origin", listing.SyncRemote)
 	require.Contains(t, raw, `"checkpoints": []`, "an empty listing must be an empty array, not null")
 
-	require.Contains(t, listOutgoingText(t, env), "No checkpoints waiting to go to origin.")
+	require.Contains(t, listOutgoingText(t, env), "No checkpoints are queued for origin.")
 }
 
 // TestCheckpointListOutgoing_MatchesWhatPushSends is the command's contract:
@@ -223,6 +223,7 @@ func TestCheckpointListOutgoing_PushDisabled(t *testing.T) {
 	text := listOutgoingText(t, env)
 	require.Contains(t, text, "push_sessions=false")
 	require.Contains(t, text, "sends none of these")
+	require.Contains(t, text, "1 checkpoint is queued for origin", "the queue says what is waiting, not what origin holds")
 
 	env.GitPushWithHooks("origin", "HEAD")
 	require.Empty(t, remoteCheckpointIDs(t, bareDir), "with pushing disabled, git push sends nothing")

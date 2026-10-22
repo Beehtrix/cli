@@ -399,3 +399,17 @@ func TestRenderPendingPoints_LogsOnlyRowsHaveHeading(t *testing.T) {
 		t.Fatalf("heading must come before the rows:\n%s", text)
 	}
 }
+
+// TestRenderOutgoingListing_EmptyQueueClaimsNothingAboutTheRemote: an empty
+// queue means nothing is waiting to be sent. It does not mean the remote holds
+// every local checkpoint: a newly elected remote, or one pushing has never
+// reached, can be missing all of them.
+func TestRenderOutgoingListing_EmptyQueueClaimsNothingAboutTheRemote(t *testing.T) {
+	t.Parallel()
+	for _, pushDisabled := range []bool{false, true} {
+		var out bytes.Buffer
+		renderOutgoingListing(&out, outgoingListing{sync: checkpointSyncInfo{Remote: "origin", PushDisabled: pushDisabled}})
+		require.Contains(t, out.String(), "No checkpoints are queued for origin.", "push disabled: %v", pushDisabled)
+		require.NotContains(t, out.String(), "has every", "push disabled: %v", pushDisabled)
+	}
+}

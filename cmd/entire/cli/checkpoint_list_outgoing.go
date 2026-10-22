@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
@@ -75,7 +76,9 @@ func loadOutgoingListing(ctx context.Context) (outgoingListing, error) {
 	if err != nil {
 		return outgoingListing{}, err
 	}
-	listing := outgoingListing{sync: computeCheckpointSyncInfo(ctx, s), result: result}
+	// The listing is the count, so status' counter must not read the queue again.
+	listed := func(context.Context, string) int { return len(result.Checkpoints) }
+	listing := outgoingListing{sync: computeCheckpointSyncInfoCounting(ctx, s, listed), result: result}
 	if len(result.Checkpoints) == 0 {
 		return listing, nil
 	}
@@ -207,12 +210,14 @@ func runCheckpointOutgoingListJSON(ctx context.Context, w, errW io.Writer) error
 	return nil
 }
 
-func runCheckpointOutgoingListHuman(ctx context.Context, w, errW io.Writer) error {
+func runCheckpointOutgoingListHuman(ctx context.Context, w, errW io.Writer, noPager bool) error {
 	listing, err := loadOutgoingListing(ctx)
 	if err != nil {
 		return reportOutgoingErr(errW, err)
 	}
-	renderOutgoingListing(w, listing)
+	var out strings.Builder
+	renderOutgoingListing(&out, listing)
+	outputExplainContent(w, out.String(), noPager)
 	return nil
 }
 
@@ -243,14 +248,13 @@ func renderOutgoingListing(w io.Writer, l outgoingListing) {
 			fmt.Fprintln(w, "Automatic checkpoint pushing is off (push_sessions=false).")
 		}
 	}
+	// An empty queue says nothing is waiting to be sent, not what the remote
+	// holds: a newly elected remote can be missing every checkpoint.
 	if n == 0 {
-		switch {
-		case dest == "":
-			fmt.Fprintln(w, "No outgoing checkpoints.")
-		case info.PushDisabled:
-			fmt.Fprintf(w, "%s has every local checkpoint.\n", dest)
-		default:
-			fmt.Fprintf(w, "No checkpoints waiting to go to %s.\n", dest)
+		if dest == "" {
+			fmt.Fprintln(w, "No checkpoints are queued.")
+		} else {
+			fmt.Fprintf(w, "No checkpoints are queued for %s.\n", dest)
 		}
 		renderStaleQueueEntries(w, l.result.StaleQueueEntries)
 		return
@@ -269,9 +273,9 @@ func outgoingHeadline(info checkpointSyncInfo, n int, dest string) string {
 	count := pluralCount(n, nounCheckpoint, nounCheckpoints)
 	switch {
 	case info.PushDisabled && dest != "":
-		return fmt.Sprintf("%s %s not on %s:", count, beVerb(n), dest)
+		return fmt.Sprintf("%s %s queued for %s:", count, beVerb(n), dest)
 	case info.PushDisabled:
-		return fmt.Sprintf("%s %s not pushed:", count, beVerb(n))
+		return fmt.Sprintf("%s %s queued:", count, beVerb(n))
 	case info.Err != "":
 		return fmt.Sprintf("'git push' sends none of these until that is fixed. %s %s queued:", count, beVerb(n))
 	case dest == "":
