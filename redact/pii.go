@@ -240,7 +240,7 @@ func detectPII(cfg *PIIConfig, s string) []taggedRegion {
 			})
 		}
 	}
-	return regions
+	return dropNestedIPRegions(regions)
 }
 
 // compilePIIPatterns builds the pattern list from config.

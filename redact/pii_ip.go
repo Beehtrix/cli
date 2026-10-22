@@ -3,6 +3,7 @@ package redact
 import (
 	"net/netip"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -71,6 +72,7 @@ func ipCandidate(s string, start, end int) (int, int, netip.Addr, bool) {
 	if end-start > 2 && s[start] == ':' && s[start+1] != ':' {
 		start++
 	}
+	start, end = trimGluedWords(s, start, end)
 	addr, err := netip.ParseAddr(s[start:end])
 	if err != nil && end-start > 2 && s[end-1] == ':' && s[end-2] != ':' {
 		end--
@@ -162,7 +164,13 @@ func followsVersionLabel(s string, start int) bool {
 func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 	if start > 0 {
 		prev := s[start-1]
-		if isIPWordByte(prev) || prev == '.' || prev == '\\' {
+		if isIPWordByte(prev) || prev == '.' {
+			return false
+		}
+		// In raw JSON a letter after a backslash belongs to an escape (\f, \b),
+		// so the candidate starts mid-token. A digit does not: \\10.0.0.5\share
+		// is a Windows share path.
+		if prev == '\\' && isLetterByte(s[start]) {
 			return false
 		}
 		if prev == ':' && addr.Is6() && !isSeparatorColon(s, start-1) {
@@ -210,10 +218,60 @@ func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 	return false
 }
 
-// isSeparatorColon reports whether the colon at s[i] follows a word rather
-// than continuing hex groups ("host:fe80::1", not "ab:fe80::1").
+// isSeparatorColon reports whether the colon at s[i] ends a word rather than
+// a hex group ("host:fe80::1" and "iface:fe80::1", not "ab:fe80::1").
 func isSeparatorColon(s string, i int) bool {
-	return i > 0 && !isHexByte(s[i-1]) && s[i-1] != ':'
+	if i == 0 || s[i-1] == ':' {
+		return false
+	}
+	j := i
+	for j > 0 && i-j <= 4 && isIPWordByte(s[j-1]) {
+		j--
+	}
+	return !isHexGroup(s[j:i])
+}
+
+// trimGluedWords drops a group the candidate s[start:end] took from a word
+// glued to the address by a colon. The regex reads the hex letters at the end
+// of "iface:" or the start of ":could" as a group ("face:fe80::1",
+// "fe80::1:c"), and the whole candidate would then be rejected as part of
+// that word. A group joined by "::" is kept, so code paths (u64::from) stay
+// whole and are rejected.
+func trimGluedWords(s string, start, end int) (int, int) {
+	if start > 0 && isIPWordByte(s[start-1]) {
+		if i := strings.IndexByte(s[start:end], ':'); i > 0 && start+i+1 < end && s[start+i+1] != ':' && isSeparatorColon(s, start+i) {
+			start += i + 1
+		}
+	}
+	if end < len(s) && isIPWordByte(s[end]) {
+		if i := strings.LastIndexByte(s[start:end], ':'); i > 0 && s[start+i-1] != ':' && !isHexGroup(wordAt(s, start+i+1)) {
+			end = start + i
+		}
+	}
+	return start, end
+}
+
+// wordAt returns up to five word bytes of s starting at i, enough to tell a
+// hex group from a longer word.
+func wordAt(s string, i int) string {
+	j := i
+	for j < len(s) && j-i < 5 && isIPWordByte(s[j]) {
+		j++
+	}
+	return s[i:j]
+}
+
+// isHexGroup reports whether w could be one IPv6 group: one to four hex digits.
+func isHexGroup(w string) bool {
+	if w == "" || len(w) > 4 {
+		return false
+	}
+	for i := range len(w) {
+		if !isHexByte(w[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // isInternalIP reports whether addr is private, link-local, or shared
@@ -328,14 +386,62 @@ func redactIPsUnderNetworkKey(key, val string, t *tally) string {
 			}
 		}
 	}
-	return redactRegions(val, regions, t)
+	return redactRegions(val, dropNestedIPRegions(regions), t)
+}
+
+// dropNestedIPRegions removes an IP region that lies inside another one, so
+// an address counts once: both IP rules match an IPv4-mapped address, the
+// IPv4 rule only its dotted tail (::ffff:10.0.0.1).
+func dropNestedIPRegions(regions []taggedRegion) []taggedRegion {
+	if len(regions) < 2 {
+		return regions
+	}
+	slices.SortFunc(regions, func(a, b taggedRegion) int {
+		if a.start != b.start {
+			return a.start - b.start
+		}
+		return b.end - a.end
+	})
+	kept := regions[:1]
+	for _, r := range regions[1:] {
+		last := kept[len(kept)-1]
+		if r.label == labelIP && last.label == labelIP && r.end <= last.end {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	return kept
 }
 
 // isNetworkKey reports whether a JSON key names an address. The key is split
 // into words first (HOST_IP, clientIP and IPAddress become host ip, client
 // ip and ip address), since \b does not separate snake_case or camelCase.
+// camelCase splitting cuts IPv6 into i_pv6, so a key with a digit is also
+// read lowercased and broken after each digit (IPv4Address: ipv4 address).
 func isNetworkKey(key string) bool {
-	return ipContextWordRegex.MatchString(strings.ReplaceAll(normalizeCredentialJSONKey(key), "_", " "))
+	if ipContextWordRegex.MatchString(strings.ReplaceAll(normalizeCredentialJSONKey(key), "_", " ")) {
+		return true
+	}
+	return strings.ContainsAny(key, "0123456789") && ipContextWordRegex.MatchString(splitAfterDigits(key))
+}
+
+func splitAfterDigits(key string) string {
+	var b strings.Builder
+	for i := range len(key) {
+		c := key[i]
+		switch {
+		case isLetterByte(c):
+			if i > 0 && isDigit(key[i-1]) {
+				b.WriteByte(' ')
+			}
+			b.WriteByte(c | 0x20)
+		case isDigit(c):
+			b.WriteByte(c)
+		default:
+			b.WriteByte(' ')
+		}
+	}
+	return b.String()
 }
 
 func isIPWordByte(c byte) bool {

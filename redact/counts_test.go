@@ -129,6 +129,9 @@ func TestJSONLBytesCounts_IP(t *testing.T) {
 	for _, tc := range []struct{ name, content string }{
 		{"address in text", textLine(t, "ssh deploy@10.24.3.17 failed")},
 		{"address under a network key", `{"host":"34.117.59.81"}` + "\n"},
+		{"ipv4-mapped address", textLine(t, "peer ::ffff:10.0.0.1")},
+		{"ipv4-mapped address under a network key", `{"host":"::ffff:34.117.59.81"}` + "\n"},
+		{"network key with a credential stem", `{"api-host":"34.117.59.81"}` + "\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := countsOf(t, tc.content)

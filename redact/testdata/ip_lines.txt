@@ -18,6 +18,7 @@ System.Runtime, Version=10.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a
 <PackageReference Include="Contoso.Client" Version="10.0.0.1" />
 [assembly: AssemblyVersion("10.1.2.3")]
 Microsoft Windows [Version 10.0.26100.4061]
+net use Z: \\«10.24.3.17»\c$ /persistent:yes
 info: Microsoft.Hosting.Lifetime[14] Now listening on: http://«10.0.4.12»:5000
 System.Net.Http.HttpRequestException: Connection refused («10.0.4.17»:5432)
 limit: Updated Contoso.Sdk from 10.2.0.0 to 10.3.0.0 in Directory.Packages.props

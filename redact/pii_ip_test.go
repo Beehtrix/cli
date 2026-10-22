@@ -45,6 +45,11 @@ func TestDetectPII_IPRedacted(t *testing.T) {
 		{"subnet inside a private block", `cidr_block = "10.24.0.0/16"`, `cidr_block = "[REDACTED_IP]/16"`},
 		{"word that only ends in version", "dns conversion 52.66.93.46", "dns conversion [REDACTED_IP]"},
 		{"context word on the address's line", "bumped lib to 3.21.12.1\nssh 52.66.93.46", "bumped lib to 3.21.12.1\nssh [REDACTED_IP]"},
+		{"ipv6 after a word ending in hex letters", "iface:fe80::1", "iface:[REDACTED_IP]"},
+		{"ipv6 after a label", "node:fd12::5 interface:fd00::7", "node:[REDACTED_IP] interface:[REDACTED_IP]"},
+		{"ipv6 before a word", "connect to fe80::1:could not reach", "connect to [REDACTED_IP]:could not reach"},
+		{"UNC path", `\\192.168.1.40\share`, `\\[REDACTED_IP]\share`},
+		{"net use", `net use Z: \\10.24.3.17\c$`, `net use Z: \\[REDACTED_IP]\c$`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -81,6 +86,7 @@ func TestDetectPII_IPNotRedacted(t *testing.T) {
 		{"python slice", "a[1::2] and b[10::-1]"},
 		{"slice after call", "f()[1::2] and x[0][1::2]"},
 		{"hex-letter code path", "c::d and dead::beef"},
+		{"code paths after words", "Vec::default and Self::Abc and code::fd12"},
 		{"hex word before colon", "ab:fe80::1"},
 		{"time", "at 12:30:45 today"},
 		{"file line col", "main.go:12:34: error"},
@@ -172,6 +178,9 @@ func TestPIIIntegration_IPUnderNetworkKey(t *testing.T) {
 		{`{"peerIP":"2600:1f18::7"}`, `{"peerIP":"[REDACTED_IP]"}`},
 		{`{"clientIP":"34.117.59.81"}`, `{"clientIP":"[REDACTED_IP]"}`},
 		{`{"HOST_IP":"34.117.59.81"}`, `{"HOST_IP":"[REDACTED_IP]"}`},
+		{`{"GlobalIPv6Address":"2600:1f18::7"}`, `{"GlobalIPv6Address":"[REDACTED_IP]"}`},
+		// A key with a credential stem still gets the IP token, not a whole-value placeholder.
+		{`{"api-host":"34.117.59.81"}`, `{"api-host":"[REDACTED_IP]"}`},
 		// No network key: a bare public address in prose is the documented gap.
 		{`{"content":"34.117.59.81"}`, `{"content":"34.117.59.81"}`},
 		// The key does not override the token checks.
@@ -209,6 +218,7 @@ func TestIsNetworkKey(t *testing.T) {
 		"host": true, "hostname": true, "remote_addr": true, "peerIP": true, "server-address": true,
 		"IP": true, "HOST_IP": true, "DB_HOST": true, "SERVER_ADDR": true, "clientIP": true,
 		"podIP": true, "IPAddress": true, "hostName": true,
+		"IPv4": true, "IPv6": true, "IPv4Address": true, "GlobalIPv6Address": true, "Ipv6Address": true,
 		"content": false, "version": false, "description": false, "shipping": false,
 		"tooltip": false, "zipCode": false,
 	} {

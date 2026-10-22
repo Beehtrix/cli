@@ -2159,6 +2159,12 @@ func keyContextFindsMore(key, val string) bool {
 	start, end := len(prefix), len(prefix)+len(val)
 	var coveredAlone []bool
 	for _, r := range detectAllLayers(prefix + val + `"`) {
+		// A network word in the key makes an IP look key-dependent, but
+		// redactIPsUnderNetworkKey owns that case and keeps the IP token
+		// instead of replacing the whole value.
+		if r.label == labelIP {
+			continue
+		}
 		s, e := max(r.start, start)-start, min(r.end, end)-start
 		if s >= e {
 			continue
