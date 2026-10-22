@@ -290,6 +290,29 @@ func TestCheckpointListCmd_SessionWithPendingErrors(t *testing.T) {
 	require.Contains(t, err.Error(), "--session cannot be combined with --pending")
 }
 
+// TestCheckpointListCmd_OutgoingRejectsOtherDatasets: --outgoing is its own
+// dataset, so the flags that select or filter the other datasets are refused
+// rather than silently ignored. Uses t.Chdir — do NOT add t.Parallel.
+func TestCheckpointListCmd_OutgoingRejectsOtherDatasets(t *testing.T) {
+	setupCheckpointListRepo(t)
+
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"--outgoing", "--pending"}, want: "--outgoing cannot be combined with --pending"},
+		{args: []string{"--outgoing", "--session", "abc"}, want: "--session cannot be combined with --outgoing"},
+	} {
+		cmd := newCheckpointListCmd()
+		cmd.SetArgs(tc.args)
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		err := cmd.Execute()
+		require.Error(t, err, "checkpoint list %v", tc.args)
+		require.Contains(t, err.Error(), tc.want)
+	}
+}
+
 // runListCmd executes `checkpoint list <args>` via the real cobra command and
 // returns stdout. Entire must already be enabled in CWD (setup helpers do this).
 func runListCmd(t *testing.T, args ...string) string {
