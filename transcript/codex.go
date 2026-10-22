@@ -16,6 +16,8 @@ const (
 	codexTypeFunctionCallOutput   = "function_call_output"
 	codexTypeCustomToolCall       = "custom_tool_call"
 	codexTypeCustomToolCallOutput = "custom_tool_call_output"
+	codexTypeReasoning            = "reasoning"
+	codexTypeTurnContext          = "turn_context"
 )
 
 // isCodexFormat checks whether JSONL content uses the Codex format.
@@ -34,7 +36,7 @@ func isCodexFormat(content []byte) bool {
 			continue
 		}
 		switch probe.Type {
-		case "session_meta", codexTypeResponseItem, "event_msg", "turn_context":
+		case "session_meta", codexTypeResponseItem, "event_msg", codexTypeTurnContext:
 			return true
 		default:
 			return false
@@ -48,9 +50,18 @@ func isCodexFormat(content []byte) bool {
 
 // codexLine is the raw parsed form of one Codex JSONL line.
 type codexLine struct {
-	Timestamp string          `json:"timestamp"`
+	Timestamp json.RawMessage `json:"timestamp"`
 	Type      string          `json:"type"`
 	Payload   json.RawMessage `json:"payload"`
+}
+
+// ts returns the timestamp string, or "" when absent or not a string.
+func (cl codexLine) ts() string {
+	var s string
+	if json.Unmarshal(cl.Timestamp, &s) != nil {
+		return ""
+	}
+	return s
 }
 
 // codexPayload captures the common fields across Codex payload types.
@@ -66,10 +77,47 @@ type codexPayload struct {
 	Output    string          `json:"output"`
 }
 
+// codexCall accumulates the items of one model call. Its usage arrives with
+// the token_count event that closes it.
+type codexCall struct {
+	ts    string
+	text  string
+	tools []map[string]json.RawMessage
+	usage *codexCallUsage
+}
+
+// codexEntry is one output line: a user line, or an assistant call rendered
+// once the whole transcript has been read so late tool outputs can land.
+type codexEntry struct {
+	user transcriptLine
+	call *codexCall
+}
+
+type codexToolSlot struct {
+	call       *codexCall
+	block      map[string]json.RawMessage
+	outputType string
+}
+
+type codexConverter struct {
+	base    transcriptLine
+	tracker *codexUsageTracker
+	model   string
+	entries []codexEntry
+	open    *codexCall
+	// awaiting is a call whose tools have returned but whose token_count has
+	// not arrived yet; Codex emits the usage event after the tool outputs.
+	awaiting *codexCall
+	tools    map[string]codexToolSlot
+}
+
 // compactCodex converts a Codex JSONL transcript into the compact format.
+// Each assistant line is one model call: the items since the previous call
+// closed, with the usage of the token_count event that closed it.
 func compactCodex(content []byte, opts Options) ([]byte, error) {
+	full := content
 	if opts.StartLine > 0 {
-		content = SliceFromLine(content, opts.StartLine)
+		content = SliceFromLine(full, opts.StartLine)
 		if content == nil {
 			return []byte{}, nil
 		}
@@ -80,118 +128,191 @@ func compactCodex(content []byte, opts Options) ([]byte, error) {
 		return nil, err
 	}
 
-	base := newTranscriptLine(opts)
-	var result []byte
-	var pendingInTok, pendingOutTok int
-
-	for i := 0; i < len(lines); i++ {
-		cl := lines[i]
-
-		// Consume token_count lines at the top level (e.g. before any assistant).
-		if isCodexTokenCountLine(cl) {
-			pendingInTok, pendingOutTok = codexTokenCount(cl.Payload)
-			continue
-		}
-
-		var p codexPayload
-		if json.Unmarshal(cl.Payload, &p) != nil {
-			continue
-		}
-
-		ts, err := json.Marshal(cl.Timestamp)
-		if err != nil {
-			continue
-		}
-
-		switch {
-		case p.Type == transcriptTypeMessage && p.Role == TypeUser:
-			text := codexUserText(p.Content)
-			if text == "" {
-				continue
-			}
-			contentJSON, err := json.Marshal([]userTextBlock{{Text: text}})
-			if err != nil {
-				continue
-			}
-			line := base
-			line.Type = TypeUser
-			line.TS = ts
-			line.Content = contentJSON
-			appendLine(&result, line)
-
-		case p.Type == transcriptTypeMessage && p.Role == TypeAssistant:
-			text := codexAssistantText(p.Content)
-			if text == "" {
-				continue
-			}
-
-			// Collect any tool calls that follow this assistant message.
-			var toolBlocks []map[string]json.RawMessage
-			inTok, outTok := pendingInTok, pendingOutTok
-			pendingInTok, pendingOutTok = 0, 0
-			for i+1 < len(lines) {
-				next := lines[i+1]
-				if isCodexTokenCountLine(next) {
-					inTok, outTok = codexTokenCount(next.Payload)
-					i++
-					continue
-				}
-				var np codexPayload
-				if json.Unmarshal(next.Payload, &np) != nil {
-					break
-				}
-				if np.Type == codexTypeFunctionCall || np.Type == codexTypeCustomToolCall {
-					i++ // consume the tool call line
-					tb := codexConsumeToolCall(np, lines, &i, &inTok, &outTok)
-					toolBlocks = append(toolBlocks, tb)
-					continue
-				}
-				// Orphan output without a preceding call — skip.
-				if np.Type == codexTypeFunctionCallOutput || np.Type == codexTypeCustomToolCallOutput {
-					i++
-					continue
-				}
-				break
-			}
-
-			contentArr := codexBuildContent(text, toolBlocks)
-			line := base
-			line.Type = TypeAssistant
-			line.TS = ts
-			line.InputTokens = int64(inTok)
-			line.OutputTokens = int64(outTok)
-			line.Content = contentArr
-			appendLine(&result, line)
-
-		case p.Type == codexTypeFunctionCall || p.Type == codexTypeCustomToolCall:
-			// Standalone tool call not preceded by assistant text.
-			inTok, outTok := pendingInTok, pendingOutTok
-			pendingInTok, pendingOutTok = 0, 0
-			tb := codexConsumeToolCall(p, lines, &i, &inTok, &outTok)
-			// Also consume any trailing token_count.
-			for i+1 < len(lines) && isCodexTokenCountLine(lines[i+1]) {
-				inTok, outTok = codexTokenCount(lines[i+1].Payload)
-				i++
-			}
-			contentArr, err := json.Marshal([]map[string]json.RawMessage{tb})
-			if err != nil {
-				continue
-			}
-			line := base
-			line.Type = TypeAssistant
-			line.TS = ts
-			line.InputTokens = int64(inTok)
-			line.OutputTokens = int64(outTok)
-			line.Content = contentArr
-			appendLine(&result, line)
-		}
+	c := &codexConverter{
+		base:    newTranscriptLine(opts),
+		tracker: newCodexUsageTracker(),
+		tools:   map[string]codexToolSlot{},
 	}
-
-	return result, nil
+	if opts.StartLine > 0 {
+		// Counters are cumulative for the whole session, so the skipped prefix
+		// sets the baseline for the first snapshot in the slice; its lines are not emitted.
+		prefix, err := parseCodexLines(full[:len(full)-len(content)])
+		if err != nil {
+			return nil, err
+		}
+		for _, cl := range prefix {
+			c.consume(cl)
+		}
+		c.entries, c.open, c.awaiting = nil, nil, nil
+	}
+	for _, cl := range lines {
+		c.consume(cl)
+	}
+	return c.render(), nil
 }
 
-// parseCodexLines reads all JSONL lines, keeping response_item and
-// token_count event_msg entries.
+func (c *codexConverter) consume(cl codexLine) {
+	switch {
+	case cl.Type == codexTypeTurnContext:
+		c.noteModel(cl.Payload)
+	case isCodexTokenCountLine(cl):
+		c.tokenCount(cl)
+	default:
+		c.responseItem(cl)
+	}
+}
+
+func (c *codexConverter) noteModel(payload json.RawMessage) {
+	var tc struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(payload, &tc) == nil && tc.Model != "" {
+		c.model = tc.Model
+	}
+}
+
+// openCall returns the call being accumulated, starting one if needed, and
+// moves its timestamp to ts unless ts is empty.
+func (c *codexConverter) openCall(ts string) *codexCall {
+	if c.open == nil {
+		c.awaiting = nil
+		c.open = &codexCall{}
+		c.entries = append(c.entries, codexEntry{call: c.open})
+	}
+	if ts != "" {
+		c.open.ts = ts
+	}
+	return c.open
+}
+
+// tokenCount attaches the usage delta of a new snapshot to the open call, else
+// to the call awaiting it, else to a new empty call. Repeated snapshots change
+// nothing; once a counter decrease has halted usage, every snapshot just closes
+// the call.
+func (c *codexConverter) tokenCount(cl codexLine) {
+	total, ok := codexTokenCountTotal(cl.Payload)
+	if !ok {
+		return
+	}
+	d, ok := c.tracker.next(total)
+	switch {
+	case ok:
+		d.Model = c.model
+		if d.Model == "" {
+			d.Model = unknownModel
+		}
+		if c.open == nil {
+			c.open = c.awaiting
+		}
+		call := c.openCall(cl.ts())
+		call.usage = &d
+		c.open, c.awaiting = nil, nil
+	case c.tracker.stopped():
+		c.open, c.awaiting = nil, nil
+	}
+}
+
+func (c *codexConverter) responseItem(cl codexLine) {
+	callID, typ := codexCallIDAndType(cl.Payload)
+	switch typ {
+	case codexTypeFunctionCallOutput, codexTypeCustomToolCallOutput:
+		if slot, ok := c.tools[callID]; ok && slot.outputType == typ {
+			output := codexToolOutputText(cl.Payload, typ)
+			slot.block["result"] = buildToolResult(toolResultEntry{output: output})
+			if c.open == slot.call {
+				c.awaiting, c.open = slot.call, nil
+			}
+		}
+		return
+	case codexTypeReasoning:
+		c.openCall(cl.ts())
+		return
+	}
+
+	var p codexPayload
+	if json.Unmarshal(cl.Payload, &p) != nil {
+		return
+	}
+	switch {
+	case p.Type == transcriptTypeMessage && p.Role == TypeUser:
+		c.user(cl.ts(), codexUserText(p.Content))
+	case p.Type == transcriptTypeMessage && p.Role == TypeAssistant:
+		text := codexAssistantText(p.Content)
+		if text == "" {
+			return
+		}
+		call := c.openCall(cl.ts())
+		if call.text != "" {
+			call.text += "\n\n"
+		}
+		call.text += text
+	case p.Type == codexTypeFunctionCall:
+		c.toolCall(cl.ts(), p, codexToolUseBlock(p), codexTypeFunctionCallOutput)
+	case p.Type == codexTypeCustomToolCall:
+		c.toolCall(cl.ts(), p, codexCustomToolUseBlock(p), codexTypeCustomToolCallOutput)
+	}
+}
+
+func codexTSJSON(ts string) json.RawMessage {
+	if ts == "" {
+		return nil
+	}
+	return mustJSON(ts)
+}
+
+func (c *codexConverter) toolCall(ts string, p codexPayload, block map[string]json.RawMessage, outputType string) {
+	call := c.openCall(ts)
+	call.tools = append(call.tools, block)
+	if p.CallID != "" {
+		c.tools[p.CallID] = codexToolSlot{call: call, block: block, outputType: outputType}
+	}
+}
+
+func (c *codexConverter) user(ts, text string) {
+	if text == "" {
+		return
+	}
+	contentJSON, err := json.Marshal([]userTextBlock{{Text: text}})
+	if err != nil {
+		return
+	}
+	line := c.base
+	line.Type = TypeUser
+	line.TS = codexTSJSON(ts)
+	line.Content = contentJSON
+	c.open, c.awaiting = nil, nil
+	c.entries = append(c.entries, codexEntry{user: line})
+}
+
+func (c *codexConverter) render() []byte {
+	var result []byte
+	for _, e := range c.entries {
+		if e.call == nil {
+			appendLine(&result, e.user)
+			continue
+		}
+		call := e.call
+		if call.text == "" && len(call.tools) == 0 && call.usage == nil {
+			continue
+		}
+		line := c.base
+		line.Type = TypeAssistant
+		line.TS = codexTSJSON(call.ts)
+		line.Content = codexBuildContent(call.text, call.tools)
+		if u := call.usage; u != nil {
+			line.Model = u.Model
+			line.InputTokens = u.Input
+			line.CacheReadTokens = u.CacheRead
+			line.OutputTokens = u.Output
+			line.ReasoningTokens = u.Reasoning
+		}
+		appendLine(&result, line)
+	}
+	return result
+}
+
+// parseCodexLines reads all JSONL lines, keeping response_item,
+// turn_context and token_count event_msg entries.
 func parseCodexLines(content []byte) ([]codexLine, error) {
 	reader := bufio.NewReader(bytes.NewReader(content))
 	var lines []codexLine
@@ -205,7 +326,7 @@ func parseCodexLines(content []byte) ([]codexLine, error) {
 		if len(bytes.TrimSpace(lineBytes)) > 0 {
 			var cl codexLine
 			if json.Unmarshal(lineBytes, &cl) == nil {
-				if cl.Type == "response_item" || isCodexTokenCountLine(cl) {
+				if cl.Type == codexTypeResponseItem || cl.Type == codexTypeTurnContext || isCodexTokenCountLine(cl) {
 					lines = append(lines, cl)
 				}
 			}
@@ -227,18 +348,6 @@ func isCodexTokenCountLine(cl codexLine) bool {
 		Type string `json:"type"`
 	}
 	return json.Unmarshal(cl.Payload, &p) == nil && p.Type == "token_count"
-}
-
-// codexTokenCount extracts input/output tokens from a token_count payload.
-func codexTokenCount(payload json.RawMessage) (input, output int) {
-	var tc struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	}
-	if json.Unmarshal(payload, &tc) == nil {
-		return tc.InputTokens, tc.OutputTokens
-	}
-	return 0, 0
 }
 
 // codexUserText extracts the actual user prompt text from a Codex user message,
@@ -313,42 +422,6 @@ func codexToolUseBlock(p codexPayload) map[string]json.RawMessage {
 	}
 
 	return block
-}
-
-// codexConsumeToolCall builds a tool_use block from a function_call or custom_tool_call,
-// consuming any trailing token_count lines and the matching output line.
-// The caller must advance i past the tool call line itself before calling this function,
-// and must verify p.Type is a tool call type.
-func codexConsumeToolCall(p codexPayload, lines []codexLine, i *int, inTok, outTok *int) map[string]json.RawMessage {
-	var tb map[string]json.RawMessage
-	var outputType string
-
-	switch p.Type {
-	case codexTypeFunctionCall:
-		tb = codexToolUseBlock(p)
-		outputType = codexTypeFunctionCallOutput
-	case codexTypeCustomToolCall:
-		tb = codexCustomToolUseBlock(p)
-		outputType = codexTypeCustomToolCallOutput
-	default:
-		return nil
-	}
-
-	for *i+1 < len(lines) && isCodexTokenCountLine(lines[*i+1]) {
-		*inTok, *outTok = codexTokenCount(lines[*i+1].Payload)
-		*i++
-	}
-
-	if *i+1 < len(lines) {
-		callID, typ := codexCallIDAndType(lines[*i+1].Payload)
-		if typ == outputType && callID == p.CallID {
-			output := codexToolOutputText(lines[*i+1].Payload, outputType)
-			tb["result"] = buildToolResult(toolResultEntry{output: output})
-			*i++
-		}
-	}
-
-	return tb
 }
 
 // codexToolOutputText extracts the output text from a tool call output payload.
@@ -434,7 +507,7 @@ func mustJSON(v interface{}) json.RawMessage {
 // codexBuildContent builds the compact content array from assistant text and
 // optional tool_use blocks.
 func codexBuildContent(text string, toolBlocks []map[string]json.RawMessage) json.RawMessage {
-	var content []map[string]json.RawMessage
+	content := []map[string]json.RawMessage{}
 
 	if text != "" {
 		content = append(content, map[string]json.RawMessage{
