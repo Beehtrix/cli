@@ -101,10 +101,9 @@ type OutgoingCheckpoint struct {
 	CheckpointID id.CheckpointID
 	// Ref is the per-checkpoint ref on git-refs, empty on git-branch.
 	Ref plumbing.ReferenceName
-	// Updated reports that an earlier version exists. On git-branch the
-	// destination's tracking ref already holds the checkpoint. On git-refs the
-	// ref has been written more than once, and nothing local records whether
-	// an earlier write was pushed.
+	// Updated reports that the destination's tracking ref already holds an
+	// earlier version (git-branch only). git-refs keeps no local record of
+	// what a push delivered, so it never sets it; see OutgoingCheckpoints.UpdatedKnown.
 	Updated bool
 }
 
@@ -112,6 +111,9 @@ type OutgoingCheckpoint struct {
 // sends, as far as local state can tell.
 type OutgoingCheckpoints struct {
 	PrimaryIsRefs bool
+	// UpdatedKnown reports whether OutgoingCheckpoint.Updated means anything:
+	// true on git-branch, false on git-refs.
+	UpdatedKnown bool
 	// Known is false when nothing local records what the destination holds
 	// (git-branch with no named remote to compare against). Checkpoints is
 	// then empty rather than a guess.
@@ -159,27 +161,9 @@ func listQueuedCheckpointRefs(ctx context.Context, repo *git.Repository) (Outgoi
 	}
 	for _, ref := range existing {
 		cid, _ := checkpoint.ParseRef(ref)
-		out.Checkpoints = append(out.Checkpoints, OutgoingCheckpoint{
-			CheckpointID: cid,
-			Ref:          ref,
-			Updated:      refWrittenMoreThanOnce(repo, ref),
-		})
+		out.Checkpoints = append(out.Checkpoints, OutgoingCheckpoint{CheckpointID: cid, Ref: ref})
 	}
 	return out, nil
-}
-
-// refWrittenMoreThanOnce reports whether a checkpoint ref's tip has a parent:
-// the first write is an orphan commit and every later one parents on the tip.
-func refWrittenMoreThanOnce(repo *git.Repository, ref plumbing.ReferenceName) bool {
-	resolved, err := repo.Reference(ref, true)
-	if err != nil {
-		return false
-	}
-	commit, err := repo.CommitObject(resolved.Hash())
-	if err != nil {
-		return false
-	}
-	return commit.NumParents() > 0
 }
 
 // listUnpushedV1Checkpoints lists the checkpoints local v1 changed since its
@@ -188,7 +172,7 @@ func refWrittenMoreThanOnce(repo *git.Repository, ref plumbing.ReferenceName) bo
 // push sends all of v1. A tracking ref behind the remote over-lists; the push
 // trusts the same ref to decide whether v1 needs pushing at all.
 func listUnpushedV1Checkpoints(ctx context.Context, repo *git.Repository, remoteName string) (OutgoingCheckpoints, error) {
-	out := OutgoingCheckpoints{Checkpoints: []OutgoingCheckpoint{}}
+	out := OutgoingCheckpoints{UpdatedKnown: true, Checkpoints: []OutgoingCheckpoint{}}
 	if remoteName == "" {
 		return out, nil
 	}

@@ -103,9 +103,10 @@ current branch. Use --pending for work that is not a checkpoint yet:
 Use --outgoing to see what your next 'git push' sends: the checkpoints not
 yet on the checkpoint sync remote, read from local state with no network
 call. Each one shows its ID, age, agent, first prompt (or summary) and the
-files it touched. A checkpoint marked "updated" has an earlier version. On
-the git-branch backend the remote already holds it; on the git-refs backend it
-was written more than once, so the remote may hold an earlier version.
+files it touched. On the git-branch backend, a checkpoint marked "updated" is
+one the remote already holds an earlier version of. The git-refs backend keeps
+no local record of what a push delivered, so it marks none (updated is null
+in --json).
 
 Output modes:
   --json              Machine-readable JSON instead of the human view.

@@ -44,8 +44,10 @@ type outgoingCheckpointJSON struct {
 	Prompt       string   `json:"prompt,omitempty"`
 	Summary      string   `json:"summary,omitempty"`
 	FilesTouched []string `json:"files_touched"`
-	Updated      bool     `json:"updated"`
-	Error        string   `json:"error,omitempty"`
+	// Updated is null on git-refs, which keeps no record of what a push
+	// delivered, so a rewrite before the first push looks the same as one after.
+	Updated *bool  `json:"updated"`
+	Error   string `json:"error,omitempty"`
 }
 
 // outgoingListing is the --outgoing dataset: where checkpoints sync to, what
@@ -205,7 +207,9 @@ func (l outgoingListing) json() outgoingCheckpointsJSON {
 			Prompt:       row.prompt,
 			Summary:      row.summary,
 			FilesTouched: row.files,
-			Updated:      row.Updated,
+		}
+		if l.result.UpdatedKnown {
+			entry.Updated = &row.Updated
 		}
 		if entry.FilesTouched == nil {
 			entry.FilesTouched = []string{}
@@ -301,11 +305,7 @@ func renderOutgoingListing(w io.Writer, l outgoingListing) {
 		if where == "" {
 			where = "the remote"
 		}
-		if l.result.PrimaryIsRefs {
-			fmt.Fprintf(w, "updated: written more than once, so %s may already have an earlier version.\n", where)
-		} else {
-			fmt.Fprintf(w, "updated: %s already has an earlier version, and the push sends the changes.\n", where)
-		}
+		fmt.Fprintf(w, "updated: %s already has an earlier version, and the push sends the changes.\n", where)
 	}
 	renderStaleQueueEntries(w, l.result.StaleQueueEntries)
 	fmt.Fprintln(w, "Details: entire checkpoint explain <id>")

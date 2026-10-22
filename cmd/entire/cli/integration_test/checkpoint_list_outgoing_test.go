@@ -47,7 +47,7 @@ type outgoingRow struct {
 	Prompt       string   `json:"prompt"`
 	Summary      string   `json:"summary"`
 	FilesTouched []string `json:"files_touched"`
-	Updated      bool     `json:"updated"`
+	Updated      *bool    `json:"updated"`
 	Error        string   `json:"error"`
 }
 
@@ -128,6 +128,19 @@ func remoteCheckpointIDs(t *testing.T, env *TestEnv, bareDir string) []string {
 	return ids
 }
 
+// requireUpdated checks the "updated" marker. git-branch knows it from the
+// tracking ref; git-refs keeps no record of what a push delivered, so it must
+// report unknown (null) rather than a guess.
+func requireUpdated(t *testing.T, backend string, row outgoingRow, want bool) {
+	t.Helper()
+	if backend == StoreGitRefs {
+		require.Nil(t, row.Updated, "git-refs cannot know whether %s was pushed before", row.CheckpointID)
+		return
+	}
+	require.NotNil(t, row.Updated, "git-branch must report updated for %s", row.CheckpointID)
+	require.Equal(t, want, *row.Updated, "updated for %s", row.CheckpointID)
+}
+
 func sortedIDs(ids ...string) []string {
 	sorted := slices.Clone(ids)
 	slices.Sort(sorted)
@@ -171,7 +184,7 @@ func TestCheckpointListOutgoing_MatchesWhatPushSends(t *testing.T) {
 		require.Equal(t, "Add auth module", row.Prompt)
 		require.Contains(t, row.FilesTouched, "auth.go")
 		require.NotEmpty(t, row.CreatedAt)
-		require.False(t, row.Updated, "a checkpoint never pushed before is not an update")
+		requireUpdated(t, backend, row, false)
 		require.Empty(t, row.Error)
 
 		text := listOutgoingText(t, env)
@@ -209,7 +222,7 @@ func TestCheckpointListOutgoing_MarksCheckpointUpdatedAfterPush(t *testing.T) {
 
 		listing, _ := listOutgoing(t, env)
 		require.Equal(t, []string{cache}, listing.ids())
-		require.False(t, listing.row(t, cache).Updated)
+		requireUpdated(t, backend, listing.row(t, cache), false)
 
 		env.GitPushWithHooks("origin", "HEAD")
 		pushed := env.RemoteCheckpointState(bareDir)
@@ -222,13 +235,44 @@ func TestCheckpointListOutgoing_MarksCheckpointUpdatedAfterPush(t *testing.T) {
 
 		listing, _ = listOutgoing(t, env)
 		require.Equal(t, []string{cache}, listing.ids(), "the rewritten checkpoint goes out again")
-		require.True(t, listing.row(t, cache).Updated, "a rewrite of a pushed checkpoint is an update")
-		require.Contains(t, listOutgoingText(t, env), "updated")
+		requireUpdated(t, backend, listing.row(t, cache), true)
+		if backend == StoreGitBranch {
+			require.Contains(t, listOutgoingText(t, env), "updated")
+		}
 
 		env.GitPushWithHooks("origin", "HEAD")
 		require.NotEqual(t, pushed, env.RemoteCheckpointState(bareDir), "the push must send the update")
 		listing, _ = listOutgoing(t, env)
 		require.Empty(t, listing.Checkpoints)
+	})
+}
+
+// TestCheckpointListOutgoing_RewriteBeforeFirstPushIsNotAnUpdate: agents
+// commit mid-turn and the stop hook then rewrites that checkpoint, so most
+// checkpoints are written twice before any push. That second write must not
+// read as an update of something already pushed.
+func TestCheckpointListOutgoing_RewriteBeforeFirstPushIsNotAnUpdate(t *testing.T) {
+	t.Parallel()
+	ForEachBackend(t, func(t *testing.T, backend string) {
+		env := NewFeatureBranchEnv(t)
+		env.CheckpointStore = backend
+		env.SetupBareRemote()
+
+		session := env.NewSession()
+		transcriptPath := session.CreateTranscript("Add cache layer", []FileChange{{Path: "cache.go", Content: "package cache"}})
+		require.NoError(t, env.SimulateUserPromptSubmitWithPromptAndTranscriptPath(session.ID, "Add cache layer", transcriptPath))
+		env.WriteFile("cache.go", "package cache")
+		env.GitAdd("cache.go")
+		env.GitCommitWithHooks("Add cache layer", "cache.go")
+		cache := env.LatestCheckpointID()
+		session.TranscriptBuilder.AddAssistantMessage("Also tuned the eviction policy.")
+		require.NoError(t, session.TranscriptBuilder.WriteToFile(transcriptPath))
+		require.NoError(t, env.SimulateStop(session.ID, transcriptPath))
+
+		listing, _ := listOutgoing(t, env)
+		require.Equal(t, []string{cache}, listing.ids())
+		requireUpdated(t, backend, listing.row(t, cache), false)
+		require.NotContains(t, listOutgoingText(t, env), "updated")
 	})
 }
 
