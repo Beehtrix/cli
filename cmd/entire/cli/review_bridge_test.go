@@ -579,3 +579,53 @@ func TestPostReviewToTrailAtCapsPostsUnchanged(t *testing.T) {
 		t.Errorf("output reports a cap that was not hit:\n%s", output)
 	}
 }
+
+// A cut inside an open code fence must close that fence before the shortened
+// note, or the note and everything after it on the trail renders as code.
+func TestShortenReviewTrailFindingBodyClosesOpenCodeFence(t *testing.T) {
+	t.Parallel()
+	plain, _ := shortenReviewTrailFindingBody(strings.Repeat("x", wantMaxPostedBodyRunes+10))
+	note := strings.TrimLeft(plain, "x")
+	budget := wantMaxPostedBodyRunes - utf8.RuneCountInString(note)
+
+	cases := []struct {
+		name   string
+		body   string
+		closer string // "" means no closing fence may be added
+	}{
+		{name: "backtick fence", body: "intro\n```go\n" + strings.Repeat("code line\n", 3000), closer: "```"},
+		{name: "longer backtick fence", body: "intro\n````md\n" + strings.Repeat("code line\n", 3000), closer: "````"},
+		{name: "tilde fence", body: "intro\n~~~\n" + strings.Repeat("code line\n", 3000), closer: "~~~"},
+		{name: "fences balanced before the cut", body: "```\nshort\n```\n" + strings.Repeat("prose line\n", 3000)},
+		{name: "fence opens where the closer would go", body: strings.Repeat("x", budget-4) + "\n```\n" + strings.Repeat("y", 20000)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := shortenReviewTrailFindingBody(c.body)
+			if !ok || !strings.HasSuffix(got, note) {
+				t.Fatalf("body was not shortened with the note: ok=%v", ok)
+			}
+			if n := utf8.RuneCountInString(got); n > wantMaxPostedBodyRunes {
+				t.Errorf("shortened body is %d characters, want at most %d", n, wantMaxPostedBodyRunes)
+			}
+			kept := strings.TrimSuffix(got, note)
+			fences := 0
+			for _, line := range strings.Split(kept, "\n") {
+				if isCodeFence(line) {
+					fences++
+				}
+			}
+			if fences%2 != 0 {
+				t.Errorf("shortened body leaves a code fence open (%d fence lines); tail=%q", fences, got[len(got)-120:])
+			}
+			lastLine := kept[strings.LastIndex(kept, "\n")+1:]
+			switch {
+			case c.closer != "" && lastLine != c.closer:
+				t.Errorf("last line before the note = %q, want the fence closed with %q", lastLine, c.closer)
+			case c.closer == "" && isCodeFence(lastLine):
+				t.Errorf("added a closing fence %q that nothing opened", lastLine)
+			}
+		})
+	}
+}

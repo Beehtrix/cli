@@ -153,18 +153,60 @@ func reviewTrailSeverityRank(severity *string) int {
 }
 
 // shortenReviewTrailFindingBody cuts an over-long body on a rune boundary so
-// that, with a note saying so, it fits maxPostedReviewFindingRunes.
+// that, with a note saying so, it fits maxPostedReviewFindingRunes. A code
+// fence the cut leaves open is closed first, or the note would render as code.
 func shortenReviewTrailFindingBody(body string) (string, bool) {
 	if utf8.RuneCountInString(body) <= maxPostedReviewFindingRunes {
 		return body, false
 	}
 	note := fmt.Sprintf("\n\n[Shortened: this finding was longer than %d characters.]", maxPostedReviewFindingRunes)
+	budget := maxPostedReviewFindingRunes - utf8.RuneCountInString(note)
+	kept := runePrefix(body, budget)
+	for {
+		fence := openCodeFence(kept)
+		if fence == "" {
+			break
+		}
+		closer := "\n" + fence
+		// Making room for the closer can drop the opening line itself, so
+		// check again after trimming.
+		if room := budget - utf8.RuneCountInString(closer); utf8.RuneCountInString(kept) > room {
+			kept = runePrefix(kept, room)
+			continue
+		}
+		kept += closer
+		break
+	}
+	return kept + note, true
+}
+
+// runePrefix returns the first n runes of s.
+func runePrefix(s string, n int) string {
 	cut := 0
-	for range maxPostedReviewFindingRunes - utf8.RuneCountInString(note) {
-		_, size := utf8.DecodeRuneInString(body[cut:])
+	for range n {
+		_, size := utf8.DecodeRuneInString(s[cut:])
 		cut += size
 	}
-	return body[:cut] + note, true
+	return s[:cut]
+}
+
+// openCodeFence returns the marker of the code fence left open at the end of
+// text, or "" when none is. Fence lines toggle as in
+// splitReviewVerdictFindings.
+func openCodeFence(text string) string {
+	open := ""
+	for _, line := range strings.Split(text, "\n") {
+		if !isCodeFence(line) {
+			continue
+		}
+		if open != "" {
+			open = ""
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		open = trimmed[:len(trimmed)-len(strings.TrimLeft(trimmed, trimmed[:1]))]
+	}
+	return open
 }
 
 // reviewTrailFindingInputs turns a trail report into trail findings.
