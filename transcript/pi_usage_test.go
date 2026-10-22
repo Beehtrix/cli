@@ -1,6 +1,7 @@
 package transcript
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -77,7 +78,51 @@ func TestPiUsage_ContentlessLineHasEmptyContentArray(t *testing.T) {
 `
 	out, err := Convert([]byte(in), agentOpts("pi"))
 	require.NoError(t, err)
-	assert.Contains(t, string(out), `"content":[]`)
+	lines, err := Decode(out)
+	require.NoError(t, err)
+	require.Len(t, lines, 1)
+	assert.Equal(t, TypeAssistant, lines[0].Type)
+	assert.NotNil(t, lines[0].Blocks)
+	assert.Empty(t, lines[0].Blocks)
+	assert.Equal(t, int64(3), lines[0].OutputTokens)
+}
+
+func TestPiUsage_NoUsageObjectLeavesLineLegacyShaped(t *testing.T) {
+	t.Parallel()
+	in := `{"type":"session","version":3,"id":"s"}
+{"type":"message","id":"m1","timestamp":"t1","message":{"role":"assistant","model":"c","content":[{"type":"text","text":"a"}]}}
+`
+	out, err := Convert([]byte(in), agentOpts("pi"))
+	require.NoError(t, err)
+	assert.Equal(t, []map[string]string{{"ts": `"t1"`}}, usageFields(t, out))
+}
+
+func TestPiUsage_SliceKeepsContentlessUsageLine(t *testing.T) {
+	t.Parallel()
+	native, err := os.ReadFile("testdata/pi_full.jsonl")
+	require.NoError(t, err)
+	opts := agentOpts("pi")
+	opts.StartLine = 6
+
+	full, boundary, err := ConvertWithBoundary(native, opts)
+	require.NoError(t, err)
+	delta, err := Convert(native, opts)
+	require.NoError(t, err)
+	assertSliceMatchesDelta(t, full, boundary, delta)
+
+	sum := func(b []byte) (n int64) {
+		lines, err := Decode(b)
+		require.NoError(t, err)
+		for _, l := range lines {
+			n += l.OutputTokens
+		}
+		return n
+	}
+	whole, err := Convert(native, agentOpts("pi"))
+	require.NoError(t, err)
+	assert.Equal(t, sum(whole), sum(full))
+	assert.Equal(t, int64(60+15+8), sum(full))
+	assert.Equal(t, int64(8), sum(delta))
 }
 
 func TestPiUsage_OldLinesStillDecode(t *testing.T) {

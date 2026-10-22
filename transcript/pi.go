@@ -138,7 +138,7 @@ func compactPi(content []byte, opts Options) ([]byte, error) {
 			blocks := piEmitAssistantContent(entry.Message.Content, results)
 			usage := piCallUsage(entry.Message)
 			if len(blocks) == 0 {
-				if !usage.hasCounts() {
+				if !piUsageHasCounts(usage) {
 					continue
 				}
 				blocks = []any{}
@@ -192,7 +192,7 @@ func piCallUsage(m pijsonl.Message) *CallUsage {
 	return u
 }
 
-func (u *CallUsage) hasCounts() bool {
+func piUsageHasCounts(u *CallUsage) bool {
 	return u != nil && (u.InputTokens != 0 || u.OutputTokens != 0 || u.CacheReadTokens != 0 ||
 		u.CacheWriteTokens != 0 || u.ReasoningTokens != 0)
 }
