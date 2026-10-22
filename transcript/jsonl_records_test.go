@@ -287,11 +287,13 @@ func TestJSONLAdapter_AlternatingFragmentRecordsGrowLinearly(t *testing.T) {
 func assertMatchesLegacy(t *testing.T, input []byte, preprocess linePreprocessor) {
 	t.Helper()
 
-	want, err := legacyCompactJSONLWith(input, defaultOpts, preprocess)
+	opts := defaultOpts
+	opts.Agent = "cursor" // claude-code lines carry per-call usage the oracle predates
+	want, err := legacyCompactJSONLWith(input, opts, preprocess)
 	if err != nil {
 		t.Fatalf("legacy: %v", err)
 	}
-	got, err := compactJSONLWith(input, defaultOpts, preprocess)
+	got, err := compactJSONLWith(input, opts, preprocess)
 	if err != nil {
 		t.Fatalf("compactJSONLWith: %v", err)
 	}
@@ -307,6 +309,7 @@ func adapterRecords(input []byte, preprocess linePreprocessor, chunks [][]byte) 
 		chunks = [][]byte{input}
 	}
 	a := newJSONLAdapter(preprocess)
+	a.perCallUsage = true
 	var recs []Record
 	for _, c := range chunks {
 		recs = append(recs, a.Feed(c)...)

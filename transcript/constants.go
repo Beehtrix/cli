@@ -11,3 +11,6 @@ const (
 	ContentTypeText    = "text"
 	ContentTypeToolUse = "tool_use"
 )
+
+// unknownModel is the model reported when a source has usage but no model.
+const unknownModel = "unknown"
