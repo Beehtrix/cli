@@ -1113,7 +1113,13 @@ func continueEnableAfterAgentValidation(
 			return err
 		}
 		ensureLogger(cmd)
-		return setupAgentHooksNonInteractive(cmd.Context(), cmd.OutOrStdout(), selectedAgent, opts)
+		if err := setupAgentHooksNonInteractive(cmd.Context(), cmd.OutOrStdout(), selectedAgent, opts); err != nil {
+			return err
+		}
+		// Here rather than in setupAgentHooksNonInteractive, which `entire
+		// agent add` also runs without enable's destination report after it.
+		printSetupCheckpointDestinationNote(cmd.Context(), cmd.OutOrStdout())
+		return nil
 	}
 
 	if settings.IsSetUpAny(ctx) {
@@ -2420,8 +2426,6 @@ func setupAgentHooksNonInteractive(ctx context.Context, w io.Writer, ag agent.Ag
 			fmt.Fprintln(w, "commit the configuration files (e.g. .entire/, .claude/).")
 		}
 	}
-
-	printSetupCheckpointDestinationNote(ctx, w)
 
 	return nil
 }

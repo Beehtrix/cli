@@ -103,3 +103,17 @@ func TestEnable_PrivacyNoticeWhileDedicatedUploadsContinue(t *testing.T) {
 		require.False(t, env.CheckpointsPresentOnRemote(origin))
 	})
 }
+
+// `entire agent add` shares enable's --agent setup path but has no destination
+// report after it, so the multi-remote note belongs to enable alone.
+func TestAgentAdd_OmitsCheckpointDestinationNote(t *testing.T) {
+	t.Parallel()
+	env := freshRepoEnv(t)
+	env.SetupBareRemote()
+	env.SetupNamedBareRemote(forkRemote)
+	env.RunCLI("enable", "--agent", agentClaudeCode, "--telemetry=false")
+
+	out := env.RunCLI("agent", "add", "codex")
+	require.Contains(t, out, "Ready.")
+	require.NotContains(t, out, "make the checkpoint destination ambiguous")
+}
