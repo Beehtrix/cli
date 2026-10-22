@@ -25,6 +25,7 @@ type CapabilityDeclarer interface {
 // have no DeclaredCaps field:
 //
 //   - CallerSessionIdentifier
+//   - ChildSessionSubagents
 //   - ContextInjector
 //   - EffectiveHookDiagnostics
 //   - HomeLayoutProvider
