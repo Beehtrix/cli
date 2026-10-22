@@ -101,10 +101,21 @@ Built-in categories (when `enabled` is `true`):
 | `email` | on | `[REDACTED_EMAIL]` |
 | `phone` (North American / NANP formats) | on | `[REDACTED_PHONE]` |
 | `address` (US street addresses) | off (more false-positive prone) | `[REDACTED_ADDRESS]` |
+| `ip` (IPv4 and IPv6 addresses, see below) | on | `[REDACTED_IP]` |
 
 Common bot/CI email addresses are not redacted (`noreply@*`, `actions@*`, `*@users.noreply.github.com`, `*@noreply.github.com`), and neither is the `git@` login of a git remote: a remote URL (`ssh://git@host/org/repo`), an scp-style remote whose path contains `/` or ends in `.git` (`git@host:org/repo.git`), or a bare `git@` on GitHub, GitLab, Bitbucket, Codeberg, or Azure DevOps (`ssh -T git@github.com`). Any other `git@` address, such as `git@company.com` in prose or `ssh -T git@gitlab.company.com`, is redacted like any other email.
 
 Phone and address matches must stand on their own: digits that are part of a longer number (`2024-123-4567890`) are not a phone number, and a street suffix must be a whole word, so `Plan` or `Started` does not end an address.
+
+IP addresses are redacted when they look like an address in use, because version numbers (`1.17.2.3`) and user agents (`Chrome/154.0.0.0`) share the dotted-quad shape. An address is redacted when any of these hold:
+
+- it is private, link-local, or shared address space (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `fc00::/7`, `fe80::/10`);
+- network syntax surrounds it: a scheme (`https://203.0.113.9`), userinfo (`deploy@203.0.113.9`), a port (`203.0.113.9:443`, which stays visible as `[REDACTED_IP]:443`), a CIDR prefix (`/32`), or a connection arrow (`->`);
+- a network word (such as `ip`, `host`, `server`, `ssh`, `tcp`, `dns`, `connect`) appears shortly before or after it.
+
+Loopback (`127.0.0.1`, `::1`), unspecified (`0.0.0.0`, `::`), `0.0.0.0/8`, and `255.255.255.255` are never redacted, and neither is an address that continues a longer token (`v1.2.3.4`, `go1.2.3.4`, `1.2.3.4-rc1`, an OID such as `1.3.6.1.4.1`, or code such as `u64::from` and `a[1::2]`). A public address printed bare with no such context, such as one line in a plain list, is not redacted; add a `custom_patterns` entry if you need every address. A version number that happens to sit next to a network word can be redacted.
+
+Older CLI versions reject unknown `pii` keys, so set `"ip": false` in a committed `.entire/settings.json` only after everyone on the team has upgraded. Turning on `enabled` is enough to get IP redaction.
 
 Teams can add their own regex patterns via `custom_patterns`. Each key is a label (uppercased in the replacement token), each value is a regex string. Example: `{"employee_id": "EMP-\\d{6}"}` produces `[REDACTED_EMPLOYEE_ID]`. A pattern that fails to compile or can match the empty string is skipped with a warning, the same as for [custom redaction rules](#customizing-redaction).
 

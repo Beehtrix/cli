@@ -285,7 +285,7 @@ var connectionStringRules = []connectionStringRule{
 //     Oracle user/password@ logins
 //  6. User-defined custom rules: configured via ConfigureCustomRules
 //  7. Bounded credential key/value pairs: DB_PASSWORD=..., Azure SAS sig=...
-//  8. PII detection: email, phone, address patterns (only when configured via ConfigurePII)
+//  8. PII detection: email, phone, address, IP patterns (only when configured via ConfigurePII)
 //
 // A string is redacted if ANY method flags it.
 func String(s string) string {

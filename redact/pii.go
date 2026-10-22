@@ -15,6 +15,7 @@ const (
 	PIIEmail   PIICategory = "email"
 	PIIPhone   PIICategory = "phone"
 	PIIAddress PIICategory = "address"
+	PIIIP      PIICategory = "ip"
 )
 
 // Label constants used in replacement tokens and pattern matching.
@@ -22,6 +23,7 @@ const (
 	labelEmail   = "EMAIL"
 	labelPhone   = "PHONE"
 	labelAddress = "ADDRESS"
+	labelIP      = "IP"
 )
 
 // PIIConfig controls which PII categories are detected and redacted.
@@ -54,7 +56,7 @@ type PIIConfig struct {
 // piiPattern is a compiled regex with its replacement token label.
 type piiPattern struct {
 	regex *regexp.Regexp
-	label string // e.g., "EMAIL", "PHONE", "ADDRESS"
+	label string // e.g., "EMAIL", "PHONE", "ADDRESS", "IP"
 }
 
 var (
@@ -189,6 +191,8 @@ var builtinPIIPatterns = []builtinPIIPattern{
 	{PIIEmail, labelEmail, emailRegex},
 	{PIIPhone, labelPhone, phoneRegex},
 	{PIIAddress, labelAddress, addressRegex},
+	{PIIIP, labelIP, ipv4CandidateRegex},
+	{PIIIP, labelIP, ipv6CandidateRegex},
 }
 
 // detectPII returns tagged regions for PII matches in s.
@@ -204,6 +208,12 @@ func detectPII(cfg *PIIConfig, s string) []taggedRegion {
 	}
 	var regions []taggedRegion
 	for _, p := range patterns {
+		// Most strings hold no address-shaped text; a byte scan rules that
+		// out before running the IP regexes over the whole string.
+		if (p.regex == ipv4CandidateRegex && !mayContainIPv4(s)) ||
+			(p.regex == ipv6CandidateRegex && !mayContainIPv6(s)) {
+			continue
+		}
 		for _, loc := range p.regex.FindAllStringIndex(s, -1) {
 			// Skip allowlisted email addresses (noreply, bot accounts, etc.)
 			// and the git login of a remote.
@@ -212,6 +222,10 @@ func detectPII(cfg *PIIConfig, s string) []taggedRegion {
 			}
 			// Skip phone-shaped digits that run on into a longer number.
 			if p.label == labelPhone && loc[1] < len(s) && s[loc[1]] >= '0' && s[loc[1]] <= '9' {
+				continue
+			}
+			// IP candidates are only shapes; isRedactableIP validates them.
+			if p.label == labelIP && !isRedactableIP(s, loc[0], loc[1]) {
 				continue
 			}
 			regions = append(regions, taggedRegion{
