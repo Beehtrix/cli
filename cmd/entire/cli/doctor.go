@@ -660,7 +660,7 @@ func checkGitHooks(cmd *cobra.Command, force bool) error {
 		fmt.Fprintln(w, "  working tree, which can reject `git push` once that path is gone, or it is a")
 		fmt.Fprintln(w, "  pre-push hook from before Entire read the refs `git push` sends.")
 	}
-	fmt.Fprintln(w, "  Fix: reinstall the managed git hooks (any non-Entire hook is backed up).")
+	fmt.Fprintln(w, "  Fix: reinstall the missing or out-of-date git hooks (any non-Entire hook is backed up).")
 
 	if !force {
 		// Degrade to warn-only when there is nobody to ask. An agent or CI run

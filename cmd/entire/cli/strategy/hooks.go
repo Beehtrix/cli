@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -471,11 +472,16 @@ func AnyGitHookInstalled(ctx context.Context) bool {
 	return CheckGitHookState(ctx) != GitHooksAbsent
 }
 
-// ReinstallGitHooks rewrites the managed git hooks using this repo's hook
-// settings — the same pair EnsureSetup runs, exported so callers outside this
-// package cannot open-code it and silently drop absolute_git_hook_path.
+// ReinstallGitHooks rewrites the managed git hooks that are missing or out of
+// date, using this repo's hook settings — the same pair EnsureSetup runs,
+// exported so callers outside this package cannot open-code it and silently
+// drop absolute_git_hook_path.
+//
+// An Entire hook that is current stays as it is even when its text differs from
+// what this version writes: it carries entireHookMarker, so InstallGitHook would
+// replace it without a backup, and the difference may be lines the user added.
 func ReinstallGitHooks(ctx context.Context) (int, error) {
-	return InstallGitHook(ctx, true, hookSettingsFromConfig(ctx))
+	return installGitHooks(ctx, true, hookSettingsFromConfig(ctx), true)
 }
 
 // legacyGitHookLaunchers are the markers of a git hook that runs Entire from the
@@ -516,26 +522,39 @@ func gitHookStateInHooksDir(hooksDir string) GitHookState {
 	}
 	outdated := false
 	for _, hook := range gitHookNames {
-		// NoFollow: a hook that is a symlink is not one Entire wrote, whatever
-		// is at the far end. Reporting Absent is what sends EnsureSetup to
-		// InstallGitHook, which backs the link up and chains to it.
-		data, err := osroot.ReadFileNoFollow(root, hook)
-		if err != nil {
+		switch hookStateIn(root, hook) {
+		case GitHooksAbsent:
 			return GitHooksAbsent
-		}
-		content := string(data)
-		if !strings.Contains(content, entireHookMarker) {
-			return GitHooksAbsent
-		}
-		if entireHookLineRunsFromWorkingTree(content) {
+		case GitHooksOutdated:
 			outdated = true
-		}
-		if hook == prePushHook && isPrePushBeforeRefList(content) {
-			// Predates passing git's ref list to Entire.
-			outdated = true
+		case GitHooksCurrent:
 		}
 	}
 	if outdated {
+		return GitHooksOutdated
+	}
+	return GitHooksCurrent
+}
+
+// hookStateIn classifies one managed hook in root, as gitHookStateInHooksDir
+// does for the set.
+func hookStateIn(root *os.Root, hook string) GitHookState {
+	// NoFollow: a hook that is a symlink is not one Entire wrote, whatever is at
+	// the far end. Reporting Absent is what sends EnsureSetup to InstallGitHook,
+	// which backs the link up and chains to it.
+	data, err := osroot.ReadFileNoFollow(root, hook)
+	if err != nil {
+		return GitHooksAbsent
+	}
+	content := string(data)
+	if !strings.Contains(content, entireHookMarker) {
+		return GitHooksAbsent
+	}
+	if entireHookLineRunsFromWorkingTree(content) {
+		return GitHooksOutdated
+	}
+	if hook == prePushHook && isPrePushBeforeRefList(content) {
+		// Predates passing git's ref list to Entire.
 		return GitHooksOutdated
 	}
 	return GitHooksCurrent
@@ -753,6 +772,12 @@ func isWindowsAbsoluteHookCommand(cmdPrefix string) bool {
 // binary form on the next install rather than leaving them pointed at repo
 // content.
 func InstallGitHook(ctx context.Context, silent, absolutePath bool) (int, error) {
+	return installGitHooks(ctx, silent, absolutePath, false)
+}
+
+// installGitHooks is InstallGitHook, limited to the hooks that are missing or
+// out of date when onlyStale is set (see ReinstallGitHooks).
+func installGitHooks(ctx context.Context, silent, absolutePath, onlyStale bool) (int, error) {
 	hooksDir, err := GetHooksDir(ctx)
 	if err != nil {
 		return 0, err
@@ -793,7 +818,13 @@ func InstallGitHook(ctx context.Context, silent, absolutePath bool) (int, error)
 		lockRoot = nil // installHooks goes ahead without the lock
 	}
 
-	installedCount, err := installHooks(ctx, lockRoot, root, hooksDir, buildHookSpecs(cmdPrefix), time.Now())
+	specs := buildHookSpecs(cmdPrefix)
+	if onlyStale {
+		specs = slices.DeleteFunc(specs, func(spec hookSpec) bool {
+			return hookStateIn(root, spec.name) == GitHooksCurrent
+		})
+	}
+	installedCount, err := installHooks(ctx, lockRoot, root, hooksDir, specs, time.Now())
 	if err != nil {
 		return installedCount, err
 	}

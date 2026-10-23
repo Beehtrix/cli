@@ -2460,3 +2460,32 @@ func TestSymlinkedHooksDirError_UsesTheQuotedCommand(t *testing.T) {
 	assert.NotContains(t, msg, "core.hooksPath "+realHooks,
 		"the bare unquoted path would be split by the shell the user pastes into")
 }
+
+// The reinstall an agent turn (EnsureSetup) or doctor --force runs replaces only
+// the hooks that need it. Every other Entire hook carries the marker, so it
+// would be overwritten without a backup, and its difference from the generated
+// text may be the user's own lines. `entire enable` still rewrites them all.
+func TestReinstallGitHooks_OnlyReplacesHooksThatNeedIt(t *testing.T) {
+	_, hooksDir := initHooksTestRepo(t)
+	_, err := InstallGitHook(context.Background(), true, false)
+	require.NoError(t, err)
+	specs := buildHookSpecs(bareEntireHookCmd)
+	read := func(name string) string {
+		t.Helper()
+		data, readErr := os.ReadFile(filepath.Join(hooksDir, name))
+		require.NoError(t, readErr)
+		return string(data)
+	}
+
+	editedPostCommit := findHookSpec(t, specs, "post-commit").content + "echo my own step\n"
+	require.NoError(t, os.WriteFile(filepath.Join(hooksDir, "post-commit"), []byte(editedPostCommit), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(hooksDir, prePushHook), []byte(oldPrePushHeader+oldPrePushBareLine), 0o755))
+	require.NoError(t, os.Remove(filepath.Join(hooksDir, "commit-msg")))
+
+	_, err = ReinstallGitHooks(context.Background())
+	require.NoError(t, err)
+
+	require.Equal(t, findHookSpec(t, specs, prePushHook).content, read(prePushHook), "the old pre-push hook is upgraded")
+	require.Equal(t, findHookSpec(t, specs, "commit-msg").content, read("commit-msg"), "a missing hook is installed")
+	require.Equal(t, editedPostCommit, read("post-commit"), "an edited Entire hook keeps the user's lines")
+}
