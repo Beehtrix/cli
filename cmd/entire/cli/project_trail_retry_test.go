@@ -54,7 +54,7 @@ func TestProjectTrailLinkRetryPreservesExecutionOptions(t *testing.T) {
 	}
 	for _, arg := range args {
 		// Trail-level fields are not link flags; an empty --status= fails validation.
-		for _, name := range []string{"body", "status", "type", "priority", "assignee"} {
+		for _, name := range []string{"title", "body", "status", "type", "priority", "assignee"} {
 			require.NotContains(t, arg, "--"+name+"=")
 		}
 	}

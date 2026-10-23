@@ -38,7 +38,7 @@ func TestProjectTrailCreateWithChange(t *testing.T) {
 			var methods []string
 			handler := repositoryTrailCreationHandler(t, forge, func(change api.ChangeCreateRequest) {
 				assert.Equal(t, "feature/new", change.BranchName)
-				assert.Equal(t, "Intent", change.Title)
+				assert.Equal(t, "feature/new", change.Title)
 				assert.Equal(t, "link", change.BranchAction)
 			})
 			_, project := setupRepositoryTrailCreation(t, forge, func(w http.ResponseWriter, r *http.Request) {
@@ -87,12 +87,13 @@ func TestProjectTrailLinkRequiresParentAndRetryHeaders(t *testing.T) {
 		assert.NoError(t, json.NewDecoder(r.Body).Decode(&request))
 		assert.Equal(t, "link", request.BranchAction)
 		assert.Equal(t, "feature/existing", request.BranchName)
+		assert.Equal(t, "feature/existing", request.Title)
 		assert.Equal(t, projectTrailTestChange, request.RepositoryID)
 		w.WriteHeader(http.StatusCreated)
 		assert.NoError(t, json.NewEncoder(w).Encode(api.ChangeCreateResponse{ID: projectTrailTestChange, TrailID: projectTrailTestID, RepositoryID: projectTrailTestChange}))
 	})
 	out, _, err := executeProjectTrailTest(t, "link", projectTrailTestID, "--project", "gh/acme", "--repo", "gh/acme/widget",
-		"--title", "Work", "--branch", "feature/existing", "--idempotency-key", "retry-link", "--json")
+		"--branch", "feature/existing", "--idempotency-key", "retry-link", "--json")
 	require.NoError(t, err)
 	require.Contains(t, out, projectTrailTestID)
 	require.Contains(t, out, "feature/existing")
@@ -127,7 +128,7 @@ func TestProjectTrailCreateSendsDescriptionOnlyOnParent(t *testing.T) {
 
 func TestProjectTrailLinkRejectsTrailFields(t *testing.T) {
 	t.Parallel()
-	for _, flag := range []string{"body", "type", "priority", "assignee"} {
+	for _, flag := range []string{"title", "body", "type", "priority", "assignee"} {
 		t.Run(flag, func(t *testing.T) {
 			t.Parallel()
 			_, _, err := executeProjectTrailTest(t, "link", projectTrailTestID, "--project", "gh/acme", "--repo", "gh/acme/widget", "--branch", "feature/work", "--"+flag, "x")

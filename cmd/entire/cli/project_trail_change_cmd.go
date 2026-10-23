@@ -17,15 +17,12 @@ import (
 // Branch membership is expressed in repository/branch terms. The backing Change
 // IDs stay inside the API adapter and are never accepted as user selectors.
 func newTrailLinkCmd() *cobra.Command {
-	var title, status, branch, base, action, key string
+	var status, branch, base, action, key string
 	cmd := &cobra.Command{
 		Use: "link <trail>", Short: "Link a repository branch to a trail",
 		Long: "Link an existing remote branch to a project trail. --branch defaults to the current branch. Use --branch-action create to create remote branch work from --base. Existing work and reviews are preserved; a branch belonging to another trail is rejected.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if cmd.Flags().Changed("title") && strings.TrimSpace(title) == "" {
-				return errors.New("--title must not be empty")
-			}
 			if err := validateProjectTrailStatusFlag(cmd, status); err != nil {
 				return err
 			}
@@ -55,10 +52,7 @@ func newTrailLinkCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if title == "" {
-				title = branch // Stable across retries even if the parent's title changes.
-			}
-			request := projectTrailChangeRequest(title, status, repoID, branch, base, action)
+			request := projectTrailChangeRequest(status, repoID, branch, base, action)
 			key = projectTrailIdempotencyKey(cmd.ErrOrStderr(), key)
 			out, err := linkProjectTrailChange(cmd.Context(), target, request, etag, key)
 			if err != nil {
@@ -71,8 +65,7 @@ func newTrailLinkCmd() *cobra.Command {
 			return nil
 		},
 	}
-	// Description, type, priority, and assignees belong to the trail.
-	cmd.Flags().StringVar(&title, "title", "", "Branch title (defaults to the branch name)")
+	// Title, description, type, priority, and assignees belong to the trail.
 	cmd.Flags().StringVar(&status, cmdStatus, "", "Lifecycle status (open, closed)")
 	addProjectTrailCreationFlags(cmd, &branch, &base, &action, &key)
 	addJSONFlag(cmd)

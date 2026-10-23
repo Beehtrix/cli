@@ -27,7 +27,6 @@ func projectTrailLinkRetry(cmd *cobra.Command, target *projectTrailTarget, chang
 	add("branch", change.BranchName)
 	add("branch-action", change.BranchAction)
 	add("base", change.Base)
-	add("title", change.Title)
 	// An empty enum flag is rejected; omission preserves the empty wire value.
 	if change.Status != "" {
 		add(cmdStatus, change.Status)

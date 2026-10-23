@@ -118,8 +118,8 @@ type ProjectTrailCreateRequest struct {
 	Changes       []ChangeCreateRequest `json:"changes,omitempty"`
 }
 
-// ChangeCreateRequest places a branch: description, type, priority, and
-// assignees belong to the project trail.
+// ChangeCreateRequest places a branch: its title is the branch name, and the
+// description, type, priority, and assignees belong to the project trail.
 type ChangeCreateRequest struct {
 	RepositoryID string `json:"repositoryId"`
 	Title        string `json:"title"`

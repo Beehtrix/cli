@@ -267,7 +267,7 @@ func newProjectTrailCreateCmd() *cobra.Command {
 				return err
 			}
 			if !noBranch || trailRepoFlag(cmd) != "" || projectTrailProjectFlag(cmd) == "" {
-				change := projectTrailChangeRequest(fields.Title, fields.Status, "", branch, base, action)
+				change := projectTrailChangeRequest(fields.Status, "", branch, base, action)
 				return createRepositoryScopedProjectTrail(cmd, request, change, key)
 			}
 			target, err := resolveProjectTrailCollection(cmd)
@@ -317,6 +317,7 @@ func projectTrailIdempotencyKey(w io.Writer, key string) string {
 	return key
 }
 
-func projectTrailChangeRequest(title, status, repoID, branch, base, action string) api.ChangeCreateRequest {
-	return api.ChangeCreateRequest{RepositoryID: repoID, Title: title, BranchName: branch, Base: base, BranchAction: action, Status: status}
+// The branch name is the Change title, so create and its link retry agree.
+func projectTrailChangeRequest(status, repoID, branch, base, action string) api.ChangeCreateRequest {
+	return api.ChangeCreateRequest{RepositoryID: repoID, Title: branch, BranchName: branch, Base: base, BranchAction: action, Status: status}
 }
