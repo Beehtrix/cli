@@ -44,7 +44,7 @@ func newProjectTrailShowCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return printProjectTrail(cmd, out, target.Change)
+			return printProjectTrail(cmd, out, target.ChangeID)
 		},
 	}
 	addProjectTrailSelectorFlags(cmd)
@@ -52,33 +52,43 @@ func newProjectTrailShowCmd() *cobra.Command {
 	return cmd
 }
 
-// projectTrailJSON is a project trail as `--json` prints it. When the trail was
-// reached through repository work, Change names that work as <repo>/<number>
-// and ChangeURL is its page inside the trail; URL stays the whole trail's page.
+// projectTrailJSON is a project trail as `--json` prints it: each change
+// gains its page inside the trail, and the change the trail was reached
+// through is marked current. URL stays the whole trail's page.
 type projectTrailJSON struct {
 	api.ProjectTrail
 
-	Change    string `json:"change,omitempty"`
-	ChangeURL string `json:"changeUrl,omitempty"`
+	Changes []projectTrailChangeJSON `json:"changes,omitempty"`
+}
+
+type projectTrailChangeJSON struct {
+	api.ChangeSummary
+
+	URL     string `json:"url,omitempty"`
+	Current bool   `json:"current,omitempty"`
 }
 
 // projectTrailChangeURL is a change's page under its trail's server-supplied
-// URL, <trail URL>/changes/<repo>/<number>; empty without a trail URL.
-func projectTrailChangeURL(trailURL string, change projectTrailChangeSelector) string {
+// URL, <trail URL>/changes/<repo>/<number>; empty when either is unknown.
+func projectTrailChangeURL(trailURL string, change api.ChangeSummary) string {
 	trailURL = strings.TrimRight(strings.TrimSpace(trailURL), "/")
-	if trailURL == "" {
+	if trailURL == "" || change.Repository == "" || change.Number <= 0 {
 		return ""
 	}
-	return trailURL + "/changes/" + url.PathEscape(change.Repo) + "/" + strconv.Itoa(change.Number)
+	return trailURL + "/changes/" + url.PathEscape(change.Repository) + "/" + strconv.Itoa(change.Number)
 }
 
-// printProjectTrail renders a project trail. change is the repository work the
-// trail was reached through, or nil when it was selected directly.
-func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, change *projectTrailChangeSelector) error {
-	out := projectTrailJSON{ProjectTrail: item}
-	if change != nil {
-		out.Change = change.String()
-		out.ChangeURL = projectTrailChangeURL(item.URL, *change)
+// printProjectTrail renders a project trail. currentChangeID is the change the
+// trail was reached through, or empty when it was selected directly.
+func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, currentChangeID string) error {
+	out := projectTrailJSON{ProjectTrail: item, Changes: mapSlice(item.Changes, func(c api.ChangeSummary) projectTrailChangeJSON {
+		return projectTrailChangeJSON{ChangeSummary: c, URL: projectTrailChangeURL(item.URL, c), Current: currentChangeID != "" && c.ID == currentChangeID}
+	})}
+	currentURL := ""
+	for _, c := range out.Changes {
+		if c.Current {
+			currentURL = c.URL
+		}
 	}
 	if jsonRequested(cmd) {
 		return printJSON(cmd.OutOrStdout(), out)
@@ -88,11 +98,8 @@ func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, change *projec
 	if trailURL := strings.TrimSpace(item.URL); trailURL != "" {
 		fmt.Fprintf(w, "URL: %s\n", tuiutil.SanitizeTerminalText(trailURL))
 	}
-	if out.Change != "" {
-		fmt.Fprintf(w, "Change: %s\n", tuiutil.SanitizeTerminalLabel(out.Change))
-	}
-	if out.ChangeURL != "" {
-		fmt.Fprintf(w, "Change URL: %s\n", tuiutil.SanitizeTerminalText(out.ChangeURL))
+	if currentURL != "" {
+		fmt.Fprintf(w, "Change URL: %s\n", tuiutil.SanitizeTerminalText(currentURL))
 	}
 	fmt.Fprintf(w, "ID: %s\nProject: %s\nStatus: %s\nType: %s\nPriority: %s\nAssignees: %s\n",
 		tuiutil.SanitizeTerminalLabel(item.ID), tuiutil.SanitizeTerminalLabel(item.ProjectID), tuiutil.SanitizeTerminalLabel(item.Status),
@@ -249,7 +256,7 @@ func newProjectTrailUpdateCmd() *cobra.Command {
 			if err := target.validateResponse(out); err != nil {
 				return err
 			}
-			return printProjectTrail(cmd, out, target.Change)
+			return printProjectTrail(cmd, out, target.ChangeID)
 		},
 	}
 	fields.flags(cmd)
@@ -309,7 +316,7 @@ func newProjectTrailCreateCmd() *cobra.Command {
 			if err := target.validateResponse(out); err != nil {
 				return err
 			}
-			return printProjectTrail(cmd, out, nil)
+			return printProjectTrail(cmd, out, "")
 		},
 	}
 	fields.flags(cmd)

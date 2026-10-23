@@ -114,6 +114,10 @@ func TestProjectTrailShowFollowsParentAcrossCells(t *testing.T) {
 		assert.Equal(t, "Bearer project-token", r.Header.Get("Authorization"))
 		item := projectTrailTestResource()
 		item.URL = "https://entire.io/gh/acme/-/trails/42/"
+		item.Changes[0].Repository = "widget"
+		item.Changes = append(item.Changes,
+			api.ChangeSummary{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAY", Repository: "api", Number: 3, Branch: "feature/a"},
+			api.ChangeSummary{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAZ", RepositoryID: "repo-hidden", Number: 9})
 		assert.NoError(t, json.NewEncoder(w).Encode(item))
 	})
 	repoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -138,13 +142,18 @@ func TestProjectTrailShowFollowsParentAcrossCells(t *testing.T) {
 	require.Equal(t, projectTrailTestID, item.ID)
 	require.True(t, item.IsPossiblyPartial)
 	require.Equal(t, "https://entire.io/gh/acme/-/trails/42/", item.URL, "the trail's own URL stays the server's")
-	require.Equal(t, "widget/7", item.Change)
-	require.Equal(t, "https://entire.io/gh/acme/-/trails/42/changes/widget/7", item.ChangeURL)
+	require.Len(t, item.Changes, 3)
+	require.Equal(t, "https://entire.io/gh/acme/-/trails/42/changes/widget/7", item.Changes[0].URL)
+	require.True(t, item.Changes[0].Current, "the branch's own change is current")
+	require.Equal(t, "https://entire.io/gh/acme/-/trails/42/changes/api/3", item.Changes[1].URL)
+	require.False(t, item.Changes[1].Current, "a same-named branch in another repository is not current")
+	require.Empty(t, item.Changes[2].URL, "a change without a repository name has no URL")
+	require.False(t, item.Changes[2].Current)
 	require.Zero(t, core.resolveCalls, "repo-only parent reads must not resolve the project via project-view access")
 
 	text, _, err := executeProjectTrailTest(t, "show", "--repo", "gh/acme/widget", "--branch", "feature/a")
 	require.NoError(t, err)
-	require.Contains(t, text, "URL: https://entire.io/gh/acme/-/trails/42/\nChange: widget/7\nChange URL: https://entire.io/gh/acme/-/trails/42/changes/widget/7\n")
+	require.Contains(t, text, "URL: https://entire.io/gh/acme/-/trails/42/\nChange URL: https://entire.io/gh/acme/-/trails/42/changes/widget/7\nID: ")
 }
 
 func TestProjectTrailMissingParentDoesNotFallBack(t *testing.T) {
@@ -176,8 +185,9 @@ func TestProjectTrailShowPrintsServerURL(t *testing.T) {
 	require.NoError(t, err)
 	var item projectTrailJSON
 	require.NoError(t, json.Unmarshal([]byte(js), &item))
-	require.Empty(t, item.Change)
-	require.Empty(t, item.ChangeURL)
+	require.Len(t, item.Changes, 1)
+	require.False(t, item.Changes[0].Current)
+	require.NotContains(t, out, "Change URL:")
 }
 
 func TestProjectTrailShowOmitsURLWithoutOne(t *testing.T) {
