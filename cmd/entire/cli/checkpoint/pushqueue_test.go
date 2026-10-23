@@ -27,8 +27,8 @@ func TestPushQueue_EnqueueDrainRemove(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, refs)
 
-	require.NoError(t, q.Enqueue(a))
-	require.NoError(t, q.Enqueue(b))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a}))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: b}))
 
 	refs, err = q.Drain()
 	require.NoError(t, err)
@@ -58,9 +58,9 @@ func TestPushQueue_DrainDedupes(t *testing.T) {
 	q := NewPushQueue(t.TempDir())
 	a := mustRefName(t, "a1b2c3d4e5f6")
 
-	require.NoError(t, q.Enqueue(a))
-	require.NoError(t, q.Enqueue(a))
-	require.NoError(t, q.Enqueue(a))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a}))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a}))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a}))
 
 	refs, err := q.Drain()
 	require.NoError(t, err)
@@ -90,10 +90,10 @@ func TestPushQueue_DrainCompactsRedundantEntries(t *testing.T) {
 	a := mustRefName(t, "a1b2c3d4e5f6")
 	b := mustRefName(t, "b2c3d4e5f6a1")
 
-	require.NoError(t, q.Enqueue(a))
-	require.NoError(t, q.Enqueue(a))
-	require.NoError(t, q.Enqueue(b))
-	require.NoError(t, q.Enqueue(a))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a}))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a}))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: b}))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a}))
 	require.Equal(t, 4, nonEmptyLineCount(t, q), "enqueue only appends")
 
 	refs, err := q.Drain()
@@ -112,7 +112,7 @@ func TestPushQueue_DrainCompactsMalformedLines(t *testing.T) {
 	t.Parallel()
 	q := NewPushQueue(t.TempDir())
 	a := mustRefName(t, "a1b2c3d4e5f6")
-	require.NoError(t, q.Enqueue(a))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a}))
 
 	f, err := os.OpenFile(q.queuePath(), os.O_WRONLY|os.O_APPEND, 0o600)
 	require.NoError(t, err)
@@ -134,12 +134,12 @@ func TestPushQueue_RemovePreservesLaterEntries(t *testing.T) {
 
 	// Simulate: drain sees [a], then b is enqueued during the push, then we
 	// Remove(a). b must survive for the next pre-push.
-	require.NoError(t, q.Enqueue(a))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a}))
 	drained, err := q.Drain()
 	require.NoError(t, err)
 	require.Equal(t, []plumbing.ReferenceName{a}, drained)
 
-	require.NoError(t, q.Enqueue(b))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: b}))
 	require.NoError(t, q.Remove(drained))
 
 	refs, err := q.Drain()
@@ -152,7 +152,7 @@ func TestPushQueue_SkipsMalformedLines(t *testing.T) {
 	dir := t.TempDir()
 	q := NewPushQueue(dir)
 	a := mustRefName(t, "a1b2c3d4e5f6")
-	require.NoError(t, q.Enqueue(a))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a}))
 
 	// Append a garbage line + a blank line directly.
 	f, err := os.OpenFile(q.queuePath(), os.O_WRONLY|os.O_APPEND, 0o600)
@@ -183,9 +183,9 @@ func TestPushQueue_PeekIsReadOnly(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, refs)
 
-	require.NoError(t, q.Enqueue(a))
-	require.NoError(t, q.Enqueue(a)) // duplicate on disk
-	require.NoError(t, q.Enqueue(b))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a}))
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: a})) // duplicate on disk
+	require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: b}))
 	require.Equal(t, 3, nonEmptyLineCount(t, q))
 
 	refs, err = q.Peek()
@@ -209,7 +209,7 @@ func TestPushQueue_RotateMovesRefsToBack(t *testing.T) {
 	b := mustRefName(t, "b2c3d4e5f6a1")
 	c := mustRefName(t, "c3d4e5f6a1b2")
 	for _, ref := range []plumbing.ReferenceName{a, b, c} {
-		require.NoError(t, q.Enqueue(ref))
+		require.NoError(t, q.EnqueueEntry(PushQueueEntry{Ref: ref}))
 	}
 
 	entry := func(ref plumbing.ReferenceName) PushQueueEntry { return PushQueueEntry{Ref: ref} }

@@ -369,7 +369,7 @@ func enqueueRefs(t *testing.T, repo *git.Repository, refs []plumbing.ReferenceNa
 	queue, err := checkpoint.PushQueueForRepo(context.Background(), repo)
 	require.NoError(t, err)
 	for _, ref := range refs {
-		require.NoError(t, queue.Enqueue(ref))
+		require.NoError(t, queue.EnqueueEntry(checkpoint.PushQueueEntry{Ref: ref}))
 	}
 	return queue
 }

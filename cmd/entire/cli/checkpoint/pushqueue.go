@@ -81,17 +81,12 @@ func PushQueueForRepo(_ context.Context, repo *git.Repository) (*PushQueue, erro
 	return NewPushQueue(dir), nil
 }
 
-// Enqueue appends a ref to the queue. It is safe to enqueue a ref already
-// present (or already pushed): Drain collapses duplicates and the batch push is
-// idempotent. Enqueue takes the lock so concurrent writers never interleave a
-// partial line.
-func (q *PushQueue) Enqueue(ref plumbing.ReferenceName) error {
-	return q.EnqueueEntry(PushQueueEntry{Ref: ref})
-}
-
 // EnqueueEntry appends an observed ref generation. A later generation of the
 // same ref supersedes it when the queue is read, while exact-generation removal
-// cannot erase the later entry.
+// cannot erase the later entry. It is safe to enqueue a ref already present (or
+// already pushed): reads collapse duplicates and the batch push is idempotent.
+// The append takes the lock so concurrent writers never interleave a partial
+// line.
 func (q *PushQueue) EnqueueEntry(entry PushQueueEntry) error {
 	root, release, err := q.lock()
 	if err != nil {
@@ -150,7 +145,7 @@ func (q *PushQueue) appendEntryLocked(root *os.Root, entry PushQueueEntry) error
 //
 // It compacts the file in place: when the on-disk queue held redundant lines
 // (duplicate enqueues of the same ref, or malformed/blank lines), Drain rewrites
-// it to the de-duplicated set. Enqueue only ever appends, so without this the
+// it to the de-duplicated set. Enqueuing only ever appends, so without this the
 // file would grow unboundedly between the Removes that are otherwise the sole
 // compaction point (e.g. a long-lived session that keeps re-enqueuing the same
 // checkpoint ref but never pushes).
@@ -275,7 +270,7 @@ func (q *PushQueue) RemoveEntries(entries []PushQueueEntry) error {
 // healthy refs behind them are never reached at all. Rotating the failures to
 // the back guarantees every queued ref eventually gets an attempt.
 //
-// One lock for the whole reorder, rather than Remove followed by Enqueue: that
+// One lock for the whole reorder, rather than a removal followed by re-enqueuing: that
 // pair leaves a window where the refs are in neither the queue nor the remote,
 // and a crash inside it drops them.
 func (q *PushQueue) Rotate(entries []PushQueueEntry) error {
