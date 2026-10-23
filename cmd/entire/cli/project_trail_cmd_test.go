@@ -112,7 +112,9 @@ func TestProjectTrailShowFollowsParentAcrossCells(t *testing.T) {
 	core, _ := setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, projectTrailTestPath, r.URL.Path)
 		assert.Equal(t, "Bearer project-token", r.Header.Get("Authorization"))
-		assert.NoError(t, json.NewEncoder(w).Encode(projectTrailTestResource()))
+		item := projectTrailTestResource()
+		item.URL = "https://entire.io/gh/acme/-/trails/42/"
+		assert.NoError(t, json.NewEncoder(w).Encode(item))
 	})
 	repoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/api/v1/trails/gh/acme/widget", r.URL.Path)
@@ -130,12 +132,19 @@ func TestProjectTrailShowFollowsParentAcrossCells(t *testing.T) {
 	t.Cleanup(func() { newTrailAPIClient = old })
 	out, _, err := executeProjectTrailTest(t, "show", "--repo", "gh/acme/widget", "--branch", "feature/a", "--json")
 	require.NoError(t, err)
-	var item api.ProjectTrail
+	var item projectTrailJSON
 	require.NoError(t, json.Unmarshal([]byte(out), &item))
 	require.Equal(t, 42, item.Number)
 	require.Equal(t, projectTrailTestID, item.ID)
 	require.True(t, item.IsPossiblyPartial)
+	require.Equal(t, "https://entire.io/gh/acme/-/trails/42/", item.URL, "the trail's own URL stays the server's")
+	require.Equal(t, "widget/7", item.Change)
+	require.Equal(t, "https://entire.io/gh/acme/-/trails/42/changes/widget/7", item.ChangeURL)
 	require.Zero(t, core.resolveCalls, "repo-only parent reads must not resolve the project via project-view access")
+
+	text, _, err := executeProjectTrailTest(t, "show", "--repo", "gh/acme/widget", "--branch", "feature/a")
+	require.NoError(t, err)
+	require.Contains(t, text, "URL: https://entire.io/gh/acme/-/trails/42/\nChange: widget/7\nChange URL: https://entire.io/gh/acme/-/trails/42/changes/widget/7\n")
 }
 
 func TestProjectTrailMissingParentDoesNotFallBack(t *testing.T) {
@@ -161,6 +170,14 @@ func TestProjectTrailShowPrintsServerURL(t *testing.T) {
 	out, _, err := executeProjectTrailTest(t, "show", "42", "--project", "gh/acme")
 	require.NoError(t, err)
 	require.Contains(t, out, "Trail #42: Project intent\nURL: https://entire.io/gh/acme/-/trails/42\nID: ")
+
+	// A trail selected directly was not reached through a change.
+	js, _, err := executeProjectTrailTest(t, "show", "42", "--project", "gh/acme", "--json")
+	require.NoError(t, err)
+	var item projectTrailJSON
+	require.NoError(t, json.Unmarshal([]byte(js), &item))
+	require.Empty(t, item.Change)
+	require.Empty(t, item.ChangeURL)
 }
 
 func TestProjectTrailShowOmitsURLWithoutOne(t *testing.T) {

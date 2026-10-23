@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -43,7 +44,7 @@ func newProjectTrailShowCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return printProjectTrail(cmd, out)
+			return printProjectTrail(cmd, out, target.Change)
 		},
 	}
 	addProjectTrailSelectorFlags(cmd)
@@ -51,14 +52,47 @@ func newProjectTrailShowCmd() *cobra.Command {
 	return cmd
 }
 
-func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail) error {
+// projectTrailJSON is a project trail as `--json` prints it. When the trail was
+// reached through repository work, Change names that work as <repo>/<number>
+// and ChangeURL is its page inside the trail; URL stays the whole trail's page.
+type projectTrailJSON struct {
+	api.ProjectTrail
+
+	Change    string `json:"change,omitempty"`
+	ChangeURL string `json:"changeUrl,omitempty"`
+}
+
+// projectTrailChangeURL is a change's page under its trail's server-supplied
+// URL, <trail URL>/changes/<repo>/<number>; empty without a trail URL.
+func projectTrailChangeURL(trailURL string, change projectTrailChangeSelector) string {
+	trailURL = strings.TrimRight(strings.TrimSpace(trailURL), "/")
+	if trailURL == "" {
+		return ""
+	}
+	return trailURL + "/changes/" + url.PathEscape(change.Repo) + "/" + strconv.Itoa(change.Number)
+}
+
+// printProjectTrail renders a project trail. change is the repository work the
+// trail was reached through, or nil when it was selected directly.
+func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, change *projectTrailChangeSelector) error {
+	out := projectTrailJSON{ProjectTrail: item}
+	if change != nil {
+		out.Change = change.String()
+		out.ChangeURL = projectTrailChangeURL(item.URL, *change)
+	}
 	if jsonRequested(cmd) {
-		return printJSON(cmd.OutOrStdout(), item)
+		return printJSON(cmd.OutOrStdout(), out)
 	}
 	w := cmd.OutOrStdout()
 	fmt.Fprintf(w, "Trail #%d: %s\n", item.Number, tuiutil.SanitizeTerminalLabel(item.Title))
-	if url := strings.TrimSpace(item.URL); url != "" {
-		fmt.Fprintf(w, "URL: %s\n", tuiutil.SanitizeTerminalText(url))
+	if trailURL := strings.TrimSpace(item.URL); trailURL != "" {
+		fmt.Fprintf(w, "URL: %s\n", tuiutil.SanitizeTerminalText(trailURL))
+	}
+	if out.Change != "" {
+		fmt.Fprintf(w, "Change: %s\n", tuiutil.SanitizeTerminalLabel(out.Change))
+	}
+	if out.ChangeURL != "" {
+		fmt.Fprintf(w, "Change URL: %s\n", tuiutil.SanitizeTerminalText(out.ChangeURL))
 	}
 	fmt.Fprintf(w, "ID: %s\nProject: %s\nStatus: %s\nType: %s\nPriority: %s\nAssignees: %s\n",
 		tuiutil.SanitizeTerminalLabel(item.ID), tuiutil.SanitizeTerminalLabel(item.ProjectID), tuiutil.SanitizeTerminalLabel(item.Status),
@@ -215,7 +249,7 @@ func newProjectTrailUpdateCmd() *cobra.Command {
 			if err := target.validateResponse(out); err != nil {
 				return err
 			}
-			return printProjectTrail(cmd, out)
+			return printProjectTrail(cmd, out, target.Change)
 		},
 	}
 	fields.flags(cmd)
@@ -275,7 +309,7 @@ func newProjectTrailCreateCmd() *cobra.Command {
 			if err := target.validateResponse(out); err != nil {
 				return err
 			}
-			return printProjectTrail(cmd, out)
+			return printProjectTrail(cmd, out, nil)
 		},
 	}
 	fields.flags(cmd)
