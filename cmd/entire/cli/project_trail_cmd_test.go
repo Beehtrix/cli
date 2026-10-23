@@ -117,7 +117,8 @@ func TestProjectTrailShowFollowsParentAcrossCells(t *testing.T) {
 		item.Changes[0].Repository = "widget"
 		item.Changes = append(item.Changes,
 			api.ChangeSummary{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAY", Repository: "api", Number: 3, Branch: "feature/a"},
-			api.ChangeSummary{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAZ", RepositoryID: "repo-hidden", Number: 9})
+			api.ChangeSummary{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAZ", RepositoryID: "repo-hidden", Number: 9},
+			api.ChangeSummary{ID: "01ARZ3NDEKTSV4RRFFQ69G5FB0", Repository: "..", Number: 5, Branch: "feature/dots"})
 		assert.NoError(t, json.NewEncoder(w).Encode(item))
 	})
 	repoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -142,13 +143,14 @@ func TestProjectTrailShowFollowsParentAcrossCells(t *testing.T) {
 	require.Equal(t, projectTrailTestID, item.ID)
 	require.True(t, item.IsPossiblyPartial)
 	require.Equal(t, "https://entire.io/gh/acme/-/trails/42/", item.URL, "the trail's own URL stays the server's")
-	require.Len(t, item.Changes, 3)
+	require.Len(t, item.Changes, 4)
 	require.Equal(t, "https://entire.io/gh/acme/-/trails/42/changes/widget/7", item.Changes[0].URL)
 	require.True(t, item.Changes[0].Current, "the branch's own change is current")
 	require.Equal(t, "https://entire.io/gh/acme/-/trails/42/changes/api/3", item.Changes[1].URL)
 	require.False(t, item.Changes[1].Current, "a same-named branch in another repository is not current")
 	require.Empty(t, item.Changes[2].URL, "a change without a repository name has no URL")
 	require.False(t, item.Changes[2].Current)
+	require.Empty(t, item.Changes[3].URL, "a repository name that is not a valid selector, like .., has no URL")
 	require.Zero(t, core.resolveCalls, "repo-only parent reads must not resolve the project via project-view access")
 
 	text, _, err := executeProjectTrailTest(t, "show", "--repo", "gh/acme/widget", "--branch", "feature/a")
@@ -158,7 +160,8 @@ func TestProjectTrailShowFollowsParentAcrossCells(t *testing.T) {
 		`    CHANGE +BRANCH +STATUS +URL\n`+
 		`    widget/7 \(current\) +feature/a +https://entire\.io/gh/acme/-/trails/42/changes/widget/7\n`+
 		`    api/3 +feature/a +https://entire\.io/gh/acme/-/trails/42/changes/api/3\n`+
-		`    repo-hidden/9\n`+
+		`    -\n`+
+		`    - +feature/dots\n`+
 		`\nDescription:\nDescription\n$`, text, "changes sit in the indented metadata block, before the description")
 	require.NotContains(t, text, "access filtering", "a possibly partial trail prints no access note")
 }

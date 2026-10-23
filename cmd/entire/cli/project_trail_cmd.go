@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -68,33 +67,37 @@ type projectTrailChangeJSON struct {
 	URL     string `json:"url,omitempty"`
 	Current bool   `json:"current,omitempty"`
 
-	// repo names the change's repository for display: the summary's, or for
-	// the current change the one the CLI resolved when the summary has none.
-	repo string
+	// selector is the change as <repo>/<number>, from the summary's repository
+	// or, for the current change, the one the CLI resolved when the summary
+	// has none; empty when no valid repository name is known.
+	selector string
 }
 
 // projectTrailChangeURL is a change's page under its trail's server-supplied
-// URL, <trail URL>/changes/<repo>/<number>; empty when any part is unknown.
-func projectTrailChangeURL(trailURL, repo string, number int) string {
+// URL, <trail URL>/changes/<repo>/<number>; empty when either is unknown.
+// The selector is validated, so it is safe as path segments.
+func projectTrailChangeURL(trailURL, selector string) string {
 	trailURL = strings.TrimRight(strings.TrimSpace(trailURL), "/")
-	if trailURL == "" || repo == "" || number <= 0 {
+	if trailURL == "" || selector == "" {
 		return ""
 	}
-	return trailURL + "/changes/" + url.PathEscape(repo) + "/" + strconv.Itoa(number)
+	return trailURL + "/changes/" + selector
 }
 
 // printProjectTrail renders a project trail. current is the change the trail
 // was reached through, or nil when it was selected directly.
 func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, current *projectTrailCurrentChange) error {
 	out := projectTrailJSON{ProjectTrail: item, Changes: mapSlice(item.Changes, func(c api.ChangeSummary) projectTrailChangeJSON {
-		entry := projectTrailChangeJSON{ChangeSummary: c, repo: c.Repository}
+		entry := projectTrailChangeJSON{ChangeSummary: c}
+		named := c
 		if current != nil && c.ID == current.ID {
 			entry.Current = true
-			if entry.repo == "" {
-				entry.repo = current.Repo
+			if named.Repository == "" {
+				named.Repository = current.Repo
 			}
 		}
-		entry.URL = projectTrailChangeURL(item.URL, entry.repo, c.Number)
+		entry.selector, _ = trailChangeSelectorFor(named)
+		entry.URL = projectTrailChangeURL(item.URL, entry.selector)
 		return entry
 	})}
 	if jsonRequested(cmd) {
@@ -163,11 +166,12 @@ func printProjectTrailDetails(w io.Writer, item api.ProjectTrail, changes []proj
 		headers := []string{colHeaderChange, colHeaderBranch, colHeaderStatus, colHeaderURL}
 		rows := make([][]string, len(changes))
 		for i, c := range changes {
-			repository := c.repo
-			if repository == "" {
-				repository = c.RepositoryID
+			// Without a valid repository name there is no selector to show;
+			// the branch still identifies the change.
+			change := c.selector
+			if change == "" {
+				change = "-"
 			}
-			change := tuiutil.SanitizeTerminalLabel(repository) + "/" + strconv.Itoa(c.Number)
 			if c.Current {
 				change += " (current)"
 			}
