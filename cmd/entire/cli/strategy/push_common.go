@@ -14,6 +14,7 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/remote"
+	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/perf"
@@ -175,15 +176,28 @@ func recoverCheckpointRef(
 		_ = repo.Storer.RemoveReference(fetchedRefName) //nolint:errcheck // cleanup is best-effort
 	}()
 
-	remoteRef, err := repo.Reference(fetchedRefName, true)
+	// go-git loads a handle's pack index once and never reloads it, so objects
+	// the fetch wrote into a new pack are invisible to a handle that has already
+	// read objects. Replay from a freshly opened repository.
+	repoPath, err := getRepoPath(repo)
+	if err != nil {
+		return checkpointRefPush{}, fmt.Errorf("get repository path: %w", err)
+	}
+	fetched, err := gitrepo.OpenPath(repoPath)
+	if err != nil {
+		return checkpointRefPush{}, fmt.Errorf("reopen repository after fetch: %w", err)
+	}
+	defer fetched.Close()
+
+	remoteRef, err := fetched.Reference(fetchedRefName, true)
 	if err != nil {
 		return checkpointRefPush{}, fmt.Errorf("resolve fetched checkpoint ref: %w", err)
 	}
-	newTip, err := replayCheckpointCandidate(ctx, repo, candidate.hash, remoteRef.Hash())
+	newTip, err := replayCheckpointCandidate(ctx, fetched, candidate.hash, remoteRef.Hash())
 	if err != nil {
 		return checkpointRefPush{}, err
 	}
-	if err := checkpointRefRecoveryCAS(ctx, repo, candidate.name, newTip, candidate.hash); err != nil {
+	if err := checkpointRefRecoveryCAS(ctx, fetched, candidate.name, newTip, candidate.hash); err != nil {
 		// newTip has no unique writer data: it is derived entirely from the
 		// immutable candidate plus the fetched remote. On a CAS conflict the
 		// writer's winning generation remains the live ref and its queue entry

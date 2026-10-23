@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -300,6 +301,66 @@ func TestPushCheckpointRefWithRecovery_PreservesConcurrentGenerationOnCASConflic
 	assert.Contains(t, files, "remote.txt")
 	assert.Contains(t, files, "local.txt")
 	assert.Contains(t, files, "concurrent.txt")
+}
+
+// go-git loads a repository handle's pack index once and does not reload it on
+// a miss, so recovery must replay from a handle that can see objects its fetch
+// wrote into a new pack. With two diverged refs, the first recovery loads the
+// index before the second fetch lands.
+func TestFlushCheckpointRefsQueue_RecoversARefFetchedIntoANewPack(t *testing.T) {
+	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
+	t.Chdir(workDir)
+	ctx := context.Background()
+	// Keep every fetch as a pack, as git does once a fetch brings at least
+	// fetch.unpackLimit objects.
+	testutil.RunGit(t, workDir, "config", "fetch.unpackLimit", "1")
+
+	repo, err := git.PlainOpen(workDir)
+	require.NoError(t, err)
+	head, err := repo.Head()
+	require.NoError(t, err)
+	base := head.Hash()
+	require.NoError(t, batchPushRefs(ctx, bareDir, refs))
+
+	// Advance each ref on the remote from another clone, so its objects reach
+	// the work repo only through recovery's fetch.
+	otherDir := t.TempDir()
+	testutil.InitRepo(t, otherDir)
+	for i, ref := range refs {
+		testutil.RunGit(t, otherDir, "fetch", "-q", bareDir, ref.String())
+		testutil.RunGit(t, otherDir, "checkout", "-q", "--detach", "FETCH_HEAD")
+		name := fmt.Sprintf("remote-%d.txt", i)
+		testutil.WriteFile(t, otherDir, name, name)
+		testutil.GitAdd(t, otherDir, name)
+		testutil.GitCommit(t, otherDir, "remote generation "+name)
+		testutil.RunGit(t, otherDir, "push", "-q", bareDir, "HEAD:"+ref.String())
+	}
+
+	for i, ref := range refs {
+		testutil.GitReset(t, workDir, base.String())
+		name := fmt.Sprintf("local-%d.txt", i)
+		testutil.WriteFile(t, workDir, name, name)
+		testutil.GitAdd(t, workDir, name)
+		testutil.GitCommit(t, workDir, "local generation "+name)
+		head, err = repo.Head()
+		require.NoError(t, err)
+		require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(ref, head.Hash())))
+	}
+	queue := enqueueRefs(t, repo, refs)
+
+	restore := captureStderr(t)
+	pushed, pushErr := flushCheckpointRefsQueue(ctx, repo, pushSettings{remote: bareDir})
+	output := restore()
+	require.NoError(t, pushErr, output)
+	assert.Equal(t, 2, pushed)
+	remaining, err := queue.Drain()
+	require.NoError(t, err)
+	assert.Empty(t, remaining, "both recovered refs landed and must leave the queue")
+	for i, ref := range refs {
+		files := remoteRefFiles(t, bareDir, ref)
+		assert.Contains(t, files, fmt.Sprintf("remote-%d.txt", i), "remote-only change must be preserved")
+		assert.Contains(t, files, fmt.Sprintf("local-%d.txt", i), "local-only change must be replayed on top")
+	}
 }
 
 // enqueueRefs seeds the repo's push queue with the given refs.
