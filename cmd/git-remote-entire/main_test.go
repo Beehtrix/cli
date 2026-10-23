@@ -9,12 +9,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/entireio/cli/cmd/entire/cli/auth"
+	"github.com/entireio/cli/cmd/entire/cli/testutil/gitenv"
 	"github.com/entireio/cli/internal/entireclient/httpclient"
 	"github.com/entireio/cli/internal/remotehelper/transport"
 )
@@ -101,10 +101,7 @@ func TestResolveProtocolVersion(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Chdir(t.TempDir())
-			t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
-			t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
-			t.Setenv("GIT_CONFIG_PARAMETERS", "")
-			t.Setenv("GIT_CONFIG_COUNT", "0")
+			gitenv.IsolateRepository(t)
 			if tc.config != "" {
 				t.Setenv("GIT_CONFIG_COUNT", "1")
 				t.Setenv("GIT_CONFIG_KEY_0", "protocol.version")
