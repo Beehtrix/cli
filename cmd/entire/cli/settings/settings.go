@@ -386,12 +386,14 @@ type ScannerSettings struct {
 }
 
 // PIISettings configures PII detection categories.
-// When Enabled is true, email and phone default to true; address defaults to false.
+// When Enabled is true, email, phone and ip default to true; address defaults
+// to false.
 type PIISettings struct {
 	Enabled        bool              `json:"enabled"`
 	Email          *bool             `json:"email,omitempty"`
 	Phone          *bool             `json:"phone,omitempty"`
 	Address        *bool             `json:"address,omitempty"`
+	IP             *bool             `json:"ip,omitempty"`
 	CustomPatterns map[string]string `json:"custom_patterns,omitempty"`
 }
 
@@ -1752,6 +1754,13 @@ func mergePIISettings(dst *PIISettings, data json.RawMessage) error {
 			return fmt.Errorf("parsing pii.address: %w", err)
 		}
 		dst.Address = &b
+	}
+	if v, ok := raw["ip"]; ok {
+		var b bool
+		if err := json.Unmarshal(v, &b); err != nil {
+			return fmt.Errorf("parsing pii.ip: %w", err)
+		}
+		dst.IP = &b
 	}
 	if v, ok := raw["custom_patterns"]; ok {
 		if err := mergeStringMap(&dst.CustomPatterns, v, "pii.custom_patterns"); err != nil {
