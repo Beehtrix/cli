@@ -259,9 +259,9 @@ func resolveProjectTrail(cmd *cobra.Command, selector string) (*projectTrailTarg
 		if err != nil {
 			return nil, err
 		}
-		if selected.Target.Change == nil {
-			selected.Target.Change = &projectTrailCurrentChange{ID: selected.Work.ID, Repo: selected.Repo}
-		}
+		// A trail selector resolves the target directly, so the branch's change
+		// is known only from the working context.
+		selected.Target.Change = &projectTrailCurrentChange{ID: selected.Work.ID, Repo: selected.Repo}
 		return selected.Target, nil
 	}
 }

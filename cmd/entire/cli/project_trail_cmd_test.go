@@ -201,6 +201,31 @@ func TestProjectTrailShowCurrentChangeWithoutRepositoryName(t *testing.T) {
 	require.NotContains(t, text, "repo-a/7")
 }
 
+// A trail selector with --branch resolves the trail directly and finds the
+// branch's change through the working context; that change is still current.
+func TestProjectTrailShowSelectorWithBranchMarksCurrent(t *testing.T) {
+	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
+		if !serveWorkingProjectRead(t, w, r) {
+			t.Errorf("unexpected project request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	})
+	setupWorkingRepoClient(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/trails/gh/acme/widget", r.URL.Path)
+		assert.NoError(t, json.NewEncoder(w).Encode(api.TrailListResponse{Trails: []api.TrailResource{{
+			ID: projectTrailTestChange, Number: 7, Branch: "feature/work",
+			Parent: &api.TrailParentReference{ID: projectTrailTestID, Number: 42, ProjectID: projectTrailTestProject,
+				Host: "gh", Project: "acme", Path: projectTrailTestPath, Jurisdiction: "eu", PrimaryProcessingCell: "project-cell"},
+		}}}))
+	})
+	out, _, err := executeProjectTrailTest(t, "show", "42", "--project", "gh/acme", "--repo", "gh/acme/widget", "--branch", "feature/work", "--json")
+	require.NoError(t, err)
+	var item projectTrailJSON
+	require.NoError(t, json.Unmarshal([]byte(out), &item))
+	require.Len(t, item.Changes, 1)
+	require.True(t, item.Changes[0].Current)
+}
+
 func TestProjectTrailMissingParentDoesNotFallBack(t *testing.T) {
 	_, server := setupProjectTrailTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		assert.NoError(t, json.NewEncoder(w).Encode(api.TrailListResponse{Trails: []api.TrailResource{{ID: projectTrailTestChange, Number: 7, Branch: "feature/a"}}}))
