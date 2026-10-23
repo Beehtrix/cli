@@ -65,31 +65,17 @@ func partitionLocalRefs(repo *git.Repository, refs []plumbing.ReferenceName) (ex
 	return existing, stale
 }
 
-// batchPushRefs pushes all of refs to target in a single git push,
-// fast-forward-only (NOT a force push). Batching keeps a backfill of many refs to
-// one network round-trip. Per-checkpoint refs normally advance by fast-forward
-// (each write parents on the prior tip), so the common case succeeds; a
-// non-fast-forward update — genuine divergence, e.g. the same checkpoint written
-// differently on another machine — is REJECTED rather than silently overwriting
-// the remote. We deliberately do not force: there is no server-side ref
-// protection, so a force push would make a buggy or racing client clobber good
-// remote history with no signal. On rejection the whole push errors; the caller
-// retries the rejected refs individually with fetch+replay recovery
+// batchPushCheckpointRefs pushes each ref at its pinned hash to target in a
+// single git push, fast-forward-only (NOT a force push). Batching keeps a backfill
+// of many refs to one network round-trip. Per-checkpoint refs normally advance by
+// fast-forward (each write parents on the prior tip), so the common case
+// succeeds; a non-fast-forward update — genuine divergence, e.g. the same
+// checkpoint written differently on another machine — is REJECTED rather than
+// silently overwriting the remote. We deliberately do not force: there is no
+// server-side ref protection, so a force push would make a buggy or racing client
+// clobber good remote history with no signal. On rejection the whole push errors;
+// the caller retries the rejected refs individually with fetch+replay recovery
 // (pushCheckpointRefWithRecovery).
-func batchPushRefs(ctx context.Context, target string, refs []plumbing.ReferenceName) error {
-	if len(refs) == 0 {
-		return nil
-	}
-	refSpecs := make([]string, 0, len(refs))
-	for _, ref := range refs {
-		refSpecs = append(refSpecs, ref.String()+":"+ref.String())
-	}
-	if _, err := remote.PushWithOptions(ctx, remote.PushOptions{Remote: target, RefSpecs: refSpecs}); err != nil {
-		return fmt.Errorf("push %d checkpoint refs: %w", len(refs), err)
-	}
-	return nil
-}
-
 func batchPushCheckpointRefs(ctx context.Context, target string, refs []checkpointRefPush) error {
 	if len(refs) == 0 {
 		return nil
@@ -108,7 +94,7 @@ func batchPushCheckpointRefs(ctx context.Context, target string, refs []checkpoi
 // confirmed remote policy/hook rejections return immediately. Other failures —
 // typically the ref diverged on the remote (the same checkpoint re-written
 // elsewhere) — fetch the remote ref and replay the local-only commits on top via
-// fetchAndRebaseRefCommon, then retry. The retry is still
+// recoverCheckpointRef, then retry. The retry is still
 // non-force: after the replay the local ref is a fast-forward over the remote, so
 // the remote commit is preserved as an ancestor rather than overwritten. The
 // cherry-pick is delta-based, so non-overlapping changes merge; a genuine overlap

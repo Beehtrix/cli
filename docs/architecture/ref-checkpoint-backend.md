@@ -273,7 +273,7 @@ When checkpoints *are* actively migrated from the branch into refs (a path that 
 | `checkpoint/id/id.go` | `ShardFor`, `Kind`/`KindOf`, ID generation |
 | `settings/checkpoints.go` | `checkpoints` block parsing + env override |
 | `strategy/manual_commit_push.go` | Pre-push: drain queue, batch push, per-ref recovery |
-| `strategy/push_common.go` | `batchPushRefs`, `pushCheckpointRefWithRecovery`, fetch+replay |
+| `strategy/push_common.go` | `batchPushCheckpointRefs`, `pushCheckpointRefWithRecovery`, fetch+replay |
 | `strategy/checkpoint_delete*.go` | `entire checkpoint delete`: read-only plan, leased per-remote deletes |
 | `checkpoint/deleted_list.go` | Local deleted-checkpoints list in the git common dir |
 

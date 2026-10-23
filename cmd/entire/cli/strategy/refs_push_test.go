@@ -49,11 +49,13 @@ func TestPartitionLocalRefs(t *testing.T) {
 	assert.Equal(t, []plumbing.ReferenceName{stale}, missing, "absent ref is stale")
 }
 
-func TestBatchPushRefs(t *testing.T) {
+func TestBatchPushCheckpointRefs(t *testing.T) {
 	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
 	t.Chdir(workDir)
+	repo, err := git.PlainOpen(workDir)
+	require.NoError(t, err)
 
-	require.NoError(t, batchPushRefs(context.Background(), bareDir, refs))
+	require.NoError(t, pushCheckpointRefsAtTips(t, repo, bareDir, refs))
 
 	// All refs now exist on the bare remote.
 	lsCmd := exec.CommandContext(context.Background(), "git", "ls-remote", bareDir)
@@ -96,24 +98,23 @@ func TestBatchPushCheckpointRefs_PinsVerifiedHash(t *testing.T) {
 	assert.Equal(t, later.Hash(), current.Hash(), "pushing the captured hash must not rewind the local ref")
 }
 
-func TestBatchPushRefs_Empty(t *testing.T) {
+func TestBatchPushCheckpointRefs_Empty(t *testing.T) {
 	t.Parallel()
 	// No refs → no git invocation, no error.
-	require.NoError(t, batchPushRefs(context.Background(), "unused-target", nil))
+	require.NoError(t, batchPushCheckpointRefs(context.Background(), "unused-target", nil))
 }
 
-// TestBatchPushRefs_AllowsFastForward: advancing a checkpoint ref to a descendant
-// commit (the normal case) pushes fine without force.
-func TestBatchPushRefs_AllowsFastForward(t *testing.T) {
+// TestBatchPushCheckpointRefs_AllowsFastForward: advancing a checkpoint ref to a
+// descendant commit (the normal case) pushes fine without force.
+func TestBatchPushCheckpointRefs_AllowsFastForward(t *testing.T) {
 	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
 	t.Chdir(workDir)
-	ctx := context.Background()
-
-	require.NoError(t, batchPushRefs(ctx, bareDir, refs))
-
-	// Advance refs[0] to a child commit (fast-forward).
 	repo, err := git.PlainOpen(workDir)
 	require.NoError(t, err)
+
+	require.NoError(t, pushCheckpointRefsAtTips(t, repo, bareDir, refs))
+
+	// Advance refs[0] to a child commit (fast-forward).
 	testutil.WriteFile(t, workDir, "two.txt", "second")
 	testutil.GitAdd(t, workDir, "two.txt")
 	testutil.GitCommit(t, workDir, "second")
@@ -121,20 +122,22 @@ func TestBatchPushRefs_AllowsFastForward(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(refs[0], head2.Hash())))
 
-	require.NoError(t, batchPushRefs(ctx, bareDir, refs[:1]), "fast-forward update should push without force")
+	require.NoError(t, pushCheckpointRefsAtTips(t, repo, bareDir, refs[:1]), "fast-forward update should push without force")
 	assert.Equal(t, head2.Hash().String(), remoteRefHash(t, bareDir, refs[0]),
 		"remote ref should advance to the descendant commit")
 }
 
-// TestBatchPushRefs_RejectsNonFastForward: a divergent (non-descendant) update is
-// rejected, and the remote ref is left untouched — the safety property that
-// distinguishes this from a force push (we have no server-side ref protection).
-func TestBatchPushRefs_RejectsNonFastForward(t *testing.T) {
+// TestBatchPushCheckpointRefs_RejectsNonFastForward: a divergent (non-descendant)
+// update is rejected, and the remote ref is left untouched — the safety property
+// that distinguishes this from a force push (we have no server-side ref
+// protection).
+func TestBatchPushCheckpointRefs_RejectsNonFastForward(t *testing.T) {
 	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
 	t.Chdir(workDir)
-	ctx := context.Background()
+	repo, err := git.PlainOpen(workDir)
+	require.NoError(t, err)
 
-	require.NoError(t, batchPushRefs(ctx, bareDir, refs))
+	require.NoError(t, pushCheckpointRefsAtTips(t, repo, bareDir, refs))
 	original := remoteRefHash(t, bareDir, refs[0])
 
 	// Point refs[0] at an orphan commit (no parent) — not a descendant of what was
@@ -144,11 +147,9 @@ func TestBatchPushRefs_RejectsNonFastForward(t *testing.T) {
 	}
 	tree := runGit("rev-parse", "HEAD^{tree}")
 	orphan := runGit("commit-tree", tree, "-m", "divergent")
-	repo, err := git.PlainOpen(workDir)
-	require.NoError(t, err)
 	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(refs[0], plumbing.NewHash(orphan))))
 
-	err = batchPushRefs(ctx, bareDir, refs[:1])
+	err = pushCheckpointRefsAtTips(t, repo, bareDir, refs[:1])
 	require.Error(t, err, "a non-fast-forward update must be rejected, not force-pushed")
 	assert.Equal(t, original, remoteRefHash(t, bareDir, refs[0]),
 		"remote ref must be unchanged after a rejected non-fast-forward push")
@@ -177,14 +178,14 @@ func TestPushCheckpointRefWithRecovery_MergesDivergedRef(t *testing.T) {
 	}
 
 	c1 := head()
-	require.NoError(t, batchPushRefs(ctx, bareDir, []plumbing.ReferenceName{ref})) // remote ref = C1
+	require.NoError(t, pushCheckpointRefsAtTips(t, repo, bareDir, []plumbing.ReferenceName{ref})) // remote ref = C1
 
 	// Remote advances: C2 (child of C1) adds b.txt; point the ref at it and push.
 	testutil.WriteFile(t, workDir, "b.txt", "b")
 	testutil.GitAdd(t, workDir, "b.txt")
 	testutil.GitCommit(t, workDir, "add b")
 	setRef(head())
-	require.NoError(t, batchPushRefs(ctx, bareDir, []plumbing.ReferenceName{ref})) // remote ref = C2
+	require.NoError(t, pushCheckpointRefsAtTips(t, repo, bareDir, []plumbing.ReferenceName{ref})) // remote ref = C2
 
 	// Local diverges: reset to C1 and make C3 (sibling of C2) adding c.txt.
 	testutil.GitReset(t, workDir, c1.String())
@@ -222,7 +223,7 @@ func TestPushCheckpointRefWithRecovery_PreservesConcurrentGenerationOnCASConflic
 	head, err := repo.Head()
 	require.NoError(t, err)
 	base := head.Hash()
-	require.NoError(t, batchPushRefs(ctx, bareDir, []plumbing.ReferenceName{ref}))
+	require.NoError(t, pushCheckpointRefsAtTips(t, repo, bareDir, []plumbing.ReferenceName{ref}))
 
 	// Advance the remote from base.
 	testutil.WriteFile(t, workDir, "remote.txt", "remote")
@@ -231,7 +232,7 @@ func TestPushCheckpointRefWithRecovery_PreservesConcurrentGenerationOnCASConflic
 	head, err = repo.Head()
 	require.NoError(t, err)
 	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(ref, head.Hash())))
-	require.NoError(t, batchPushRefs(ctx, bareDir, []plumbing.ReferenceName{ref}))
+	require.NoError(t, pushCheckpointRefsAtTips(t, repo, bareDir, []plumbing.ReferenceName{ref}))
 	remoteTip := head.Hash()
 
 	// Create a disconnected queued generation that recovery will try to replay.
@@ -329,7 +330,7 @@ func TestFlushCheckpointRefsQueue_SupersededRecoveriesDoNotStopTheRetry(t *testi
 	head, err = repo.Head()
 	require.NoError(t, err)
 	setRefs(head.Hash())
-	require.NoError(t, batchPushRefs(ctx, bareDir, refs))
+	require.NoError(t, pushCheckpointRefsAtTips(t, repo, bareDir, refs))
 
 	testutil.GitReset(t, workDir, base.String())
 	testutil.WriteFile(t, workDir, "local.txt", "local")
@@ -385,7 +386,7 @@ func TestFlushCheckpointRefsQueue_RecoversARefFetchedIntoANewPack(t *testing.T) 
 	head, err := repo.Head()
 	require.NoError(t, err)
 	base := head.Hash()
-	require.NoError(t, batchPushRefs(ctx, bareDir, refs))
+	require.NoError(t, pushCheckpointRefsAtTips(t, repo, bareDir, refs))
 
 	// Advance each ref on the remote from another clone, so its objects reach
 	// the work repo only through recovery's fetch.
@@ -426,6 +427,23 @@ func TestFlushCheckpointRefsQueue_RecoversARefFetchedIntoANewPack(t *testing.T) 
 		assert.Contains(t, files, fmt.Sprintf("remote-%d.txt", i), "remote-only change must be preserved")
 		assert.Contains(t, files, fmt.Sprintf("local-%d.txt", i), "local-only change must be replayed on top")
 	}
+}
+
+// pushCheckpointRefsAtTips pins each ref to its current local tip, as the flush
+// does, and pushes them in one batch. Tests use it to seed or advance the remote.
+func pushCheckpointRefsAtTips(t *testing.T, repo *git.Repository, target string, refs []plumbing.ReferenceName) error {
+	t.Helper()
+	pushes := make([]checkpointRefPush, 0, len(refs))
+	for _, name := range refs {
+		ref, err := repo.Reference(name, true)
+		require.NoError(t, err)
+		pushes = append(pushes, checkpointRefPush{
+			token: checkpoint.PushQueueEntry{Ref: name, Hash: ref.Hash()},
+			name:  name,
+			hash:  ref.Hash(),
+		})
+	}
+	return batchPushCheckpointRefs(t.Context(), target, pushes)
 }
 
 // enqueueRefs seeds the repo's push queue with the given refs.

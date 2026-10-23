@@ -94,7 +94,10 @@ func TestPrePushCheckpointRefs_RejectionDoesNotRewriteExistingRef(t *testing.T) 
 	paths.ClearWorktreeRootCache()
 	t.Setenv("ENTIRE_CHECKPOINTS_PRIMARY", "git-refs")
 	testutil.RunGit(t, workDir, "remote", "add", "origin", bareDir)
-	require.NoError(t, batchPushRefs(t.Context(), bareDir, refs[:1]))
+	repo, err := gitrepo.OpenPath(workDir)
+	require.NoError(t, err)
+	defer repo.Close()
+	require.NoError(t, pushCheckpointRefsAtTips(t, repo, bareDir, refs[:1]))
 	remoteTip := remoteRefHash(t, bareDir, refs[0])
 
 	// Backfill a ref that already exists remotely. Pin the timestamp in the
@@ -106,9 +109,6 @@ func TestPrePushCheckpointRefs_RejectionDoesNotRewriteExistingRef(t *testing.T) 
 	localTip := strings.TrimSpace(testutil.RunGit(t, workDir, "commit-tree", tree, "-p", "HEAD", "-m", "checkpoint backfill"))
 	testutil.RunGit(t, workDir, "update-ref", refs[0].String(), localTip)
 	installCheckpointRejectHook(t, bareDir, false, "")
-	repo, err := gitrepo.OpenPath(workDir)
-	require.NoError(t, err)
-	defer repo.Close()
 	queue := enqueueRefs(t, repo, refs[:1])
 
 	for range 2 {
