@@ -67,6 +67,9 @@ func TestDetectPII_IPRedacted(t *testing.T) {
 		{"ipv6 after a color code", "addr \x1b[1;35mfd12::5\x1b[0m", "addr \x1b[1;35m[REDACTED_IP]\x1b[0m"},
 		{"network word inside a color code", "\x1b[1mssh\x1b[0m 34.117.59.81", "\x1b[1mssh\x1b[0m [REDACTED_IP]"},
 		{"color code left as an escape", `\u001b[35m10.0.0.5\u001b[0m`, `\u001b[35m[REDACTED_IP]\u001b[0m`},
+		{"address range", "dhcp-range=192.168.1.1-192.168.1.254", "dhcp-range=[REDACTED_IP]-[REDACTED_IP]"},
+		{"nip.io name", "http://10.0.0.5.nip.io/", "http://[REDACTED_IP].nip.io/"},
+		{"sslip.io name with a label", "app.10.0.0.5.sslip.io", "app.[REDACTED_IP].sslip.io"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -92,6 +95,10 @@ func TestDetectPII_IPNotRedacted(t *testing.T) {
 		{"v-prefixed version", "release v1.2.3.4 shipped"},
 		{"letter-prefixed version", "go1.2.3.4 and python3.1.2.3"},
 		{"version with suffix", "tag 1.2.3.4-rc1"},
+		{"version with a package revision", "pkg 10.1.2.3-1ubuntu1"},
+		{"version in a file name", "foo-1.2.3.4.tar.gz and foo-10.1.2.3.tar.gz"},
+		{"longer dotted number", "server 10.0.0.5.6"},
+		{"name under another domain", "build.10.1.2.3.example.com"},
 		{"user agent", "Chrome/154.0.0.0 Safari/537.36"},
 		{".NET version", `Version=1.0.0.0, Culture=neutral`},
 		{"OID", "oid 1.3.6.1.4.1.311"},

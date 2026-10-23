@@ -165,9 +165,10 @@ func followsVersionLabel(s string, start int) bool {
 // dotted number (an OID such as 1.3.6.1.4.1), a user agent (Chrome/154.0.0.0),
 // or a code path (u64::from, a[1::2]).
 func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
+	wildcardDNS := addr.Is4() && underWildcardDNS(s, end)
 	if start > 0 {
 		prev := s[start-1]
-		if (isIPWordByte(prev) && !followsEscape(s, start)) || prev == '.' {
+		if (isIPWordByte(prev) && !followsEscape(s, start)) || (prev == '.' && !wildcardDNS) {
 			return false
 		}
 		// In raw JSON a letter after a backslash belongs to an escape (\f, \b),
@@ -193,7 +194,12 @@ func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 		if next == ':' && addr.Is6() && isHexGroup(wordAt(s, end+1)) {
 			return false
 		}
-		if (next == '.' || next == '-') && end+1 < len(s) && isIPWordByte(s[end+1]) {
+		if next == '.' && end+1 < len(s) && isIPWordByte(s[end+1]) && !wildcardDNS {
+			return false
+		}
+		// A dash suffix continues a version (1.2.3.4-rc1, 10.1.2.3-1ubuntu1);
+		// the next address of a range (10.0.0.1-10.0.0.9) does not.
+		if next == '-' && end+1 < len(s) && isIPWordByte(s[end+1]) && !startsWithIPv4(s[end+1:]) {
 			return false
 		}
 	}
@@ -224,6 +230,37 @@ func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 		return !isIPWordByte(before) && before != ']' && before != ')'
 	}
 	return false
+}
+
+// wildcardDNSSuffixes are services whose host names embed an address:
+// 10.0.0.5.nip.io resolves to 10.0.0.5.
+var wildcardDNSSuffixes = []string{".nip.io", ".sslip.io"}
+
+// underWildcardDNS reports whether s[end:] starts with a wildcard DNS suffix
+// that ends the host name.
+func underWildcardDNS(s string, end int) bool {
+	rest := s[end:]
+	for _, suffix := range wildcardDNSSuffixes {
+		if len(rest) < len(suffix) || !strings.EqualFold(rest[:len(suffix)], suffix) {
+			continue
+		}
+		if len(rest) == len(suffix) || (!isIPWordByte(rest[len(suffix)]) && rest[len(suffix)] != '-') {
+			return true
+		}
+	}
+	return false
+}
+
+// startsWithIPv4 reports whether t starts with a dotted-quad address. An
+// address is at most 15 bytes, so the regex only needs one byte past it.
+func startsWithIPv4(t string) bool {
+	t = t[:min(len(t), 16)]
+	loc := ipv4CandidateRegex.FindStringIndex(t)
+	if loc == nil || loc[0] != 0 {
+		return false
+	}
+	_, err := netip.ParseAddr(t[:loc[1]])
+	return err == nil
 }
 
 // followsEscape reports whether the letter before s[start] ends an escape
