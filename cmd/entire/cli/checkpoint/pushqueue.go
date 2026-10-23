@@ -98,7 +98,33 @@ func (q *PushQueue) EnqueueEntry(entry PushQueueEntry) error {
 		return err
 	}
 	defer release()
+	return q.appendEntryLocked(root, entry)
+}
 
+// EnqueueRef records the ref's current observed generation. When the ref
+// cannot be resolved it still queues the ref, with no generation: a ref that
+// misses the queue is never pushed, while a generation-less entry is the legacy
+// form delivery already re-resolves (and prunes if the ref is gone).
+//
+// The ref is read while the lock is held, so records land in the order their
+// tips were read. A tip read before the lock could otherwise be appended after a
+// newer generation's record and, as the latest line, hide that generation.
+func (q *PushQueue) EnqueueRef(repo *git.Repository, refName plumbing.ReferenceName) error {
+	root, release, err := q.lock()
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	entry := PushQueueEntry{Ref: refName}
+	if ref, err := repo.Reference(refName, true); err == nil {
+		entry.Hash = ref.Hash()
+	}
+	return q.appendEntryLocked(root, entry)
+}
+
+// appendEntryLocked appends one record. The caller must hold the lock.
+func (q *PushQueue) appendEntryLocked(root *os.Root, entry PushQueueEntry) error {
 	diskEntry := pushQueueEntry{Ref: entry.Ref.String()}
 	if !entry.Hash.IsZero() {
 		diskEntry.Hash = entry.Hash.String()
@@ -116,18 +142,6 @@ func (q *PushQueue) EnqueueEntry(entry PushQueueEntry) error {
 		return fmt.Errorf("append push queue entry: %w", err)
 	}
 	return nil
-}
-
-// EnqueueRef records the ref's current observed generation. When the ref
-// cannot be resolved it still queues the ref, with no generation: a ref that
-// misses the queue is never pushed, while a generation-less entry is the legacy
-// form delivery already re-resolves (and prunes if the ref is gone).
-func (q *PushQueue) EnqueueRef(repo *git.Repository, refName plumbing.ReferenceName) error {
-	entry := PushQueueEntry{Ref: refName}
-	if ref, err := repo.Reference(refName, true); err == nil {
-		entry.Hash = ref.Hash()
-	}
-	return q.EnqueueEntry(entry)
 }
 
 // Drain returns the de-duplicated refs currently queued, in first-seen order. It

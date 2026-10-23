@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
@@ -334,6 +335,39 @@ func TestPushQueue_EnqueueRefQueuesAnUnresolvableRef(t *testing.T) {
 	entries, err := q.PeekEntries()
 	require.NoError(t, err)
 	assert.Equal(t, []PushQueueEntry{{Ref: missing}}, entries)
+}
+
+// EnqueueRef must read the tip while it holds the queue lock. A tip read before
+// the lock can be appended after a newer generation's record and, as the ref's
+// latest line, hide it: cleanup for a push of the older tip would then drop the
+// ref with the newer generation still unpushed.
+func TestPushQueue_EnqueueRefRecordsTheTipSeenUnderTheLock(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	repo, err := gitrepo.OpenPath(dir)
+	require.NoError(t, err)
+	q := NewPushQueue(t.TempDir())
+	ref := mustRefName(t, "a1b2c3d4e5f6")
+	older := plumbing.NewHash(strings.Repeat("a", 40))
+	newer := plumbing.NewHash(strings.Repeat("b", 40))
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(ref, older)))
+
+	_, release, err := q.lock()
+	require.NoError(t, err)
+	enqueued := make(chan error, 1)
+	go func() { enqueued <- q.EnqueueRef(repo, ref) }()
+	// Give the enqueue time to reach the lock before the ref moves. If it starts
+	// late it sees the newer tip regardless, so the wait cannot fail a correct
+	// implementation.
+	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(ref, newer)))
+	release()
+	require.NoError(t, <-enqueued)
+
+	entries, err := q.PeekEntries()
+	require.NoError(t, err)
+	assert.Equal(t, []PushQueueEntry{{Ref: ref, Hash: newer}}, entries)
 }
 
 // A line whose ref is well formed but whose generation is corrupt keeps the
