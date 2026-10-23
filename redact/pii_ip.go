@@ -167,7 +167,7 @@ func followsVersionLabel(s string, start int) bool {
 func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 	if start > 0 {
 		prev := s[start-1]
-		if (isIPWordByte(prev) && !followsJSONEscape(s, start)) || prev == '.' {
+		if (isIPWordByte(prev) && !followsEscape(s, start)) || prev == '.' {
 			return false
 		}
 		// In raw JSON a letter after a backslash belongs to an escape (\f, \b),
@@ -207,7 +207,7 @@ func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 	if !strings.ContainsAny(candidate, "0123456789") && !isInternalIP(addr) {
 		return false
 	}
-	if ipv6Groups(candidate) >= 3 || start == 0 || followsJSONEscape(s, start) {
+	if ipv6Groups(candidate) >= 3 || start == 0 || followsEscape(s, start) {
 		return true
 	}
 	switch s[start-1] {
@@ -226,11 +226,22 @@ func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 	return false
 }
 
-// followsJSONEscape reports whether the byte before s[start] is the letter of
-// a JSON escape (\n, \t) left in a string decoded only once, such as Codex
-// function_call.arguments. That letter ends the escape, not a word.
-func followsJSONEscape(s string, start int) bool {
-	return start > 1 && isLetterByte(s[start-1]) && skipJSONEscapeLetter(s, start-1) == start
+// followsEscape reports whether the letter before s[start] ends an escape
+// rather than a word: a JSON escape (\n, \t) left in a string decoded only
+// once, such as Codex function_call.arguments, or an ANSI color code
+// (ESC[35m) from terminal output.
+func followsEscape(s string, start int) bool {
+	if start < 2 || !isLetterByte(s[start-1]) {
+		return false
+	}
+	if skipJSONEscapeLetter(s, start-1) == start {
+		return true
+	}
+	i := start - 2
+	for i >= 0 && start-i < 16 && (isDigit(s[i]) || s[i] == ';') {
+		i--
+	}
+	return i >= 0 && s[i] == '[' && (strings.HasSuffix(s[:i], "\x1b") || strings.HasSuffix(s[:i], `\u001b`))
 }
 
 // isSeparatorColon reports whether the colon at s[i] ends a word rather than
@@ -253,7 +264,7 @@ func isSeparatorColon(s string, i int) bool {
 // that word. A group joined by "::" is kept, so code paths (u64::from) stay
 // whole and are rejected.
 func trimGluedWords(s string, start, end int) (int, int) {
-	if start > 0 && isIPWordByte(s[start-1]) && !followsJSONEscape(s, start) {
+	if start > 0 && isIPWordByte(s[start-1]) && !followsEscape(s, start) {
 		if i := strings.IndexByte(s[start:end], ':'); i > 0 && start+i+1 < end && s[start+i+1] != ':' && isSeparatorColon(s, start+i) {
 			start += i + 1
 		}
@@ -328,58 +339,39 @@ func ipHasContext(s string, start, end int, addr netip.Addr) bool {
 // ipContextWindow returns the text searched for a network word on each side
 // of s[start:end]. It stays on the address's own line, because one transcript
 // string holds a whole command output, and it drops a word the window cuts,
-// because \b would match at the cut ("ghost" seen as "host"). Text decoded
-// only once keeps its escapes, so a literal \n or \r also ends the line and a
-// literal \t separates words.
+// because \b would match at the cut ("ghost" seen as "host").
 func ipContextWindow(s string, start, end int) (string, string) {
 	lo := max(start-ipContextBefore, 0)
-	if i := pastLastLineBreak(s[lo:start]); i > 0 {
-		lo += i
-	} else {
-		for lo > 0 && lo < start && isIPWordByte(s[lo-1]) {
-			lo++
-		}
+	if i := strings.LastIndexByte(s[lo:start], '\n'); i >= 0 {
+		lo += i + 1
+	}
+	for lo > 0 && lo < start && isIPWordByte(s[lo-1]) {
+		lo++
 	}
 	hi := min(end+ipContextAfter, len(s))
-	if i := firstLineBreak(s[end:hi]); i >= 0 {
+	if i := strings.IndexByte(s[end:hi], '\n'); i >= 0 {
 		hi = end + i
-	} else {
-		for hi < len(s) && hi > end && isIPWordByte(s[hi]) {
-			hi--
-		}
 	}
-	return escapedTabsAsSpaces(s[lo:start]), escapedTabsAsSpaces(s[end:hi])
+	for hi < len(s) && hi > end && isIPWordByte(s[hi]) {
+		hi--
+	}
+	return separateEscapes(s[lo:start]), separateEscapes(s[end:hi])
 }
 
-// pastLastLineBreak returns the offset just past the last line break in w (a
-// newline, or a literal \n or \r), or 0 when it has none.
-func pastLastLineBreak(w string) int {
-	i := strings.LastIndexByte(w, '\n') + 1
-	for _, esc := range []string{`\n`, `\r`} {
-		if j := strings.LastIndex(w, esc); j >= 0 {
-			i = max(i, j+len(esc))
-		}
-	}
-	return i
-}
+// windowEscapeRegex matches escapes that glue onto the next word: a JSON
+// escape left in text decoded only once (\nssh) and an ANSI color code
+// (ESC[1mssh), written raw or as an escape. A literal \n is not taken as a
+// line break, because a Windows path (C:\keys\node1.pem) or a C string has
+// the same bytes.
+var windowEscapeRegex = regexp.MustCompile(`\\[nrt]|(?:\x1b|\\u001b)\[[0-9;]*[A-Za-z]`)
 
-// firstLineBreak returns the offset of the first line break in w (a newline,
-// or a literal \n or \r), or -1 when it has none.
-func firstLineBreak(w string) int {
-	i := strings.IndexByte(w, '\n')
-	for _, esc := range []string{`\n`, `\r`} {
-		if j := strings.Index(w, esc); j >= 0 && (i < 0 || j < i) {
-			i = j
-		}
-	}
-	return i
-}
-
-func escapedTabsAsSpaces(w string) string {
-	if !strings.Contains(w, `\t`) {
+// separateEscapes replaces the escapes in a context window with spaces so
+// the word after each one starts at a word boundary.
+func separateEscapes(w string) string {
+	if !strings.ContainsAny(w, "\\\x1b") {
 		return w
 	}
-	return strings.ReplaceAll(w, `\t`, "  ")
+	return windowEscapeRegex.ReplaceAllString(w, " ")
 }
 
 // mayContainIPv4 reports whether s has a digit-dot-digit sequence, which
@@ -432,7 +424,7 @@ func redactIPsUnderNetworkKey(key, val string, t *tally) string {
 	for _, re := range []*regexp.Regexp{ipv4CandidateRegex, ipv6CandidateRegex} {
 		for _, loc := range re.FindAllStringIndex(val, -1) {
 			if start, end, _, ok := ipCandidate(val, loc[0], loc[1]); ok {
-				regions = append(regions, taggedRegion{region: region{start, end}, label: labelIP, layer: layerPII})
+				regions = append(regions, taggedRegion{region: region{start, end}, label: labelIP, layer: layerPII, builtinIP: true})
 			}
 		}
 	}
@@ -452,13 +444,13 @@ func isVersionValue(key, val string) bool {
 	return err == nil
 }
 
-// withoutIPs returns r with IP matches dropped.
+// withoutIPs returns r with the built-in IP matches dropped.
 func (r leafRedactor) withoutIPs() leafRedactor {
 	detect := r.detect
 	r.detect = func(s string) []taggedRegion {
 		var kept []taggedRegion
 		for _, t := range detect(s) {
-			if t.label != labelIP {
+			if !t.builtinIP {
 				kept = append(kept, t)
 			}
 		}

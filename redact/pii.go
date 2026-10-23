@@ -235,8 +235,9 @@ func detectPII(cfg *PIIConfig, s string) []taggedRegion {
 				loc[0], loc[1] = start, end
 			}
 			regions = append(regions, taggedRegion{
-				region: region{loc[0], loc[1]},
-				label:  p.label,
+				region:    region{loc[0], loc[1]},
+				label:     p.label,
+				builtinIP: p.regex == ipv4CandidateRegex || p.regex == ipv6CandidateRegex,
 			})
 		}
 	}

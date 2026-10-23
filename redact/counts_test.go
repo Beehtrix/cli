@@ -155,6 +155,17 @@ func TestJSONLBytesCounts_CredentialValueWithIP(t *testing.T) {
 	require.Equal(t, map[string]int{"IP": 0}, got.PII)
 }
 
+// Counts do not depend on the order the splice visits keyed and array copies.
+func TestJSONLBytesCounts_KeyedAndArrayCopiesAreStable(t *testing.T) {
+	ConfigurePII(PIIConfig{Enabled: true, Categories: map[PIICategory]bool{PIIIP: true}})
+	t.Cleanup(resetPIIConfig)
+
+	for range 20 {
+		got := countsOf(t, `{"hosts":"10.0.0.5 34.117.59.81","notes":["10.0.0.5 34.117.59.81"]}`+"\n")
+		require.Equal(t, 3, got.Replacements, "two in the hosts copy, one in the notes copy")
+	}
+}
+
 // A layer that did not run is absent, which is different from a layer that ran
 // and found nothing.
 func TestJSONLBytesCounts_AbsentInactiveAndZeroAreDistinct(t *testing.T) {

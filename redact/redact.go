@@ -333,6 +333,9 @@ type taggedRegion struct {
 
 	label string
 	layer layer
+	// builtinIP marks a match of the built-in IP rules. A custom PII pattern
+	// named ip shares the IP label but not the rules that depend on context.
+	builtinIP bool
 }
 
 type jsonReplacement struct {
@@ -1954,6 +1957,20 @@ func applyJSONReplacements(s string, repls []jsonReplacement) (result string, wr
 	if len(repls) == 0 {
 		return s, 0, nil
 	}
+	// Keyed replacements go first. An unkeyed one replaces every copy of its
+	// text, so applied earlier it would also rewrite a keyed copy that needs
+	// a different result (a password under a credential key, an address under
+	// a network key), and the outcome would follow the walk's map order.
+	repls = slices.Clone(repls)
+	slices.SortStableFunc(repls, func(a, b jsonReplacement) int {
+		switch {
+		case a.key != "" && b.key == "":
+			return -1
+		case a.key == "" && b.key != "":
+			return 1
+		}
+		return 0
+	})
 	for _, r := range repls {
 		origJSON, err := jsonEncodeString(r.original)
 		if err != nil {
@@ -2184,7 +2201,7 @@ func keyContextFindsMore(key, val string) bool {
 		// A network word in the key makes an IP look key-dependent, but
 		// redactIPsUnderNetworkKey owns that case and keeps the IP token
 		// instead of replacing the whole value.
-		if networkKey && r.label == labelIP {
+		if networkKey && r.builtinIP {
 			continue
 		}
 		s, e := max(r.start, start)-start, min(r.end, end)-start

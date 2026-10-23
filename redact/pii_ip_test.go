@@ -57,6 +57,16 @@ func TestDetectPII_IPRedacted(t *testing.T) {
 		{"network word after a literal newline escape", `cat <<EOF\nssh 34.117.59.81\nEOF`, `cat <<EOF\nssh [REDACTED_IP]\nEOF`},
 		{"short network word after a literal newline escape", `x\nnc 34.117.59.81 22`, `x\nnc [REDACTED_IP] 22`},
 		{"network word after a literal tab escape", `printf 'a\tssh 34.117.59.81'`, `printf 'a\tssh [REDACTED_IP]'`},
+		// A backslash in a Windows path or a C string is not a line break.
+		{"windows key path", `ssh -i C:\keys\node1.pem 34.117.59.81`, `ssh -i C:\keys\node1.pem [REDACTED_IP]`},
+		{"windows cert path", `curl --cacert C:\certs\root.pem 34.117.59.81`, `curl --cacert C:\certs\root.pem [REDACTED_IP]`},
+		{"C string with a newline escape", `fmt.Printf("ssh to host\n", "34.117.59.81")`, `fmt.Printf("ssh to host\n", "[REDACTED_IP]")`},
+		// ANSI color codes in terminal output.
+		{"address after a color code", "    inet \x1b[35m10.0.0.5\x1b[0m/24", "    inet \x1b[35m[REDACTED_IP]\x1b[0m/24"},
+		{"log line starting with a color code", "\x1b[32m10.0.0.5\x1b[0m - - GET /", "\x1b[32m[REDACTED_IP]\x1b[0m - - GET /"},
+		{"ipv6 after a color code", "addr \x1b[1;35mfd12::5\x1b[0m", "addr \x1b[1;35m[REDACTED_IP]\x1b[0m"},
+		{"network word inside a color code", "\x1b[1mssh\x1b[0m 34.117.59.81", "\x1b[1mssh\x1b[0m [REDACTED_IP]"},
+		{"color code left as an escape", `\u001b[35m10.0.0.5\u001b[0m`, `\u001b[35m[REDACTED_IP]\u001b[0m`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -115,7 +125,6 @@ func TestDetectPII_IPNotRedacted(t *testing.T) {
 		{"documentation ipv4", "curl https://203.0.113.9/health; ssh deploy@198.51.100.7; host 192.0.2.10"},
 		{"documentation ipv6", "server 2001:db8::8a2e:370:7334 and 3fff::1"},
 		{"context word on another line", "git remote -v\nbumped protobuf to 3.21.12.1"},
-		{"context word before a literal newline escape", `ssh build\nbump to 3.21.12.1`},
 		{"context word cut at the left edge", "ghost " + strings.Repeat("b", 54) + " 1.17.2.3"},
 		{"context word cut at the right edge", "1.17.2.3 " + strings.Repeat("a", 26) + " ipsum"},
 	}
@@ -237,6 +246,15 @@ func TestPIIIntegration_IPSameTextUnderTwoKeys(t *testing.T) {
 			`{"db_password":["REDACTED"],"hosts":["REDACTED"]}`,
 		},
 		{`{"password":["hunter2 34.117.59.81"],"hosts":["hunter2 34.117.59.81"]}`, `{"password":["REDACTED"],"hosts":["REDACTED"]}`},
+		// A keyed copy and an array copy are spliced separately; each keeps its own result.
+		{
+			`{"client_secret":"Hunter2pass for 10.0.0.5","args":["Hunter2pass for 10.0.0.5"]}`,
+			`{"client_secret":"REDACTED","args":["Hunter2pass for [REDACTED_IP]"]}`,
+		},
+		{
+			`{"hosts":"10.0.0.5 34.117.59.81","notes":["10.0.0.5 34.117.59.81"]}`,
+			`{"hosts":"[REDACTED_IP] [REDACTED_IP]","notes":["[REDACTED_IP] 34.117.59.81"]}`,
+		},
 	}
 	for _, tt := range tests {
 		for range 20 {
@@ -273,6 +291,27 @@ func TestPIIIntegration_CredentialValueWithPII(t *testing.T) {
 		if want := `{"` + key + `":"REDACTED"}`; got != want {
 			t.Errorf("JSONLContent(%s) = %s, want %s", in, got, want)
 		}
+	}
+}
+
+// The version-key exemption is for the built-in rule; a custom pattern named
+// ip still redacts every address it matches.
+//
+// Not parallel: sets the package-global PII config.
+func TestPIIIntegration_VersionKeyKeepsCustomIPPattern(t *testing.T) {
+	ConfigurePII(PIIConfig{
+		Enabled:        true,
+		Categories:     map[PIICategory]bool{PIIIP: true},
+		CustomPatterns: map[string]string{"ip": `\b\d{1,3}(?:\.\d{1,3}){3}\b`},
+	})
+	t.Cleanup(resetPIIConfig)
+
+	got, err := JSONLContent(`{"version":"34.117.59.81"}`)
+	if err != nil {
+		t.Fatalf("JSONLContent: %v", err)
+	}
+	if want := `{"version":"[REDACTED_IP]"}`; got != want {
+		t.Errorf("JSONLContent = %s, want %s", got, want)
 	}
 }
 
