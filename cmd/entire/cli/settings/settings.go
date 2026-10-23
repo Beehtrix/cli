@@ -2128,6 +2128,31 @@ func (s *EntireSettings) IsFilteredFetchesEnabled() bool {
 	return ok && val
 }
 
+// maxCheckpointRefListTimeout caps
+// strategy_options.checkpoint_ref_list_timeout_seconds. The setting usually
+// comes from a committed settings.json, so a cloned repository must not be able
+// to make a names-only listing wait longer than one full checkpoint read fetch
+// (remote.ReadFetchTimeout).
+const maxCheckpointRefListTimeout = 2 * time.Minute
+
+// CheckpointRefListTimeoutValue returns how long remote checkpoint discovery
+// waits for each remote to list checkpoint refs, from
+// strategy_options.checkpoint_ref_list_timeout_seconds. Zero means unset (the
+// option is absent, not a number, or not positive) and the caller uses its
+// default. Values above maxCheckpointRefListTimeout are capped to it.
+func (s *EntireSettings) CheckpointRefListTimeoutValue() time.Duration {
+	if s.StrategyOptions == nil {
+		return 0
+	}
+	// JSON numbers decode into map[string]any as float64.
+	secs, ok := s.StrategyOptions["checkpoint_ref_list_timeout_seconds"].(float64)
+	if !ok || secs <= 0 {
+		return 0
+	}
+	// Cap in seconds before converting so a huge value cannot overflow Duration.
+	return time.Duration(min(secs, maxCheckpointRefListTimeout.Seconds()) * float64(time.Second))
+}
+
 // IsPushSessionsDisabled checks if push_sessions is disabled in settings.
 // Returns true if push_sessions is explicitly set to false.
 func (s *EntireSettings) IsPushSessionsDisabled() bool {

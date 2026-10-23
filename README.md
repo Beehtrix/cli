@@ -536,6 +536,7 @@ Personal overrides, gitignored by default:
 | `strategy_options.checkpoint_remote`      | `{"provider": "github", "repo": "org/repo"}` | Push checkpoint data to a separate repo (see below)                               |
 | `strategy_options.checkpoint_push_remote` | remote name, e.g. `"upstream"`               | Pin which single remote carries checkpoint data (see below)                       |
 | `strategy_options.filtered_fetches`       | `true`, `false`                              | Use `--filter=blob:none` on checkpoint fetches                                    |
+| `strategy_options.checkpoint_ref_list_timeout_seconds` | seconds (default `5`, max `120`) | How long `entire checkpoint list` waits for each remote to list checkpoints that aren't local yet. Raise it if checkpoints pushed from another machine are missing because the remote answers slowly |
 | `strategy_options.summarize.enabled`      | `true`, `false`                              | Auto-generate AI summaries at commit time                                         |
 | `summary_generation.provider`             | e.g. `claude-code`, `codex`, `pi`            | Which agent generates summaries (defaults to Claude)                              |
 | `summary_generation.model`                | provider-specific model hint                 | Model hint for summary generation (requires `provider`)                            |
