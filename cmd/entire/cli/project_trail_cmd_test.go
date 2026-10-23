@@ -153,11 +153,13 @@ func TestProjectTrailShowFollowsParentAcrossCells(t *testing.T) {
 
 	text, _, err := executeProjectTrailTest(t, "show", "--repo", "gh/acme/widget", "--branch", "feature/a")
 	require.NoError(t, err)
-	require.Contains(t, text, "URL: https://entire.io/gh/acme/-/trails/42/\nID: ")
-	require.Regexp(t, `(?s)Assignees: alice\nChanges:\nCHANGE +BRANCH +STATUS +URL\n`+
-		`widget/7 \(current\) +feature/a +https://entire\.io/gh/acme/-/trails/42/changes/widget/7\n`+
-		`api/3 +feature/a +https://entire\.io/gh/acme/-/trails/42/changes/api/3\n`+
-		`repo-hidden/9 *\n\nDescription\n`, text, "changes sit in the metadata block, before the description")
+	require.Regexp(t, `(?s)^Trail #42: Project intent\n  ID:        `+projectTrailTestID+`\n.*`+
+		`  URL:       https://entire\.io/gh/acme/-/trails/42/\n  Assignees: alice\n  Changes:\n`+
+		`    CHANGE +BRANCH +STATUS +URL\n`+
+		`    widget/7 \(current\) +feature/a +https://entire\.io/gh/acme/-/trails/42/changes/widget/7\n`+
+		`    api/3 +feature/a +https://entire\.io/gh/acme/-/trails/42/changes/api/3\n`+
+		`    repo-hidden/9\n`+
+		`\nDescription:\nDescription\n$`, text, "changes sit in the indented metadata block, before the description")
 	require.NotContains(t, text, "access filtering", "a possibly partial trail prints no access note")
 }
 
@@ -217,11 +219,17 @@ func TestProjectTrailShowPrintsServerURL(t *testing.T) {
 	setupProjectTrailTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		item := projectTrailTestResource()
 		item.URL = "https://entire.io/gh/acme/-/trails/42"
+		item.Project = &api.TrailProject{ID: projectTrailTestProject}
+		item.Project.Reference.Forge, item.Project.Reference.Project = "gh", "acme"
+		item.Type, item.Priority = "task", "none"
+		item.Assignees = nil
 		assert.NoError(t, json.NewEncoder(w).Encode(item))
 	})
 	out, _, err := executeProjectTrailTest(t, "show", "42", "--project", "gh/acme")
 	require.NoError(t, err)
-	require.Contains(t, out, "Trail #42: Project intent\nURL: https://entire.io/gh/acme/-/trails/42\nID: ")
+	require.Contains(t, out, "Trail #42: Project intent\n  ID:      "+projectTrailTestID+"\n  Project: gh/acme\n  Status:  open\n  URL:     https://entire.io/gh/acme/-/trails/42\n  Type:    task\n  Changes:\n")
+	require.NotContains(t, out, "Priority:", "priority none is hidden")
+	require.NotContains(t, out, "Assignees:", "an empty assignee list is hidden")
 
 	// A trail selected directly was not reached through a change.
 	js, _, err := executeProjectTrailTest(t, "show", "42", "--project", "gh/acme", "--json")

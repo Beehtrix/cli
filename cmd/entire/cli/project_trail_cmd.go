@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"charm.land/lipgloss/v2"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
@@ -99,17 +100,69 @@ func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, current *proje
 	if jsonRequested(cmd) {
 		return printJSON(cmd.OutOrStdout(), out)
 	}
-	w := cmd.OutOrStdout()
-	fmt.Fprintf(w, "Trail #%d: %s\n", item.Number, tuiutil.SanitizeTerminalLabel(item.Title))
-	if trailURL := strings.TrimSpace(item.URL); trailURL != "" {
-		fmt.Fprintf(w, "URL: %s\n", tuiutil.SanitizeTerminalText(trailURL))
+	printProjectTrailDetails(cmd.OutOrStdout(), item, out.Changes)
+	return nil
+}
+
+// printProjectTrailDetails renders the human project `trail show` view in the
+// legacy view's style: a yellow title, indented fields with aligned yellow
+// labels, colored statuses, then the changes and the description.
+func printProjectTrailDetails(w io.Writer, item api.ProjectTrail, changes []projectTrailChangeJSON) {
+	styles := newStatusStyles(w)
+	label := func(s string) string { return styles.render(styles.yellow, s) }
+	status := func(s string) string {
+		if style, ok := trailStatusColor(styles, trail.Status(s)); ok {
+			return styles.render(style, s)
+		}
+		return s
 	}
-	fmt.Fprintf(w, "ID: %s\nProject: %s\nStatus: %s\nType: %s\nPriority: %s\nAssignees: %s\n",
-		tuiutil.SanitizeTerminalLabel(item.ID), tuiutil.SanitizeTerminalLabel(item.ProjectID), tuiutil.SanitizeTerminalLabel(item.Status),
-		tuiutil.SanitizeTerminalLabel(item.Type), tuiutil.SanitizeTerminalLabel(item.Priority), tuiutil.SanitizeTerminalLabel(strings.Join(item.Assignees, ", ")))
-	if len(out.Changes) > 0 {
-		fmt.Fprintln(w, "Changes:")
-		if err := printTable(w, []string{colHeaderChange, colHeaderBranch, colHeaderStatus, colHeaderURL}, out.Changes, func(c projectTrailChangeJSON) []string {
+
+	project := item.ProjectID
+	if item.Project != nil && item.Project.Reference.Forge != "" && item.Project.Reference.Project != "" {
+		project = item.Project.Reference.Forge + "/" + item.Project.Reference.Project
+	}
+	type field struct{ name, value string }
+	fields := []field{
+		{"ID:", tuiutil.SanitizeTerminalLabel(item.ID)},
+		{"Project:", tuiutil.SanitizeTerminalLabel(project)},
+		{"Status:", status(tuiutil.SanitizeTerminalLabel(item.Status))},
+	}
+	if trailURL := strings.TrimSpace(item.URL); trailURL != "" {
+		fields = append(fields, field{"URL:", tuiutil.SanitizeTerminalText(trailURL)})
+	}
+	if len(item.Assignees) > 0 {
+		fields = append(fields, field{"Assignees:", tuiutil.SanitizeTerminalLabel(strings.Join(item.Assignees, ", "))})
+	}
+	if t := strings.TrimSpace(item.Type); t != "" {
+		fields = append(fields, field{"Type:", tuiutil.SanitizeTerminalLabel(t)})
+	}
+	if p := strings.TrimSpace(item.Priority); p != "" && p != string(trail.PriorityNone) {
+		fields = append(fields, field{"Priority:", tuiutil.SanitizeTerminalLabel(p)})
+	}
+	const timeLayout = "2006-01-02T15:04:05Z07:00"
+	if !item.CreatedAt.IsZero() {
+		fields = append(fields, field{"Created:", item.CreatedAt.Format(timeLayout)})
+	}
+	if !item.UpdatedAt.IsZero() {
+		fields = append(fields, field{"Updated:", item.UpdatedAt.Format(timeLayout)})
+	}
+	if item.ClosedAt != nil {
+		fields = append(fields, field{"Closed:", item.ClosedAt.Format(timeLayout)})
+	}
+	width := 0
+	for _, f := range fields {
+		width = max(width, len(f.name))
+	}
+
+	fmt.Fprintln(w, label(fmt.Sprintf("Trail #%d: %s", item.Number, tuiutil.SanitizeTerminalLabel(item.Title))))
+	for _, f := range fields {
+		fmt.Fprintf(w, "  %s %s\n", label(f.name+strings.Repeat(" ", width-len(f.name))), f.value)
+	}
+	if len(changes) > 0 {
+		fmt.Fprintf(w, "  %s\n", label("Changes:"))
+		headers := []string{colHeaderChange, colHeaderBranch, colHeaderStatus, colHeaderURL}
+		rows := make([][]string, len(changes))
+		for i, c := range changes {
 			repository := c.repo
 			if repository == "" {
 				repository = c.RepositoryID
@@ -118,15 +171,35 @@ func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, current *proje
 			if c.Current {
 				change += " (current)"
 			}
-			return []string{change, tuiutil.SanitizeTerminalLabel(c.Branch), tuiutil.SanitizeTerminalLabel(c.Status), tuiutil.SanitizeTerminalText(c.URL)}
-		}); err != nil {
-			return err
+			rows[i] = []string{change, tuiutil.SanitizeTerminalLabel(c.Branch), tuiutil.SanitizeTerminalLabel(c.Status), tuiutil.SanitizeTerminalText(c.URL)}
+		}
+		// Pad on the plain text, then style, so color codes do not skew alignment.
+		widths := columnWidths(headers, rows)
+		writeRow := func(cells []string, style func(col int, cell string) string) {
+			var b strings.Builder
+			b.WriteString("    ")
+			for i, cell := range cells {
+				padded := cell
+				if i < len(cells)-1 {
+					padded += strings.Repeat(" ", widths[i]-lipgloss.Width(cell)+2)
+				}
+				b.WriteString(style(i, padded))
+			}
+			fmt.Fprintln(w, strings.TrimRight(b.String(), " "))
+		}
+		writeRow(headers, func(_ int, cell string) string { return label(cell) })
+		for _, r := range rows {
+			writeRow(r, func(col int, cell string) string {
+				if col == 2 {
+					return strings.Replace(cell, strings.TrimSpace(cell), status(strings.TrimSpace(cell)), 1)
+				}
+				return cell
+			})
 		}
 	}
 	if item.Body != "" {
-		fmt.Fprintf(w, "\n%s\n", tuiutil.SanitizeTerminalText(item.Body))
+		fmt.Fprintf(w, "\n%s\n%s\n", label("Description:"), tuiutil.SanitizeTerminalText(item.Body))
 	}
-	return nil
 }
 
 func newProjectTrailListCmd() *cobra.Command {
