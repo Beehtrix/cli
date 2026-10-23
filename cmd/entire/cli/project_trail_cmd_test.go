@@ -161,6 +161,44 @@ func TestProjectTrailShowFollowsParentAcrossCells(t *testing.T) {
 	require.NotContains(t, text, "access filtering", "a possibly partial trail prints no access note")
 }
 
+// The trail's change summary leaves repository empty until the server has
+// synced the repository's display name; the current change still links by the
+// name the CLI resolved it in.
+func TestProjectTrailShowCurrentChangeWithoutRepositoryName(t *testing.T) {
+	setupProjectTrailTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		item := projectTrailTestResource()
+		item.URL = "https://entire.io/gh/acme/-/trails/42"
+		assert.NoError(t, json.NewEncoder(w).Encode(item))
+	})
+	repoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		assert.NoError(t, json.NewEncoder(w).Encode(api.TrailListResponse{Trails: []api.TrailResource{{
+			ID: projectTrailTestChange, Number: 7, Branch: "feature/a",
+			Parent: &api.TrailParentReference{ID: projectTrailTestID, Number: 42, ProjectID: projectTrailTestProject,
+				Host: "gh", Project: "acme", Path: projectTrailTestPath, Jurisdiction: "eu", PrimaryProcessingCell: "project-cell"},
+		}}}))
+	}))
+	t.Cleanup(repoServer.Close)
+	old := newTrailAPIClient
+	newTrailAPIClient = func(context.Context, bool, string, string, string) (*api.Client, string, error) {
+		return api.NewClientWithBaseURL("repo-token", repoServer.URL), "repo-id", nil
+	}
+	t.Cleanup(func() { newTrailAPIClient = old })
+
+	out, _, err := executeProjectTrailTest(t, "show", "--repo", "gh/acme/widget", "--branch", "feature/a", "--json")
+	require.NoError(t, err)
+	var item projectTrailJSON
+	require.NoError(t, json.Unmarshal([]byte(out), &item))
+	require.Len(t, item.Changes, 1)
+	require.Empty(t, item.Changes[0].Repository, "the server's summary is passed through unchanged")
+	require.True(t, item.Changes[0].Current)
+	require.Equal(t, "https://entire.io/gh/acme/-/trails/42/changes/widget/7", item.Changes[0].URL)
+
+	text, _, err := executeProjectTrailTest(t, "show", "--repo", "gh/acme/widget", "--branch", "feature/a")
+	require.NoError(t, err)
+	require.Contains(t, text, "widget/7 (current)")
+	require.NotContains(t, text, "repo-a/7")
+}
+
 func TestProjectTrailMissingParentDoesNotFallBack(t *testing.T) {
 	_, server := setupProjectTrailTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		assert.NoError(t, json.NewEncoder(w).Encode(api.TrailListResponse{Trails: []api.TrailResource{{ID: projectTrailTestChange, Number: 7, Branch: "feature/a"}}}))

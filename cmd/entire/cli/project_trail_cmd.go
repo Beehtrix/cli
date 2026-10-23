@@ -44,7 +44,7 @@ func newProjectTrailShowCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return printProjectTrail(cmd, out, target.ChangeID)
+			return printProjectTrail(cmd, out, target.Change)
 		},
 	}
 	addProjectTrailSelectorFlags(cmd)
@@ -66,23 +66,35 @@ type projectTrailChangeJSON struct {
 
 	URL     string `json:"url,omitempty"`
 	Current bool   `json:"current,omitempty"`
+
+	// repo names the change's repository for display: the summary's, or for
+	// the current change the one the CLI resolved when the summary has none.
+	repo string
 }
 
 // projectTrailChangeURL is a change's page under its trail's server-supplied
-// URL, <trail URL>/changes/<repo>/<number>; empty when either is unknown.
-func projectTrailChangeURL(trailURL string, change api.ChangeSummary) string {
+// URL, <trail URL>/changes/<repo>/<number>; empty when any part is unknown.
+func projectTrailChangeURL(trailURL, repo string, number int) string {
 	trailURL = strings.TrimRight(strings.TrimSpace(trailURL), "/")
-	if trailURL == "" || change.Repository == "" || change.Number <= 0 {
+	if trailURL == "" || repo == "" || number <= 0 {
 		return ""
 	}
-	return trailURL + "/changes/" + url.PathEscape(change.Repository) + "/" + strconv.Itoa(change.Number)
+	return trailURL + "/changes/" + url.PathEscape(repo) + "/" + strconv.Itoa(number)
 }
 
-// printProjectTrail renders a project trail. currentChangeID is the change the
-// trail was reached through, or empty when it was selected directly.
-func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, currentChangeID string) error {
+// printProjectTrail renders a project trail. current is the change the trail
+// was reached through, or nil when it was selected directly.
+func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, current *projectTrailCurrentChange) error {
 	out := projectTrailJSON{ProjectTrail: item, Changes: mapSlice(item.Changes, func(c api.ChangeSummary) projectTrailChangeJSON {
-		return projectTrailChangeJSON{ChangeSummary: c, URL: projectTrailChangeURL(item.URL, c), Current: currentChangeID != "" && c.ID == currentChangeID}
+		entry := projectTrailChangeJSON{ChangeSummary: c, repo: c.Repository}
+		if current != nil && c.ID == current.ID {
+			entry.Current = true
+			if entry.repo == "" {
+				entry.repo = current.Repo
+			}
+		}
+		entry.URL = projectTrailChangeURL(item.URL, entry.repo, c.Number)
+		return entry
 	})}
 	if jsonRequested(cmd) {
 		return printJSON(cmd.OutOrStdout(), out)
@@ -98,7 +110,7 @@ func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, currentChangeI
 	if len(out.Changes) > 0 {
 		fmt.Fprintln(w, "Changes:")
 		if err := printTable(w, []string{colHeaderChange, colHeaderBranch, colHeaderStatus, colHeaderURL}, out.Changes, func(c projectTrailChangeJSON) []string {
-			repository := c.Repository
+			repository := c.repo
 			if repository == "" {
 				repository = c.RepositoryID
 			}
@@ -250,7 +262,7 @@ func newProjectTrailUpdateCmd() *cobra.Command {
 			if err := target.validateResponse(out); err != nil {
 				return err
 			}
-			return printProjectTrail(cmd, out, target.ChangeID)
+			return printProjectTrail(cmd, out, target.Change)
 		},
 	}
 	fields.flags(cmd)
@@ -310,7 +322,7 @@ func newProjectTrailCreateCmd() *cobra.Command {
 			if err := target.validateResponse(out); err != nil {
 				return err
 			}
-			return printProjectTrail(cmd, out, "")
+			return printProjectTrail(cmd, out, nil)
 		},
 	}
 	fields.flags(cmd)
