@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `strategy_options.checkpoint_ref_list_timeout_seconds` sets how long `entire checkpoint list` waits for each remote to list checkpoints that aren't local yet (default 5 seconds, at most 120). Raise it when a slow remote leaves checkpoints pushed from another machine out of the list
+- `strategy_options.checkpoint_ref_list_timeout_seconds` sets how long `entire checkpoint list` waits for each remote to list checkpoints that aren't local yet (default 5 seconds, at most 120). Raise it when a slow remote leaves checkpoints pushed from another machine out of the list ([#2875](https://github.com/entireio/cli/pull/2875))
 
 ## [0.12.0] - 2026-10-21
 
