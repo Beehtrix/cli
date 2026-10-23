@@ -144,12 +144,19 @@ func (f *projectTrailFields) flags(cmd *cobra.Command) {
 	cmd.Flags().StringSliceVar(&f.Assignees, "assignee", nil, "Assignee logins; replaces the complete list (--assignee= clears it)")
 }
 
+func validateProjectTrailStatusFlag(cmd *cobra.Command, status string) error {
+	if cmd.Flags().Changed(cmdStatus) && !validProjectTrailStatus(status) {
+		return errors.New("project trail status must be open or closed (merged belongs to a change)")
+	}
+	return nil
+}
+
 func (f *projectTrailFields) validate(cmd *cobra.Command, creating bool) error {
 	if (creating || cmd.Flags().Changed("title")) && strings.TrimSpace(f.Title) == "" {
 		return errors.New("--title is required and must not be empty")
 	}
-	if cmd.Flags().Changed("status") && !validProjectTrailStatus(f.Status) {
-		return errors.New("project trail status must be open or closed (merged belongs to a change)")
+	if err := validateProjectTrailStatusFlag(cmd, f.Status); err != nil {
+		return err
 	}
 	return validateTrailCreateEnums(cmd, f.Type, f.Priority)
 }
@@ -260,7 +267,7 @@ func newProjectTrailCreateCmd() *cobra.Command {
 				return err
 			}
 			if !noBranch || trailRepoFlag(cmd) != "" || projectTrailProjectFlag(cmd) == "" {
-				change := projectTrailChangeRequest(fields, "", branch, base, action)
+				change := projectTrailChangeRequest(fields.Title, fields.Status, "", branch, base, action)
 				return createRepositoryScopedProjectTrail(cmd, request, change, key)
 			}
 			target, err := resolveProjectTrailCollection(cmd)
@@ -310,10 +317,6 @@ func projectTrailIdempotencyKey(w io.Writer, key string) string {
 	return key
 }
 
-func projectTrailChangeRequest(fields projectTrailFields, repoID, branch, base, action string) api.ChangeCreateRequest {
-	return api.ChangeCreateRequest{
-		RepositoryID: repoID,
-		Title:        fields.Title, Body: fields.Body, BranchName: branch, Base: base, BranchAction: action,
-		Status: fields.Status, Type: fields.Type, Priority: fields.Priority, Assignees: fields.Assignees,
-	}
+func projectTrailChangeRequest(title, status, repoID, branch, base, action string) api.ChangeCreateRequest {
+	return api.ChangeCreateRequest{RepositoryID: repoID, Title: title, BranchName: branch, Base: base, BranchAction: action, Status: status}
 }
