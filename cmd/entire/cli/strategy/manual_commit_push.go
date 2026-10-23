@@ -711,9 +711,10 @@ func flushCheckpointRefsQueue(ctx context.Context, repo *git.Repository, ps push
 	if firstErr != nil {
 		// Counts attempts, not the queue: refs skipped by an early abort were
 		// never tried, and reporting them as failures would overstate what the
-		// remote actually refused.
+		// remote actually refused. Superseded refs were attempted but did not
+		// fail, so only the failures are counted.
 		return len(pushed), fmt.Errorf("%d of %d attempted checkpoint refs failed to push: %w",
-			attempted-len(pushed), attempted, firstErr)
+			len(failed), attempted, firstErr)
 	}
 	return len(pushed), nil
 }

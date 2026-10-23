@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -304,15 +305,35 @@ func TestPushCheckpointRefWithRecovery_PreservesConcurrentGenerationOnCASConflic
 	assert.Contains(t, files, "concurrent.txt")
 }
 
-// A recovery that loses its CAS to a concurrent write leaves the newer
-// generation local and queued. That is not a failed push: it must not count
-// toward maxConsecutiveRefPushFailures, so a burst of concurrent writes cannot
-// stop the retry before the remaining refs are attempted.
-func TestFlushCheckpointRefsQueue_SupersededRecoveriesDoNotStopTheRetry(t *testing.T) {
-	const n = maxConsecutiveRefPushFailures + 1
+// recoveryCAS is the signature of the checkpointRefRecoveryCAS seam.
+type recoveryCAS func(ctx context.Context, repo *git.Repository, refName plumbing.ReferenceName, newHash, expectedOld plumbing.Hash) error
+
+// stubRecoveryCAS replaces the recovery install for one test.
+func stubRecoveryCAS(t *testing.T, cas recoveryCAS) {
+	t.Helper()
+	old := checkpointRefRecoveryCAS
+	checkpointRefRecoveryCAS = cas
+	t.Cleanup(func() { checkpointRefRecoveryCAS = old })
+}
+
+// loseRecoveryCAS moves the ref to base just before the install, as a concurrent
+// session write would, so the real CAS reports a conflict.
+func loseRecoveryCAS(t *testing.T, base plumbing.Hash) recoveryCAS {
+	t.Helper()
+	return func(ctx context.Context, repo *git.Repository, refName plumbing.ReferenceName, newHash, expectedOld plumbing.Hash) error {
+		require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(refName, base)))
+		return checkpoint.CASPersistentRef(ctx, repo, refName, newHash, expectedOld)
+	}
+}
+
+// divergeCheckpointRefs pushes n checkpoint refs at a remote generation, points
+// them locally at a sibling generation, and queues them, so each one needs
+// recovery. It returns the work repo, the remote, the refs, their common base,
+// and the queue.
+func divergeCheckpointRefs(t *testing.T, n int) (*git.Repository, string, []plumbing.ReferenceName, plumbing.Hash, *checkpoint.PushQueue) {
+	t.Helper()
 	workDir, bareDir, refs := setupRepoWithNCheckpointRefs(t, n)
 	t.Chdir(workDir)
-	ctx := context.Background()
 	repo, err := git.PlainOpen(workDir)
 	require.NoError(t, err)
 	head, err := repo.Head()
@@ -339,26 +360,25 @@ func TestFlushCheckpointRefsQueue_SupersededRecoveriesDoNotStopTheRetry(t *testi
 	head, err = repo.Head()
 	require.NoError(t, err)
 	setRefs(head.Hash())
-	queue := enqueueRefs(t, repo, refs)
+	return repo, bareDir, refs, base, enqueueRefs(t, repo, refs)
+}
 
-	// Every recovery loses its CAS: a writer moves the ref just before the
-	// install, and the real CAS reports the conflict.
-	oldCAS := checkpointRefRecoveryCAS
+// A recovery that loses its CAS to a concurrent write leaves the newer
+// generation local and queued. That is not a failed push: it must not count
+// toward maxConsecutiveRefPushFailures, so a burst of concurrent writes cannot
+// stop the retry before the remaining refs are attempted.
+func TestFlushCheckpointRefsQueue_SupersededRecoveriesDoNotStopTheRetry(t *testing.T) {
+	const n = maxConsecutiveRefPushFailures + 1
+	repo, bareDir, _, base, queue := divergeCheckpointRefs(t, n)
+	lose := loseRecoveryCAS(t, base)
 	installs := 0
-	checkpointRefRecoveryCAS = func(
-		casCtx context.Context,
-		casRepo *git.Repository,
-		refName plumbing.ReferenceName,
-		newHash, expectedOld plumbing.Hash,
-	) error {
+	stubRecoveryCAS(t, func(ctx context.Context, casRepo *git.Repository, refName plumbing.ReferenceName, newHash, expectedOld plumbing.Hash) error {
 		installs++
-		require.NoError(t, casRepo.Storer.SetReference(plumbing.NewHashReference(refName, base)))
-		return checkpoint.CASPersistentRef(casCtx, casRepo, refName, newHash, expectedOld)
-	}
-	t.Cleanup(func() { checkpointRefRecoveryCAS = oldCAS })
+		return lose(ctx, casRepo, refName, newHash, expectedOld)
+	})
 
 	restore := captureStderr(t)
-	pushed, pushErr := flushCheckpointRefsQueue(ctx, repo, pushSettings{remote: bareDir})
+	pushed, pushErr := flushCheckpointRefsQueue(context.Background(), repo, pushSettings{remote: bareDir})
 	output := restore()
 	require.NoError(t, pushErr, output)
 	assert.Zero(t, pushed)
@@ -367,6 +387,25 @@ func TestFlushCheckpointRefsQueue_SupersededRecoveriesDoNotStopTheRetry(t *testi
 	queued, err := queue.PeekEntries()
 	require.NoError(t, err)
 	assert.Len(t, queued, n, "superseded refs stay queued for the next push")
+}
+
+// Superseded refs were attempted but did not fail, so the flush error counts
+// only the real failures among the attempts.
+func TestFlushCheckpointRefsQueue_ReportsOnlyRealFailures(t *testing.T) {
+	repo, bareDir, refs, base, _ := divergeCheckpointRefs(t, 3)
+	lose := loseRecoveryCAS(t, base)
+	stubRecoveryCAS(t, func(ctx context.Context, casRepo *git.Repository, refName plumbing.ReferenceName, newHash, expectedOld plumbing.Hash) error {
+		if refName == refs[0] {
+			return errors.New("simulated install failure")
+		}
+		return lose(ctx, casRepo, refName, newHash, expectedOld)
+	})
+
+	restore := captureStderr(t)
+	pushed, pushErr := flushCheckpointRefsQueue(context.Background(), repo, pushSettings{remote: bareDir})
+	restore()
+	assert.Zero(t, pushed)
+	require.ErrorContains(t, pushErr, "1 of 3 attempted checkpoint refs failed to push")
 }
 
 // go-git loads a repository handle's pack index once and does not reload it on
