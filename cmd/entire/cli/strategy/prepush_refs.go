@@ -3,6 +3,7 @@ package strategy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,31 +25,69 @@ type PrePushRef struct {
 	RemoteSHA string
 }
 
+// maxPrePushFieldLen bounds how much of one field of a ref line is kept. Only a
+// ref name can be longer, and its first bytes already decide whether it is a
+// checkpoint ref: longer than the v1 name, or under the per-checkpoint prefix.
+const maxPrePushFieldLen = 4096
+
 // ParsePrePushRefs reads the "<local ref> <local sha> <remote ref> <remote sha>"
 // lines git passes to a pre-push hook and keeps the ones that touch checkpoint
 // refs, the only ones Entire needs. It reads to the end with no size cap: a
 // `--mirror` of a repository with many tags can be large, and a truncated list
-// could hide a checkpoint ref line. Memory stays bounded because other lines
-// are dropped as they are read. Malformed lines are skipped; a line too long to
-// be a ref line is an error.
+// could hide a checkpoint ref line. For the same reason an oversized ref name
+// is cut short rather than failing the whole list. Memory stays bounded because
+// other lines are dropped as they are read and each field keeps at most
+// maxPrePushFieldLen bytes. Malformed lines are skipped; only a failed read is
+// an error.
 func ParsePrePushRefs(r io.Reader) ([]PrePushRef, error) {
 	refs := []PrePushRef{}
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 4096), 64*1024)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) != 4 {
-			continue
+	br := bufio.NewReader(r)
+	var fields [4]string
+	nfields := 0
+	var field []byte
+	inField := false
+	endField := func() {
+		if !inField {
+			return
 		}
-		ref := PrePushRef{LocalRef: fields[0], LocalSHA: fields[1], RemoteRef: fields[2], RemoteSHA: fields[3]}
-		if isCheckpointRefName(ref.LocalRef) || isCheckpointRefName(ref.RemoteRef) {
-			refs = append(refs, ref)
+		if nfields < len(fields) {
+			fields[nfields] = string(field)
+		}
+		nfields++
+		field = field[:0]
+		inField = false
+	}
+	endLine := func() {
+		endField()
+		if nfields == len(fields) {
+			ref := PrePushRef{LocalRef: fields[0], LocalSHA: fields[1], RemoteRef: fields[2], RemoteSHA: fields[3]}
+			if isCheckpointRefName(ref.LocalRef) || isCheckpointRefName(ref.RemoteRef) {
+				refs = append(refs, ref)
+			}
+		}
+		nfields = 0
+	}
+	for {
+		b, err := br.ReadByte()
+		if errors.Is(err, io.EOF) {
+			endLine()
+			return refs, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read pre-push refs: %w", err)
+		}
+		switch b {
+		case '\n':
+			endLine()
+		case ' ', '\t', '\r':
+			endField()
+		default:
+			inField = true
+			if len(field) < maxPrePushFieldLen {
+				field = append(field, b)
+			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read pre-push refs: %w", err)
-	}
-	return refs, nil
 }
 
 type prePushRefsKey struct{}

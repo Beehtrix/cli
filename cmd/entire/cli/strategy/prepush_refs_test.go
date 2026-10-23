@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 )
 
 const (
@@ -47,6 +49,59 @@ func TestParsePrePushRefs_LongListKeepsTheLastLine(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, refs, 1)
 	require.Equal(t, testSHA2, refs[0].LocalSHA)
+}
+
+// One line with an oversized ref name must not make the whole list unknown. A
+// checkpoint ref on that line still counts, and the lines after it are still
+// read.
+func TestParsePrePushRefs_OversizedRefName(t *testing.T) {
+	t.Parallel()
+	const v1 = "refs/heads/entire/checkpoints/v1"
+	huge := "refs/heads/" + strings.Repeat("x", 70<<10)
+	hugeCheckpoint := checkpoint.CheckpointRefPrefix + strings.Repeat("y", 70<<10)
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  PrePushRef
+	}{
+		{
+			name:  "v1 sent to an oversized remote name",
+			input: v1 + " " + testSHA1 + " " + huge + " " + zeroSHA + "\n",
+			want:  PrePushRef{LocalRef: v1, LocalSHA: testSHA1, RemoteSHA: zeroSHA},
+		},
+		{
+			name:  "an oversized local name pushed onto v1",
+			input: huge + " " + testSHA1 + " " + v1 + " " + zeroSHA + "\n",
+			want:  PrePushRef{LocalSHA: testSHA1, RemoteRef: v1, RemoteSHA: zeroSHA},
+		},
+		{
+			name: "an oversized line with no checkpoint ref, then v1",
+			input: huge + " " + testSHA1 + " " + huge + " " + zeroSHA + "\n" +
+				v1 + " " + testSHA2 + " " + v1 + " " + zeroSHA + "\n",
+			want: PrePushRef{LocalRef: v1, LocalSHA: testSHA2, RemoteRef: v1, RemoteSHA: zeroSHA},
+		},
+		{
+			name:  "an oversized name under the checkpoint ref prefix",
+			input: hugeCheckpoint + " " + testSHA1 + " " + hugeCheckpoint + " " + zeroSHA + "\n",
+			want:  PrePushRef{LocalSHA: testSHA1, RemoteSHA: zeroSHA},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			refs, err := ParsePrePushRefs(strings.NewReader(tc.input))
+			require.NoError(t, err)
+			require.Len(t, refs, 1)
+			got := refs[0]
+			require.Equal(t, tc.want.LocalSHA, got.LocalSHA)
+			require.Equal(t, tc.want.RemoteSHA, got.RemoteSHA)
+			if tc.want.LocalRef != "" {
+				require.Equal(t, tc.want.LocalRef, got.LocalRef)
+			}
+			if tc.want.RemoteRef != "" {
+				require.Equal(t, tc.want.RemoteRef, got.RemoteRef)
+			}
+		})
+	}
 }
 
 type failingReader struct{}
