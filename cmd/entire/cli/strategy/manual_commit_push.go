@@ -634,6 +634,14 @@ func flushCheckpointRefsQueue(ctx context.Context, repo *git.Repository, ps push
 		}
 		attempted++
 		landed, pushErr := pushCheckpointRefWithRecovery(flushCtx, repo, dest.target, ref)
+		if errors.Is(pushErr, errCheckpointRefSuperseded) {
+			// A session wrote this ref during recovery. Its newer generation stays
+			// queued for the next push, so this neither counts toward the stop nor
+			// is reported as a failure.
+			logging.Info(ctx, "git-refs push: checkpoint ref changed during recovery; newer generation stays queued",
+				slog.String("ref", ref.name.String()))
+			continue
+		}
 		if pushErr != nil {
 			consecutiveFailures++
 			logging.Warn(ctx, "git-refs push: checkpoint ref push/sync failed; left queued, not overwritten",

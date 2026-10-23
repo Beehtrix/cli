@@ -107,7 +107,7 @@ Rewrites are atomic (temp file + rename under the lock) so a concurrent reader n
 4. On success, **removes** the pushed entries from the queue (`RemoveEntries`).
 5. On a batch failure (typically a non-fast-forward rejection), **falls back to per-ref recovery** (`pushCheckpointRefWithRecovery`) and removes from the queue only the entries whose refs land.
 
-Recovery fetches the remote ref, replays the exact commit the push tried to send onto it, and installs the result only if the local ref still points at that commit (compare-and-swap). If a session wrote the ref in the meantime, that write wins: it stays the local ref and stays queued, and a later push delivers it.
+Recovery fetches the remote ref, replays the exact commit the push tried to send onto it, and installs the result only if the local ref still points at that commit (compare-and-swap). If a session wrote the ref in the meantime, that write wins: it stays the local ref and stays queued, and a later push delivers it. The flush treats that ref as superseded, not failed, so it does not count toward the consecutive-failure stop or the reported failures.
 
 Confirmed remote policy/hook rejections skip fetch/replay: replay cannot fix a
 policy block and would needlessly rewrite local commits if the ref already exists

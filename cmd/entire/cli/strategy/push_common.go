@@ -34,6 +34,11 @@ type checkpointRefPush struct {
 
 var checkpointRefRecoveryCAS = checkpoint.CASPersistentRef //nolint:gochecknoglobals // deterministic recovery-race test seam
 
+// errCheckpointRefSuperseded marks a recovery that lost its compare-and-swap to
+// a concurrent checkpoint write. The newer generation stays local and queued, so
+// the flush treats the ref as superseded rather than as a failed push.
+var errCheckpointRefSuperseded = errors.New("checkpoint ref superseded by a newer local generation")
+
 func (p checkpointRefPush) refSpec() string {
 	return p.hash.String() + ":" + p.name.String()
 }
@@ -204,6 +209,9 @@ func recoverCheckpointRef(
 		// remains untouched. A later delivery recomputes the replay from that
 		// winner; retaining this losing intermediate under another ref would
 		// create a second source of truth for the checkpoint.
+		if errors.Is(err, gitrepo.ErrRefCASConflict) {
+			err = fmt.Errorf("%w: %w", errCheckpointRefSuperseded, err)
+		}
 		return checkpointRefPush{}, fmt.Errorf("install recovered checkpoint ref %s: %w", candidate.name, err)
 	}
 	candidate.hash = newTip
