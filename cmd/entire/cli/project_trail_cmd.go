@@ -92,20 +92,12 @@ func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, currentChangeI
 	if trailURL := strings.TrimSpace(item.URL); trailURL != "" {
 		fmt.Fprintf(w, "URL: %s\n", tuiutil.SanitizeTerminalText(trailURL))
 	}
-	for _, c := range out.Changes {
-		if c.Current && c.URL != "" {
-			fmt.Fprintf(w, "Current change URL: %s\n", tuiutil.SanitizeTerminalText(c.URL))
-		}
-	}
 	fmt.Fprintf(w, "ID: %s\nProject: %s\nStatus: %s\nType: %s\nPriority: %s\nAssignees: %s\n",
 		tuiutil.SanitizeTerminalLabel(item.ID), tuiutil.SanitizeTerminalLabel(item.ProjectID), tuiutil.SanitizeTerminalLabel(item.Status),
 		tuiutil.SanitizeTerminalLabel(item.Type), tuiutil.SanitizeTerminalLabel(item.Priority), tuiutil.SanitizeTerminalLabel(strings.Join(item.Assignees, ", ")))
-	if item.Body != "" {
-		fmt.Fprintf(w, "\n%s\n", tuiutil.SanitizeTerminalText(item.Body))
-	}
-	if len(item.Changes) > 0 {
-		fmt.Fprintln(w, "\nRepositories and branches:")
-		return printTable(w, []string{colHeaderChange, colHeaderBranch, colHeaderStatus, colHeaderTitle}, out.Changes, func(c projectTrailChangeJSON) []string {
+	if len(out.Changes) > 0 {
+		fmt.Fprintln(w, "Changes:")
+		if err := printTable(w, []string{colHeaderChange, colHeaderBranch, colHeaderStatus, colHeaderURL}, out.Changes, func(c projectTrailChangeJSON) []string {
 			repository := c.Repository
 			if repository == "" {
 				repository = c.RepositoryID
@@ -114,8 +106,13 @@ func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, currentChangeI
 			if c.Current {
 				change += " (current)"
 			}
-			return []string{change, tuiutil.SanitizeTerminalLabel(c.Branch), tuiutil.SanitizeTerminalLabel(c.Status), tuiutil.SanitizeTerminalLabel(c.Title)}
-		})
+			return []string{change, tuiutil.SanitizeTerminalLabel(c.Branch), tuiutil.SanitizeTerminalLabel(c.Status), tuiutil.SanitizeTerminalText(c.URL)}
+		}); err != nil {
+			return err
+		}
+	}
+	if item.Body != "" {
+		fmt.Fprintf(w, "\n%s\n", tuiutil.SanitizeTerminalText(item.Body))
 	}
 	return nil
 }

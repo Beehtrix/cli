@@ -41,6 +41,7 @@ const (
 	colHeaderSource   = "SOURCE"
 	colHeaderStatus   = "STATUS"
 	colHeaderTitle    = "TITLE"
+	colHeaderURL      = "URL"
 	colHeaderType     = "TYPE"
 )
 

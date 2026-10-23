@@ -153,12 +153,11 @@ func TestProjectTrailShowFollowsParentAcrossCells(t *testing.T) {
 
 	text, _, err := executeProjectTrailTest(t, "show", "--repo", "gh/acme/widget", "--branch", "feature/a")
 	require.NoError(t, err)
-	require.Contains(t, text, "URL: https://entire.io/gh/acme/-/trails/42/\nCurrent change URL: https://entire.io/gh/acme/-/trails/42/changes/widget/7\nID: ")
-	require.Contains(t, text, "CHANGE")
-	require.Contains(t, text, "widget/7 (current)")
-	require.Contains(t, text, "api/3 ")
-	require.Contains(t, text, "repo-hidden/9")
-	require.NotContains(t, text, "api/3 (current)")
+	require.Contains(t, text, "URL: https://entire.io/gh/acme/-/trails/42/\nID: ")
+	require.Regexp(t, `(?s)Assignees: alice\nChanges:\nCHANGE +BRANCH +STATUS +URL\n`+
+		`widget/7 \(current\) +feature/a +https://entire\.io/gh/acme/-/trails/42/changes/widget/7\n`+
+		`api/3 +feature/a +https://entire\.io/gh/acme/-/trails/42/changes/api/3\n`+
+		`repo-hidden/9 *\n\nDescription\n`, text, "changes sit in the metadata block, before the description")
 	require.NotContains(t, text, "access filtering", "a possibly partial trail prints no access note")
 }
 
@@ -193,7 +192,6 @@ func TestProjectTrailShowPrintsServerURL(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(js), &item))
 	require.Len(t, item.Changes, 1)
 	require.False(t, item.Changes[0].Current)
-	require.NotContains(t, out, "Current change URL:")
 	require.NotContains(t, out, "(current)")
 }
 
