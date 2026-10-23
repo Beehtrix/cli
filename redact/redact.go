@@ -2148,10 +2148,10 @@ func redactLeafValue(key string, credentialContext bool, val string, redactor le
 		return RedactedPlaceholder
 	}
 	version := isVersionValue(key, val)
-	if version {
-		redactor = redactor.withoutIPs()
-	}
 	regions := redactor.detect(val)
+	if version {
+		regions = slices.DeleteFunc(slices.Clone(regions), func(r taggedRegion) bool { return r.builtinIP })
+	}
 	// PII inside a credential value (an address or email next to the
 	// password) does not make the rest of it safe to keep.
 	if onlyPIIRegions(regions) && isCredentialJSONSecretKey(key, credentialContext) &&
@@ -2196,12 +2196,11 @@ func keyContextFindsMore(key, val string) bool {
 	prefix := `"` + key + `":"`
 	start, end := len(prefix), len(prefix)+len(val)
 	var coveredAlone []bool
-	networkKey := isNetworkKey(key)
 	for _, r := range detectAllLayers(prefix + val + `"`) {
 		// A network word in the key makes an IP look key-dependent, but
 		// redactIPsUnderNetworkKey owns that case and keeps the IP token
 		// instead of replacing the whole value.
-		if networkKey && r.builtinIP {
+		if r.builtinIP && isNetworkKey(key) {
 			continue
 		}
 		s, e := max(r.start, start)-start, min(r.end, end)-start

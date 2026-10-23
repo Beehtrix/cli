@@ -70,6 +70,11 @@ func TestDetectPII_IPRedacted(t *testing.T) {
 		{"address range", "dhcp-range=192.168.1.1-192.168.1.254", "dhcp-range=[REDACTED_IP]-[REDACTED_IP]"},
 		{"nip.io name", "http://10.0.0.5.nip.io/", "http://[REDACTED_IP].nip.io/"},
 		{"sslip.io name with a label", "app.10.0.0.5.sslip.io", "app.[REDACTED_IP].sslip.io"},
+		{"hex-only label before an internal ipv6", "db:fd12::5 dc:fe80::1 cafe:fd00::7 ab:fe80::1", "db:[REDACTED_IP] dc:[REDACTED_IP] cafe:[REDACTED_IP] ab:[REDACTED_IP]"},
+		{"unbracketed ipv6 with a port", "connect to 2600:1f18:4c2:9300:6e1a:2b3c:4d5e:7f80:443", "connect to [REDACTED_IP]:443"},
+		{"octal color code", `printf '\033[35m10.0.0.5\033[0m'`, `printf '\033[35m[REDACTED_IP]\033[0m'`},
+		{"\\e color code", `echo -e "\e[35m10.0.0.5\e[0m"`, `echo -e "\e[35m[REDACTED_IP]\e[0m"`},
+		{"network word in an octal color code", `printf '\033[1mssh\033[0m 34.117.59.81'`, `printf '\033[1mssh\033[0m [REDACTED_IP]'`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -114,7 +119,6 @@ func TestDetectPII_IPNotRedacted(t *testing.T) {
 		{"escape letter that starts the candidate", `\fe80::1`},
 		{"md5 key fingerprint", "Server host key: ecdsa-sha2-nistp256 MD5:12:f8:7e:78:61:b4:bf:e2:de:24:15:96:4e:d4:72:53"},
 		{"sha1 key fingerprint", "server fingerprint SHA1:AB:CD:12:34:56:78:9A:BC:DE:F0:12:34:56:78:9A:BC:DE:F0:12:34"},
-		{"hex word before colon", "ab:fe80::1"},
 		{"time", "at 12:30:45 today"},
 		{"file line col", "main.go:12:34: error"},
 		{"mac address", "ether aa:bb:cc:dd:ee:ff"},
@@ -210,6 +214,11 @@ func TestPIIIntegration_IPUnderNetworkKey(t *testing.T) {
 		{`{"api-host":"34.117.59.81"}`, `{"api-host":"[REDACTED_IP]"}`},
 		{`{"api-IPs":"34.117.59.81"}`, `{"api-IPs":"[REDACTED_IP]"}`},
 		{`{"externalIPs":["34.117.59.81"]}`, `{"externalIPs":["[REDACTED_IP]"]}`},
+		// The key gives an address context, not descriptive text around one.
+		{`{"hostname":"build 1.17.2.3"}`, `{"hostname":"build 1.17.2.3"}`},
+		{`{"server_info":"Apache 2.4.57.1"}`, `{"server_info":"Apache 2.4.57.1"}`},
+		{`{"hosts":"34.117.59.81, 13.234.90.180"}`, `{"hosts":"[REDACTED_IP], [REDACTED_IP]"}`},
+		{`{"host":"[2600:1f18::7]:443"}`, `{"host":"[[REDACTED_IP]]:443"}`},
 		// A version key keeps its value even in a private range.
 		{`{"version":"10.1.2.3"}`, `{"version":"10.1.2.3"}`},
 		{`{"assemblyVersion":"10.1.2.3"}`, `{"assemblyVersion":"10.1.2.3"}`},
@@ -242,10 +251,11 @@ func TestPIIIntegration_IPSameTextUnderTwoKeys(t *testing.T) {
 	ConfigurePII(PIIConfig{Enabled: true, Categories: map[PIICategory]bool{PIIIP: true}})
 	t.Cleanup(resetPIIConfig)
 
-	text := "dial 34.117.59.81 " + strings.Repeat("x", 70) + " 52.66.93.46"
-	redacted := "dial [REDACTED_IP] " + strings.Repeat("x", 70) + " [REDACTED_IP]"
 	tests := []struct{ in, want string }{
-		{`{"notes":["` + text + `"],"hosts":["` + text + `"]}`, `{"notes":["` + redacted + `"],"hosts":["` + redacted + `"]}`},
+		{`{"notes":["10.0.0.5 34.117.59.81"],"hosts":["10.0.0.5 34.117.59.81"]}`, `{"notes":["[REDACTED_IP] [REDACTED_IP]"],"hosts":["[REDACTED_IP] [REDACTED_IP]"]}`},
+		// Text redacted in one field is redacted wherever it appears, a version
+		// value included; leaving that copy would show the address anyway.
+		{`{"version":"10.1.2.3","notes":["10.1.2.3"]}`, `{"version":"[REDACTED_IP]","notes":["[REDACTED_IP]"]}`},
 		// A whole-value placeholder under a credential key hides more than IP
 		// tokens, however many there are.
 		{

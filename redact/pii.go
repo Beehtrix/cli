@@ -214,6 +214,7 @@ func detectPII(cfg *PIIConfig, s string) []taggedRegion {
 			(p.regex == ipv6CandidateRegex && !mayContainIPv6(s)) {
 			continue
 		}
+		builtinIP := p.regex == ipv4CandidateRegex || p.regex == ipv6CandidateRegex
 		for _, loc := range p.regex.FindAllStringIndex(s, -1) {
 			// Skip allowlisted email addresses (noreply, bot accounts, etc.)
 			// and the git login of a remote.
@@ -227,7 +228,7 @@ func detectPII(cfg *PIIConfig, s string) []taggedRegion {
 			// The built-in IP candidates are only shapes; redactableIP
 			// validates them and may trim the match. Matched by regex, not
 			// label, so a custom pattern named "ip" is left as written.
-			if p.regex == ipv4CandidateRegex || p.regex == ipv6CandidateRegex {
+			if builtinIP {
 				start, end, ok := redactableIP(s, loc[0], loc[1])
 				if !ok {
 					continue
@@ -237,7 +238,7 @@ func detectPII(cfg *PIIConfig, s string) []taggedRegion {
 			regions = append(regions, taggedRegion{
 				region:    region{loc[0], loc[1]},
 				label:     p.label,
-				builtinIP: p.regex == ipv4CandidateRegex || p.regex == ipv6CandidateRegex,
+				builtinIP: builtinIP,
 			})
 		}
 	}

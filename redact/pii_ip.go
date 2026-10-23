@@ -81,12 +81,30 @@ func ipCandidate(s string, start, end int) (int, int, netip.Addr, bool) {
 		end--
 		addr, err = netip.ParseAddr(s[start:end])
 	}
+	// A full eight-group address with a port and no brackets reads as nine
+	// groups (2600:...:7f80:443); the last one is the port.
+	if err != nil && strings.Count(s[start:end], ":") == 8 && !strings.Contains(s[start:end], "::") {
+		if i := strings.LastIndexByte(s[start:end], ':'); isPort(s[start+i+1 : end]) {
+			end = start + i
+			addr, err = netip.ParseAddr(s[start:end])
+		}
+	}
 	if err != nil {
 		return 0, 0, netip.Addr{}, false
 	}
 	addr = addr.Unmap()
 	if !ipStandsAlone(s, start, end, addr) {
 		return 0, 0, netip.Addr{}, false
+	}
+	// A hex-only label glued on by a colon (db:fd12::5) makes the whole run
+	// parse as one public address; the internal address after it is the one
+	// in use.
+	if addr.Is6() && !isInternalIP(addr) {
+		if i := strings.IndexByte(s[start:end], ':'); i > 0 && start+i+1 < end && s[start+i+1] != ':' {
+			if inner, err := netip.ParseAddr(s[start+i+1 : end]); err == nil && isInternalIP(inner.Unmap()) {
+				start, addr = start+i+1, inner.Unmap()
+			}
+		}
 	}
 	if addr.IsLoopback() || addr.IsUnspecified() {
 		return 0, 0, netip.Addr{}, false
@@ -190,8 +208,9 @@ func ipStandsAlone(s string, start, end int, addr netip.Addr) bool {
 			return false
 		}
 		// A longer colon run, such as a key fingerprint (MD5:12:f8:...), is
-		// not an address even when eight of its groups parse as one.
-		if next == ':' && addr.Is6() && isHexGroup(wordAt(s, end+1)) {
+		// not an address even when eight of its groups parse as one. A port
+		// (:443) ends the run.
+		if next == ':' && addr.Is6() && isHexGroup(wordAt(s, end+1)) && !endsWithPort(s, end+1) {
 			return false
 		}
 		if next == '.' && end+1 < len(s) && isIPWordByte(s[end+1]) && !wildcardDNS {
@@ -266,7 +285,7 @@ func startsWithIPv4(t string) bool {
 // followsEscape reports whether the letter before s[start] ends an escape
 // rather than a word: a JSON escape (\n, \t) left in a string decoded only
 // once, such as Codex function_call.arguments, or an ANSI color code
-// (ESC[35m) from terminal output.
+// (ESC[35m, \033[35m) from terminal output or a script.
 func followsEscape(s string, start int) bool {
 	if start < 2 || !isLetterByte(s[start-1]) {
 		return false
@@ -278,8 +297,20 @@ func followsEscape(s string, start int) bool {
 	for i >= 0 && start-i < 16 && (isDigit(s[i]) || s[i] == ';') {
 		i--
 	}
-	return i >= 0 && s[i] == '[' && (strings.HasSuffix(s[:i], "\x1b") || strings.HasSuffix(s[:i], `\u001b`))
+	if i < 0 || s[i] != '[' {
+		return false
+	}
+	for _, esc := range ansiEscapeSpellings {
+		if strings.HasSuffix(s[:i], esc) {
+			return true
+		}
+	}
+	return false
 }
+
+// ansiEscapeSpellings are the ways ESC appears before a color code: raw, as
+// a JSON escape, and as written in shell and source strings.
+var ansiEscapeSpellings = []string{"\x1b", `\u001b`, `\033`, `\x1b`, `\e`}
 
 // isSeparatorColon reports whether the colon at s[i] ends a word rather than
 // a hex group ("host:fe80::1" and "iface:fe80::1", not "ab:fe80::1").
@@ -312,6 +343,26 @@ func trimGluedWords(s string, start, end int) (int, int) {
 		}
 	}
 	return start, end
+}
+
+// isPort reports whether w is a decimal port number.
+func isPort(w string) bool {
+	if w == "" || len(w) > 5 {
+		return false
+	}
+	for i := range len(w) {
+		if !isDigit(w[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// endsWithPort reports whether s[i:] starts with a port that is not followed
+// by another colon group.
+func endsWithPort(s string, i int) bool {
+	w := wordAt(s, i)
+	return isPort(w) && (i+len(w) == len(s) || s[i+len(w)] != ':')
 }
 
 // wordAt returns up to five word bytes of s starting at i, enough to tell a
@@ -400,7 +451,7 @@ func ipContextWindow(s string, start, end int) (string, string) {
 // (ESC[1mssh), written raw or as an escape. A literal \n is not taken as a
 // line break, because a Windows path (C:\keys\node1.pem) or a C string has
 // the same bytes.
-var windowEscapeRegex = regexp.MustCompile(`\\[nrt]|(?:\x1b|\\u001b)\[[0-9;]*[A-Za-z]`)
+var windowEscapeRegex = regexp.MustCompile(`\\[nrt]|(?:\x1b|\\u001b|\\033|\\x1b|\\e)\[[0-9;]*[A-Za-z]`)
 
 // separateEscapes replaces the escapes in a context window with spaces so
 // the word after each one starts at a word boundary.
@@ -453,8 +504,7 @@ func isHexByte(c byte) bool {
 // public address has. It runs on the already-redacted value and counts its
 // matches in t, like the PII layer.
 func redactIPsUnderNetworkKey(key, val string, t *tally) string {
-	cfg := getPIIConfig()
-	if cfg == nil || !cfg.Enabled || !cfg.Categories[PIIIP] || !isNetworkKey(key) {
+	if !ipCategoryEnabled() || !isNetworkKey(key) {
 		return val
 	}
 	var regions []taggedRegion
@@ -465,7 +515,52 @@ func redactIPsUnderNetworkKey(key, val string, t *tally) string {
 			}
 		}
 	}
-	return redactRegions(val, dropNestedIPRegions(regions), t)
+	regions = dropNestedIPRegions(regions)
+	// The key names the value, so it is context only for addresses the value
+	// holds directly (a list, a URL, user@host), not for one inside
+	// descriptive text ({"hostname":"build 1.17.2.3"}).
+	kept := regions[:0]
+	from := 0
+	for _, r := range regions {
+		if !hasWordsBefore(val[from:r.start]) {
+			kept = append(kept, r)
+		}
+		from = r.end
+	}
+	return redactRegions(val, kept, t)
+}
+
+// placeholderRegex matches the tokens redaction writes, which are not
+// descriptive text.
+var placeholderRegex = regexp.MustCompile(`\[?REDACTED(?:_[A-Z]+)?\]?`)
+
+// hasWordsBefore reports whether the text between one address and the next
+// holds descriptive words. A URL scheme, userinfo, redaction placeholders and
+// escapes are not words, and a label that ends in : or = (HOST_IP=,
+// "server": ") names the address that follows.
+func hasWordsBefore(seg string) bool {
+	if i := strings.LastIndex(seg, "://"); i >= 0 {
+		seg = seg[i+len("://"):]
+	}
+	if i := strings.LastIndexByte(seg, '@'); i >= 0 {
+		seg = seg[i+1:]
+	}
+	seg = separateEscapes(placeholderRegex.ReplaceAllString(seg, ""))
+	if label := strings.TrimRight(seg, " \t\"'[(\\"); strings.HasSuffix(label, ":") || strings.HasSuffix(label, "=") {
+		return false
+	}
+	for i := range len(seg) {
+		if isLetterByte(seg[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// ipCategoryEnabled reports whether the built-in IP rules run.
+func ipCategoryEnabled() bool {
+	cfg := getPIIConfig()
+	return cfg != nil && cfg.Enabled && cfg.Categories[PIIIP]
 }
 
 // isVersionValue reports whether val is the value of a version key (version,
@@ -473,27 +568,15 @@ func redactIPsUnderNetworkKey(key, val string, t *tally) string {
 // version ({"version":"10.1.2.3"}). The JSONL walk scans a value without its
 // key, so this is the version-label rule for JSON.
 func isVersionValue(key, val string) bool {
-	k := normalizeCredentialJSONKey(key)
-	if k != "version" && !strings.HasSuffix(k, "_version") {
+	v := strings.TrimSpace(val)
+	if len(v) > 64 || !ipCategoryEnabled() {
 		return false
 	}
-	_, err := netip.ParseAddr(strings.TrimSpace(val))
-	return err == nil
-}
-
-// withoutIPs returns r with the built-in IP matches dropped.
-func (r leafRedactor) withoutIPs() leafRedactor {
-	detect := r.detect
-	r.detect = func(s string) []taggedRegion {
-		var kept []taggedRegion
-		for _, t := range detect(s) {
-			if !t.builtinIP {
-				kept = append(kept, t)
-			}
-		}
-		return kept
+	if _, err := netip.ParseAddr(v); err != nil {
+		return false
 	}
-	return r
+	k := normalizeCredentialJSONKey(key)
+	return k == "version" || strings.HasSuffix(k, "_version")
 }
 
 // dropNestedIPRegions removes an IP region that lies inside another one, so
@@ -556,7 +639,7 @@ func splitAfterDigits(key string) string {
 }
 
 func isIPWordByte(c byte) bool {
-	return isDigit(c) || c == '_' || isLetterByte(c)
+	return isASCIIAlnum(c) || c == '_'
 }
 
 func isLetterByte(c byte) bool { return c|0x20 >= 'a' && c|0x20 <= 'z' }
