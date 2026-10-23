@@ -159,6 +159,7 @@ The agent's own transcript is never modified at all. Entire reads from it and le
 If your AI sessions will touch sensitive data:
 
 - **Use a private repository.** This is the simplest and most complete protection. Committed checkpoints are then only visible to collaborators.
+- **Keep checkpoints out of a public repository.** If the code must stay public, upload checkpoints to a separate private repository with `entire configure --local --checkpoint-remote github:<owner>/<repo>` (`strategy_options.checkpoint_remote`, see [Checkpoint Remote](../README.md#checkpoint-remote)), or stop uploading them with `entire configure --local --skip-push-sessions` (`strategy_options.push_sessions: false`). `--local` makes the setting take effect for your clone: a project `checkpoint_remote` owned by a different account than `origin` is ignored, and a local `push_sessions` overrides the project one.
 - **Avoid passing sensitive files to your agent.** Content that never enters the agent conversation never appears in transcripts.
 - **Never paste a screenshot or image containing secrets or personal data.** Nothing in Entire reads what an image depicts, and on most agents the image is stored unredacted — see [What Entire does NOT understand: pasted images and screenshots](#what-entire-does-not-understand-pasted-images-and-screenshots).
 - **Review before pushing.** Checkpoints are written locally — at commit time, or when a session with no file changes is snapshotted with the hidden `entire checkpoint create` — and pushed separately, so there is always a window to inspect them:
@@ -177,7 +178,7 @@ If your AI sessions will touch sensitive data:
   git log --oneline entire/checkpoints/v1
   ```
 
-- **Know your push destination.** Checkpoint data syncs to exactly one elected remote; `entire status` names it and reports how many checkpoints are still unpushed, and on the git-refs backend `entire checkpoint list --outgoing` lists them.
+- **Know your push destination.** Checkpoint data syncs to exactly one elected remote; `entire status` names it and reports how many checkpoints are still unpushed, and on the git-refs backend `entire checkpoint list --outgoing` lists them. `entire enable` also names the destination every time it runs.
 
 ## What Gets Redacted
 
