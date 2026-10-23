@@ -29,6 +29,7 @@ const (
 // same columns.
 const (
 	colHeaderBranch   = "BRANCH"
+	colHeaderChange   = "CHANGE"
 	colHeaderCloneURL = "CLONE URL"
 	colHeaderCluster  = "CLUSTER"
 	colHeaderGrantee  = "GRANTEE"

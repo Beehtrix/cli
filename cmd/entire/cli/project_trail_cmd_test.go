@@ -153,7 +153,13 @@ func TestProjectTrailShowFollowsParentAcrossCells(t *testing.T) {
 
 	text, _, err := executeProjectTrailTest(t, "show", "--repo", "gh/acme/widget", "--branch", "feature/a")
 	require.NoError(t, err)
-	require.Contains(t, text, "URL: https://entire.io/gh/acme/-/trails/42/\nChange URL: https://entire.io/gh/acme/-/trails/42/changes/widget/7\nID: ")
+	require.Contains(t, text, "URL: https://entire.io/gh/acme/-/trails/42/\nCurrent change URL: https://entire.io/gh/acme/-/trails/42/changes/widget/7\nID: ")
+	require.Contains(t, text, "CHANGE")
+	require.Contains(t, text, "widget/7 (current)")
+	require.Contains(t, text, "api/3 ")
+	require.Contains(t, text, "repo-hidden/9")
+	require.NotContains(t, text, "api/3 (current)")
+	require.NotContains(t, text, "access filtering", "a possibly partial trail prints no access note")
 }
 
 func TestProjectTrailMissingParentDoesNotFallBack(t *testing.T) {
@@ -187,7 +193,8 @@ func TestProjectTrailShowPrintsServerURL(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(js), &item))
 	require.Len(t, item.Changes, 1)
 	require.False(t, item.Changes[0].Current)
-	require.NotContains(t, out, "Change URL:")
+	require.NotContains(t, out, "Current change URL:")
+	require.NotContains(t, out, "(current)")
 }
 
 func TestProjectTrailShowOmitsURLWithoutOne(t *testing.T) {

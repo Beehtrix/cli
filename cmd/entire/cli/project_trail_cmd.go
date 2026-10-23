@@ -84,12 +84,6 @@ func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, currentChangeI
 	out := projectTrailJSON{ProjectTrail: item, Changes: mapSlice(item.Changes, func(c api.ChangeSummary) projectTrailChangeJSON {
 		return projectTrailChangeJSON{ChangeSummary: c, URL: projectTrailChangeURL(item.URL, c), Current: currentChangeID != "" && c.ID == currentChangeID}
 	})}
-	currentURL := ""
-	for _, c := range out.Changes {
-		if c.Current {
-			currentURL = c.URL
-		}
-	}
 	if jsonRequested(cmd) {
 		return printJSON(cmd.OutOrStdout(), out)
 	}
@@ -98,8 +92,10 @@ func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, currentChangeI
 	if trailURL := strings.TrimSpace(item.URL); trailURL != "" {
 		fmt.Fprintf(w, "URL: %s\n", tuiutil.SanitizeTerminalText(trailURL))
 	}
-	if currentURL != "" {
-		fmt.Fprintf(w, "Change URL: %s\n", tuiutil.SanitizeTerminalText(currentURL))
+	for _, c := range out.Changes {
+		if c.Current && c.URL != "" {
+			fmt.Fprintf(w, "Current change URL: %s\n", tuiutil.SanitizeTerminalText(c.URL))
+		}
 	}
 	fmt.Fprintf(w, "ID: %s\nProject: %s\nStatus: %s\nType: %s\nPriority: %s\nAssignees: %s\n",
 		tuiutil.SanitizeTerminalLabel(item.ID), tuiutil.SanitizeTerminalLabel(item.ProjectID), tuiutil.SanitizeTerminalLabel(item.Status),
@@ -107,17 +103,18 @@ func printProjectTrail(cmd *cobra.Command, item api.ProjectTrail, currentChangeI
 	if item.Body != "" {
 		fmt.Fprintf(w, "\n%s\n", tuiutil.SanitizeTerminalText(item.Body))
 	}
-	if item.IsPossiblyPartial {
-		fmt.Fprintln(w, "\nRepository and branch information may be incomplete due to access filtering.")
-	}
 	if len(item.Changes) > 0 {
 		fmt.Fprintln(w, "\nRepositories and branches:")
-		return printTable(w, []string{"REPOSITORY", colHeaderBranch, colHeaderStatus, colHeaderTitle}, item.Changes, func(c api.ChangeSummary) []string {
+		return printTable(w, []string{colHeaderChange, colHeaderBranch, colHeaderStatus, colHeaderTitle}, out.Changes, func(c projectTrailChangeJSON) []string {
 			repository := c.Repository
 			if repository == "" {
 				repository = c.RepositoryID
 			}
-			return []string{tuiutil.SanitizeTerminalLabel(repository), tuiutil.SanitizeTerminalLabel(c.Branch), tuiutil.SanitizeTerminalLabel(c.Status), tuiutil.SanitizeTerminalLabel(c.Title)}
+			change := tuiutil.SanitizeTerminalLabel(repository) + "/" + strconv.Itoa(c.Number)
+			if c.Current {
+				change += " (current)"
+			}
+			return []string{change, tuiutil.SanitizeTerminalLabel(c.Branch), tuiutil.SanitizeTerminalLabel(c.Status), tuiutil.SanitizeTerminalLabel(c.Title)}
 		})
 	}
 	return nil
