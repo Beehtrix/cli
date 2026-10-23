@@ -1576,3 +1576,35 @@ func TestLoadFromBytes_LeftoverInvestigateKeyContract(t *testing.T) {
 		}
 	})
 }
+
+func TestLoad_PIIIPDecodesAndMerges(t *testing.T) {
+	tmpDir := t.TempDir()
+	entireDir := filepath.Join(tmpDir, ".entire")
+	if err := os.MkdirAll(entireDir, 0o755); err != nil {
+		t.Fatalf("failed to create .entire directory: %v", err)
+	}
+
+	// Base sets ip through the strict decode; local overrides it through the merge.
+	baseContent := `{"enabled":true,"redaction":{"pii":{"enabled":true,"ip":false}}}`
+	if err := os.WriteFile(filepath.Join(entireDir, "settings.json"), []byte(baseContent), 0o644); err != nil {
+		t.Fatalf("failed to write settings file: %v", err)
+	}
+	localContent := `{"redaction":{"pii":{"ip":true}}}`
+	if err := os.WriteFile(filepath.Join(entireDir, "settings.local.json"), []byte(localContent), 0o644); err != nil {
+		t.Fatalf("failed to write local settings file: %v", err)
+	}
+
+	testutil.InitRepo(t, tmpDir)
+	t.Chdir(tmpDir)
+
+	settings, err := Load(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if settings.Redaction == nil || settings.Redaction.PII == nil {
+		t.Fatal("expected redaction.pii to be non-nil")
+	}
+	if settings.Redaction.PII.IP == nil || !*settings.Redaction.PII.IP {
+		t.Errorf("IP = %v, want true from the local override", settings.Redaction.PII.IP)
+	}
+}
