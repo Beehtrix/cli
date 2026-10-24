@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `entire checkpoint list --outgoing` shows which checkpoints the next `git push` will upload (ID, age, agent, first prompt and files touched) and where they go, reading only local state. On the git-refs backend, the count in `entire status` now matches that list and no longer includes queued refs that were deleted locally ([#2866](https://github.com/entireio/cli/pull/2866))
+- On the git-refs backend, `entire checkpoint list --outgoing` shows which checkpoints the next `git push` will upload (ID, age, agent, first prompt and files touched) and where they go, reading only local state. The count in `entire status` now matches that list and no longer includes queued refs that were deleted locally. `--outgoing` is not supported on the git-branch backend ([#2866](https://github.com/entireio/cli/pull/2866))
 - `entire enable` ends with a checkpoint privacy notice: where checkpoints will be uploaded, that they contain agent transcripts readable by anyone if the destination is public, that secret redaction is best effort, and how to stop uploads or use a separate private repo ([#2865](https://github.com/entireio/cli/pull/2865))
 - `entire repo view` shows a `Sync:` section when GitHub blocks the owner's installation (for example an org IP allow list), including the fix and the resync command. The new `entire repo mirror resync` queues a resync for every placement once the block is cleared. `--json` adds `syncBlock` and `syncStatus` ([#2870](https://github.com/entireio/cli/pull/2870))
 - PII redaction has a new `ip` category (`[REDACTED_IP]`), on by default when `redaction.pii.enabled` is true. It redacts private and link-local addresses, and public ones only when they appear in a network context, so version numbers and user agents are kept ([#2861](https://github.com/entireio/cli/pull/2861))
@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- OpenCode child sessions and Factory AI Droid Workers count toward the parent session's tokens in status, sessions, attach and checkpoint metadata, each counted exactly once. The `entire explain` header total includes subagents ([#2824](https://github.com/entireio/cli/pull/2824))
+- OpenCode child sessions and Factory AI Droid Workers count toward the parent session's tokens in status, sessions, attach and checkpoint metadata, each counted exactly once. The `entire checkpoint explain` header total includes subagents ([#2824](https://github.com/entireio/cli/pull/2824))
 - A commit from a linked worktree by an agent that started in the main checkout (for example after Claude Code's `EnterWorktree`) no longer pulls the main checkout's unrelated mid-turn sessions into its checkpoint ([#2821](https://github.com/entireio/cli/pull/2821))
 - The background session sweep and `entire doctor` write a salvaged checkpoint on the session's recorded branch instead of the sweeping worktree's branch. If the session's original worktree is unusable, they fall back to the current repository instead of failing. Existing misattributed checkpoints are not rewritten ([#2833](https://github.com/entireio/cli/pull/2833), [#2863](https://github.com/entireio/cli/pull/2863))
 - `git-remote-entire` honors `protocol.version` from git config, so fetches over `entire://` with protocol v0 or v1 no longer exit 1 without a message ([#2869](https://github.com/entireio/cli/pull/2869))
