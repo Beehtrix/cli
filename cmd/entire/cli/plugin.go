@@ -44,13 +44,13 @@ const selfUpdatePluginName = "upgrade"
 //
 // Membership is deliberately narrow. The offer is a prompt that defaults to
 // Yes and ends in a downloaded binary linked onto $PATH, so it belongs only to
-// names this CLI previously answered itself — a user typing them has every
-// reason to expect the command to exist. `graph` is the on-demand semantic
-// index; `brain` is documented as `entire brain`, so the docs send users to a
-// command that is a plugin they may not have; `investigate` was a built-in
-// until it moved to the entire-investigate plugin, and without the offer
-// `entire investigate` would answer an established command with "unknown
-// command for entire".
+// former built-ins and to commands Entire's docs or generated agent guides
+// tell people to run as `entire <name>` — names a user types because we told
+// them the command exists. `graph` is what Brain's agent guide sends agents to
+// (`entire graph search`); `brain` is documented as `entire brain`;
+// `investigate` was a built-in until it moved to the entire-investigate
+// plugin, and without the offer `entire investigate` would answer an
+// established command with "unknown command for entire".
 //
 // A name here must be resolvable through the plugin index: the install path
 // looks it up there and nowhere else, so an unlisted name turns the prompt

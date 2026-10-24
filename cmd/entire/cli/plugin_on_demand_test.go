@@ -524,8 +524,9 @@ func TestMaybeRunPlugin_MissingInvestigateNonInteractive(t *testing.T) { //nolin
 
 // TestOffersOnDemandInstall_IsNarrow pins that the offer is not extended to
 // arbitrary names. The prompt defaults to Yes and ends in a downloaded binary
-// linked onto $PATH, so it belongs only to names this CLI previously answered
-// itself.
+// linked onto $PATH, so it belongs only to former built-ins and to commands
+// Entire's docs or generated agent guides tell people to run as
+// `entire <name>`.
 func TestOffersOnDemandInstall_IsNarrow(t *testing.T) {
 	t.Parallel()
 	for _, name := range []string{"graph", "brain", "investigate"} {
