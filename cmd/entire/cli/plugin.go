@@ -46,16 +46,18 @@ const selfUpdatePluginName = "upgrade"
 // Yes and ends in a downloaded binary linked onto $PATH, so it belongs only to
 // names this CLI previously answered itself — a user typing them has every
 // reason to expect the command to exist. `graph` is the on-demand semantic
-// index; `investigate` was a built-in until it moved to the
-// entire-investigate plugin, and without the offer `entire investigate` would
-// answer an established command with "unknown command for entire".
+// index; `brain` is documented as `entire brain`, so the docs send users to a
+// command that is a plugin they may not have; `investigate` was a built-in
+// until it moved to the entire-investigate plugin, and without the offer
+// `entire investigate` would answer an established command with "unknown
+// command for entire".
 //
 // A name here must be resolvable through the plugin index: the install path
 // looks it up there and nowhere else, so an unlisted name turns the prompt
 // into a failure that the fall-through would have reported more plainly.
 //
 //nolint:gochecknoglobals // package-level set; a slice because there is no const slice in Go.
-var onDemandInstallPluginNames = []string{"graph", "investigate"}
+var onDemandInstallPluginNames = []string{"graph", "brain", "investigate"}
 
 // offersOnDemandInstall reports whether a missing plugin by this name should
 // be offered for installation.

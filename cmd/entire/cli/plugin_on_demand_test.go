@@ -528,12 +528,12 @@ func TestMaybeRunPlugin_MissingInvestigateNonInteractive(t *testing.T) { //nolin
 // itself.
 func TestOffersOnDemandInstall_IsNarrow(t *testing.T) {
 	t.Parallel()
-	for _, name := range []string{"graph", "investigate"} {
+	for _, name := range []string{"graph", "brain", "investigate"} {
 		if !offersOnDemandInstall(name) {
 			t.Errorf("offersOnDemandInstall(%q) = false, want true", name)
 		}
 	}
-	for _, name := range []string{"run", "upgrade", "brain", "ci", "definitely-not-a-plugin", ""} {
+	for _, name := range []string{"run", "upgrade", "ci", "definitely-not-a-plugin", ""} {
 		if offersOnDemandInstall(name) {
 			t.Errorf("offersOnDemandInstall(%q) = true, want false", name)
 		}
