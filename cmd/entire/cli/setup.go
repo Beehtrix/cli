@@ -1552,16 +1552,7 @@ func runEnableInteractive(ctx context.Context, w io.Writer, agents []agent.Agent
 
 	fmt.Fprintln(w, "\nReady.")
 
-	// Note about empty repos at the end, after setup is complete
-	if repo, err := strategy.OpenRepository(ctx); err == nil {
-		defer repo.Close()
-		if strategy.IsEmptyRepository(repo) {
-			fmt.Fprintln(w)
-			fmt.Fprintln(w, "Note: Session checkpoints require at least one commit. To get started,")
-			fmt.Fprintln(w, "commit the configuration files (e.g. .entire/, .claude/).")
-		}
-	}
-
+	offerCommitConfig(ctx, w, opts)
 	printSetupCheckpointDestinationNote(ctx, w)
 
 	return nil
@@ -2331,15 +2322,7 @@ func setupAgentHooksNonInteractive(ctx context.Context, w io.Writer, ag agent.Ag
 
 	fmt.Fprintln(w, "\nReady.")
 
-	if repo, err := strategy.OpenRepository(ctx); err == nil {
-		defer repo.Close()
-		if strategy.IsEmptyRepository(repo) {
-			fmt.Fprintln(w)
-			fmt.Fprintln(w, "Note: Session checkpoints require at least one commit. To get started,")
-			fmt.Fprintln(w, "commit the configuration files (e.g. .entire/, .claude/).")
-		}
-	}
-
+	offerCommitConfig(ctx, w, opts)
 	return nil
 }
 
