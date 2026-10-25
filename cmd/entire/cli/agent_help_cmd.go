@@ -237,6 +237,14 @@ var agentHelpGuidance = map[string]string{
 
 	"trail": agentHelpTrailSandboxGuidance,
 
+	// Shared by both trail models: comments are human conversation, findings
+	// are the agent's channel. The write verbs refuse in agent sessions
+	// (guardTrailCommentWrites); this is the copy an agent reads first.
+	"trail comment": "Trail discussions are for people: read them for context, but do not start,\n" +
+		"reply to, edit, delete, or resolve one. Use `entire trail finding` for agent\n" +
+		"review findings, questions, and follow-ups, including when asked to\n" +
+		"\"comment\" on a trail. Comment writes refuse in agent sessions.",
+
 	"checkpoint delete": "Destructive and irreversible on the remote. Never run this unless the user\n" +
 		"explicitly asks to delete that checkpoint; do not pass --force on your own.",
 }

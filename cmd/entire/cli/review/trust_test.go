@@ -388,7 +388,7 @@ func TestTruncateDisplayFitsWidth(t *testing.T) {
 	}
 }
 
-// Every variable detectAgentCaller can return needs a readable agent name.
+// Every variable DetectAgentCaller can return needs a readable agent name.
 func TestAgentCallerNamesCoverDetection(t *testing.T) {
 	t.Parallel()
 
@@ -423,8 +423,8 @@ func TestDetectAgentCaller(t *testing.T) {
 		for k, v := range tt.env {
 			t.Setenv(k, v)
 		}
-		if got := detectAgentCaller(); got != tt.want {
-			t.Errorf("detectAgentCaller() with %v = %q, want %q", tt.env, got, tt.want)
+		if got := DetectAgentCaller(); got != tt.want {
+			t.Errorf("DetectAgentCaller() with %v = %q, want %q", tt.env, got, tt.want)
 		}
 	}
 }

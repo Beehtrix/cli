@@ -85,6 +85,10 @@ Selectors are project-local numbers or trail ULIDs, or `<repo>/<number>` for one
   `--assignee=` still clears the list without resolving identities.
 - Project discussion write JSON includes only resources the server returned:
   reply/edit can contain a message without a discussion. ETags remain internal.
+- Comment writes in both trail models refuse an agent caller
+  (`review.DetectAgentCaller`) before resolving the trail, pointing at
+  `entire trail finding`; discussions are for people. `list` and `show` stay
+  open to agents.
 - Finding creation derives a bounded, deterministic review-start
   `Idempotency-Key` from the finding client IDs. The server replays that review
   for 24 hours; its review-local `client_id` checks then deduplicate the findings.

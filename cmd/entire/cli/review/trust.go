@@ -254,11 +254,11 @@ func shortSHA(sha string) string {
 	return sha
 }
 
-// detectAgentCaller returns a label for the agent running this command, or ""
+// DetectAgentCaller returns a label for the agent running this command, or ""
 // when none is detected. CLAUDECODE is checked here because the shared
 // sentinel list omits it; AI_AGENT is the cross-tool convention, and external
 // agents can declare their own variables.
-func detectAgentCaller() string {
+func DetectAgentCaller() string {
 	for _, name := range agent.CallerSessionEnvVars() {
 		if os.Getenv(name) != "" {
 			return agentCallerLabel(name)
@@ -287,7 +287,7 @@ func detectAgentCaller() string {
 	return ""
 }
 
-// agentCallerNames maps the variables detectAgentCaller checks to agent names.
+// agentCallerNames maps the variables DetectAgentCaller checks to agent names.
 var agentCallerNames = map[string]string{
 	"CLAUDECODE":                "Claude Code",
 	"CLAUDE_CODE_SESSION_ID":    "Claude Code",
@@ -305,7 +305,7 @@ var agentCallerNames = map[string]string{
 	"FACTORY_ENV":               "Factory Droid",
 }
 
-// AgentCallerEnvVars lists every built-in variable detectAgentCaller reads, so
+// AgentCallerEnvVars lists every built-in variable DetectAgentCaller reads, so
 // tests can clear them all.
 func AgentCallerEnvVars() []string {
 	names := append(agent.CallerSessionEnvVars(), interactive.AgentSubprocessEnvVars()...)

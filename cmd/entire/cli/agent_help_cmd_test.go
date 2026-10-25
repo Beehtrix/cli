@@ -1013,6 +1013,35 @@ func TestAgentHelpProjectTrailGuidance_OnlyInProjectTree(t *testing.T) {
 	}
 }
 
+// Both trail models point agents from comments to findings, on the group and
+// on every comment subcommand, while keeping trail's sandbox guidance.
+func TestAgentHelpTrailCommentGuidance_PointsAtFindings(t *testing.T) {
+	t.Parallel()
+
+	const findingsLine = "Use `entire trail finding` for agent\nreview findings"
+	sandboxLine := strings.SplitN(agentHelpTrailSandboxGuidance, "\n", 2)[0]
+	legacy := &cobra.Command{Use: "entire"}
+	legacy.AddCommand(newTrailCmdForMode(false))
+	for name, root := range map[string]*cobra.Command{"project": projectTrailsHelpTestRoot(), "legacy": legacy} {
+		comment := agentHelpFindChild(agentHelpFindChild(root, "trail"), "comment")
+		if comment == nil {
+			t.Fatalf("%s trail comment not found", name)
+		}
+		if strings.Contains(comment.Long, findingsLine) {
+			t.Errorf("%s trail comment guidance is duplicated into its cobra help; keep it agent-only", name)
+		}
+		for _, cmd := range append([]*cobra.Command{comment}, comment.Commands()...) {
+			got := agentHelpGuidanceFor(cmd)
+			if !strings.Contains(got, findingsLine) || !strings.Contains(got, sandboxLine) {
+				t.Errorf("%s %q guidance should carry the findings rule and the sandbox guidance:\n%s", name, cmd.CommandPath(), got)
+			}
+			if strings.Contains(got, trailCommentHumanOverrideFlag) {
+				t.Errorf("%s %q guidance must not name the human override:\n%s", name, cmd.CommandPath(), got)
+			}
+		}
+	}
+}
+
 // Group guidance reaches the leaves agents actually look up: `agent-help trail
 // finding list` must carry trail's network/keyring explanation, in text and JSON.
 func TestAgentHelpGuidance_InheritedByLeafCommands(t *testing.T) {
