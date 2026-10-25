@@ -138,9 +138,6 @@ func (f *Folder) line(m *message) ([]byte, bool) {
 	line.OutputTokens = int64(m.outputTokens)
 	if u := m.usage; u != nil && m.role == TypeAssistant {
 		line.Model = u.Model
-		if line.Model == "" {
-			line.Model = unknownModel
-		}
 		line.InputTokens = u.InputTokens
 		line.OutputTokens = u.OutputTokens
 		line.CacheReadTokens = u.CacheReadTokens
@@ -414,6 +411,10 @@ func cloneToolResult(r *ToolResult) *ToolResult {
 	if r.File != nil {
 		file := *r.File
 		c.File = &file
+	}
+	if r.Agent != nil {
+		agent := *r.Agent
+		c.Agent = &agent
 	}
 	return &c
 }

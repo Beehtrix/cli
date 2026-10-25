@@ -12,8 +12,10 @@ const (
 	ContentTypeToolUse = "tool_use"
 )
 
-// unknownModel is the model reported when a source has usage but no model.
-const unknownModel = "unknown"
+// syntheticModel is the placeholder Claude Code writes as message.model on
+// entries it synthesizes, such as API errors. It names no model, so lines
+// omit it.
+const syntheticModel = "<synthetic>"
 
 // agentClaudeCode is the Options.Agent value for Claude Code transcripts.
 const agentClaudeCode = "claude-code"

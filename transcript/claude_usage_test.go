@@ -69,10 +69,16 @@ func TestClaudeUsage_Convert(t *testing.T) {
 			},
 		},
 		{
-			name: "usage without model reports unknown",
+			name: "usage without model omits model",
 			input: `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"text","text":"a"}],"usage":{"input_tokens":3,"output_tokens":2}}}
 `,
-			want: []map[string]string{{"ts": `"t1"`, "model": `"unknown"`, "input_tokens": "3", "output_tokens": "2"}},
+			want: []map[string]string{{"ts": `"t1"`, "input_tokens": "3", "output_tokens": "2"}},
+		},
+		{
+			name: "the <synthetic> placeholder is not a model",
+			input: `{"type":"assistant","timestamp":"t1","message":{"id":"m1","model":"<synthetic>","content":[{"type":"text","text":"API Error"}],"usage":{"input_tokens":3,"output_tokens":2}}}
+`,
+			want: []map[string]string{{"ts": `"t1"`, "input_tokens": "3", "output_tokens": "2"}},
 		},
 		{
 			name: "no usage (absent, null or malformed) leaves the line legacy-shaped even with a model",
@@ -220,12 +226,12 @@ func TestFold_UsageSnapshot(t *testing.T) {
 			want:    []map[string]string{{"ts": `"t2"`, "model": `"m"`, "input_tokens": "5", "output_tokens": "1", "cache_read_tokens": "100"}},
 		},
 		{
-			name: "only assistant lines carry a snapshot, and a model-less one reports unknown",
+			name: "only assistant lines carry a snapshot, and a model-less one omits model",
 			records: []Record{
 				{Op: OpMessage, ID: "b", Role: TypeAssistant, TS: rawMsg(`"t1"`), Content: rawMsg(`[{"type":"text","text":"x"}]`), Usage: &CallUsage{InputTokens: 4}},
 				{Op: OpMessage, ID: "u", Role: TypeUser, TS: rawMsg(`"t2"`), Content: rawMsg(`[{"text":"q"}]`), Usage: &CallUsage{Model: "m", InputTokens: 4}},
 			},
-			want: []map[string]string{{"ts": `"t1"`, "model": `"unknown"`, "input_tokens": "4"}, {"ts": `"t2"`}},
+			want: []map[string]string{{"ts": `"t1"`, "input_tokens": "4"}, {"ts": `"t2"`}},
 		},
 	}
 	for _, tt := range tests {
