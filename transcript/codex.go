@@ -12,6 +12,7 @@ import (
 const (
 	transcriptTypeMessage         = "message"
 	codexTypeResponseItem         = "response_item"
+	codexTypeEventMsg             = "event_msg"
 	codexTypeFunctionCall         = "function_call"
 	codexTypeFunctionCallOutput   = "function_call_output"
 	codexTypeCustomToolCall       = "custom_tool_call"
@@ -36,7 +37,7 @@ func isCodexFormat(content []byte) bool {
 			continue
 		}
 		switch probe.Type {
-		case "session_meta", codexTypeResponseItem, "event_msg", codexTypeTurnContext:
+		case "session_meta", codexTypeResponseItem, codexTypeEventMsg, codexTypeTurnContext:
 			return true
 		default:
 			return false
@@ -110,6 +111,8 @@ type codexConverter struct {
 	entries   []codexEntry
 	open      *codexCall
 	tools     map[string]codexToolSlot
+	// subagents maps spawn_agent call IDs to the launched subagent's thread.
+	subagents map[string]string
 }
 
 // compactCodex converts a Codex JSONL transcript into the compact format.
@@ -140,6 +143,7 @@ func compactCodex(content []byte, opts Options) ([]byte, error) {
 		tracker:   newCodexUsageTracker(),
 		snapshots: codexHasSnapshots(prefix) || codexHasSnapshots(lines),
 		tools:     map[string]codexToolSlot{},
+		subagents: codexSubagentThreads(full),
 	}
 	// Counters are cumulative for the whole session, so the skipped prefix
 	// seeds the usage baseline. The last line before StartLine is part of the
@@ -217,9 +221,6 @@ func (c *codexConverter) tokenCount(cl codexLine) {
 	switch {
 	case ok:
 		d.Model = c.model
-		if d.Model == "" {
-			d.Model = unknownModel
-		}
 		c.openCall(cl.ts()).usage = &d
 	case c.tracker.stopped():
 		if c.open != nil {
@@ -237,7 +238,7 @@ func (c *codexConverter) responseItem(cl codexLine) {
 	case codexTypeFunctionCallOutput, codexTypeCustomToolCallOutput:
 		if slot, ok := c.tools[callID]; ok && slot.outputType == typ {
 			output := codexToolOutputText(cl.Payload, typ)
-			slot.block["result"] = buildToolResult(toolResultEntry{output: output})
+			slot.block["result"] = buildToolResult(toolResultEntry{output: output, agentID: c.subagents[callID]})
 			if !c.snapshots && c.open == slot.call {
 				c.open = nil
 			}
@@ -360,9 +361,45 @@ func parseCodexLines(content []byte) ([]codexLine, error) {
 	return lines, nil
 }
 
+// codexSubagentThreads maps each spawn_agent call ID to the thread of the
+// subagent it started, from item_completed SubAgentActivity events.
+func codexSubagentThreads(content []byte) map[string]string {
+	if !bytes.Contains(content, []byte(`"SubAgentActivity"`)) {
+		return nil
+	}
+	threads := make(map[string]string)
+	reader := bufio.NewReader(bytes.NewReader(content))
+	for {
+		lineBytes, err := reader.ReadBytes('\n')
+		if bytes.Contains(lineBytes, []byte(`"SubAgentActivity"`)) {
+			var line struct {
+				Type    string `json:"type"`
+				Payload struct {
+					Type string `json:"type"`
+					Item struct {
+						Type          string `json:"type"`
+						Kind          string `json:"kind"`
+						ID            string `json:"id"`
+						AgentThreadID string `json:"agent_thread_id"`
+					} `json:"item"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal(lineBytes, &line) == nil && line.Type == codexTypeEventMsg &&
+				line.Payload.Type == "item_completed" && line.Payload.Item.Type == "SubAgentActivity" &&
+				line.Payload.Item.Kind == "started" && line.Payload.Item.ID != "" && line.Payload.Item.AgentThreadID != "" {
+				threads[line.Payload.Item.ID] = line.Payload.Item.AgentThreadID
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return threads
+}
+
 // isCodexTokenCountLine checks if a codexLine is an event_msg with token_count payload.
 func isCodexTokenCountLine(cl codexLine) bool {
-	if cl.Type != "event_msg" {
+	if cl.Type != codexTypeEventMsg {
 		return false
 	}
 	var p struct {

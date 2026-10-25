@@ -158,8 +158,8 @@ func TestCompact_CodexInlineCases(t *testing.T) {
 			input: cxJoin(cxUser("t1", "hi"), cxReasoning("t2"), cxTokens("t3", 10, 0, 4, 4), cxTokens("t4", 20, 2, 9)),
 			expected: []string{
 				cxPre + `"type":"user","ts":"t1","content":[{"text":"hi"}]}`,
-				cxPre + `"type":"assistant","ts":"t3","model":"unknown","input_tokens":10,"output_tokens":4,"reasoning_tokens":4,"content":[]}`,
-				cxPre + `"type":"assistant","ts":"t4","model":"unknown","input_tokens":8,"cache_read_tokens":2,"output_tokens":5,"content":[]}`,
+				cxPre + `"type":"assistant","ts":"t3","input_tokens":10,"output_tokens":4,"reasoning_tokens":4,"content":[]}`,
+				cxPre + `"type":"assistant","ts":"t4","input_tokens":8,"cache_read_tokens":2,"output_tokens":5,"content":[]}`,
 			},
 		},
 		{
@@ -181,7 +181,7 @@ func TestCompact_CodexInlineCases(t *testing.T) {
 				cxCall("t4", "c2"), cxOutput("t5", "c2", "ok"), cxTokens("t6", 10, 0, 4)),
 			expected: []string{
 				cxPre + `"type":"user","ts":"t1","content":[{"text":"go"}]}`,
-				cxPre + `"type":"assistant","ts":"t6","model":"unknown","input_tokens":10,"output_tokens":4,"content":[` + c1 + `,` + strings.Replace(c1, `"c1"`, `"c2"`, 1) + `]}`,
+				cxPre + `"type":"assistant","ts":"t6","input_tokens":10,"output_tokens":4,"content":[` + c1 + `,` + strings.Replace(c1, `"c1"`, `"c2"`, 1) + `]}`,
 			},
 		},
 		{
@@ -193,8 +193,8 @@ func TestCompact_CodexInlineCases(t *testing.T) {
 				cxTokens("t7", 20, 2, 9)),
 			expected: []string{
 				cxPre + `"type":"user","ts":"t1","content":[{"text":"go"}]}`,
-				cxPre + `"type":"assistant","ts":"t3","model":"unknown","input_tokens":10,"output_tokens":4,"content":[{"type":"text","text":"a"}]}`,
-				cxPre + `"type":"assistant","ts":"t7","model":"unknown","input_tokens":8,"cache_read_tokens":2,"output_tokens":5,"content":[{"type":"text","text":"b"}]}`,
+				cxPre + `"type":"assistant","ts":"t3","input_tokens":10,"output_tokens":4,"content":[{"type":"text","text":"a"}]}`,
+				cxPre + `"type":"assistant","ts":"t7","input_tokens":8,"cache_read_tokens":2,"output_tokens":5,"content":[{"type":"text","text":"b"}]}`,
 			},
 		},
 		{
@@ -203,7 +203,7 @@ func TestCompact_CodexInlineCases(t *testing.T) {
 				cxTokens("t4", 0, 0, 0), cxOutput("t5", "c1", "ok"), cxTokens("t6", 10, 0, 4)),
 			expected: []string{
 				cxPre + `"type":"user","ts":"t1","content":[{"text":"go"}]}`,
-				cxPre + `"type":"assistant","ts":"t6","model":"unknown","input_tokens":10,"output_tokens":4,"content":[{"type":"text","text":"a"},` + c1 + `]}`,
+				cxPre + `"type":"assistant","ts":"t6","input_tokens":10,"output_tokens":4,"content":[{"type":"text","text":"a"},` + c1 + `]}`,
 			},
 		},
 		{
@@ -212,8 +212,8 @@ func TestCompact_CodexInlineCases(t *testing.T) {
 				cxOutput("t4", "c1", "ok"), cxMessage("t5", "next"), cxTokens("t6", 20, 0, 9)),
 			expected: []string{
 				cxPre + `"type":"user","ts":"t1","content":[{"text":"go"}]}`,
-				cxPre + `"type":"assistant","ts":"t3","model":"unknown","input_tokens":10,"output_tokens":4,"content":[` + c1 + `]}`,
-				cxPre + `"type":"assistant","ts":"t6","model":"unknown","input_tokens":10,"output_tokens":5,"content":[{"type":"text","text":"next"}]}`,
+				cxPre + `"type":"assistant","ts":"t3","input_tokens":10,"output_tokens":4,"content":[` + c1 + `]}`,
+				cxPre + `"type":"assistant","ts":"t6","input_tokens":10,"output_tokens":5,"content":[{"type":"text","text":"next"}]}`,
 			},
 		},
 		{
@@ -231,8 +231,8 @@ func TestCompact_CodexInlineCases(t *testing.T) {
 			input: cxJoin(cxMessage("t1", "one"), strings.Replace(cxTokens("x", 10, 0, 4), `"x"`, `123`, 1),
 				cxMessage("t3", "two"), cxTokens("t4", 20, 0, 8)),
 			expected: []string{
-				cxPre + `"type":"assistant","ts":"t1","model":"unknown","input_tokens":10,"output_tokens":4,"content":[{"type":"text","text":"one"}]}`,
-				cxPre + `"type":"assistant","ts":"t4","model":"unknown","input_tokens":10,"output_tokens":4,"content":[{"type":"text","text":"two"}]}`,
+				cxPre + `"type":"assistant","ts":"t1","input_tokens":10,"output_tokens":4,"content":[{"type":"text","text":"one"}]}`,
+				cxPre + `"type":"assistant","ts":"t4","input_tokens":10,"output_tokens":4,"content":[{"type":"text","text":"two"}]}`,
 			},
 		},
 	}
@@ -287,7 +287,7 @@ func TestCodexOneLinePerCall_SumsEqualNativeDeltas(t *testing.T) {
 	}
 	assertJSONLines(t, out, []string{
 		cxPre + `"type":"user","ts":"t01","content":[{"text":"go"}]}`,
-		cxPre + `"type":"assistant","ts":"t03","model":"unknown","input_tokens":60,"cache_read_tokens":40,"output_tokens":10,"reasoning_tokens":5,"content":[]}`,
+		cxPre + `"type":"assistant","ts":"t03","input_tokens":60,"cache_read_tokens":40,"output_tokens":10,"reasoning_tokens":5,"content":[]}`,
 		cxPre + `"type":"assistant","ts":"t10","model":"gpt-a","input_tokens":100,"cache_read_tokens":100,"output_tokens":40,"reasoning_tokens":10,"content":[{"type":"text","text":"on it"},` + tool("c1") + `,` + tool("c2") + `]}`,
 		cxPre + `"type":"assistant","ts":"t14","model":"gpt-b","input_tokens":100,"cache_read_tokens":200,"output_tokens":40,"content":[` + tool("c3") + `]}`,
 		cxPre + `"type":"assistant","ts":"t16","model":"gpt-b","input_tokens":40,"cache_read_tokens":60,"output_tokens":30,"reasoning_tokens":10,"content":[{"type":"text","text":"done"}]}`,
@@ -404,7 +404,7 @@ func TestCompact_CodexStartLine_SeedsUsageFromSkippedPrefix(t *testing.T) {
 
 	expected := []string{
 		`{"v":1,"agent":"codex","cli_version":"0.5.1","type":"user","ts":"t5","content":[{"text":"second prompt"}]}`,
-		`{"v":1,"agent":"codex","cli_version":"0.5.1","type":"assistant","ts":"t7","model":"unknown","input_tokens":20,"output_tokens":15,"cache_read_tokens":30,"content":[{"type":"text","text":"second answer"}]}`,
+		`{"v":1,"agent":"codex","cli_version":"0.5.1","type":"assistant","ts":"t7","input_tokens":20,"output_tokens":15,"cache_read_tokens":30,"content":[{"type":"text","text":"second answer"}]}`,
 	}
 
 	result, err := Convert(input, opts)
@@ -432,7 +432,7 @@ func TestCompact_CodexStartLine_IncludesTheLastCallTheSliceChanges(t *testing.T)
 				cxOutput("t5", "c2", "ok"), cxTokens("t6", 10, 0, 4)),
 			startLine: 4,
 			want: []string{
-				cxPre + `"type":"assistant","ts":"t6","model":"unknown","input_tokens":10,"output_tokens":4,"content":[` + tool("c1") + `,` + tool("c2") + `]}`,
+				cxPre + `"type":"assistant","ts":"t6","input_tokens":10,"output_tokens":4,"content":[` + tool("c1") + `,` + tool("c2") + `]}`,
 			},
 		},
 		{
@@ -440,7 +440,7 @@ func TestCompact_CodexStartLine_IncludesTheLastCallTheSliceChanges(t *testing.T)
 			input:     cxJoin(cxUser("t1", "go"), cxCall("t2", "c1"), cxOutput("t3", "c1", "ok"), cxTokens("t4", 10, 0, 4)),
 			startLine: 3,
 			want: []string{
-				cxPre + `"type":"assistant","ts":"t4","model":"unknown","input_tokens":10,"output_tokens":4,"content":[` + tool("c1") + `]}`,
+				cxPre + `"type":"assistant","ts":"t4","input_tokens":10,"output_tokens":4,"content":[` + tool("c1") + `]}`,
 			},
 		},
 		{
@@ -448,7 +448,7 @@ func TestCompact_CodexStartLine_IncludesTheLastCallTheSliceChanges(t *testing.T)
 			input:     cxJoin(cxUser("t1", "go"), cxCall("t2", "c1"), cxTokens("t3", 10, 0, 4), cxOutput("t4", "c1", "ok")),
 			startLine: 3,
 			want: []string{
-				cxPre + `"type":"assistant","ts":"t3","model":"unknown","input_tokens":10,"output_tokens":4,"content":[` + tool("c1") + `]}`,
+				cxPre + `"type":"assistant","ts":"t3","input_tokens":10,"output_tokens":4,"content":[` + tool("c1") + `]}`,
 			},
 		},
 		{
