@@ -34,7 +34,12 @@ One JSON object per line, each line terminated by `\n`.
 
 Usage and model fields are per call, never copied from a session aggregate. A zero omitted by JSON encoding does not assert that the source reported zero.
 
-On every line, `input_tokens` excludes the tokens in that line's `cache_read_tokens` and `cache_write_tokens`, so their sum is the call's total input and never double counts. Lines written before the cache fields existed carry none, and some of them counted cached input in `input_tokens`: older Codex lines, and Pi lines from Google models before pi-ai subtracted cached tokens (March 2026). Their total is still right, but its cache share is unknown, so pricing them at the fresh-input rate overstates their cost. No other field marks a line as old or new; `model` in particular says nothing about how `input_tokens` was counted.
+On every line, `input_tokens` excludes the tokens in that line's `cache_read_tokens` and `cache_write_tokens`, so adding them never double counts. The sum is the call's total input only on lines from a converter that writes the cache fields. Lines written before that carry no cache fields, and their `input_tokens` is one of two things:
+
+- Fresh input only (Claude Code, and Pi except as below): the cached input is missing from the line, so the sum understates the call's input.
+- Fresh plus cached input (Codex, and Pi on Google models before pi-ai subtracted cached tokens in March 2026): the total is right, but its cache share is unknown, so pricing it at the fresh-input rate overstates the cost.
+
+Other agents' lines copy the native input count as the agent defines it. Only `agent` and the `cli_version` that wrote a line tell these cases apart; no field marks a line as old or new, and `model` in particular says nothing about how `input_tokens` was counted.
 
 Converters fill only what the native transcript reports per call. Claude Code, Codex and Pi record per-call usage and model; their converters do not write the new fields yet. Copilot CLI has only a shutdown aggregate, Cursor is hook-only, and external plugins and Antigravity report usage out of band, so their lines do not get these fields. Native timestamps are preserved where present; a missing one stays empty rather than fabricated.
 
