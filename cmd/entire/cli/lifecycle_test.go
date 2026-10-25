@@ -1938,7 +1938,7 @@ func TestHandleLifecycleTurnStart_ContextInjectionUnknownCacheInjectsBaseOnly(t 
 	require.False(t, state.ContextInjectionDecided, "unknown/missing cache should not permanently suppress the trails injection")
 	require.Len(t, *ag.injected, 1)
 	require.Contains(t, (*ag.injected)[0], "entire agent-help")
-	require.NotContains(t, (*ag.injected)[0], "A trail is")
+	require.NotContains(t, (*ag.injected)[0], "A Trail is")
 
 	runContextInjectionTurn(t, ag, sessionID)
 	require.Len(t, *ag.injected, 1, "the base text is injected once per session")
@@ -1957,7 +1957,7 @@ func TestHandleLifecycleTurnStart_ContextInjectionFreshTrueInjectsBoth(t *testin
 	require.True(t, state.ContextInjectionDecided, "fresh true cache should make a final injection decision")
 	require.Len(t, *ag.injected, 1)
 	require.Contains(t, (*ag.injected)[0], "entire agent-help")
-	require.Contains(t, (*ag.injected)[0], "A trail is")
+	require.Contains(t, (*ag.injected)[0], "A Trail is")
 
 	runContextInjectionTurn(t, ag, sessionID)
 	require.Len(t, *ag.injected, 1)
@@ -1974,7 +1974,7 @@ func TestHandleLifecycleTurnStart_ContextInjectionDisabledInjectsBaseOnce(t *tes
 
 	require.True(t, state.ContextInjectionDecided)
 	require.Len(t, *ag.injected, 1)
-	require.NotContains(t, (*ag.injected)[0], "A trail is")
+	require.NotContains(t, (*ag.injected)[0], "A Trail is")
 
 	runContextInjectionTurn(t, ag, sessionID)
 	require.Len(t, *ag.injected, 1)
@@ -1991,14 +1991,14 @@ func TestHandleLifecycleTurnStart_ContextInjectionTrailsFollowOnLaterTurn(t *tes
 
 	runContextInjectionTurn(t, ag, sessionID)
 	require.Len(t, *ag.injected, 1)
-	require.NotContains(t, (*ag.injected)[0], "A trail is")
+	require.NotContains(t, (*ag.injected)[0], "A Trail is")
 
 	require.NoError(t, saveTrailsEnabledForRepo(context.Background(), true))
 	state := runContextInjectionTurn(t, ag, sessionID)
 
 	require.True(t, state.ContextInjectionDecided)
 	require.Len(t, *ag.injected, 2)
-	require.Contains(t, (*ag.injected)[1], "A trail is")
+	require.Contains(t, (*ag.injected)[1], "A Trail is")
 	require.NotContains(t, (*ag.injected)[1], "entire agent-help", "the base text must not repeat")
 
 	runContextInjectionTurn(t, ag, sessionID)

@@ -489,9 +489,8 @@ func normalizeToolUsePaths(files []string, eventCWD, repoRoot string) []string {
 // here as it grows — and adds only what an agent must know even if it never
 // drills in: commits auto-capture checkpoints, and setup/destructive commands
 // need the user's go-ahead. It also names the auto-detected repo (from the
-// already-loaded session scope, no IO) and the standing rule that the agent is
-// inside the repo and must never ask the user for the repo name. Kept terse: it
-// costs context-window tokens on the first turn of every session.
+// already-loaded session scope, no IO). Kept terse: it costs context-window
+// tokens on the first turn of every session.
 //
 // The base text goes out in every session; the trails paragraph only where
 // trails are enabled for the repo. Either part can be omitted: trails
@@ -513,21 +512,22 @@ func entireContextInjection(scope trailEnablementScope, base, trails bool) strin
 		b.WriteString("Entire is enabled for this repo. Run `entire agent-help` to see what entire does and which subcommand fits, then `entire agent-help <command>` for its exact, current flags. ")
 	}
 	if trails {
-		b.WriteString("A trail is a project-level work item spanning repositories and branches; each change on it is one branch in one repository. ")
-		b.WriteString("Infer the trail from the current branch; if it's unclear whether work belongs on an existing trail or a new one, ask the user. ")
-		b.WriteString("Keep the trail's description current with `entire trail update`, and when referencing a trail or change, include the full URL that `entire trail show` prints. ")
+		b.WriteString("A Trail is a project-level work item that can contain multiple changes from different repositories and branches. ")
+		b.WriteString("Inside a checkout, `entire trail` infers the repository. Outside one, pass `--project <forge>/<owner>`, plus `--repo` and `--branch` when needed. ")
+		b.WriteString("If it's unclear whether work belongs on an existing trail or a new one, ask the user. Keep a trail's description current with `entire trail update`. ")
+		b.WriteString("When referencing a trail or change, include its full URL. ")
 	}
 	if !base {
 		return strings.TrimSpace(b.String())
 	}
-	b.WriteString("Commits capture the AI session as a checkpoint automatically; create a checkpoint by hand only when the user asks. ")
+	b.WriteString("Commits capture the AI session as a checkpoint automatically; only create checkpoints manually when the user asks. ")
 	b.WriteString("If a setup or destructive command (enable, disable, clean, auth) is needed, always ask the user before running it. ")
 	b.WriteString(contextInjectionRepoLine(scope))
 	return b.String()
 }
 
-// contextInjectionRepoLine names the auto-detected repo, or falls back to the
-// generic no-ask rule when the scope is missing or unsafe to embed.
+// contextInjectionRepoLine names the auto-detected repo, or falls back to a
+// generic line when the scope is missing or unsafe to embed.
 func contextInjectionRepoLine(scope trailEnablementScope) string {
 	repo := ""
 	if scope.Forge != "" && scope.Owner != "" && scope.Repo != "" {
@@ -539,10 +539,9 @@ func contextInjectionRepoLine(scope trailEnablementScope) string {
 	// binary, or tampered) degrades to the generic message rather than reaching
 	// that sink.
 	if repo != "" && strings.IndexFunc(repo, unicode.IsControl) < 0 {
-		return "This repo is auto-detected from the git origin remote as " + repo +
-			"; you are already inside it, so never ask the user for the repo name."
+		return "This repo is " + repo + ", auto-detected from the git origin remote."
 	}
-	return "Entire auto-detects the repo from the git origin remote, so never ask the user for the repo name."
+	return "Entire auto-detects the repo from the git origin remote."
 }
 
 // emitContextInjection writes ag's native context-injection payload to stdout
