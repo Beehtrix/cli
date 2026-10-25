@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"slices"
 
@@ -79,7 +78,27 @@ func offerCommitConfig(ctx context.Context, w io.Writer, opts EnableOptions) err
 	}
 
 	branch := currentBranchName(repo)
-	render, commit, err := commitConfigPrompt(ctx, os.Stderr, pending, branch)
+	// Runs while the prompt's terminal is still open: git's own output (hooks,
+	// signing) and the outcome go where the question was asked.
+	commitAndReport := func(render io.Writer) error {
+		if err := commitConfigFiles(ctx, root, pending, configCommitMessage, render); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr //nolint:wrapcheck // wrapped below as the interruption it is
+			}
+			fmt.Fprintf(render, "Could not commit them: %v\n", err)
+			return nil
+		}
+		if branch != "" {
+			fmt.Fprintf(render, "✓ Committed them to %s\n", branch)
+		} else {
+			fmt.Fprintln(render, "✓ Committed them")
+		}
+		return nil
+	}
+	render, err := commitConfigPrompt(ctx, opts.promptErrOut(), pending, branch, commitAndReport)
+	// Checked before the error is classified: Ctrl+C at the question or
+	// during a slow commit hook is an interruption, which
+	// handleFormCancellation would read as an answer.
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return fmt.Errorf("commit cancelled: %w", ctxErr)
 	}
@@ -90,19 +109,6 @@ func offerCommitConfig(ctx context.Context, w io.Writer, opts EnableOptions) err
 			logging.Debug(ctx, "commit-config prompt failed", "error", cerr)
 			printConfigToCommit(w, pending)
 		}
-		return nil
-	}
-	if !commit {
-		return nil
-	}
-	if err := commitConfigFiles(ctx, root, pending, configCommitMessage, render); err != nil {
-		fmt.Fprintf(render, "Could not commit them: %v\n", err)
-		return nil
-	}
-	if branch != "" {
-		fmt.Fprintf(render, "✓ Committed them to %s\n", branch)
-	} else {
-		fmt.Fprintln(render, "✓ Committed them")
 	}
 	return nil
 }
@@ -153,17 +159,18 @@ func currentBranchName(repo *git.Repository) string {
 	return head.Target().Short()
 }
 
-// promptCommitConfig lists files and asks whether to commit them to branch.
-// The list and the question go to the same place through runPromptFormOn —
-// errOut when it is a terminal, otherwise the controlling terminal — so the
-// developer never answers about files they cannot see, whichever stream is
-// redirected. render is where they went, for the outcome to follow.
-func promptCommitConfig(ctx context.Context, errOut io.Writer, files []string, branch string) (render io.Writer, commit bool, err error) {
+// promptCommitConfig lists files, asks whether to commit them to branch, and
+// on yes runs commitAndReport. The list, the question, and commitAndReport's
+// output share one writer through runPromptFormThen — errOut when it is a
+// terminal, otherwise the controlling terminal, held open until
+// commitAndReport returns — so the developer never answers about files they
+// cannot see, and sees what came of it, whichever stream is redirected.
+func promptCommitConfig(ctx context.Context, errOut io.Writer, files []string, branch string, commitAndReport func(io.Writer) error) (render io.Writer, err error) {
 	title := "Commit them now? (HEAD is detached)"
 	if branch != "" {
 		title = fmt.Sprintf("Commit them to %s now?", branch)
 	}
-	commit = true
+	commit := true
 	form := NewAccessibleForm(
 		huh.NewGroup(
 			huh.NewConfirm().
@@ -173,12 +180,14 @@ func promptCommitConfig(ctx context.Context, errOut io.Writer, files []string, b
 				Value(&commit),
 		),
 	)
-	render, err = runPromptFormOn(ctx, errOut, form, func(w io.Writer) error {
+	preamble := func(w io.Writer) error {
 		printConfigToCommit(w, files)
 		return nil
-	})
-	if err != nil {
-		return render, false, err
 	}
-	return render, commit, nil
+	return runPromptFormThen(ctx, errOut, form, preamble, func(render io.Writer) error {
+		if !commit {
+			return nil
+		}
+		return commitAndReport(render)
+	})
 }

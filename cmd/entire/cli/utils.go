@@ -103,6 +103,15 @@ func runPromptFormWithPreamble(cmd *cobra.Command, form *huh.Form, preamble func
 // runPromptFormOn is runPromptFormWithPreamble for callers that hold the
 // command's context and error stream rather than the command itself.
 func runPromptFormOn(ctx context.Context, errOut io.Writer, form *huh.Form, preamble func(io.Writer) error) (render io.Writer, err error) {
+	return runPromptFormThen(ctx, errOut, form, preamble, nil)
+}
+
+// runPromptFormThen is runPromptFormOn that, once the form completes, runs then
+// on the render writer before releasing the terminal. The writer returned by
+// the others may be a fallback terminal that is already closed, so whatever an
+// answer sets off — output of its own, and the report of how it went — belongs
+// in then, or it is written to nothing. then's error is returned as is.
+func runPromptFormThen(ctx context.Context, errOut io.Writer, form *huh.Form, preamble, then func(io.Writer) error) (render io.Writer, err error) {
 	render = errOut
 	if !interactive.IsTerminalWriter(render) {
 		term, terr := openPromptTerminal()
@@ -129,7 +138,13 @@ func runPromptFormOn(ctx context.Context, errOut io.Writer, form *huh.Form, prea
 	// Returned unwrapped: every caller classifies it, matching huh's own
 	// sentinels through handleFormCancellation, and wraps whatever survives
 	// with the name of the thing being prompted for.
-	return render, form.WithOutput(render).RunWithContext(ctx) //nolint:wrapcheck // classified and wrapped by the caller
+	if err := form.WithOutput(render).RunWithContext(ctx); err != nil {
+		return render, err //nolint:wrapcheck // classified and wrapped by the caller
+	}
+	if then != nil {
+		return render, then(render)
+	}
+	return render, nil
 }
 
 // printSessionCommand writes a single session resume command line to w.

@@ -36,7 +36,7 @@ func newCommitConfigRepo(t *testing.T, empty bool) string {
 	return dir
 }
 
-type commitConfigPromptFunc = func(context.Context, io.Writer, []string, string) (io.Writer, bool, error)
+type commitConfigPromptFunc = func(context.Context, io.Writer, []string, string, func(io.Writer) error) (io.Writer, error)
 
 // stubCommitConfig replaces the prompt and, when commit is non-nil, the commit
 // for one test.
@@ -50,29 +50,37 @@ func stubCommitConfig(t *testing.T, prompt commitConfigPromptFunc, commit func(c
 	}
 }
 
-// promptedCommitConfig is a stub prompt that renders like the real one — the
-// list, on render — and answers with commit and err.
+// promptedCommitConfig is a stub prompt that behaves like the real one — the
+// list on render, then on yes the commit and its report on the same writer —
+// and answers with commit, or fails with err.
 type promptedCommitConfig struct {
 	render *bytes.Buffer
 	commit bool
 	err    error
 
 	asked  bool
+	errOut io.Writer
 	files  []string
 	branch string
 }
 
-func (p *promptedCommitConfig) prompt(_ context.Context, _ io.Writer, files []string, branch string) (io.Writer, bool, error) {
-	p.asked, p.files, p.branch = true, files, branch
+func (p *promptedCommitConfig) prompt(_ context.Context, errOut io.Writer, files []string, branch string, commitAndReport func(io.Writer) error) (io.Writer, error) {
+	p.asked, p.errOut, p.files, p.branch = true, errOut, files, branch
 	printConfigToCommit(p.render, files)
-	return p.render, p.commit, p.err
+	if p.err != nil {
+		return p.render, p.err
+	}
+	if !p.commit {
+		return p.render, nil
+	}
+	return p.render, commitAndReport(p.render)
 }
 
 func failOnPrompt(t *testing.T) commitConfigPromptFunc {
 	t.Helper()
-	return func(context.Context, io.Writer, []string, string) (io.Writer, bool, error) {
+	return func(context.Context, io.Writer, []string, string, func(io.Writer) error) (io.Writer, error) {
 		t.Error("prompted to commit when no prompt was expected")
-		return io.Discard, false, nil
+		return io.Discard, nil
 	}
 }
 
@@ -296,48 +304,107 @@ func TestOfferCommitConfig_DeclinedAbortedOrFailed(t *testing.T) {
 
 // Not parallel: chdirs and sets environment variables.
 func TestOfferCommitConfig_InterruptIsAnError(t *testing.T) {
+	t.Run("at the question", func(t *testing.T) {
+		newCommitConfigRepo(t, false)
+		t.Setenv(interactive.EnvTestTTY, "1")
+		ctx, cancel := context.WithCancel(context.Background())
+		stubCommitConfig(t, func(context.Context, io.Writer, []string, string, func(io.Writer) error) (io.Writer, error) {
+			cancel() // Ctrl+C while the question is up
+			return io.Discard, context.Canceled
+		}, func(context.Context, string, []string, string, io.Writer) error {
+			t.Error("committed after an interrupt")
+			return nil
+		})
+
+		if err := offerCommitConfig(ctx, io.Discard, EnableOptions{}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("offerCommitConfig() error = %v, want context.Canceled", err)
+		}
+	})
+	t.Run("during the commit", func(t *testing.T) {
+		newCommitConfigRepo(t, false)
+		t.Setenv(interactive.EnvTestTTY, "1")
+		ctx, cancel := context.WithCancel(context.Background())
+		p := &promptedCommitConfig{render: &bytes.Buffer{}, commit: true}
+		stubCommitConfig(t, p.prompt, func(context.Context, string, []string, string, io.Writer) error {
+			cancel() // Ctrl+C during a slow pre-commit hook kills git
+			return errors.New("git commit: signal: killed")
+		})
+
+		if err := offerCommitConfig(ctx, io.Discard, EnableOptions{}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("offerCommitConfig() error = %v, want context.Canceled", err)
+		}
+		assertOutput(t, p.render.String(), nil, []string{"Could not commit them", "✓ Committed"})
+	})
+}
+
+// Not parallel: chdirs and sets environment variables.
+func TestOfferCommitConfig_PromptsOnTheCommandsErrorStream(t *testing.T) {
 	newCommitConfigRepo(t, false)
 	t.Setenv(interactive.EnvTestTTY, "1")
-	ctx, cancel := context.WithCancel(context.Background())
-	stubCommitConfig(t, func(context.Context, io.Writer, []string, string) (io.Writer, bool, error) {
-		cancel() // Ctrl+C while the question is up
-		return io.Discard, false, context.Canceled
-	}, func(context.Context, string, []string, string, io.Writer) error {
-		t.Error("committed after an interrupt")
-		return nil
-	})
+	p := &promptedCommitConfig{render: &bytes.Buffer{}}
+	stubCommitConfig(t, p.prompt, nil)
 
-	err := offerCommitConfig(ctx, io.Discard, EnableOptions{})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("offerCommitConfig() error = %v, want context.Canceled", err)
+	var errOut bytes.Buffer
+	runOfferCommitConfig(t, EnableOptions{errOut: &errOut})
+	if p.errOut != &errOut {
+		t.Errorf("prompt got error stream %v, want the command's", p.errOut)
 	}
 }
 
+// closeableTerminal is a fallback prompt terminal that records what was
+// written to it and fails every write after Close, as a closed tty would.
+type closeableTerminal struct {
+	t      *testing.T
+	buf    bytes.Buffer
+	closed bool
+}
+
+func (c *closeableTerminal) Write(p []byte) (int, error) {
+	if c.closed {
+		c.t.Errorf("write to the prompt terminal after it was closed: %q", p)
+		return 0, os.ErrClosed
+	}
+	return c.buf.Write(p)
+}
+
+func (c *closeableTerminal) Close() error {
+	c.closed = true
+	return nil
+}
+
 // Not parallel: swaps the terminal opener and sets ACCESSIBLE.
-func TestPromptCommitConfig_ListAndQuestionShareTheTerminal(t *testing.T) {
+func TestPromptCommitConfig_ListQuestionAndOutcomeShareTheTerminal(t *testing.T) {
 	// The command's error stream is redirected (not a terminal), so the form
-	// falls back to the controlling terminal; the list must go there with it,
-	// not to a stream the developer is not watching.
+	// falls back to the controlling terminal. The list must go there with the
+	// question, and the commit and its report must reach it before it closes.
 	t.Setenv("ACCESSIBLE", "1")
-	var terminal bytes.Buffer
+	terminal := &closeableTerminal{t: t}
 	prev := openPromptTerminal
 	openPromptTerminal = func() (promptTerminal, error) {
-		return promptTerminal{in: strings.NewReader("y\n"), out: &terminal}, nil
+		return promptTerminal{in: strings.NewReader("y\n"), out: terminal, close: terminal.Close}, nil
 	}
 	t.Cleanup(func() { openPromptTerminal = prev })
 
 	var redirected bytes.Buffer
-	render, commit, err := promptCommitConfig(t.Context(), &redirected, []string{EntireSettingsFile, ".claude/settings.json"}, "main")
+	committed := false
+	render, err := promptCommitConfig(t.Context(), &redirected, []string{EntireSettingsFile, ".claude/settings.json"}, "main", func(w io.Writer) error {
+		committed = true
+		_, err := io.WriteString(w, "hook output\n✓ Committed them to main\n")
+		return err
+	})
 	if err != nil {
 		t.Fatalf("promptCommitConfig() error = %v", err)
 	}
-	if !commit {
+	if !committed {
 		t.Error("answering y should commit")
 	}
-	if render != &terminal {
-		t.Error("render should be the terminal the form used, for the outcome to follow it")
+	if !terminal.closed {
+		t.Error("the fallback terminal should be closed once the prompt returns")
 	}
-	assertOutput(t, terminal.String(), []string{"  .entire/settings.json\n  .claude/settings.json\n", "Commit them to main now?"}, nil)
+	if render != terminal {
+		t.Error("render should be the terminal the form used")
+	}
+	assertOutput(t, terminal.buf.String(), []string{"  .entire/settings.json\n  .claude/settings.json\n", "Commit them to main now?", "hook output\n✓ Committed them to main\n"}, nil)
 	if redirected.Len() != 0 {
 		t.Errorf("nothing should go to the redirected stream, got:\n%s", redirected.String())
 	}

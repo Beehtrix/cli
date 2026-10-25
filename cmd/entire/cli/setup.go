@@ -83,6 +83,9 @@ type EnableOptions struct {
 	CheckpointRemote       string
 	CheckpointPushRemote   string
 	checkpointRemoteChoice *enableCheckpointRemoteChoice
+	// errOut is the command's error stream, where prompts at the end of setup
+	// render; see promptErrOut.
+	errOut io.Writer
 	// CheckpointBackend selects the persistent checkpoint storage backend
 	// ("branch"/"refs" or the canonical "git-branch"/"git-refs"). Empty leaves
 	// the current/default (git-branch) backend in place.
@@ -106,6 +109,15 @@ type EnableOptions struct {
 	// to commit it. Set by `entire agent add`, a targeted command that should
 	// not end in a prompt about files beyond the one agent it touched.
 	NoCommitOffer bool
+}
+
+// promptErrOut is the error stream prompts render on: the command's, when the
+// caller recorded it, otherwise the process's.
+func (opts *EnableOptions) promptErrOut() io.Writer {
+	if opts.errOut != nil {
+		return opts.errOut
+	}
+	return os.Stderr
 }
 
 // applyStrategyOptions sets strategy_options on settings from CLI flags.
@@ -1111,6 +1123,7 @@ func continueEnableAfterAgentValidation(
 	needsIdentity bool,
 	resolveIdentity gitIdentityResolver,
 ) error {
+	opts.errOut = cmd.ErrOrStderr()
 	if selectedAgent != nil {
 		if err := runEnableIdentityPreflight(ctx, cmd, repoRoot, needsIdentity, resolveIdentity); err != nil {
 			return err
