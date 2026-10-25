@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
@@ -222,4 +223,72 @@ func claudeWriteTranscript(t *testing.T, path, content string) []byte {
 		out = append(out, '\n')
 	}
 	return out
+}
+
+// An ENDED session with no persisted files takes the discard action whatever
+// its transcript shows, so its transcript must not count as new content in
+// post-commit: that would keep it from ever being marked fully condensed, and
+// every later commit would judge it again.
+func TestEndedSessionWithTranscriptOnlyEdits_FullyCondensedAfterCommit(t *testing.T) {
+	dir := idleLiveTranscriptRepo(t)
+	saveIdleLiveTranscriptSession(t, dir, dir, func(st *SessionState) {
+		endedAt := time.Now()
+		st.Phase = session.PhaseEnded
+		st.EndedAt = &endedAt
+		st.LastCheckpointID = id.MustCheckpointID("0a0b0c0d0e0f") // condensed before, so it is kept
+	})
+	testutil.WriteFile(t, dir, "feature.go", "package feature\n")
+	testutil.GitAdd(t, dir, "feature.go")
+	testutil.GitCommit(t, dir, "feat: add the feature\n\nEntire-Checkpoint: a1b2c3d4e5f6")
+	s := NewManualCommitStrategy()
+	require.NoError(t, s.PostCommit(context.Background()))
+
+	state, err := s.loadSessionState(context.Background(), idleLiveSessionID)
+	require.NoError(t, err)
+	require.True(t, state.FullyCondensed, "an ENDED session with nothing to condense is done")
+}
+
+// A subagent's edits are read from its full transcript, so an IDLE session
+// whose main transcript has not grown since its last checkpoint must not
+// claim a commit through edits that checkpoint already holds: the claim would
+// hold a file-less ACTIVE session off the commit at the read-only gate, while
+// the IDLE session itself has no new content to condense, leaving the trailer
+// unresolved.
+func TestIdleSessionWithCheckpointedSubagentEdits_DoesNotClaimCommit(t *testing.T) {
+	dir := idleLiveTranscriptRepo(t)
+	transcriptDir := t.TempDir()
+	mainTranscript := filepath.Join(transcriptDir, "transcript.jsonl")
+	require.NoError(t, os.WriteFile(mainTranscript, []byte(`{"type":"assistant","uuid":"a1","message":{"content":[{"type":"tool_use","id":"toolu_task1","name":"Task","input":{"prompt":"implement feature"}}]}}
+{"type":"user","uuid":"u1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_task1","content":"agentId: sub123"}]}}
+`), 0o600))
+	subagentsDir := paths.SubagentsDir(transcriptDir, idleLiveSessionID)
+	require.NoError(t, os.MkdirAll(subagentsDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(subagentsDir, paths.AgentTranscriptFileName("sub123")),
+		claudeWriteTranscript(t, filepath.Join(dir, "feature.go"), "package feature\n"), 0o600))
+	saveIdleLiveTranscriptSession(t, dir, dir, func(st *SessionState) {
+		st.TranscriptPath = mainTranscript
+		st.CheckpointTranscriptStart = 2 // the last checkpoint holds the whole main transcript
+	})
+	readerTranscript := filepath.Join(t.TempDir(), "reader.jsonl")
+	require.NoError(t, os.WriteFile(readerTranscript, []byte(testTranscriptPromptResponse), 0o600))
+	// Backdated so the reader's condensation doesn't wait for a transcript flush.
+	stale := time.Now().Add(-3 * time.Minute)
+	require.NoError(t, os.Chtimes(readerTranscript, stale, stale))
+	now := time.Now()
+	require.NoError(t, SaveSessionState(context.Background(), &SessionState{
+		SessionID:           "sess-reader",
+		BaseCommit:          testutil.GetHeadHash(t, dir),
+		WorktreePath:        dir,
+		AgentType:           agent.AgentTypeClaudeCode,
+		TranscriptPath:      readerTranscript,
+		StartedAt:           now,
+		LastInteractionTime: &now,
+		Phase:               session.PhaseActive,
+	}))
+	testutil.WriteFile(t, dir, "feature.go", "package feature\n")
+	testutil.GitAdd(t, dir, "feature.go")
+
+	ids := commitThroughHooks(t, dir, NewManualCommitStrategy(), "feat: add the feature\n")
+	require.Len(t, ids, 1, "the ACTIVE reader is stamped by the fast path: %v", ids)
+	requireFreshTrailersResolve(t, ids)
 }
