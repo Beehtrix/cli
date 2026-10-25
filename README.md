@@ -382,11 +382,11 @@ entire checkpoint explain <id>              # one checkpoint in full
 Repositories enabled by older versions of Entire, and any repo whose settings have no `checkpoints` block, use the legacy backend: one shared `entire/checkpoints/v1` branch holding every checkpoint. It keeps working. To move such a repo to per-checkpoint refs:
 
 ```bash
-entire configure --checkpoint-backend refs   # new checkpoints are written as refs
-entire doctor migrate-checkpoints            # convert existing ones (idempotent; --dry-run to preview)
+entire doctor migrate-checkpoints            # convert existing checkpoints first (idempotent; --dry-run to preview)
+entire configure --checkpoint-backend refs   # then write new checkpoints as refs
 ```
 
-Checkpoints already on the branch stay readable after the switch. `--checkpoint-backend branch` (on `enable` or `configure`) selects the legacy backend explicitly, for interoperating with older clients.
+Run the migration before switching: once `git-refs` is the primary store, `migrate-checkpoints` has nothing to do, and switching the backend alone does not convert existing checkpoints. Checkpoints left on the branch stay readable after the switch. `--checkpoint-backend branch` (on `enable` or `configure`) selects the legacy backend explicitly, for interoperating with older clients.
 
 ### How It Works
 
@@ -434,7 +434,7 @@ Multiple AI sessions can run on the same commit. If you start a second session w
 ```bash
 entire api /api/v1/clusters
 entire api --to cell "/api/v1/me/recap?repo={repo_id}"
-entire api -X POST /api/v1/projects -f name=demo
+entire api /api/v1/me
 ```
 
 See [CLI and entire.com](https://docs.entire.com/platforms/cli-and-entire-com) for how the CLI and the web app fit together.
@@ -833,7 +833,7 @@ Per-agent setup guides are at [docs.entire.com/agents](https://docs.entire.com/a
 
 Entire automatically redacts detected secrets (API keys, tokens, credentials) from transcripts and metadata before writing a checkpoint, but redaction is best effort, not bulletproof. Review checkpoints with `entire checkpoint explain` before you push.
 
-To keep transcripts out of a public repository, upload checkpoints to a separate private repo with [`checkpoint_remote`](#checkpoint-remote) (`entire configure --local --checkpoint-remote github:<owner>/<repo>`), or stop uploading them with `entire configure --local --skip-push-sessions`. `--local` makes the setting take effect for your clone: a project `checkpoint_remote` owned by a different account than `origin` is ignored, and a local `push_sessions` overrides the project one. `entire enable` names the checkpoint destination every time it runs. To remove a checkpoint that was already pushed, `entire checkpoint delete <id>` deletes it locally and from every checkpoint remote that holds it.
+To keep transcripts out of a public repository, upload checkpoints to a separate private repo with [`checkpoint_remote`](#checkpoint-remote) (`entire configure --local --checkpoint-remote github:<owner>/<repo>`), or stop uploading them with `entire configure --local --skip-push-sessions`. `--local` makes the setting take effect for your clone: a project `checkpoint_remote` owned by a different account than `origin` is ignored, and a local `push_sessions` overrides the project one. `entire enable` names the checkpoint destination every time it runs. `entire checkpoint delete <id>` deletes a checkpoint locally and from every checkpoint remote that holds it, but it is not a full purge: on the legacy `entire/checkpoints/v1` branch it removes the checkpoint from the branch tip only, so the branch's history still contains it, and other checkpoints from the same session each carry that session's full transcript and are not deleted.
 
 Older Entire versions also kept local `entire/<commit>-<worktree>` shadow branches whose code-file snapshots were raw blobs of your working tree. Current versions no longer create them, but do not delete leftover ones automatically: `entire doctor` reports them and `entire doctor --force` deletes them, leaving pending agent work alone (plain `entire clean` would also clear the session state that records it). `entire disable --uninstall` deletes the `entire/<commit>-<worktree>` form too, and lists any oldest-form `entire/<commit>` branches without deleting them, since a branch of yours named after a short SHA looks the same; `entire clean --all` covers that form after you confirm. See [docs/security-and-privacy.md](docs/security-and-privacy.md) for the full picture, including the configurable scanner layers and opt-in PII redaction.
 
