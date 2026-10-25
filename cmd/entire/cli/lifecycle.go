@@ -509,7 +509,8 @@ func normalizeToolUsePaths(files []string, eventCWD, repoRoot string) []string {
 func entireContextInjection(scope trailEnablementScope, base, trails bool) string {
 	var b strings.Builder
 	if base {
-		b.WriteString("Entire is enabled for this repo. Run `entire agent-help` to see what entire does and which subcommand fits, then `entire agent-help <command>` for its exact, current flags. ")
+		b.WriteString(contextInjectionEnabledLine(scope))
+		b.WriteString(" Run `entire agent-help` to see what entire does and which subcommand fits, then `entire agent-help <command>` for its exact, current flags. ")
 	}
 	if trails {
 		b.WriteString("A Trail is a project-level work item that can contain multiple changes from different repositories and branches. ")
@@ -517,18 +518,16 @@ func entireContextInjection(scope trailEnablementScope, base, trails bool) strin
 		b.WriteString("If it's unclear whether work belongs on an existing trail or a new one, ask the user. Keep a trail's description current with `entire trail update`. ")
 		b.WriteString("When referencing a trail or change, include its full URL. ")
 	}
-	if !base {
-		return strings.TrimSpace(b.String())
+	if base {
+		b.WriteString("Commits capture the AI session as a checkpoint automatically; only create checkpoints manually when the user asks. ")
+		b.WriteString("If a setup or destructive command (enable, disable, clean, auth) is needed, always ask the user before running it.")
 	}
-	b.WriteString("Commits capture the AI session as a checkpoint automatically; only create checkpoints manually when the user asks. ")
-	b.WriteString("If a setup or destructive command (enable, disable, clean, auth) is needed, always ask the user before running it. ")
-	b.WriteString(contextInjectionRepoLine(scope))
-	return b.String()
+	return strings.TrimSpace(b.String())
 }
 
-// contextInjectionRepoLine names the auto-detected repo, or falls back to a
-// generic line when the scope is missing or unsafe to embed.
-func contextInjectionRepoLine(scope trailEnablementScope) string {
+// contextInjectionEnabledLine opens the base text and names the auto-detected
+// repo, or omits it when the scope is missing or unsafe to embed.
+func contextInjectionEnabledLine(scope trailEnablementScope) string {
 	repo := ""
 	if scope.Forge != "" && scope.Owner != "" && scope.Repo != "" {
 		repo = trailEnablementRepoKey(scope.Forge, scope.Owner, scope.Repo)
@@ -539,9 +538,9 @@ func contextInjectionRepoLine(scope trailEnablementScope) string {
 	// binary, or tampered) degrades to the generic message rather than reaching
 	// that sink.
 	if repo != "" && strings.IndexFunc(repo, unicode.IsControl) < 0 {
-		return "This repo is " + repo + ", auto-detected from the git origin remote."
+		return "Entire is enabled for this repo (`" + repo + "`, auto-detected from the git origin remote)."
 	}
-	return "Entire auto-detects the repo from the git origin remote."
+	return "Entire is enabled for this repo."
 }
 
 // emitContextInjection writes ag's native context-injection payload to stdout

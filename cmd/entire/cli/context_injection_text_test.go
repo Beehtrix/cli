@@ -17,13 +17,13 @@ func TestEntireContextInjection_PointsAtAgentHelpWithRepo(t *testing.T) {
 	for _, trails := range []bool{false, true} {
 		got := entireContextInjection(injectionTestScope, true, trails)
 
-		for _, want := range []string{"entire agent-help", "This repo is gh/acme/app, auto-detected from the git origin remote."} {
+		for _, want := range []string{"entire agent-help"} {
 			if !strings.Contains(got, want) {
 				t.Fatalf("injection (trails=%v) missing %q:\n%s", trails, want, got)
 			}
 		}
-		if !strings.HasSuffix(got, "auto-detected from the git origin remote.") {
-			t.Errorf("injection (trails=%v) should end with the repo line:\n%s", trails, got)
+		if !strings.HasPrefix(got, "Entire is enabled for this repo (`gh/acme/app`, auto-detected from the git origin remote). ") {
+			t.Errorf("injection (trails=%v) should open by naming the repo:\n%s", trails, got)
 		}
 		if strings.Contains(got, "view, create, update, or watch") {
 			t.Errorf("injection (trails=%v) should not enumerate subcommands:\n%s", trails, got)
@@ -74,7 +74,7 @@ func TestEntireContextInjection_OmitsPerTaskCommandRecommendations(t *testing.T)
 }
 
 // When the repo can't be determined, the pointer still points at agent-help and
-// says the repo is auto-detected, without emitting a malformed repo line.
+// opens without naming a repo, rather than emitting a malformed one.
 func TestEntireContextInjection_NoRepo(t *testing.T) {
 	t.Parallel()
 
@@ -83,8 +83,8 @@ func TestEntireContextInjection_NoRepo(t *testing.T) {
 	if !strings.Contains(got, "entire agent-help") {
 		t.Fatalf("missing agent-help pointer:\n%s", got)
 	}
-	if !strings.HasSuffix(got, "Entire auto-detects the repo from the git origin remote.") {
-		t.Errorf("missing generic repo line:\n%s", got)
+	if !strings.HasPrefix(got, "Entire is enabled for this repo. ") {
+		t.Errorf("missing generic opening line:\n%s", got)
 	}
 	if strings.Contains(got, "//") {
 		t.Errorf("malformed empty repo line:\n%s", got)
@@ -101,8 +101,8 @@ func TestEntireContextInjection_PartialScopeOmitsRepo(t *testing.T) {
 	if strings.Contains(got, "gh/acme") {
 		t.Errorf("partial scope must not emit a repo line:\n%s", got)
 	}
-	if !strings.Contains(got, "entire agent-help") || !strings.HasSuffix(got, "Entire auto-detects the repo from the git origin remote.") {
-		t.Errorf("partial scope must still point at agent-help with the generic repo line:\n%s", got)
+	if !strings.Contains(got, "entire agent-help") || !strings.HasPrefix(got, "Entire is enabled for this repo. ") {
+		t.Errorf("partial scope must still point at agent-help with the generic opening line:\n%s", got)
 	}
 }
 
