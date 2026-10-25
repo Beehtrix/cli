@@ -1,6 +1,6 @@
 package transcript
 
-// This file preserves the two-pass JSONL compactor that compactJSONLWith used
+// This file preserves the two-pass JSONL compactor that the JSONL converter used
 // before it became "records adapter, then fold". It is the byte-for-byte
 // oracle for the equivalence tests in jsonl_records_test.go. Do not edit it to match
 // new behavior; the intentional divergences are marked below.

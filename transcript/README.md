@@ -41,7 +41,11 @@ On every line, `input_tokens` excludes the tokens in that line's `cache_read_tok
 
 Other agents' lines copy the native input count as the agent defines it. Only `agent` and the `cli_version` that wrote a line tell these cases apart; no field marks a line as old or new, and `model` in particular says nothing about how `input_tokens` was counted.
 
-Converters fill only what the native transcript reports per call. Claude Code, Codex and Pi record per-call usage and model; their converters do not write the new fields yet. Copilot CLI has only a shutdown aggregate, Cursor is hook-only, and external plugins and Antigravity report usage out of band, so their lines do not get these fields. Native timestamps are preserved where present; a missing one stays empty rather than fabricated.
+Converters fill only what the native transcript reports per call. Claude Code, Codex and Pi record per-call usage and model; the Claude Code converter writes them (below), the Codex and Pi converters do not yet. Copilot CLI has only a shutdown aggregate, Cursor is hook-only, and external plugins and Antigravity report usage out of band, so their lines do not get these fields. Native timestamps are preserved where present; a missing one stays empty rather than fabricated.
+
+### Per-call usage
+
+Claude Code (`Options.Agent` `claude-code`, and `NewClaudeAdapter`; Cursor and Droid keep legacy counts): streaming fragments of one message ID become one line carrying the whole usage row with the strictly highest `output_tokens` (earlier wins ties) and the model of the first fragment that reports one, skipping Claude Code's `<synthetic>` placeholder; `ts` is the last fragment's. The 5m/1h cache-write split is emitted only when both durations are reported. A message with no usage object on any fragment has no model or usage fields. User entries holding only tool results between fragments of one ID do not split the call: the later fragments become separate lines without usage, and the best row stays on the call's first line (the first with visible content, since a thinking-only message has no line), so a call's usage is counted once. Read per-call usage from the full converted transcript: in a checkpoint slice (`ConvertWithBoundary`), a usage row that arrives after a tool result goes to the call's first line, which can sit before the slice boundary.
 
 ### Blocks
 
@@ -178,14 +182,15 @@ One JSON object per record. An omitted field and a zero-length one mean the same
 | `content` | any JSON | `message`, `append` | Normally an array of blocks. `message` replaces the content; `append` adds the blocks of an array and ignores anything else. Appending to content that is not an array discards that content, since it has no blocks. |
 | `toolUseId` | string | `result` | The `tool_use` block to target, searching from the end. Empty targets the last `tool_use` block. |
 | `result` | object | `result` | The tool result object described under Blocks. Required on `result`. |
+| `usage` | object | `message`, `append`, `usage` | Optional per-call snapshot (`model`, `inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `cacheWrite5mTokens`, `cacheWrite1hTokens`, `reasoningTokens`). When present it replaces the message's whole snapshot, and the line's usage fields come from it instead of `inputTokens`/`outputTokens`. |
 | `inputTokens`, `outputTokens` | int | `message`, `append`, `usage` | A non-zero value replaces the previous one; agents report cumulative usage. |
 
 What each op does to the message `id` names:
 
-- `message` creates it, or restates it: role, source ID, timestamp and content are replaced, token counts are updated, and a dropped message is restored. A message keeps the position where it was first created.
+- `message` creates it, or restates it: role, source ID, timestamp and content are replaced, token counts and any usage snapshot are updated, and a dropped message is restored. A message keeps the position where it was first created.
 - `append` concatenates content blocks and replaces the timestamp. Appending to non-array content (a string, `null`, or none) replaces it with the appended blocks, possibly none: the result is always an array.
 - `result` sets the result of one `tool_use` block. Nothing changes when the content is not an array, when one of its blocks is not an object, or when no block matches.
-- `usage` updates token counts.
+- `usage` updates token counts and, when it carries `usage`, the per-call snapshot.
 - `drop` hides the message.
 
 Every op except `message` must target a message created earlier, in this batch or a previous one.
