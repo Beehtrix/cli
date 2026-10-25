@@ -95,7 +95,7 @@ func offerCommitConfig(ctx context.Context, w io.Writer, opts EnableOptions) err
 		}
 		return nil
 	}
-	render, err := commitConfigPrompt(ctx, opts.promptErrOut(), pending, branch, commitAndReport)
+	err = commitConfigPrompt(ctx, opts.promptErrOut(), pending, branch, commitAndReport)
 	// Checked before the error is classified: Ctrl+C at the question or
 	// during a slow commit hook is an interruption, which
 	// handleFormCancellation would read as an answer.
@@ -103,12 +103,11 @@ func offerCommitConfig(ctx context.Context, w io.Writer, opts EnableOptions) err
 		return fmt.Errorf("commit cancelled: %w", ctxErr)
 	}
 	if err != nil {
-		if cerr := handleFormCancellation(render, "Commit", err); cerr != nil {
-			// The prompt never showed (no terminal to open): fall back to
-			// the list, which is all a non-interactive enable gets anyway.
-			logging.Debug(ctx, "commit-config prompt failed", "error", cerr)
-			printConfigToCommit(w, pending)
-		}
+		// The prompt reports its own aborts, so this is a prompt that never
+		// showed (no terminal to open) or failed: fall back to the list,
+		// which is all a non-interactive enable gets anyway.
+		logging.Debug(ctx, "commit-config prompt failed", "error", err)
+		printConfigToCommit(w, pending)
 	}
 	return nil
 }
@@ -160,12 +159,14 @@ func currentBranchName(repo *git.Repository) string {
 }
 
 // promptCommitConfig lists files, asks whether to commit them to branch, and
-// on yes runs commitAndReport. The list, the question, and commitAndReport's
-// output share one writer through runPromptFormThen — errOut when it is a
-// terminal, otherwise the controlling terminal, held open until
-// commitAndReport returns — so the developer never answers about files they
-// cannot see, and sees what came of it, whichever stream is redirected.
-func promptCommitConfig(ctx context.Context, errOut io.Writer, files []string, branch string, commitAndReport func(io.Writer) error) (render io.Writer, err error) {
+// on yes runs commitAndReport. The list, the question, an abort's "Commit
+// cancelled.", and commitAndReport's output share one writer through
+// runPromptFormThen — errOut when it is a terminal, otherwise the controlling
+// terminal, held open until all of them are written — so the developer never
+// answers about files they cannot see, and sees what came of it, whichever
+// stream is redirected. An abort inside the form is an answer and returns
+// nil; an interruption (ctx cancelled) or a form failure is returned.
+func promptCommitConfig(ctx context.Context, errOut io.Writer, files []string, branch string, commitAndReport func(io.Writer) error) error {
 	title := "Commit them now? (HEAD is detached)"
 	if branch != "" {
 		title = fmt.Sprintf("Commit them to %s now?", branch)
@@ -184,10 +185,19 @@ func promptCommitConfig(ctx context.Context, errOut io.Writer, files []string, b
 		printConfigToCommit(w, files)
 		return nil
 	}
-	return runPromptFormThen(ctx, errOut, form, preamble, func(render io.Writer) error {
+	_, err := runPromptFormThen(ctx, errOut, form, preamble, func(render io.Writer, formErr error) error {
+		if formErr != nil {
+			if ctx.Err() != nil {
+				// An interruption, for the caller to report; handleFormCancellation
+				// would read context.Canceled as an abort.
+				return formErr
+			}
+			return handleFormCancellation(render, "Commit", formErr)
+		}
 		if !commit {
 			return nil
 		}
 		return commitAndReport(render)
 	})
+	return err
 }

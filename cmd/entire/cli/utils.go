@@ -106,12 +106,14 @@ func runPromptFormOn(ctx context.Context, errOut io.Writer, form *huh.Form, prea
 	return runPromptFormThen(ctx, errOut, form, preamble, nil)
 }
 
-// runPromptFormThen is runPromptFormOn that, once the form completes, runs then
-// on the render writer before releasing the terminal. The writer returned by
-// the others may be a fallback terminal that is already closed, so whatever an
-// answer sets off — output of its own, and the report of how it went — belongs
-// in then, or it is written to nothing. then's error is returned as is.
-func runPromptFormThen(ctx context.Context, errOut io.Writer, form *huh.Form, preamble, then func(io.Writer) error) (render io.Writer, err error) {
+// runPromptFormThen is runPromptFormOn that, once the form has run, hands its
+// error (nil when answered) to then on the render writer before releasing the
+// terminal. The writer returned by the others may be a fallback terminal that
+// is already closed, so whatever follows the form — an abort's "cancelled"
+// line, the action an answer sets off, the report of how it went — belongs in
+// then, or it is written to nothing. then's error is returned as is; then is
+// not called when the terminal cannot be opened, since no form ran.
+func runPromptFormThen(ctx context.Context, errOut io.Writer, form *huh.Form, preamble func(io.Writer) error, then func(io.Writer, error) error) (render io.Writer, err error) {
 	render = errOut
 	if !interactive.IsTerminalWriter(render) {
 		term, terr := openPromptTerminal()
@@ -138,13 +140,11 @@ func runPromptFormThen(ctx context.Context, errOut io.Writer, form *huh.Form, pr
 	// Returned unwrapped: every caller classifies it, matching huh's own
 	// sentinels through handleFormCancellation, and wraps whatever survives
 	// with the name of the thing being prompted for.
-	if err := form.WithOutput(render).RunWithContext(ctx); err != nil {
-		return render, err //nolint:wrapcheck // classified and wrapped by the caller
-	}
+	formErr := form.WithOutput(render).RunWithContext(ctx)
 	if then != nil {
-		return render, then(render)
+		return render, then(render, formErr)
 	}
-	return render, nil
+	return render, formErr //nolint:wrapcheck // classified and wrapped by the caller
 }
 
 // printSessionCommand writes a single session resume command line to w.

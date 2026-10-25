@@ -10,8 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"charm.land/huh/v2"
-
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/interactive"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
@@ -36,7 +34,7 @@ func newCommitConfigRepo(t *testing.T, empty bool) string {
 	return dir
 }
 
-type commitConfigPromptFunc = func(context.Context, io.Writer, []string, string, func(io.Writer) error) (io.Writer, error)
+type commitConfigPromptFunc = func(context.Context, io.Writer, []string, string, func(io.Writer) error) error
 
 // stubCommitConfig replaces the prompt and, when commit is non-nil, the commit
 // for one test.
@@ -64,23 +62,23 @@ type promptedCommitConfig struct {
 	branch string
 }
 
-func (p *promptedCommitConfig) prompt(_ context.Context, errOut io.Writer, files []string, branch string, commitAndReport func(io.Writer) error) (io.Writer, error) {
+func (p *promptedCommitConfig) prompt(_ context.Context, errOut io.Writer, files []string, branch string, commitAndReport func(io.Writer) error) error {
 	p.asked, p.errOut, p.files, p.branch = true, errOut, files, branch
 	printConfigToCommit(p.render, files)
 	if p.err != nil {
-		return p.render, p.err
+		return p.err
 	}
 	if !p.commit {
-		return p.render, nil
+		return nil
 	}
-	return p.render, commitAndReport(p.render)
+	return commitAndReport(p.render)
 }
 
 func failOnPrompt(t *testing.T) commitConfigPromptFunc {
 	t.Helper()
-	return func(context.Context, io.Writer, []string, string, func(io.Writer) error) (io.Writer, error) {
+	return func(context.Context, io.Writer, []string, string, func(io.Writer) error) error {
 		t.Error("prompted to commit when no prompt was expected")
-		return io.Discard, nil
+		return nil
 	}
 }
 
@@ -269,7 +267,6 @@ func TestOfferCommitConfig_DeclinedAbortedOrFailed(t *testing.T) {
 		out       []string
 	}{
 		{name: "declined"},
-		{name: "aborted in the form", promptErr: huh.ErrUserAborted, render: []string{"Commit cancelled.\n"}},
 		{
 			name:      "no terminal to prompt on",
 			promptErr: errors.New("open prompt terminal: no controlling terminal"),
@@ -308,9 +305,9 @@ func TestOfferCommitConfig_InterruptIsAnError(t *testing.T) {
 		newCommitConfigRepo(t, false)
 		t.Setenv(interactive.EnvTestTTY, "1")
 		ctx, cancel := context.WithCancel(context.Background())
-		stubCommitConfig(t, func(context.Context, io.Writer, []string, string, func(io.Writer) error) (io.Writer, error) {
+		stubCommitConfig(t, func(context.Context, io.Writer, []string, string, func(io.Writer) error) error {
 			cancel() // Ctrl+C while the question is up
-			return io.Discard, context.Canceled
+			return context.Canceled
 		}, func(context.Context, string, []string, string, io.Writer) error {
 			t.Error("committed after an interrupt")
 			return nil
@@ -387,7 +384,7 @@ func TestPromptCommitConfig_ListQuestionAndOutcomeShareTheTerminal(t *testing.T)
 
 	var redirected bytes.Buffer
 	committed := false
-	render, err := promptCommitConfig(t.Context(), &redirected, []string{EntireSettingsFile, ".claude/settings.json"}, "main", func(w io.Writer) error {
+	err := promptCommitConfig(t.Context(), &redirected, []string{EntireSettingsFile, ".claude/settings.json"}, "main", func(w io.Writer) error {
 		committed = true
 		_, err := io.WriteString(w, "hook output\n✓ Committed them to main\n")
 		return err
@@ -401,13 +398,35 @@ func TestPromptCommitConfig_ListQuestionAndOutcomeShareTheTerminal(t *testing.T)
 	if !terminal.closed {
 		t.Error("the fallback terminal should be closed once the prompt returns")
 	}
-	if render != terminal {
-		t.Error("render should be the terminal the form used")
-	}
 	assertOutput(t, terminal.buf.String(), []string{"  .entire/settings.json\n  .claude/settings.json\n", "Commit them to main now?", "hook output\n✓ Committed them to main\n"}, nil)
 	if redirected.Len() != 0 {
 		t.Errorf("nothing should go to the redirected stream, got:\n%s", redirected.String())
 	}
+}
+
+// Not parallel: swaps the terminal opener.
+func TestPromptCommitConfig_AbortIsReportedOnTheTerminal(t *testing.T) {
+	// Esc/Ctrl+C inside the form is an answer: "Commit cancelled." goes to the
+	// fallback terminal the question was on, before it closes, and nothing is
+	// committed.
+	terminal := &closeableTerminal{t: t}
+	prev := openPromptTerminal
+	openPromptTerminal = func() (promptTerminal, error) {
+		return promptTerminal{in: strings.NewReader("\x03"), out: terminal, close: terminal.Close}, nil
+	}
+	t.Cleanup(func() { openPromptTerminal = prev })
+
+	err := promptCommitConfig(t.Context(), &bytes.Buffer{}, []string{EntireSettingsFile}, "main", func(io.Writer) error {
+		t.Error("committed after an abort")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("promptCommitConfig() error = %v, want nil for an abort", err)
+	}
+	if !terminal.closed {
+		t.Error("the fallback terminal should be closed once the prompt returns")
+	}
+	assertOutput(t, terminal.buf.String(), []string{"Commit cancelled.\n"}, nil)
 }
 
 // Not parallel: chdirs and sets environment variables.
