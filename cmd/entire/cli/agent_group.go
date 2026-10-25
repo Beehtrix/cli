@@ -121,6 +121,7 @@ Examples:
 				SearchSkill:    searchSkill,
 				AgentHelpSkill: agentHelpSkill,
 				Telemetry:      true,
+				NoCommitOffer:  true,
 			}
 			return setupAgentHooksNonInteractive(cmd.Context(), cmd.OutOrStdout(), ag, opts)
 		},

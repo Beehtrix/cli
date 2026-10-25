@@ -97,7 +97,13 @@ func runPromptForm(cmd *cobra.Command, form *huh.Form) (render io.Writer, err er
 // set, on the writer the form renders on: what the question asks about follows
 // the prompt rather than the command's output.
 func runPromptFormWithPreamble(cmd *cobra.Command, form *huh.Form, preamble func(io.Writer) error) (render io.Writer, err error) {
-	render = cmd.ErrOrStderr()
+	return runPromptFormOn(cmd.Context(), cmd.ErrOrStderr(), form, preamble)
+}
+
+// runPromptFormOn is runPromptFormWithPreamble for callers that hold the
+// command's context and error stream rather than the command itself.
+func runPromptFormOn(ctx context.Context, errOut io.Writer, form *huh.Form, preamble func(io.Writer) error) (render io.Writer, err error) {
+	render = errOut
 	if !interactive.IsTerminalWriter(render) {
 		term, terr := openPromptTerminal()
 		if terr != nil {
@@ -123,7 +129,7 @@ func runPromptFormWithPreamble(cmd *cobra.Command, form *huh.Form, preamble func
 	// Returned unwrapped: every caller classifies it, matching huh's own
 	// sentinels through handleFormCancellation, and wraps whatever survives
 	// with the name of the thing being prompted for.
-	return render, form.WithOutput(render).RunWithContext(cmd.Context()) //nolint:wrapcheck // classified and wrapped by the caller
+	return render, form.WithOutput(render).RunWithContext(ctx) //nolint:wrapcheck // classified and wrapped by the caller
 }
 
 // printSessionCommand writes a single session resume command line to w.

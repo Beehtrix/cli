@@ -10,16 +10,14 @@ import (
 	"strings"
 	"testing"
 
+	"charm.land/huh/v2"
+
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/interactive"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
 
 const testEntireGitignore = ".entire/.gitignore"
-
-// origCommitConfigCanPrompt is the production gate, for tests that need it back
-// after stubCommitConfig stands in a terminal.
-var origCommitConfigCanPrompt = commitConfigCanPrompt
 
 // newCommitConfigRepo chdirs into a fresh repository with git isolated from
 // the developer's global and system config, commits a README unless empty is
@@ -38,28 +36,43 @@ func newCommitConfigRepo(t *testing.T, empty bool) string {
 	return dir
 }
 
-// stubCommitConfig replaces the prompt and the commit for one test, and
-// stands in a terminal for the output so the offer can be asked.
-func stubCommitConfig(t *testing.T, prompt func(string) (bool, error), commit func(context.Context, string, []string, string, io.Writer) error) {
+type commitConfigPromptFunc = func(context.Context, io.Writer, []string, string) (io.Writer, bool, error)
+
+// stubCommitConfig replaces the prompt and, when commit is non-nil, the commit
+// for one test.
+func stubCommitConfig(t *testing.T, prompt commitConfigPromptFunc, commit func(context.Context, string, []string, string, io.Writer) error) {
 	t.Helper()
-	origPrompt, origCommit, origCanPrompt := commitConfigPrompt, commitConfigFiles, commitConfigCanPrompt
-	t.Cleanup(func() {
-		commitConfigPrompt, commitConfigFiles, commitConfigCanPrompt = origPrompt, origCommit, origCanPrompt
-	})
-	commitConfigCanPrompt = func(io.Writer) bool { return true }
-	if prompt != nil {
-		commitConfigPrompt = prompt
-	}
+	origPrompt, origCommit := commitConfigPrompt, commitConfigFiles
+	t.Cleanup(func() { commitConfigPrompt, commitConfigFiles = origPrompt, origCommit })
+	commitConfigPrompt = prompt
 	if commit != nil {
 		commitConfigFiles = commit
 	}
 }
 
-func failOnPrompt(t *testing.T) func(string) (bool, error) {
+// promptedCommitConfig is a stub prompt that renders like the real one — the
+// list, on render — and answers with commit and err.
+type promptedCommitConfig struct {
+	render *bytes.Buffer
+	commit bool
+	err    error
+
+	asked  bool
+	files  []string
+	branch string
+}
+
+func (p *promptedCommitConfig) prompt(_ context.Context, _ io.Writer, files []string, branch string) (io.Writer, bool, error) {
+	p.asked, p.files, p.branch = true, files, branch
+	printConfigToCommit(p.render, files)
+	return p.render, p.commit, p.err
+}
+
+func failOnPrompt(t *testing.T) commitConfigPromptFunc {
 	t.Helper()
-	return func(string) (bool, error) {
+	return func(context.Context, io.Writer, []string, string) (io.Writer, bool, error) {
 		t.Error("prompted to commit when no prompt was expected")
-		return false, nil
+		return io.Discard, false, nil
 	}
 }
 
@@ -77,8 +90,17 @@ func assertOutput(t *testing.T, out string, want, notWant []string) {
 	}
 }
 
+func runOfferCommitConfig(t *testing.T, opts EnableOptions) string {
+	t.Helper()
+	var out bytes.Buffer
+	if err := offerCommitConfig(context.Background(), &out, opts); err != nil {
+		t.Fatalf("offerCommitConfig() error = %v", err)
+	}
+	return out.String()
+}
+
 // Not parallel: newCommitConfigRepo chdirs and sets environment variables.
-func TestOfferCommitConfig_ListsPendingFilesWithoutPrompting(t *testing.T) {
+func TestOfferCommitConfig_ListsPendingFilesWithoutATerminal(t *testing.T) {
 	tests := []struct {
 		name    string
 		empty   bool
@@ -121,6 +143,30 @@ func TestOfferCommitConfig_ListsPendingFilesWithoutPrompting(t *testing.T) {
 			want: []string{"  .claude/settings.json\n"},
 		},
 		{
+			// Deselecting an agent rewrites or removes its hook config; the
+			// agent is no longer installed, but the change still has to ship.
+			name: "deselected agent hook config removed",
+			prepare: func(t *testing.T, dir string) {
+				t.Helper()
+				testutil.WriteFile(t, dir, ".cursor/hooks.json", "{}")
+				testutil.GitAdd(t, dir, ".cursor/hooks.json")
+				testutil.GitCommit(t, dir, "cursor hooks")
+				if err := os.Remove(".cursor/hooks.json"); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: []string{"  .cursor/hooks.json\n"},
+		},
+		{
+			name: "skill files",
+			prepare: func(t *testing.T, dir string) {
+				t.Helper()
+				testutil.WriteFile(t, dir, agentHelpSkillTemplatePath(agent.AgentNameClaudeCode), "skill")
+				testutil.WriteFile(t, dir, searchSkillTemplatePath(agent.AgentNameCodex), "skill")
+			},
+			want: []string{"  .claude/skills/entire/SKILL.md\n", "  .agents/skills/"},
+		},
+		{
 			name: "everything committed",
 			prepare: func(t *testing.T, dir string) {
 				t.Helper()
@@ -144,23 +190,27 @@ func TestOfferCommitConfig_ListsPendingFilesWithoutPrompting(t *testing.T) {
 				tt.prepare(t, dir)
 			}
 			stubCommitConfig(t, failOnPrompt(t), nil)
-			commitConfigCanPrompt = func(io.Writer) bool { return false }
 
-			var out bytes.Buffer
-			offerCommitConfig(context.Background(), &out, EnableOptions{})
-			assertOutput(t, out.String(), tt.want, tt.notWant)
+			assertOutput(t, runOfferCommitConfig(t, EnableOptions{}), tt.want, tt.notWant)
 		})
 	}
 }
 
 // Not parallel: chdirs and sets environment variables.
-func TestOfferCommitConfig_YesFlagNeverPrompts(t *testing.T) {
-	newCommitConfigRepo(t, false)
-	stubCommitConfig(t, failOnPrompt(t), nil)
+func TestOfferCommitConfig_ListsWithoutPromptingWhenToldNotToAsk(t *testing.T) {
+	tests := map[string]EnableOptions{
+		"--yes":     {Yes: true},
+		"agent add": {NoCommitOffer: true},
+	}
+	for name, opts := range tests {
+		t.Run(name, func(t *testing.T) {
+			newCommitConfigRepo(t, false)
+			t.Setenv(interactive.EnvTestTTY, "1")
+			stubCommitConfig(t, failOnPrompt(t), nil)
 
-	var out bytes.Buffer
-	offerCommitConfig(context.Background(), &out, EnableOptions{Yes: true})
-	assertOutput(t, out.String(), []string{"Make sure to commit these files", "  .entire/settings.json\n"}, nil)
+			assertOutput(t, runOfferCommitConfig(t, opts), []string{"Make sure to commit these files", "  .entire/settings.json\n"}, nil)
+		})
+	}
 }
 
 // Not parallel: chdirs and sets environment variables.
@@ -174,21 +224,20 @@ func TestOfferCommitConfig_CommitsOnlyTheConfigFiles(t *testing.T) {
 			dir := newCommitConfigRepo(t, empty)
 			testutil.WriteFile(t, dir, "staged.txt", "unrelated")
 			testutil.GitAdd(t, dir, "staged.txt")
+			t.Setenv(interactive.EnvTestTTY, "1")
 			branch := strings.TrimSpace(testutil.RunGit(t, dir, "symbolic-ref", "--short", "HEAD"))
 
-			var askedBranch string
-			stubCommitConfig(t, func(b string) (bool, error) {
-				askedBranch = b
-				return true, nil
-			}, nil)
+			p := &promptedCommitConfig{render: &bytes.Buffer{}, commit: true}
+			stubCommitConfig(t, p.prompt, nil)
+			out := runOfferCommitConfig(t, EnableOptions{})
 
-			var out bytes.Buffer
-			offerCommitConfig(context.Background(), &out, EnableOptions{})
-
-			if askedBranch != branch {
-				t.Errorf("prompt got branch %q, want %q", askedBranch, branch)
+			if !slices.Equal(p.files, []string{EntireSettingsFile}) || p.branch != branch {
+				t.Errorf("prompt got %v on %q, want [%s] on %q", p.files, p.branch, EntireSettingsFile, branch)
 			}
-			assertOutput(t, out.String(), []string{"  .entire/settings.json\n", "✓ Committed them to " + branch + "\n"}, nil)
+			// The list and the outcome go where the prompt rendered, not to
+			// the command's output.
+			assertOutput(t, p.render.String(), []string{"  .entire/settings.json\n", "✓ Committed them to " + branch + "\n"}, nil)
+			assertOutput(t, out, nil, []string{"Make sure to commit these files"})
 
 			committed := strings.Fields(testutil.RunGit(t, dir, "show", "--name-only", "--format=%s", "HEAD"))
 			if !slices.Equal(committed, []string{"Enable", "Entire", EntireSettingsFile}) {
@@ -202,63 +251,96 @@ func TestOfferCommitConfig_CommitsOnlyTheConfigFiles(t *testing.T) {
 }
 
 // Not parallel: chdirs and sets environment variables.
-func TestOfferCommitConfig_DeclinedOrFailedCommitListsFiles(t *testing.T) {
+func TestOfferCommitConfig_DeclinedAbortedOrFailed(t *testing.T) {
 	tests := []struct {
-		name   string
-		prompt func(string) (bool, error)
-		commit func(context.Context, string, []string, string, io.Writer) error
-		want   []string
+		name      string
+		commit    bool
+		promptErr error
+		commitErr error
+		render    []string
+		out       []string
 	}{
+		{name: "declined"},
+		{name: "aborted in the form", promptErr: huh.ErrUserAborted, render: []string{"Commit cancelled.\n"}},
 		{
-			name:   "declined",
-			prompt: func(string) (bool, error) { return false, nil },
+			name:      "no terminal to prompt on",
+			promptErr: errors.New("open prompt terminal: no controlling terminal"),
+			out:       []string{"Make sure to commit these files", "  .entire/settings.json\n"},
 		},
 		{
-			name:   "prompt aborted",
-			prompt: func(string) (bool, error) { return false, errors.New("user aborted") },
-		},
-		{
-			name:   "commit failed",
-			prompt: func(string) (bool, error) { return true, nil },
-			commit: func(context.Context, string, []string, string, io.Writer) error {
-				return errors.New("git commit: exit status 1")
-			},
-			want: []string{"Could not commit them: git commit: exit status 1\n"},
+			name:      "commit failed",
+			commit:    true,
+			commitErr: errors.New("git commit: exit status 1"),
+			render:    []string{"Could not commit them: git commit: exit status 1\n"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			newCommitConfigRepo(t, false)
-			commit := tt.commit
-			if commit == nil {
-				commit = func(context.Context, string, []string, string, io.Writer) error {
+			t.Setenv(interactive.EnvTestTTY, "1")
+			p := &promptedCommitConfig{render: &bytes.Buffer{}, commit: tt.commit, err: tt.promptErr}
+			stubCommitConfig(t, p.prompt, func(context.Context, string, []string, string, io.Writer) error {
+				if !tt.commit {
 					t.Error("committed after the prompt was not accepted")
-					return nil
 				}
-			}
-			stubCommitConfig(t, tt.prompt, commit)
+				return tt.commitErr
+			})
 
-			var out bytes.Buffer
-			offerCommitConfig(context.Background(), &out, EnableOptions{})
-			want := append(slices.Clone(tt.want), "Make sure to commit these files", "  .entire/settings.json\n")
-			assertOutput(t, out.String(), want, []string{"✓ Committed"})
+			out := runOfferCommitConfig(t, EnableOptions{})
+			assertOutput(t, p.render.String(), tt.render, []string{"✓ Committed"})
+			assertOutput(t, out, tt.out, []string{"✓ Committed"})
 		})
 	}
 }
 
 // Not parallel: chdirs and sets environment variables.
-func TestOfferCommitConfig_RedirectedOutputNeverPrompts(t *testing.T) {
+func TestOfferCommitConfig_InterruptIsAnError(t *testing.T) {
 	newCommitConfigRepo(t, false)
-	// A controlling terminal exists, but the list is going to a buffer the
-	// developer cannot see, so asking about it would be asking blind.
 	t.Setenv(interactive.EnvTestTTY, "1")
-	stubCommitConfig(t, failOnPrompt(t), nil)
-	commitConfigCanPrompt = origCommitConfigCanPrompt
+	ctx, cancel := context.WithCancel(context.Background())
+	stubCommitConfig(t, func(context.Context, io.Writer, []string, string) (io.Writer, bool, error) {
+		cancel() // Ctrl+C while the question is up
+		return io.Discard, false, context.Canceled
+	}, func(context.Context, string, []string, string, io.Writer) error {
+		t.Error("committed after an interrupt")
+		return nil
+	})
 
-	var out bytes.Buffer
-	offerCommitConfig(context.Background(), &out, EnableOptions{})
-	assertOutput(t, out.String(), []string{"Make sure to commit these files", "  .entire/settings.json\n"}, nil)
+	err := offerCommitConfig(ctx, io.Discard, EnableOptions{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("offerCommitConfig() error = %v, want context.Canceled", err)
+	}
+}
+
+// Not parallel: swaps the terminal opener and sets ACCESSIBLE.
+func TestPromptCommitConfig_ListAndQuestionShareTheTerminal(t *testing.T) {
+	// The command's error stream is redirected (not a terminal), so the form
+	// falls back to the controlling terminal; the list must go there with it,
+	// not to a stream the developer is not watching.
+	t.Setenv("ACCESSIBLE", "1")
+	var terminal bytes.Buffer
+	prev := openPromptTerminal
+	openPromptTerminal = func() (promptTerminal, error) {
+		return promptTerminal{in: strings.NewReader("y\n"), out: &terminal}, nil
+	}
+	t.Cleanup(func() { openPromptTerminal = prev })
+
+	var redirected bytes.Buffer
+	render, commit, err := promptCommitConfig(t.Context(), &redirected, []string{EntireSettingsFile, ".claude/settings.json"}, "main")
+	if err != nil {
+		t.Fatalf("promptCommitConfig() error = %v", err)
+	}
+	if !commit {
+		t.Error("answering y should commit")
+	}
+	if render != &terminal {
+		t.Error("render should be the terminal the form used, for the outcome to follow it")
+	}
+	assertOutput(t, terminal.String(), []string{"  .entire/settings.json\n  .claude/settings.json\n", "Commit them to main now?"}, nil)
+	if redirected.Len() != 0 {
+		t.Errorf("nothing should go to the redirected stream, got:\n%s", redirected.String())
+	}
 }
 
 // Not parallel: chdirs and sets environment variables.
@@ -275,11 +357,9 @@ func TestRunEnableOnConfiguredRepo_OffersPendingConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			newCommitConfigRepo(t, false)
 			writeSettings(t, tt.settings)
-			var asked bool
-			stubCommitConfig(t, func(string) (bool, error) {
-				asked = true
-				return false, nil
-			}, nil)
+			t.Setenv(interactive.EnvTestTTY, "1")
+			p := &promptedCommitConfig{render: &bytes.Buffer{}}
+			stubCommitConfig(t, p.prompt, nil)
 
 			cmd := newEnableCmd()
 			var out bytes.Buffer
@@ -287,10 +367,10 @@ func TestRunEnableOnConfiguredRepo_OffersPendingConfig(t *testing.T) {
 			if err := runEnableOnConfiguredRepo(context.Background(), cmd, EnableOptions{}); err != nil {
 				t.Fatalf("runEnableOnConfiguredRepo() error = %v", err)
 			}
-			if !asked {
-				t.Error("configured-repo enable did not offer to commit the pending configuration")
+			if !p.asked || !slices.Contains(p.files, EntireSettingsFile) {
+				t.Errorf("configured-repo enable should offer to commit %s; asked=%v files=%v", EntireSettingsFile, p.asked, p.files)
 			}
-			assertOutput(t, out.String(), []string{tt.want, "Make sure to commit these files", "  .entire/settings.json\n"}, nil)
+			assertOutput(t, out.String(), []string{tt.want}, nil)
 		})
 	}
 }

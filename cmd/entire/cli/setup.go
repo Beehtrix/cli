@@ -102,6 +102,10 @@ type EnableOptions struct {
 	ImportHistory  bool
 	SearchSkill    bool
 	AgentHelpSkill bool
+	// NoCommitOffer lists the configuration still to commit without offering
+	// to commit it. Set by `entire agent add`, a targeted command that should
+	// not end in a prompt about files beyond the one agent it touched.
+	NoCommitOffer bool
 }
 
 // applyStrategyOptions sets strategy_options on settings from CLI flags.
@@ -1072,7 +1076,7 @@ publish the repository yourself when you're ready.`,
 	cmd.Flags().BoolVar(&opts.AbsoluteGitHookPath, flagAbsoluteGitHookPath, false, "Embed full binary path in git hooks (for GUI git clients that don't source shell profiles)")
 	cmd.Flags().BoolVar(&opts.SearchSkill, flagSearchSkill, false, "Install the optional Entire search skill for selected agent(s)")
 	cmd.Flags().BoolVar(&opts.AgentHelpSkill, flagAgentHelpSkill, false, "Install the stable Entire agent-help skill (points agents at `entire agent-help`) for selected agent(s)")
-	cmd.Flags().BoolVarP(&opts.Yes, "yes", "y", false, "Accept all defaults without prompting (in a non-repo directory: init git and commit; then enable all agents and accept telemetry). Does not import existing agent history — see --"+flagImportHistory)
+	cmd.Flags().BoolVarP(&opts.Yes, "yes", "y", false, "Accept all defaults without prompting (in a non-repo directory: init git and commit; then enable all agents and accept telemetry). In an existing repository it lists the configuration files to commit rather than committing them. Does not import existing agent history — see --"+flagImportHistory)
 	cmd.Flags().BoolVar(&opts.ImportHistory, flagImportHistory, false, importHistoryFlagUsage)
 	addInsecureHTTPAuthFlag(cmd, &insecureHTTPAuth)
 
@@ -1356,8 +1360,7 @@ func runEnableOnConfiguredRepoWithPreflight(ctx context.Context, cmd *cobra.Comm
 		if !usedSetupFlow {
 			fmt.Fprintln(w, "Entire is already enabled.")
 		}
-		printEnabledStatus(ctx, w, opts)
-		return nil
+		return printEnabledStatus(ctx, w, opts)
 	}
 	return runEnable(ctx, w, useProject, opts)
 }
@@ -1552,21 +1555,27 @@ func runEnableInteractive(ctx context.Context, w io.Writer, agents []agent.Agent
 
 	fmt.Fprintln(w, "\nReady.")
 
-	offerCommitConfig(ctx, w, opts)
+	if err := offerCommitConfig(ctx, w, opts); err != nil {
+		return err
+	}
 	printSetupCheckpointDestinationNote(ctx, w)
 
 	return nil
 }
 
 // printEnabledStatus prints agents, a hint about `entire agent`, and the
-// configuration still to commit.
-func printEnabledStatus(ctx context.Context, w io.Writer, opts EnableOptions) {
+// configuration still to commit. It fails only when the commit offer is
+// interrupted.
+func printEnabledStatus(ctx context.Context, w io.Writer, opts EnableOptions) error {
 	if displayNames := InstalledAgentDisplayNames(ctx); len(displayNames) > 0 {
 		fmt.Fprintf(w, "Agents: %s\n", strings.Join(displayNames, ", "))
 	}
 	fmt.Fprintln(w, "\nTo add more agents, run `entire agent add <name>`.")
-	offerCommitConfig(ctx, w, opts)
+	if err := offerCommitConfig(ctx, w, opts); err != nil {
+		return err
+	}
 	printSetupCheckpointDestinationNote(ctx, w)
+	return nil
 }
 
 // resolveFirstRunCheckpointBackend decides the checkpoint storage backend
@@ -1612,8 +1621,7 @@ func runEnable(ctx context.Context, w io.Writer, useProjectSettings bool, opts E
 	}
 
 	fmt.Fprintln(w, "Entire is now enabled.")
-	printEnabledStatus(ctx, w, opts)
-	return nil
+	return printEnabledStatus(ctx, w, opts)
 }
 
 // runDisable flips the enabled flag to false in the resolved settings scope.
@@ -2324,8 +2332,7 @@ func setupAgentHooksNonInteractive(ctx context.Context, w io.Writer, ag agent.Ag
 
 	fmt.Fprintln(w, "\nReady.")
 
-	offerCommitConfig(ctx, w, opts)
-	return nil
+	return offerCommitConfig(ctx, w, opts)
 }
 
 // validateSetupFlags checks that --local and --project flags are not both specified.
