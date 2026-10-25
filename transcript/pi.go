@@ -198,19 +198,26 @@ func piUsageHasCounts(u *CallUsage) bool {
 }
 
 // piEmitUserContent decodes a Pi user message's content (string or block array)
-// into compact user blocks.
-func piEmitUserContent(raw json.RawMessage) []piCompactUserBlock {
+// into compact user blocks. Image items pass through verbatim, in source order.
+func piEmitUserContent(raw json.RawMessage) []any {
 	if text := pijsonl.DecodeStringContent(raw); text != "" {
-		return []piCompactUserBlock{{Text: text}}
+		return []any{piCompactUserBlock{Text: text}}
 	}
-	var items []pijsonl.ContentItem
+	var items []json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return nil
 	}
-	blocks := make([]piCompactUserBlock, 0, len(items))
-	for _, item := range items {
-		if item.Type == pijsonl.ContentTypeText && item.Text != "" {
+	blocks := make([]any, 0, len(items))
+	for _, rawItem := range items {
+		var item pijsonl.ContentItem
+		if err := json.Unmarshal(rawItem, &item); err != nil {
+			continue
+		}
+		switch {
+		case item.Type == pijsonl.ContentTypeText && item.Text != "":
 			blocks = append(blocks, piCompactUserBlock{Text: item.Text})
+		case item.Type == BlockImage:
+			blocks = append(blocks, rawItem)
 		}
 	}
 	return blocks
