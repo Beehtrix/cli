@@ -39,6 +39,7 @@ Environment Variables:
 const (
 	groupSetup        = "setup"
 	groupSessions     = "sessions"
+	groupTrails       = "trails"
 	groupAccount      = "account"
 	groupControlPlane = "controlplane"
 )
@@ -181,6 +182,7 @@ func NewRootCmd() *cobra.Command {
 	cmd.AddGroup(
 		&cobra.Group{ID: groupSetup, Title: "Entire Setup:"},
 		&cobra.Group{ID: groupSessions, Title: "Sessions & Checkpoints:"},
+		&cobra.Group{ID: groupTrails, Title: "Trails:"},
 		&cobra.Group{ID: groupAccount, Title: "Account:"},
 		&cobra.Group{ID: groupControlPlane, Title: "Control Plane:"},
 	)
@@ -199,6 +201,7 @@ func NewRootCmd() *cobra.Command {
 	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newOrgCmd(), groupControlPlane)))     // 'org' — control-plane org management
 	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newProjectCmd(), groupControlPlane))) // 'project' — control-plane project management
 	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newRepoCmd(), groupControlPlane)))    // 'repo' — control-plane repo lifecycle
+	cmd.AddCommand(inGroup(newTrailCmd(), groupTrails))                                   // 'trail' — trails across repositories and branches
 
 	// Top-level lifecycle and standalone commands.
 	experimental.Register(cmd, cliReview.NewCommand(buildReviewDeps())) // `review` (experimental)
@@ -225,7 +228,6 @@ func NewRootCmd() *cobra.Command {
 	// Hidden infrastructure.
 	cmd.AddCommand(newMCPCmd(cmd)) // MCP stdio server for MCP-host agents
 	cmd.AddCommand(newHooksCmd())
-	cmd.AddCommand(newTrailCmd())
 	cmd.AddCommand(newSendAnalyticsCmd())
 	cmd.AddCommand(newCurlBashPostInstallCmd())
 	cmd.AddCommand(newRefreshTrailEnablementCmd())
