@@ -24,7 +24,7 @@ type Line struct {
 	Timestamp          string
 	ID                 string
 	Model              string
-	InputTokens        int64
+	InputTokens        int64 // excludes CacheReadTokens and CacheWriteTokens
 	OutputTokens       int64
 	CacheReadTokens    int64
 	CacheWriteTokens   int64

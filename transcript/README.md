@@ -24,15 +24,19 @@ One JSON object per line, each line terminated by `\n`.
 | `cli_version` | string | no | Version of the producer that wrote the line. The name is historical. |
 | `ts` | string | no | Source timestamp where available, normally RFC 3339. May be omitted or empty when the native transcript has no timestamp. The generic JSONL converter copies source timestamps verbatim, so a non-string value can occur; readers ignore it. |
 | `id` | string | no | Assistant message ID. Streaming fragments with the same ID are merged into one line. |
-| `model` | string | no | Assistant lines only; native per-call model when reported. No inference from a session-wide default. |
-| `input_tokens` | int | no | Assistant lines only. Fresh, non-cached input when produced by the new converters. Historical v1 Codex/OpenAI lines may include cached input in this field; readers must not reinterpret stored old lines. |
+| `model` | string | no | Assistant lines only. The model the source reports for this call, verbatim; omitted when it reports none. Never inferred from a session-wide default, and never a placeholder: a value the agent writes in place of a model (Claude Code's `<synthetic>` on API-error entries) is omitted. |
+| `input_tokens` | int | no | Assistant lines only. Input not counted in the line's `cache_read_tokens` or `cache_write_tokens`; see below. |
 | `output_tokens` | int | no | Assistant lines only; includes reasoning tokens when the source reports them as part of output. |
 | `cache_read_tokens`, `cache_write_tokens` | int | no | Assistant lines only; per-call cached input read and total cached input written. Cache counts are separate from fresh `input_tokens`. |
 | `cache_write_5m_tokens`, `cache_write_1h_tokens` | int | no | Assistant lines only; an optional breakdown of `cache_write_tokens`, emitted only when the source reports the split (even when a reported value is zero). Absence means unknown, not zero or all 5m. Do not add the split to the total when summing usage. |
 | `reasoning_tokens` | int | no | Assistant lines only; subset of `output_tokens` when reported by the source, not additional output. |
 | `content` | array of blocks, string, or `null` | yes | Normally an array. A string can appear when an assistant message's source content was a string. `null` can appear because the writer does not omit empty content. |
 
-Usage and model fields are per call, never copied from a session aggregate. Claude Code and Codex native transcripts supply per-call usage/model, but this format/decode change does not yet make converters emit the new optional model, cache, or reasoning fields. A converter follow-up will emit them from native per-call data. Other native agents may populate only fields their own per-call records actually report. Copilot CLI has only a shutdown aggregate, Cursor is hook-only, and external plugins and Antigravity report usage out of band: their assistant lines do not acquire these optional fields from those sources. A zero omitted by JSON encoding does not assert that the source reported zero. Native timestamps are preserved where present; absence remains empty rather than a fabricated time.
+Usage and model fields are per call, never copied from a session aggregate. A zero omitted by JSON encoding does not assert that the source reported zero.
+
+On every line, `input_tokens` excludes the tokens in that line's `cache_read_tokens` and `cache_write_tokens`, so their sum is the call's total input and never double counts. Lines written before the cache fields existed carry none, and some of them counted cached input in `input_tokens`: older Codex lines, and Pi lines from Google models before pi-ai subtracted cached tokens (March 2026). Their total is still right, but its cache share is unknown, so pricing them at the fresh-input rate overstates their cost. No other field marks a line as old or new; `model` in particular says nothing about how `input_tokens` was counted.
+
+Converters fill only what the native transcript reports per call. Claude Code, Codex and Pi record per-call usage and model; their converters do not write the new fields yet. Copilot CLI has only a shutdown aggregate, Cursor is hook-only, and external plugins and Antigravity report usage out of band, so their lines do not get these fields. Native timestamps are preserved where present; a missing one stays empty rather than fabricated.
 
 ### Blocks
 
@@ -51,7 +55,7 @@ Usage and model fields are per call, never copied from a session aggregate. Clau
 1. Readers ignore unknown fields, keep unknown block types (available through
    `Block.Raw`), and return lines with an unknown `type` as they are, so
    consumers can skip them.
-2. New fields, block types and line types are additive and optional. `v` stays `1`. Old v1 lines without the new usage/model fields remain valid, including lines whose historical `input_tokens` was cache-inclusive; readers cannot distinguish that older meaning from the field alone.
+2. New fields, block types and line types are additive and optional. `v` stays `1`. Old v1 lines without the new usage and model fields remain valid.
 3. `v` is bumped only for a breaking change.
 
 ## Reading

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- `github.com/entireio/cli/transcript`: `Line` exposes per-call `Model`, cache read/write (with the 5m/1h split) and reasoning token counts, and its `InputTokens` and `OutputTokens` are now `int64`. Code that assigns them to an `int` needs a conversion ([#2834](https://github.com/entireio/cli/pull/2834))
+
 ## [0.12.0] - 2026-10-21
 
 ### Breaking changes and migrations
