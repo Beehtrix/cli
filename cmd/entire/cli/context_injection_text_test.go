@@ -107,7 +107,8 @@ func TestEntireContextInjection_PartialScopeOmitsRepo(t *testing.T) {
 }
 
 // The trails paragraph appears only when trails are enabled, sits between the
-// agent-help pointer and the commit rule, and asks for full trail/change URLs.
+// agent-help pointer and the commit rule, asks for full trail/change URLs, and
+// sends trail feedback to findings rather than comments.
 func TestEntireContextInjection_TrailsParagraphOnlyWhenEnabled(t *testing.T) {
 	t.Parallel()
 
@@ -124,7 +125,7 @@ func TestEntireContextInjection_TrailsParagraphOnlyWhenEnabled(t *testing.T) {
 	if pointer < 0 || trail < 0 || commits < 0 || pointer >= trail || trail >= commits {
 		t.Errorf("want agent-help pointer, then trails, then commits:\n%s", with)
 	}
-	for _, want := range []string{"`entire trail update`", "`--project <forge>/<owner>`", "include its full URL"} {
+	for _, want := range []string{"`entire trail update`", "`--project <forge>/<owner>`", "include its full URL", "findings (`entire trail finding`), never as trail comments"} {
 		if !strings.Contains(with, want) {
 			t.Errorf("trails paragraph missing %q:\n%s", want, with)
 		}

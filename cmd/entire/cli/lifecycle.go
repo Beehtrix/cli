@@ -517,6 +517,7 @@ func entireContextInjection(scope trailEnablementScope, base, trails bool) strin
 		b.WriteString("Inside a checkout, `entire trail` infers the repository. Outside one, pass `--project <forge>/<owner>`, plus `--repo` and `--branch` when needed. ")
 		b.WriteString("If it's unclear whether work belongs on an existing trail or a new one, ask the user. Keep a trail's description current with `entire trail update`. ")
 		b.WriteString("When referencing a trail or change, include its full URL. ")
+		b.WriteString("Post feedback on a trail as findings (`entire trail finding`), never as trail comments; comments are for people. ")
 	}
 	if base {
 		b.WriteString("Commits capture the AI session as a checkpoint automatically; only create checkpoints manually when the user asks. ")
