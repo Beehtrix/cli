@@ -29,7 +29,7 @@ func TestCompact_Pi_LinearTranscript(t *testing.T) {
 
 	expected := []string{
 		`{"v":1,"agent":"pi","cli_version":"0.5.1","type":"user","ts":"2026-03-27T21:00:01.000Z","content":[{"text":"Create hello.txt"}]}`,
-		`{"v":1,"agent":"pi","cli_version":"0.5.1","type":"assistant","ts":"2026-03-27T21:00:02.000Z","id":"m2","input_tokens":100,"output_tokens":50,"content":[{"type":"tool_use","id":"tc1","name":"Write","input":{"content":"hello world\n","path":"hello.txt"},"result":{"output":"Written 12 bytes","status":"success"}}]}`,
+		`{"v":1,"agent":"pi","cli_version":"0.5.1","type":"assistant","ts":"2026-03-27T21:00:02.000Z","id":"m2","input_tokens":100,"output_tokens":50,"cache_read_tokens":10,"cache_write_tokens":5,"content":[{"type":"tool_use","id":"tc1","name":"Write","input":{"content":"hello world\n","path":"hello.txt"},"result":{"output":"Written 12 bytes","status":"success"}}]}`,
 		`{"v":1,"agent":"pi","cli_version":"0.5.1","type":"assistant","ts":"2026-03-27T21:00:04.000Z","id":"m4","input_tokens":200,"output_tokens":30,"content":[{"type":"text","text":"Created hello.txt with the content hello world."}]}`,
 	}
 
