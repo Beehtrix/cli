@@ -12,9 +12,15 @@ import (
 	"strings"
 )
 
-// Options provides metadata fields written to every output line.
+// Options provides metadata fields written to every output line, and picks
+// the conversion where the transcript's format alone does not.
 type Options struct {
-	Agent      string // e.g. "claude-code"
+	// Agent is written to every line, e.g. "claude-code". Claude Code and
+	// Cursor share a JSONL line format, so for that format Agent also selects
+	// the accounting: "claude-code" emits per-call usage (model, fresh input,
+	// cache and output tokens), and any other value converts as Cursor, with
+	// legacy per-message input and output counts.
+	Agent      string
 	CLIVersion string // e.g. "0.42.0"
 	StartLine  int    // checkpoint_transcript_start (0 = no truncation)
 }

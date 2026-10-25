@@ -9,8 +9,14 @@ import (
 // JSONLAdapter turns a Claude Code, Cursor or Droid JSONL transcript into
 // transcript records. It is incremental: Feed accepts the transcript in
 // chunks split anywhere, and the records depend only on the bytes fed, not
-// on how they were chunked. Folding the records reproduces what compaction
-// produced before it was split into adapter and fold.
+// on how they were chunked. Convert uses the same constructors, so folding
+// the records reproduces Convert's output for that agent.
+//
+// The constructor fixes the behavior. NewClaudeAdapter also emits per-call
+// usage snapshots (model, fresh input, cache and output tokens) by the rules
+// below; NewCursorAdapter and NewDroidAdapter keep the legacy per-message
+// input and output token counts. NewDroidAdapter unwraps Droid's envelope
+// before parsing each line.
 //
 // The compaction rules live here, as decisions about which message a record
 // targets:
@@ -25,7 +31,7 @@ import (
 //     own results still count). Other results are dropped, as is a user entry
 //     that held only such results.
 //   - The text and images of a user entry become a separate user message.
-//   - With perCallUsage set, the fragment with the strictly highest output
+//   - For Claude Code, the fragment with the strictly highest output
 //     tokens supplies the message's usage snapshot (an earlier one wins ties)
 //     and the first fragment naming a model supplies its model. User entries
 //     holding only tool results between fragments of one message ID do not
@@ -45,7 +51,8 @@ import (
 // from line 1 rather than start a fresh adapter mid-file.
 //
 // Folding every record from Feed and a final Flush reproduces Convert's
-// output for the same bytes (with Options.StartLine 0). Records carry no
+// output for the same bytes, with Options.StartLine 0 and the Options.Agent
+// that selects this constructor ("claude-code" for NewClaudeAdapter). Records carry no
 // redaction: redact the transcript before feeding it, as checkpoints do.
 type JSONLAdapter struct {
 	preprocess   linePreprocessor
@@ -337,7 +344,9 @@ func (o *openAssistant) changedUsage() *CallUsage {
 		return nil
 	}
 	o.sent = snapshot
-	return snapshot
+	// The record gets its own copy: a caller changing it must not change what
+	// the adapter believes it last sent.
+	return cloneCallUsage(snapshot)
 }
 
 func sameUsage(a, b *CallUsage) bool {
