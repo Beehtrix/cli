@@ -69,10 +69,16 @@ func TestClaudeUsage_Convert(t *testing.T) {
 			},
 		},
 		{
-			name: "usage without model reports unknown",
+			name: "usage without model omits model",
 			input: `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"text","text":"a"}],"usage":{"input_tokens":3,"output_tokens":2}}}
 `,
-			want: []map[string]string{{"ts": `"t1"`, "model": `"unknown"`, "input_tokens": "3", "output_tokens": "2"}},
+			want: []map[string]string{{"ts": `"t1"`, "input_tokens": "3", "output_tokens": "2"}},
+		},
+		{
+			name: "the <synthetic> placeholder is not a model",
+			input: `{"type":"assistant","timestamp":"t1","message":{"id":"m1","model":"<synthetic>","content":[{"type":"text","text":"API Error"}],"usage":{"input_tokens":3,"output_tokens":2}}}
+`,
+			want: []map[string]string{{"ts": `"t1"`, "input_tokens": "3", "output_tokens": "2"}},
 		},
 		{
 			name: "no usage (absent, null or malformed) leaves the line legacy-shaped even with a model",
@@ -220,12 +226,12 @@ func TestFold_UsageSnapshot(t *testing.T) {
 			want:    []map[string]string{{"ts": `"t2"`, "model": `"m"`, "input_tokens": "5", "output_tokens": "1", "cache_read_tokens": "100"}},
 		},
 		{
-			name: "only assistant lines carry a snapshot, and a model-less one reports unknown",
+			name: "only assistant lines carry a snapshot, and a model-less one omits model",
 			records: []Record{
 				{Op: OpMessage, ID: "b", Role: TypeAssistant, TS: rawMsg(`"t1"`), Content: rawMsg(`[{"type":"text","text":"x"}]`), Usage: &CallUsage{InputTokens: 4}},
 				{Op: OpMessage, ID: "u", Role: TypeUser, TS: rawMsg(`"t2"`), Content: rawMsg(`[{"text":"q"}]`), Usage: &CallUsage{Model: "m", InputTokens: 4}},
 			},
-			want: []map[string]string{{"ts": `"t1"`, "model": `"unknown"`, "input_tokens": "4"}, {"ts": `"t2"`}},
+			want: []map[string]string{{"ts": `"t1"`, "input_tokens": "4"}, {"ts": `"t2"`}},
 		},
 	}
 	for _, tt := range tests {
@@ -298,5 +304,53 @@ func TestSameUsage(t *testing.T) {
 	}
 	if !sameUsage(nil, nil) || sameUsage(&base, nil) || sameUsage(nil, &base) {
 		t.Error("nil handling")
+	}
+}
+
+// A record's usage snapshot belongs to the caller: changing it must not change
+// what the adapter believes it last sent, or a later update would be dropped.
+func TestJSONLAdapter_UsageSnapshotIsCallersCopy(t *testing.T) {
+	t.Parallel()
+
+	a := NewClaudeAdapter()
+	first := a.Feed([]byte(`{"type":"assistant","timestamp":"t1","message":{"id":"m1","model":"c","content":[{"type":"text","text":"a"}],"usage":{"input_tokens":3,"output_tokens":5}}}` + "\n"))
+	if len(first) != 1 || first[0].Usage == nil {
+		t.Fatalf("first fragment: got %+v, want one message record with usage", first)
+	}
+	first[0].Usage.OutputTokens = 9 // the next fragment's real value
+
+	next := a.Feed([]byte(`{"type":"assistant","timestamp":"t2","message":{"id":"m1","model":"c","content":[{"type":"text","text":"b"}],"usage":{"input_tokens":3,"output_tokens":9}}}` + "\n"))
+	if len(next) != 1 || next[0].Usage == nil || next[0].Usage.OutputTokens != 9 {
+		t.Fatalf("second fragment: got %+v, want an append record with usage output 9", next)
+	}
+}
+
+// Late usage for a call split by a tool result lands on the call's first line.
+// When a checkpoint boundary falls between the two, the slice after the
+// boundary has none of that call's usage, so per-call usage must be read from
+// the full conversion.
+func TestConvertWithBoundary_LateUsageLandsBeforeBoundary(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`{"type":"assistant","timestamp":"t1","message":{"id":"m1","model":"c","content":[{"type":"tool_use","id":"x","name":"n","input":{}}],"usage":{"input_tokens":3,"output_tokens":5}}}
+{"type":"user","timestamp":"t2","message":{"content":[{"type":"tool_result","tool_use_id":"x","content":"ok"}]}}
+{"type":"assistant","timestamp":"t3","message":{"id":"m1","model":"c","content":[{"type":"text","text":"b"}],"usage":{"input_tokens":3,"output_tokens":9}}}
+`)
+	opts := defaultOpts
+	opts.StartLine = 2
+	full, boundary, err := ConvertWithBoundary(input, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := usageFields(t, full)
+	want := []map[string]string{
+		{"ts": `"t1"`, "model": `"c"`, "input_tokens": "3", "output_tokens": "9"},
+		{"ts": `"t3"`},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("full conversion:\n got %v\nwant %v", got, want)
+	}
+	if boundary != 1 {
+		t.Fatalf("boundary = %d, want 1 (the call's first line is before it)", boundary)
 	}
 }

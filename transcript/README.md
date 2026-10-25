@@ -24,21 +24,30 @@ One JSON object per line, each line terminated by `\n`.
 | `cli_version` | string | no | Version of the producer that wrote the line. The name is historical. |
 | `ts` | string | no | Source timestamp where available, normally RFC 3339. May be omitted or empty when the native transcript has no timestamp. The generic JSONL converter copies source timestamps verbatim, so a non-string value can occur; readers ignore it. |
 | `id` | string | no | Assistant message ID. Streaming fragments with the same ID are merged into one line. |
-| `model` | string | no | Assistant lines only; native per-call model when reported. No inference from a session-wide default. |
-| `input_tokens` | int | no | Assistant lines only. Fresh, non-cached input when produced by the new converters. Historical v1 Codex/OpenAI lines may include cached input in this field; readers must not reinterpret stored old lines. |
+| `model` | string | no | Assistant lines only. The model the source reports for this call, verbatim; omitted when it reports none. Never inferred from a session-wide default, and never a placeholder: a value the agent writes in place of a model (Claude Code's `<synthetic>` on API-error entries) is omitted. |
+| `input_tokens` | int | no | Assistant lines only. Input not counted in the line's `cache_read_tokens` or `cache_write_tokens`; see below. |
 | `output_tokens` | int | no | Assistant lines only; includes reasoning tokens when the source reports them as part of output. |
 | `cache_read_tokens`, `cache_write_tokens` | int | no | Assistant lines only; per-call cached input read and total cached input written. Cache counts are separate from fresh `input_tokens`. |
 | `cache_write_5m_tokens`, `cache_write_1h_tokens` | int | no | Assistant lines only; an optional breakdown of `cache_write_tokens`, emitted only when the source reports the split (even when a reported value is zero). Absence means unknown, not zero or all 5m. Do not add the split to the total when summing usage. |
 | `reasoning_tokens` | int | no | Assistant lines only; subset of `output_tokens` when reported by the source, not additional output. |
 | `content` | array of blocks, string, or `null` | yes | Normally an array. A string can appear when an assistant message's source content was a string. `null` can appear because the writer does not omit empty content. |
 
-Usage and model fields are per call, never copied from a session aggregate. The Claude Code, Codex and Pi converters emit them from native per-call data (below). Other native agents may populate only fields their own per-call records actually report. Copilot CLI has only a shutdown aggregate, Cursor is hook-only, and external plugins and Antigravity report usage out of band: their assistant lines do not acquire these optional fields from those sources. A zero omitted by JSON encoding does not assert that the source reported zero. Native timestamps are preserved where present; absence remains empty rather than a fabricated time.
+Usage and model fields are per call, never copied from a session aggregate. A zero omitted by JSON encoding does not assert that the source reported zero.
+
+On every line, `input_tokens` excludes the tokens in that line's `cache_read_tokens` and `cache_write_tokens`, so adding them never double counts. The sum is the call's total input only on lines from a converter that writes the cache fields. Lines written before that carry no cache fields, and their `input_tokens` is one of two things:
+
+- Fresh input only (Claude Code, and Pi except as below): the cached input is missing from the line, so the sum understates the call's input.
+- Fresh plus cached input (Codex, and Pi on Google models before pi-ai subtracted cached tokens in March 2026): the total is right, but its cache share is unknown, so pricing it at the fresh-input rate overstates the cost.
+
+Other agents' lines copy the native input count as the agent defines it. Only `agent` and the `cli_version` that wrote a line tell these cases apart; no field marks a line as old or new, and `model` in particular says nothing about how `input_tokens` was counted.
+
+Converters fill only what the native transcript reports per call. Claude Code, Codex and Pi record per-call usage and model, and their converters write them (below). Copilot CLI has only a shutdown aggregate, Cursor is hook-only, and external plugins and Antigravity report usage out of band, so their lines do not get these fields. Native timestamps are preserved where present; a missing one stays empty rather than fabricated.
 
 ### Per-call usage
 
-A line with usage always has `model` (`"unknown"` when the source names none), and a line with a `model` has fresh `input_tokens`: non-cached input, excluding cache reads and writes. The 5m/1h split is emitted when the source reports it (a reported zero is not absence); Pi reports only the 1h part, and 5m is the remainder of `cache_write_tokens`. `reasoning_tokens` is a subset of `output_tokens`. An assistant line can carry usage with empty content (`"content":[]`, for example an aborted or thinking-only call): readers that render transcripts should skip it, and readers that count usage must keep it.
+An assistant line can carry usage with empty content (`"content":[]`, for example an aborted or thinking-only call): readers that render transcripts should skip it, and readers that count usage must keep it.
 
-Claude Code, only when `Options.Agent` is `claude-code` (Cursor and Droid keep legacy counts): streaming fragments of one message ID become one line carrying the whole usage row with the strictly highest `output_tokens` (earlier wins ties) and the model of the first fragment that reports one; `ts` is the last fragment's. A message with no usage object on any fragment has no model or usage fields. Tool-result lines between fragments of one ID do not split the call: the later fragments become separate lines without usage, and the best row stays on the call's first line (the first with visible content, since a thinking-only message has no line), so a call's usage is counted once. Read per-call usage from the full converted transcript: in a checkpoint slice (`ConvertWithBoundary`), a usage row that arrives after a tool result goes to the call's first line, which can sit before the slice boundary.
+Claude Code (`Options.Agent` `claude-code`, and `NewClaudeAdapter`; Cursor and Droid keep legacy counts): streaming fragments of one message ID become one line carrying the whole usage row with the strictly highest `output_tokens` (earlier wins ties) and the model of the first fragment that reports one, skipping Claude Code's `<synthetic>` placeholder; `ts` is the last fragment's. The 5m/1h cache-write split is emitted only when both durations are reported. A message with no usage object on any fragment has no model or usage fields. User entries holding only tool results between fragments of one ID do not split the call: the later fragments become separate lines without usage, and the best row stays on the call's first line (the first with visible content, since a thinking-only message has no line), so a call's usage is counted once. Read per-call usage from the full converted transcript: in a checkpoint slice (`ConvertWithBoundary`), a usage row that arrives after a tool result goes to the call's first line, which can sit before the slice boundary.
 
 Codex: one assistant line per model call, made of the reasoning, message and tool-call items up to the `token_count` that closes it (real order: call, output, `token_count`; outputs attach to their call by `call_id`). Usage is the difference between consecutive cumulative `info.total_token_usage` snapshots, and `ts` is the closing snapshot's when present, otherwise the last item's. Fresh input is `input - cached` clamped at zero; Codex lines carry no cache-write fields. Repeated snapshots and snapshots missing the input, cached-input or output counter are ignored, `reasoning_tokens` needs both adjacent snapshots to report it, and a decrease in any counter stops usage on later lines. A call with usage but no text or tool calls (for example reasoning-only) emits `content: []`, so consumers may see empty assistant lines; a call with neither usage nor content is omitted. Without usable `total_token_usage` snapshots (flat per-event totals are not read), no `token_count` closes a call, so consecutive assistant items merge into one line until the next user line or tool output; with usable snapshots, a tool output does not end its call. After a counter decrease, total snapshots still close calls but carry no usage, starting with the call the decrease closes. With `StartLine`, the last line before the boundary is part of the slice when its tool output or closing snapshot arrives after it (a one-line head overlap, which can repeat that call's usage); a later output for any earlier call lands only on that call's earlier line.
 
@@ -48,8 +57,16 @@ Pi, one native message per call (no fragments to merge): `model` is `message.mod
 
 - User text: `{"id"?: string, "text": string}`. There is no `type` field (a v1 quirk).
 - Assistant text: `{"type": "text", "text": string}`.
-- Tool use: `{"type": "tool_use", "id"?: string, "name": string, "input": any, "result"?: {"output": string, "status": "success"|"error", "file"?: {"filePath": string, "numLines"?: int}, "matchCount"?: int}}`.
-  Tool results are inlined into the `tool_use` block that requested them.
+- Tool use: `{"type": "tool_use", "id"?: string, "name": string, "input": any, "result"?: {"output": string, "status": "success"|"error", "file"?: {"filePath": string, "numLines"?: int}, "matchCount"?: int, "agent"?: {"id": string}}}`.
+  Tool results are inlined into the `tool_use` block that requested them,
+  matched by tool call ID where the agent records one, including the results
+  of parallel calls that the agent writes separately.
+  `agent.id` is the agent's own ID for the subagent session or thread the call
+  launched (never the tool call ID, which is the block's `id`), when the parent
+  transcript records one: Claude Code's `toolUseResult.agentId` (Agent, and
+  forked Skill calls), Codex's `SubAgentActivity` thread for a `spawn_agent`
+  call, OpenCode's `task` session (`state.metadata.sessionId`), and Copilot's
+  `subagent.started` agent for a task call.
 - Image: passed through from the source verbatim. The image source is either
   inline base64 or an `entire-asset:assets/…` placeholder left by image
   externalization.
@@ -61,7 +78,7 @@ Pi, one native message per call (no fragments to merge): `model` is `message.mod
 1. Readers ignore unknown fields, keep unknown block types (available through
    `Block.Raw`), and return lines with an unknown `type` as they are, so
    consumers can skip them.
-2. New fields, block types and line types are additive and optional. `v` stays `1`. Old v1 lines without the new usage/model fields remain valid, including lines whose historical `input_tokens` was cache-inclusive; readers cannot distinguish that older meaning from the field alone.
+2. New fields, block types and line types are additive and optional. `v` stays `1`. Old v1 lines without the new usage and model fields remain valid.
 3. `v` is bumped only for a breaking change.
 
 ## Reading
@@ -142,11 +159,20 @@ once emitted, so they can be streamed and stored as plain appends. `Fold`
 applies records in order and returns the transcript lines.
 
 In this repository the fold is used by `Convert`: for Claude Code, Cursor and
-Droid, it runs an adapter that turns the native transcript into records and then
-folds them. The other converters still write lines directly. The fold is meant
-to be shared with a backend that folds the same records to show a live session,
-so that a live view and a checkpoint's `transcript.jsonl` match byte for byte;
-that integration does not exist yet.
+Droid, it runs a `JSONLAdapter` that turns the native transcript into records
+and then folds them. The other converters still write lines directly. The fold
+is meant to be shared with a backend that folds the same records to show a live
+session, so that a live view and a checkpoint's `transcript.jsonl` match byte
+for byte.
+
+A live producer uses the same adapter (`NewClaudeAdapter`, `NewCursorAdapter`,
+`NewDroidAdapter`). `Feed` accepts the transcript in chunks split anywhere and
+returns the records for the lines it completed; `Flush` consumes a trailing
+partial line and is called only once the transcript is final. Fold keys are
+stable only when the adapter is fed from the transcript's first line, so a
+producer that restarts replays from line 1. `Lines` reports how many source
+lines have been consumed. Records carry the transcript's bytes as fed: redact
+before feeding.
 
 ### Record wire format v1
 

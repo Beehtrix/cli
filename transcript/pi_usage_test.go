@@ -39,10 +39,10 @@ func TestPiUsage_Convert(t *testing.T) {
 			},
 		},
 		{
-			name: "no cacheWrite1h means no split; model missing reports unknown",
+			name: "no cacheWrite1h means no split; model missing is omitted",
 			input: head + `{"type":"message","id":"m1","timestamp":"t1","message":{"role":"assistant","content":[{"type":"text","text":"a"}],"usage":{"input":2,"output":3,"cacheRead":0,"cacheWrite":6}}}
 `,
-			want: []map[string]string{{"ts": `"t1"`, "model": `"unknown"`, "input_tokens": "2", "output_tokens": "3", "cache_write_tokens": "6"}},
+			want: []map[string]string{{"ts": `"t1"`, "input_tokens": "2", "output_tokens": "3", "cache_write_tokens": "6"}},
 		},
 		{
 			name: "contentless call with usage keeps its line, zero usage does not",

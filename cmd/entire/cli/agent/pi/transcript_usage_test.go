@@ -39,9 +39,6 @@ func TestCompactUsageSumsMatchNativeTotals(t *testing.T) {
 
 			var in, outTok, read, write int64
 			for _, l := range lines {
-				if l.Model == "" {
-					continue
-				}
 				in += l.InputTokens
 				outTok += l.OutputTokens
 				read += l.CacheReadTokens

@@ -405,5 +405,9 @@ func cloneToolResult(r *ToolResult) *ToolResult {
 		file := *r.File
 		c.File = &file
 	}
+	if r.Agent != nil {
+		agent := *r.Agent
+		c.Agent = &agent
+	}
 	return &c
 }
