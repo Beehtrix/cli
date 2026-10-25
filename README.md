@@ -1,35 +1,27 @@
 # Entire CLI
 
-Entire hooks into your Git workflow to capture AI agent sessions as you work. Sessions are indexed alongside commits, creating a searchable record of how code was written in your repo.
+[Entire](https://entire.com) is a Git forge built for agent–human collaboration. This CLI is how you use it from the terminal: create and host repositories, mirror them across regions, run work through Trails, and capture every agent session into your repo so the reasoning behind your code is never lost.
 
-With Entire, you can:
+Entire is built on three primitives, and the CLI covers all of them:
 
-- **Understand why code changed** — see the full prompt/response transcript and files touched
-- **Pick up where you left off** — resume an agent session and its conversation from a checkpoint
-- **Keep Git history clean** — agent context lives outside your branch's history
-- **Onboard faster** — show the path from prompt → change → commit
-- **Maintain traceability** — support audit and compliance requirements when needed
+- **Distributed Git hosting** — Entire runs a Git-compatible source control server built for agent traffic. Create Entire-native repositories, or mirror your GitHub repositories, and place them on clusters in the regions you choose for data residency and for agents that clone and push in parallel. → [Repositories & Git Hosting](#repositories--git-hosting)
+- **Trails** — instead of reviewing a diff in a pull request, a Trail gives you a heads-up display for a change: its intent, the branches across repositories that implement it, the agent sessions behind them, and findings from automated, customizable evals that agents score on every push. → [Trails](#trails)
+- **Continuous memory** — sessions and prompts from any coding agent are synced into your Git repository as checkpoints linked to your commits, and stay searchable by you and your agents. → [Capturing Agent Sessions](#capturing-agent-sessions)
 
-## Why Entire
+The ecosystem is open: the CLI works with Claude Code, Codex, Cursor, Copilot CLI, OpenCode, Antigravity, Factory AI Droid, and Pi (and more through the [external agent protocol](docs/architecture/external-agent-protocol.md)), extends through [plugins](#plugins), and Trails report CI results from partners such as Buildkite and Depot.
 
-- **Understand why code changed, not just what** — Transcripts, prompts, files touched, token usage, tool calls, and more are captured alongside every commit.
-- **Resume from any checkpoint** — Go back to any previous agent session and pick up exactly where you or a coworker left off.
-- **Full context preserved and searchable** — A versioned record of every AI interaction tied to your git history, with nothing lost.
-- **Zero context switching** — Git-native, two-step setup, works with Claude Code, Codex, Cursor, Antigravity, Pi, and more.
+The CLI is open source under the MIT license. Full documentation lives at **[docs.entire.com](https://docs.entire.com)**.
 
 ## Table of Contents
 
-- [Why Entire](#why-entire)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [Release Channels](#release-channels)
-- [Typical Workflow](#typical-workflow)
+- [Repositories & Git Hosting](#repositories--git-hosting)
+- [Trails](#trails)
+- [Capturing Agent Sessions](#capturing-agent-sessions)
 - [Key Concepts](#key-concepts)
-  - [Sessions](#sessions)
-  - [Checkpoints](#checkpoints)
-  - [Checkpoint Storage](#checkpoint-storage)
-  - [How It Works](#how-it-works)
-  - [Strategy](#strategy)
+- [Search, Activity & the API](#search-activity--the-api)
 - [Headless & CI Authentication](#headless--ci-authentication)
 - [Commands Reference](#commands-reference)
 - [Plugins](#plugins)
@@ -44,14 +36,16 @@ With Entire, you can:
 
 - Git
 - macOS, Linux or Windows
-- [Supported agent](#agent-hook-configuration) installed and authenticated
+- For session capture, a [supported agent](#agent-hook-configuration) installed and authenticated
 - Go 1.27.3+ only if you install with `go install` (the packaged installs bundle their own runtime)
+
+Hosting, mirroring, Trails, and search need an Entire account (`entire login`). Capturing agent sessions into your repository works without one.
 
 ## Quick Start
 
-### macOS and Linux
+### 1. Install
 
-Install with Homebrew:
+**macOS and Linux** — with Homebrew:
 
 ```bash
 brew install --cask entireio/tap/entire
@@ -62,34 +56,26 @@ Use the fully-qualified cask name (`entireio/tap/entire`, not `entire`). Homebre
 Or with the install script:
 
 ```bash
-curl -fsSL https://entire.com/install.sh | bash                          # stable
-# curl -fsSL https://entire.com/install.sh | bash -s -- --channel nightly  # or nightly
+curl -fsSL https://entire.com/install.sh | bash
 ```
 
-### Windows
-
-Install with Windows PowerShell 5.1 or later:
+**Windows** — with Windows PowerShell 5.1 or later:
 
 ```powershell
-irm https://entire.com/install.ps1 | iex  # stable
-# or nightly:
-# iex "& {$(irm https://entire.com/install.ps1)} -Channel nightly"
+irm https://entire.com/install.ps1 | iex
 ```
 
-For stable releases, the PowerShell installer uses Scoop when it is available,
-adding the Entire bucket if needed. Without Scoop — and for nightly releases —
-it verifies the release checksum and installs both `entire.exe` and
-`git-remote-entire.exe` to `%USERPROFILE%\.local\bin`, adding that directory to
-your user `PATH` if needed.
+For stable releases, the PowerShell installer uses Scoop when it is available, adding the Entire bucket if needed. Without Scoop — and for nightly releases — it verifies the release checksum and installs both `entire.exe` and `git-remote-entire.exe` to `%USERPROFILE%\.local\bin`, adding that directory to your user `PATH` if needed.
 
-Or install the stable release with Scoop:
+Or install the stable release with Scoop directly:
 
 ```powershell
 scoop bucket add entire https://github.com/entireio/scoop-bucket.git
 scoop install entire/entire
 ```
 
-#### Migrating an old `cli` Scoop install (package rename)
+<details>
+<summary>Migrating an old <code>cli</code> Scoop install (package rename)</summary>
 
 The Scoop package was renamed from `cli` to `entire`. If your install is still registered as the old `cli` package, run the migration below. It installs the new package before removing the old one, so the old install is only removed once the new one is in place (`scoop reset` re-links the shared `entire.exe` and `git-remote-entire.exe` shims). Run it where `entire` is **not** running — a live `entire.exe` locks its own shim, so Scoop can't relink or uninstall it mid-run:
 
@@ -99,7 +85,10 @@ cmd.exe /D /C "scoop install entire/entire && scoop uninstall entire/cli && scoo
 
 If the first step fails with "couldn't find manifest", your bucket clone predates the renamed package — run `scoop update` to refresh it, then retry the command above. Nothing is removed until the install succeeds, so a failed attempt leaves your existing install working.
 
-### Go (development/manual setup)
+</details>
+
+<details>
+<summary>Go (development/manual setup)</summary>
 
 ```bash
 go install github.com/entireio/cli/cmd/entire@latest
@@ -116,52 +105,173 @@ Install both, or just `entire` if you never clone over `entire://`. Git finds th
 
 One difference from a stable release: a `go install` build leaves [experimental commands](#experimental-commands) visible in `entire help`, the same as a nightly or a local build.
 
-### Enable in your project
+</details>
+
+### 2. Sign in
 
 ```bash
-cd your-project && entire enable
-
-# Check status
-entire status
+entire login
 ```
 
-After the initial setup, use `entire agent` to add or remove agents, `entire configure` to update non-agent settings, and `entire enable` / `entire disable` to toggle Entire on or off.
+### 3. Put a repository on Entire
+
+Mirror an existing GitHub repository onto one or more regions, then clone it from the nearest one:
+
+```bash
+entire repo mirror add                       # wizard: pick repos and regions
+entire repo clone /gh/<owner>/<repo> --nearest
+```
+
+Or create an Entire-native repository:
+
+```bash
+entire project create                        # wizard: owner, name, region
+entire repo create <name> --project <project>
+entire repo clone /et/<project>/<name>
+```
+
+### 4. Capture your agent sessions
+
+```bash
+cd your-project
+entire enable
+```
+
+`entire enable` asks which agents to connect, installs their hooks and Entire's git hooks, and writes `.entire/settings.json`. Then use your agent and commit as usual — each commit that includes agent work gets a checkpoint:
+
+```bash
+entire status                    # current sessions and where checkpoints are uploaded
+entire checkpoint explain <id>   # the prompt, transcript, and files behind a checkpoint
+entire search "why did we add rate limiting"
+```
+
+After the initial setup, use `entire agent` to add or remove agents, `entire configure` to update non-agent settings, and `entire enable` / `entire disable` to toggle session capture on or off.
 
 ## Release Channels
 
 Entire currently ships two release channels:
 
-- `stable`: recommended for most users. Stable releases change less often and are the default for Homebrew, Scoop, and `install.sh`.
+- `stable`: recommended for most users. Stable releases change less often and are the default for Homebrew, Scoop, `install.sh`, and `install.ps1`.
 - `nightly`: prerelease builds for users who want the latest changes earlier. Nightlies are published more frequently and may include newer, less-proven changes than stable.
 
-How to use each channel:
-
-- Homebrew stable: `brew install --cask entireio/tap/entire`
-- Homebrew nightly: `brew install --cask entireio/tap/entire@nightly`
-- `install.sh` stable: `curl -fsSL https://entire.com/install.sh | bash`
-- `install.sh` nightly: `curl -fsSL https://entire.com/install.sh | bash -s -- --channel nightly`
-- `install.ps1` stable (uses Scoop when available): `irm https://entire.com/install.ps1 | iex`
-- `install.ps1` nightly: `iex "& {$(irm https://entire.com/install.ps1)} -Channel nightly"`
-- Scoop: currently supports `stable` only via `scoop install entire/entire`
+| Installer   | Stable                                               | Nightly                                                                   |
+| ----------- | ---------------------------------------------------- | ------------------------------------------------------------------------- |
+| Homebrew    | `brew install --cask entireio/tap/entire`            | `brew install --cask entireio/tap/entire@nightly`                         |
+| install.sh  | `curl -fsSL https://entire.com/install.sh \| bash`   | `curl -fsSL https://entire.com/install.sh \| bash -s -- --channel nightly` |
+| install.ps1 | `irm https://entire.com/install.ps1 \| iex`          | `iex "& {$(irm https://entire.com/install.ps1)} -Channel nightly"`        |
+| Scoop       | `scoop install entire/entire`                        | not available — use `install.ps1`                                         |
 
 ### If GitHub is down
 
-Release artifacts are published to `install.entire.com` as well as to GitHub, and
-`install.sh` reads that origin first — so the normal install command keeps
-working through a GitHub outage. If you need to bypass version discovery
-entirely, pin a version or fetch the archive directly:
+Release artifacts are published to `install.entire.com` as well as to GitHub, and `install.sh` reads that origin first — so the normal install command keeps working through a GitHub outage. If you need to bypass version discovery entirely, pin a version or fetch the archive directly:
 
 ```bash
 curl -fsSL https://entire.com/install.sh | bash -s -- --version 0.10.0
 curl -fsSL https://install.entire.com/v0.10.0/entire_darwin_arm64.tar.gz | tar -xz
 ```
 
-Homebrew and Scoop still resolve their manifests from GitHub, so use one of the
-commands above (or `go install github.com/entireio/cli/cmd/entire@v0.10.0`, which
-is served from the Go module proxy) while GitHub is unavailable. See
-[Release Origins](docs/architecture/release-origins.md).
+Homebrew and Scoop still resolve their manifests from GitHub, so use one of the commands above (or `go install github.com/entireio/cli/cmd/entire@v0.10.0`, which is served from the Go module proxy) while GitHub is unavailable. See [Release Origins](docs/architecture/release-origins.md).
 
-## Typical Workflow
+## Repositories & Git Hosting
+
+Entire hosts Git repositories on clusters in several regions. Agents clone, fetch, and push against the cluster closest to where they run, and you choose which regions hold a copy of your code. Repositories live in **projects**, which belong to an **organization** or a personal account.
+
+Every repository command names its forge:
+
+- `/et/<project>/<repo>` — an **Entire-native** repository, hosted on Entire
+- `/gh/<owner>/<repo>` — a **GitHub mirror**, kept in sync with its GitHub upstream
+- `entire://<cluster>/…` — a full clone URL that names the cluster directly
+
+### Regions and clusters
+
+```bash
+entire cluster list                          # clusters you can place projects and repos on
+entire org create <name> --region <slug>     # jurisdiction such as us or eu
+entire project create <name> --owner <org> --region <slug>
+```
+
+Organizations and projects carry a **region** (jurisdiction) for data residency. Individual repositories are placed on **clusters** — hosts such as `aws-us-east-2.entire.io` or `aws-eu-central-1.entire.io` — and a repository can have copies on several of them.
+
+### Create an Entire-native repository
+
+```bash
+entire repo create web --project acme                       # private by default
+entire repo create web --project acme --visibility public   # readable by any signed-in Entire user
+entire repo create                                          # wizard: project, name, visibility, options
+```
+
+`entire repo create` waits for provisioning to finish (bounded by `--wait-timeout`, or skip with `--no-wait`) and supports `--object-format sha256`. To replicate a native repository into more regions, add mirrors of it: `entire repo mirror add /et/acme/web --cluster aws-eu-central-1.entire.io`.
+
+### Mirror a GitHub repository
+
+```bash
+entire repo mirror list                      # your mirrors, and GitHub repos you could onboard
+entire repo mirror add                       # wizard: pick repos, pick regions
+entire repo mirror add /gh/acme/web --cluster aws-us-east-2.entire.io,aws-eu-central-1.entire.io
+entire repo mirror resync /gh/acme/web       # catch a mirror up with GitHub now
+entire repo mirror remove /gh/acme/web --cluster aws-eu-central-1.entire.io
+```
+
+A mirror keeps GitHub as the source of truth: clones and fetches come from Entire, and pushes through a mirror are forwarded to GitHub, where your GitHub permissions, branch protection, and required checks still apply. `entire repo mirror detach /gh/acme/web --into /et/acme/web` converts a mirror into an Entire-native repository when you are ready to move off GitHub (`--dry-run` lists the preconditions first).
+
+### Clone and connect existing checkouts
+
+```bash
+entire repo clone /et/acme/web                    # pick a cluster when there are several
+entire repo clone /gh/acme/web --nearest          # time each cluster and use the fastest
+entire repo clone /gh/acme/web --cluster aws-eu-central-1.entire.io
+
+entire repo remote add entire                     # add Entire alongside your existing origin
+entire repo remote add origin --override          # or route origin itself through Entire
+```
+
+Clones use `entire://` URLs, resolved by the `git-remote-entire` helper that ships with the packaged installs. After that, it is plain Git: `git fetch`, `git pull`, and `git push` work as usual.
+
+**Entire-native branches.** On a mirror, branches named `entire/unmirrored/<name>` are never forwarded to GitHub. They stay on the Entire cluster that received the push, so they are not subject to GitHub's push rate limits and keep working during a GitHub outage. Push the same commits to a branch without the prefix when you want them on GitHub. Entire does not currently back up unmirrored branches, and they are not visible from mirrors in other regions.
+
+### Manage repositories and access
+
+```bash
+entire repo view /et/acme/web                       # identity, visibility, every cluster holding a copy
+entire repo list --project acme
+entire repo edit /et/acme/web --visibility private
+entire repo protection add /et/acme/web main        # refuse force pushes and deletion
+entire repo protection add /et/acme/web main --server-side-merge-only
+entire repo grant add /et/acme/web github:alice --role writer
+entire project grant add acme github:alice --role reader
+entire org invite send acme-org --email dev@example.com --role admin
+entire repo delete /et/acme/web
+```
+
+Branch protection applies to Entire-native repositories; a GitHub mirror uses its upstream's protection. With `--server-side-merge-only`, a branch moves only through a merge Entire performs, such as a Trail merge.
+
+Commands that need a choice offer a picker in a terminal and accept flags in scripts, and most take `--json`. See [Repositories](https://docs.entire.com/guides/repositories/overview) for the full guide.
+
+## Trails
+
+A **Trail** captures the intent behind a piece of work — a title, description, type, priority, and assignees — and links the repository branches that implement it, even across several repositories in a project. Each branch on a Trail collects its agent sessions, review findings, CI results from connected providers, and approvals, and merges from the Trail when it is ready.
+
+```bash
+entire trail create --title "Add rate limiting" --type feature   # publishes the current branch
+entire trail list --project et/acme --status open
+entire trail show                       # the trail for the current branch
+entire trail watch                      # stream reviews, findings, and runner events live
+
+entire trail finding                    # findings dashboard for this branch
+entire trail finding apply <id>         # apply a finding's suggested fix
+entire trail finding resolve <id> -m "fixed in abc123"
+
+entire trail comment add -m "Should this cover the admin API too?"
+entire trail approve
+entire trail merge                      # merge this branch's change into its base
+entire trail resume 42                  # restore the trail branch's sessions and continue
+```
+
+Trails select the project from the current repository (`gh/<owner>` or `et/<project>`); pass `--project` or `--repo` to work on another one without a checkout. Other subcommands are `checkout`, `link`, `unlink`, `update`, and `approvals`.
+
+**Runners** are the per-repository evaluators — risk, confidence, drift, security, review, and others — that score each push on a Trail. They live in `.entire/runners/`, and `entire runner setup` creates the default set and can tailor its prompts to your repository using its docs, history, and past findings.
+
+## Capturing Agent Sessions
 
 ### 1. Enable Entire in Your Repository
 
@@ -177,7 +287,7 @@ After setup:
 - Use `entire agent` to add or remove agents.
 - Use `entire configure` to update non-agent settings (telemetry, hooks, checkpoint remote, summary provider).
 
-The hooks capture session data as you work. Checkpoints are created when you or the agent make a git commit. Your code commits stay clean, Entire never creates commits on your active branch. Session metadata is stored outside your branch's history, in the checkpoint storage described under [Checkpoint Storage](#checkpoint-storage).
+The hooks capture session data as you work. Checkpoints are created when you or the agent make a git commit. Your code commits stay clean: Entire never creates commits on your active branch. Session metadata is stored outside your branch's history, in the checkpoint storage described under [Checkpoint Storage](#checkpoint-storage).
 
 #### Existing git hooks
 
@@ -188,23 +298,30 @@ If your repository already has git hooks (your own scripts, git-lfs, lefthook, p
 
 ### 2. Work with Your AI Agent
 
-Just use one of your AI agents as before. Entire runs in the background, tracking your session:
+Use your AI agents as before. Entire runs in the background, tracking your session:
 
 ```
 entire status  # Check current session status anytime
 ```
 
-### 3. Resume a Previous Session
-
-To restore the latest checkpointed session metadata for a branch:
+### 3. Understand Past Work
 
 ```
-entire session resume <branch>
+entire checkpoint explain <id>    # the story behind a checkpoint, commit, or session
+entire search "<what you want>"   # find past work by intent (requires entire login)
+entire recap                      # summarize recent checkpoint activity
 ```
 
-Entire checks out the branch, restores the latest checkpointed session metadata (one or more sessions), and prints command(s) to continue.
+### 4. Resume a Previous Session
 
-### 4. Disable Entire (Optional)
+```
+entire session resume            # interactive picker
+entire session resume <branch>   # latest checkpointed session(s) for a branch
+```
+
+With a branch, Entire checks out the branch, restores the latest checkpointed session metadata (one or more sessions), and prints command(s) to continue.
+
+### 5. Disable Entire (Optional)
 
 ```
 entire disable
@@ -224,7 +341,7 @@ Sessions are stored separately from your code commits, in the repo's checkpoint 
 
 ### Checkpoints
 
-A **checkpoint** is a snapshot within a session—a "save point" in your work.
+A **checkpoint** is the code change paired with the conversation behind it — a "save point" in your work.
 
 Checkpoints are created when you or the agent make a git commit, and the commit carries an `Entire-Checkpoint: <id>` trailer linking the two.
 
@@ -242,7 +359,7 @@ The ref points at a commit whose tree *is* that checkpoint — `metadata.json`, 
 
 Because checkpoints are independent refs, they are written, pushed, and fetched independently. There is no shared branch tip for concurrent sessions to contend on, and a reader can fetch exactly the one checkpoint it needs instead of a whole history. A checkpoint written on another machine is fetched on demand the first time you read it.
 
-`entire enable` sets this up; there is nothing to configure. It is recorded in `.entire/settings.json` as:
+A first-time `entire enable` sets this up; there is nothing to configure. It is recorded in `.entire/settings.json` as:
 
 ```json
 {
@@ -259,6 +376,17 @@ git for-each-ref refs/entire/checkpoints    # the raw refs
 entire checkpoint list                      # checkpoints on this branch
 entire checkpoint explain <id>              # one checkpoint in full
 ```
+
+#### Legacy branch storage
+
+Repositories enabled by older versions of Entire, and any repo whose settings have no `checkpoints` block, use the legacy backend: one shared `entire/checkpoints/v1` branch holding every checkpoint. It keeps working. To move such a repo to per-checkpoint refs:
+
+```bash
+entire configure --checkpoint-backend refs   # new checkpoints are written as refs
+entire doctor migrate-checkpoints            # convert existing ones (idempotent; --dry-run to preview)
+```
+
+Checkpoints already on the branch stay readable after the switch. `--checkpoint-backend branch` (on `enable` or `configure`) selects the legacy backend explicitly, for interoperating with older clients.
 
 ### How It Works
 
@@ -281,23 +409,35 @@ Your Branch                      Checkpoint storage
      ▼
 ```
 
-As you work, Entire tracks which files the agent touched (and their content hashes) in local session state, alongside a local copy of the transcript; nothing is written to git until you commit. When you commit, that work is condensed into a permanent checkpoint and linked to your commit by an `Entire-Checkpoint` trailer.
+As you work, Entire tracks which files the agent touched (and their content hashes) in local session state, alongside a local copy of the transcript; nothing is written to git until you commit. When you commit, that work is condensed into a permanent checkpoint and linked to your commit by an `Entire-Checkpoint` trailer. Secrets are redacted before the checkpoint is written (see [Security & Privacy](#security--privacy)).
 
-### Strategy
-
-Entire uses a manual-commit strategy that keeps your git history clean:
+Entire uses a single manual-commit strategy that keeps your git history clean:
 
 - **No commits on your branch** — Entire never creates commits on the active branch
 - **Safe on any branch** — works on main, master, and feature branches alike
-- **Metadata stored separately** — session data lives in per-checkpoint refs, never in your branch's history
+- **Metadata stored separately** — session data lives in checkpoint storage, never in your branch's history
 
 ### Git Worktrees
 
-Entire works seamlessly with [git worktrees](https://git-scm.com/docs/git-worktree). Each worktree has independent session tracking, so you can run multiple AI sessions in different worktrees without conflicts.
+Entire works with [git worktrees](https://git-scm.com/docs/git-worktree). Each worktree has independent session tracking, so you can run multiple AI sessions in different worktrees without conflicts.
 
 ### Concurrent Sessions
 
 Multiple AI sessions can run on the same commit. If you start a second session while another has uncommitted work, Entire warns you and tracks them separately. Both sessions' checkpoints are preserved, and a commit condenses every session with pending work in that worktree.
+
+## Search, Activity & the API
+
+- **Search** — `entire search` runs hybrid (semantic + keyword) search over checkpoints, commits, and sessions, scoped to the current repo or `--all-repos`. `--json --compact` returns a trimmed shape suited to agents, and `entire checkpoint explain <id>` fetches the full detail of a hit.
+- **Activity and dispatches** — `entire activity` shows your activity overview, repository breakdown, and recent sessions from entire.com. `entire dispatch` writes a summary of recent agent work; `--local` generates it with your locally installed agent CLI instead of the Entire server.
+- **Raw API access** — `entire api <path>` makes an authenticated request to an Entire API and prints the JSON response, like `gh api`. It attaches your token and picks the host: `--to core` (the default) reaches the control plane (orgs, projects, repos, mirrors, clusters), `--to cell` reaches your home data cell (activity, repo aggregates), and `--jurisdiction <slug>` reaches another jurisdiction's cell. `{owner}`, `{repo}`, and `{repo_id}` in the path are filled from the current repository. These endpoints are internal and can change without notice; where a purpose-built command exists, prefer it.
+
+```bash
+entire api /api/v1/clusters
+entire api --to cell "/api/v1/me/recap?repo={repo_id}"
+entire api -X POST /api/v1/projects -f name=demo
+```
+
+See [CLI and entire.com](https://docs.entire.com/platforms/cli-and-entire-com) for how the CLI and the web app fit together.
 
 ## Headless & CI Authentication
 
@@ -327,20 +467,20 @@ ENTIRE_TOKEN=<login-or-sa-session-JWT> entire ...
 
 ## Commands Reference
 
-Descriptions below are the commands' own summaries. `entire help` always reflects the installed binary; `entire agent-help` is the machine-readable version agents read.
+Descriptions below are the commands' own summaries. `entire help` always reflects the installed binary; `entire agent-help` is the machine-readable version agents read. The [CLI reference](https://docs.entire.com/cli-reference) documents every command.
 
 ### Setup
 
-| Command            | Description                                                                        |
-| ------------------ | ---------------------------------------------------------------------------------- |
-| `entire enable`    | Enable Entire in current repository                                                |
-| `entire disable`   | Disable Entire in current repository                                               |
-| `entire status`    | Show Entire status (`--json` for structured output)                                |
-| `entire agent`     | Manage agent integrations (`add`, `remove`, `list`)                                |
-| `entire configure` | Update non-agent Entire settings in the current repository                          |
-| `entire doctor`    | Diagnose and fix session issues (`trace`, `logs`, `bundle`, `migrate-checkpoints`)  |
-| `entire clean`     | Clean up Entire session data (`--all` for repo-wide cleanup)                       |
-| `entire plugin`    | Manage Entire plugins (see [Plugins](#plugins))                                    |
+| Command            | Description                                                                                |
+| ------------------ | ------------------------------------------------------------------------------------------ |
+| `entire enable`    | Enable Entire in current repository                                                        |
+| `entire disable`   | Disable Entire in current repository                                                       |
+| `entire status`    | Show Entire status (`--json` for structured output)                                        |
+| `entire agent`     | Manage agent integrations (`add`, `remove`, `list`)                                        |
+| `entire configure` | Update Entire settings in the current repository                                           |
+| `entire doctor`    | Diagnose and fix session issues (`trace`, `logs`, `bundle`, `migrate-checkpoints`)         |
+| `entire clean`     | Clean up Entire session data (`--all` for repo-wide cleanup)                               |
+| `entire plugin`    | Manage Entire plugins (`install`, `list`, `upgrade`, `search`, `browse`, `info`, `doctor`, `index`, `remove`; see [Plugins](#plugins)) |
 
 ### Sessions & Checkpoints
 
@@ -348,7 +488,7 @@ Descriptions below are the commands' own summaries. `entire help` always reflect
 | ----------------------------- | ---------------------------------------------------------------------------------------- |
 | `entire session`              | Manage agent sessions (`list`, `info`, `current`, `stop`, `attach`, `adopt`, `resume`, `tokens`) |
 | `entire session resume`       | Resume a stopped session — interactive picker, or by branch                               |
-| `entire checkpoint`           | Inspect and search checkpoints (`list`, `explain`, `tokens`, `search`)                    |
+| `entire checkpoint`           | Inspect and search checkpoints (`list`, `explain`, `search`, `tokens`, `delete`)          |
 | `entire checkpoint explain`   | Explain a checkpoint, commit, or session                                                 |
 | `entire search`               | Search checkpoints, commits, and sessions using semantic and keyword matching            |
 | `entire activity`             | Show your activity overview                                                              |
@@ -361,17 +501,28 @@ Descriptions below are the commands' own summaries. `entire help` always reflect
 | ---------------- | ------------------------------------------------------------------------------------ |
 | `entire login`   | Log in to Entire (browser by default; `--device` for the device-code flow)            |
 | `entire logout`  | Log out of Entire                                                                    |
-| `entire auth`    | Manage authentication (`status`, `contexts`, `switch`, `token`, `login`, `logout`)       |
+| `entire auth`    | Manage authentication (`status`, `contexts`, `switch`, `token`, `login`, `logout`)   |
 
-### Control Plane
+Every command accepts `--context <name>` to act as a different saved login for that one invocation; `entire auth contexts` lists them.
 
-| Command          | Description                                                                       |
-| ---------------- | --------------------------------------------------------------------------------- |
-| `entire cluster` | Show the Entire clusters you can place projects and repos on (`list`)              |
-| `entire org`     | Manage Entire organizations (`create`, `list`, `get`, `delete`, `grant`)           |
-| `entire project` | Manage Entire projects (`create`, `list`, `get`, `delete`, `grant`)                |
-| `entire repo`    | Manage Entire repositories (`create`, `list`, `view`, `edit`, `delete`, `clone`, `mirror`, `remote`, `access`, `visibility`, `protection`, `grant`) |
-| `entire api`     | Make an authenticated request to an Entire API and print the response              |
+### Repositories & Hosting
+
+| Command               | Description                                                                       |
+| --------------------- | --------------------------------------------------------------------------------- |
+| `entire cluster`      | Show the Entire clusters you can place projects and repos on (`list`)              |
+| `entire org`          | Manage Entire organizations (`create`, `list`, `get`, `delete`, `grant`, `invite`) |
+| `entire project`      | Manage Entire projects (`create`, `list`, `get`, `delete`, `grant`)                |
+| `entire repo`         | Manage Entire repositories (`create`, `list`, `view`, `edit`, `delete`, `clone`, `mirror`, `remote`, `visibility`, `protection`, `grant`) |
+| `entire repo mirror`  | Manage where a repository is mirrored across Entire clusters (`add`, `list`, `remove`, `resync`, `detach`) |
+| `entire api`          | Make an authenticated request to an Entire API and print the response              |
+
+### Trails
+
+| Command                | Description                                                                       |
+| ---------------------- | --------------------------------------------------------------------------------- |
+| `entire trail`         | Manage trails across repositories and branches (`create`, `list`, `show`, `update`, `link`, `unlink`, `checkout`, `resume`, `watch`, `comment`, `approve`, `approvals`, `merge`) |
+| `entire trail finding` | Manage a trail's agent findings (`list`, `show`, `add`, `apply`, `resolve`, `dismiss`, `reopen`, `update`) |
+| `entire runner`        | Set up and tune trail runners for this repository (`setup`; experimental)          |
 
 ### Other
 
@@ -404,6 +555,7 @@ These are visible in developer and nightly builds and hidden in stable releases,
 | `--agent <name>`                            | Agent to set up hooks for: `antigravity`, `claude-code`, `codex`, `copilot-cli`, `cursor`, `factoryai-droid`, `opencode`, `pi` (external agents on `$PATH` also work). Enables non-interactive mode |
 | `--yes`, `-y`                               | Accept all defaults without prompting                                                                             |
 | `--force`, `-f`                             | Force reinstall hooks (removes existing Entire hooks first)                                                       |
+| `--checkpoint-backend <refs\|branch>`       | Checkpoint storage backend: `refs` (default) or `branch` (legacy); see [Checkpoint Storage](#checkpoint-storage)  |
 | `--checkpoint-remote <provider:owner/repo>` | Push checkpoint data to a separate repo; providers `github`, `gitlab` (e.g., `github:org/checkpoints-repo`)      |
 | `--checkpoint-push-remote <name>`           | Select an existing Git remote for checkpoints; always saves to this clone's `.entire/settings.local.json`, even with `--project` |
 | `--skip-push-sessions`                      | Disable automatic pushing of checkpoint data on git push                                                           |
@@ -440,7 +592,7 @@ Typical uses:
 
 - Toggle telemetry
 - Reinstall the Entire git hook (`--force`, `--absolute-git-hook-path`)
-- Update strategy options such as `--checkpoint-remote` or `--skip-push-sessions`
+- Update strategy options such as `--checkpoint-remote`, `--skip-push-sessions`, or `--checkpoint-backend`
 - Pick the provider, model, and timeout for `entire checkpoint explain --generate` (`--summarize-provider`, `--summarize-model`, `--summarize-timeout-seconds`)
 
 **Examples:**
@@ -527,7 +679,7 @@ Personal overrides, gitignored by default:
 | ----------------------------------------- | -------------------------------------------- | --------------------------------------------------------------------------------- |
 | `enabled`                                 | `true`, `false`                              | Enable/disable Entire                                                             |
 | `log_level`                               | `debug`, `info`, `warn`, `error`             | Logging verbosity                                                                 |
-| `checkpoints.primary.type`                | `git-refs`                                   | Checkpoint storage backend — written by `entire enable`, see [Checkpoint Storage](#checkpoint-storage) |
+| `checkpoints.primary.type`                | `git-refs`, `git-branch`                     | Checkpoint storage backend — `git-refs` is written by `entire enable`; absent means legacy `git-branch`. See [Checkpoint Storage](#checkpoint-storage) |
 | `telemetry`                               | `true`, `false`                              | Send anonymous usage statistics to Posthog                                        |
 | `absolute_git_hook_path`                  | `true`, `false`                              | Embed the full binary path in git hooks, for GUI git clients that don't source shell profiles |
 | `commit_linking`                          | `always`, `prompt`                           | Link commits to sessions automatically, or ask each time (default `prompt`)        |
@@ -549,18 +701,20 @@ Personal overrides, gitignored by default:
 
 Each agent stores its hook configuration in its own directory. When you run `entire enable`, hooks are installed in the appropriate location for each selected agent:
 
-| Agent            | Hook Location                 | Format            |
-| ---------------- | ----------------------------- | ----------------- |
-| Antigravity      | `.agents/hooks.json`          | JSON hooks config |
-| Claude Code      | `.claude/settings.json`       | JSON hooks config |
-| Codex            | `.codex/hooks.json`           | JSON hooks config |
-| Copilot CLI      | `.github/hooks/entire.json`   | JSON hooks config |
-| Cursor           | `.cursor/hooks.json`          | JSON hooks config |
-| Factory AI Droid | `.factory/settings.json`      | JSON hooks config |
-| OpenCode         | `.opencode/plugins/entire.ts` | TypeScript plugin |
+| Agent            | Hook Location                    | Format               |
+| ---------------- | -------------------------------- | -------------------- |
+| Antigravity      | `.agents/hooks.json`             | JSON hooks config    |
+| Claude Code      | `.claude/settings.json`          | JSON hooks config    |
+| Codex            | `.codex/hooks.json`              | JSON hooks config    |
+| Copilot CLI      | `.github/hooks/entire.json`      | JSON hooks config    |
+| Cursor           | `.cursor/hooks.json`             | JSON hooks config    |
+| Factory AI Droid | `.factory/settings.json`         | JSON hooks config    |
+| OpenCode         | `.opencode/plugins/entire.ts`    | TypeScript plugin    |
 | Pi               | `.pi/extensions/entire/index.ts` | TypeScript extension |
 
 You can enable multiple agents at the same time — each agent's hooks are independent. Entire detects which agents are active by checking for installed hooks, not by a setting in `settings.json`.
+
+Agents not listed here can integrate through the [external agent protocol](docs/architecture/external-agent-protocol.md): an `entire-agent-<name>` binary on `$PATH` appears as an agent option.
 
 ### Checkpoint Remote
 
@@ -671,13 +825,15 @@ Two exceptions to field-by-field merging:
 - Entire supports Copilot CLI, but not Copilot in VS Code, in other IDEs, or on github.com.
 - Entire supports Pi coding agent (Preview). Pi uses a TypeScript extension instead of a JSON hook config. Subagent capture is not currently available.
 
+Per-agent setup guides are at [docs.entire.com/agents](https://docs.entire.com/agents/overview).
+
 ## Security & Privacy
 
-**Your session transcripts are stored in your git repository**, in the [per-checkpoint refs](#checkpoint-storage) described above. If your repository is public, this data is visible to anyone.
+**Your session transcripts are stored in your git repository**, in the [checkpoint storage](#checkpoint-storage) described above. If your repository is public, this data is visible to anyone.
 
 Entire automatically redacts detected secrets (API keys, tokens, credentials) from transcripts and metadata before writing a checkpoint, but redaction is best effort, not bulletproof. Review checkpoints with `entire checkpoint explain` before you push.
 
-To keep transcripts out of a public repository, upload checkpoints to a separate private repo with [`checkpoint_remote`](#checkpoint-remote) (`entire configure --local --checkpoint-remote github:<owner>/<repo>`), or stop uploading them with `entire configure --local --skip-push-sessions`. `--local` makes the setting take effect for your clone: a project `checkpoint_remote` owned by a different account than `origin` is ignored, and a local `push_sessions` overrides the project one. `entire enable` names the checkpoint destination every time it runs.
+To keep transcripts out of a public repository, upload checkpoints to a separate private repo with [`checkpoint_remote`](#checkpoint-remote) (`entire configure --local --checkpoint-remote github:<owner>/<repo>`), or stop uploading them with `entire configure --local --skip-push-sessions`. `--local` makes the setting take effect for your clone: a project `checkpoint_remote` owned by a different account than `origin` is ignored, and a local `push_sessions` overrides the project one. `entire enable` names the checkpoint destination every time it runs. To remove a checkpoint that was already pushed, `entire checkpoint delete <id>` deletes it locally and from every checkpoint remote that holds it.
 
 Older Entire versions also kept local `entire/<commit>-<worktree>` shadow branches whose code-file snapshots were raw blobs of your working tree. Current versions no longer create them, but do not delete leftover ones automatically: `entire doctor` reports them and `entire doctor --force` deletes them, leaving pending agent work alone (plain `entire clean` would also clear the session state that records it). `entire disable --uninstall` deletes the `entire/<commit>-<worktree>` form too, and lists any oldest-form `entire/<commit>` branches without deleting them, since a branch of yours named after a short SHA looks the same; `entire clean --all` covers that form after you confirm. See [docs/security-and-privacy.md](docs/security-and-privacy.md) for the full picture, including the configurable scanner layers and opt-in PII redaction.
 
@@ -689,6 +845,7 @@ Older Entire versions also kept local `entire/<commit>-<worktree>` shadow branch
 | ---------------------------------- | ----------------------------------------------------------------- |
 | "Not a git repository"             | Navigate to a Git repository first                                |
 | "Entire is disabled"               | Run `entire enable`                                               |
+| Agent hooks outdated after a CLI upgrade | Run `entire agent add <name>`; add `--force` if that does not fix them |
 | A session stuck ACTIVE, or leftover session state | Run `entire doctor`, then `entire clean --force` if it persists |
 | Anything else                      | Run `entire doctor`; `entire doctor bundle` produces a redacted diagnostic bundle for a bug report |
 
@@ -727,7 +884,7 @@ This uses simpler text prompts instead of interactive TUI elements.
 
 ## Development
 
-This project uses [mise](https://mise.jdx.dev/) for task automation and dependency management.
+This project uses [mise](https://mise.jdx.dev/) for task automation and dependency management. Contributor guidelines are in [CONTRIBUTING.md](CONTRIBUTING.md), and [docs/first-time-contributors.md](docs/first-time-contributors.md) is a good starting point.
 
 ### Prerequisites
 
@@ -737,14 +894,14 @@ This project uses [mise](https://mise.jdx.dev/) for task automation and dependen
 
 ```
 # Clone the repository
-git clone <repo-url>
+git clone https://github.com/entireio/cli.git
 cd cli
-
-# Install dependencies (including Go)
-mise install
 
 # Trust the mise configuration (required on first setup)
 mise trust
+
+# Install dependencies (including Go)
+mise install
 
 # Build the CLI
 mise run build
@@ -782,6 +939,9 @@ mise run lint
 
 # Format the code
 mise run fmt
+
+# Format, lint, and run all CI tests (before every commit)
+mise run check
 ```
 
 ### Local Device Auth Testing
@@ -817,6 +977,7 @@ entire --help              # General help
 entire <command> --help    # Command-specific help
 ```
 
+- **Documentation:** https://docs.entire.com
 - **GitHub Issues:** Report bugs or request features at https://github.com/entireio/cli/issues
 - **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines
 
