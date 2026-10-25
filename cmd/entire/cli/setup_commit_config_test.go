@@ -404,11 +404,13 @@ func TestPromptCommitConfig_ListQuestionAndOutcomeShareTheTerminal(t *testing.T)
 	}
 }
 
-// Not parallel: swaps the terminal opener.
+// Not parallel: swaps the terminal opener and sets ACCESSIBLE.
 func TestPromptCommitConfig_AbortIsReportedOnTheTerminal(t *testing.T) {
 	// Esc/Ctrl+C inside the form is an answer: "Commit cancelled." goes to the
 	// fallback terminal the question was on, before it closes, and nothing is
-	// committed.
+	// committed. Accessible mode reads Ctrl+C as invalid input rather than an
+	// abort, so an inherited ACCESSIBLE would fail this for the wrong reason.
+	t.Setenv("ACCESSIBLE", "")
 	terminal := &closeableTerminal{t: t}
 	prev := openPromptTerminal
 	openPromptTerminal = func() (promptTerminal, error) {
