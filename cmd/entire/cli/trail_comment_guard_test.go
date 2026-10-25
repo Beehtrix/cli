@@ -14,7 +14,7 @@ import (
 )
 
 // clearAgentCallerEnv makes the test process look like a human's shell to
-// review.DetectAgentCaller, whatever agent runs the test suite.
+// review.DetectAgentSession, whatever agent runs the test suite.
 func clearAgentCallerEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range review.AgentCallerEnvVars() {
@@ -70,23 +70,65 @@ func TestTrailCommentWritesRefuseAgentCallers(t *testing.T) {
 	}
 }
 
-// With the override, an agent caller's write goes through.
+// A write reaches the API when an agent passes the override, and when nothing
+// but GIT_TERMINAL_PROMPT=0 is set: human shells and scripts suppress git
+// prompts too, and that names no agent.
 //
 // Not parallel: sets the agent-caller environment and replaces the project
 // routing constructors.
-func TestTrailCommentHumanOverrideLetsAgentWrite(t *testing.T) {
-	clearAgentCallerEnv(t)
-	t.Setenv("CLAUDECODE", "1")
-	calls := 0
-	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		assert.Equal(t, http.MethodPost, r.Method)
-		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"discussion": api.TrailDiscussionSummary{ID: "discussion-one", Title: "Plan", TrailID: projectTrailTestID},
-		}))
-	})
-	_, _, err := executeProjectTrailTest(t, "comment", "add", "-m", "Plan", "--human-says-do-it",
-		"--project", "gh/acme", "--trail", projectTrailTestID)
-	require.NoError(t, err)
-	require.Equal(t, 1, calls)
+func TestTrailCommentWritesAllowedCallers(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		env   map[string]string
+		extra []string
+	}{
+		{"agent with override", map[string]string{"CLAUDECODE": "1"}, []string{"--human-says-do-it"}},
+		{"git prompt suppression only", map[string]string{"GIT_TERMINAL_PROMPT": "0"}, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clearAgentCallerEnv(t)
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+			calls := 0
+			setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				assert.Equal(t, http.MethodPost, r.Method)
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+					"discussion": api.TrailDiscussionSummary{ID: "discussion-one", Title: "Plan", TrailID: projectTrailTestID},
+				}))
+			})
+			args := append([]string{"comment", "add", "-m", "Plan", "--project", "gh/acme", "--trail", projectTrailTestID}, tt.extra...)
+			_, _, err := executeProjectTrailTest(t, args...)
+			require.NoError(t, err)
+			require.Equal(t, 1, calls)
+		})
+	}
+}
+
+// Agents read discussions for context, so list and show run in an agent
+// session.
+//
+// Not parallel: sets the agent-caller environment and replaces the project
+// routing constructors.
+func TestTrailCommentReadsAllowAgentCallers(t *testing.T) {
+	for _, args := range [][]string{{"list", "--json"}, {"show", "discussion-one", "--json"}} {
+		t.Run(args[0], func(t *testing.T) {
+			clearAgentCallerEnv(t)
+			t.Setenv("CLAUDECODE", "1")
+			calls := 0
+			setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+					"discussion": api.TrailDiscussionSummary{ID: "discussion-one", Title: "Plan", TrailID: projectTrailTestID},
+					"items":      []api.TrailDiscussionSummary{{ID: "discussion-one", Title: "Plan"}},
+				}))
+			})
+			out, _, err := executeProjectTrailTest(t, append([]string{"comment", "--project", "gh/acme", "--trail", projectTrailTestID}, args...)...)
+			require.NoError(t, err)
+			require.Equal(t, 1, calls)
+			require.Contains(t, out, "discussion-one")
+		})
+	}
 }

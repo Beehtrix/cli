@@ -99,15 +99,18 @@ replies. Code-review comments are managed separately under 'entire trail finding
 }
 
 // trailCommentHumanOverrideFlag lets a comment write through from an agent
-// session once a human has explicitly asked for it. Deliberately undocumented
-// for now: hidden from help and agent-help and never named in the refusal, so
-// an agent cannot discover it on its own.
+// session. The guard is a workflow nudge, not an authorization check: the flag
+// proves nothing about who asked, and the source and binary still reveal it.
+// It is kept out of help, agent-help, and the refusal so an agent is not handed
+// it as the obvious next step.
 const trailCommentHumanOverrideFlag = "human-says-do-it"
 
 // guardTrailCommentWrites refuses every comment write in an agent session:
 // discussions are conversation between people, and agents report through
 // findings. Only list and show stay open, so a write verb added later is
-// guarded by default.
+// guarded by default. Detection counts only agents that identify themselves
+// (review.DetectAgentSession); GIT_TERMINAL_PROMPT=0 alone is a human's or
+// script's prompt suppression and must not block their writes.
 func guardTrailCommentWrites(group *cobra.Command) {
 	for _, child := range group.Commands() {
 		if name := child.Name(); name == cmdList || name == discussionShow {
@@ -120,7 +123,7 @@ func guardTrailCommentWrites(group *cobra.Command) {
 		}
 		run := child.RunE
 		child.RunE = func(cmd *cobra.Command, args []string) error {
-			if caller := review.DetectAgentCaller(); caller != "" && !humanSaysDoIt {
+			if caller := review.DetectAgentSession(); caller != "" && !humanSaysDoIt {
 				return fmt.Errorf("refusing `%s` from %s: trail comments are for people. "+
 					"Post feedback as a finding with `entire trail finding` instead",
 					cmd.CommandPath(), caller)

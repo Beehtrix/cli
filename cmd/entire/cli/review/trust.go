@@ -254,11 +254,27 @@ func shortSHA(sha string) string {
 	return sha
 }
 
-// DetectAgentCaller returns a label for the agent running this command, or ""
-// when none is detected. CLAUDECODE is checked here because the shared
-// sentinel list omits it; AI_AGENT is the cross-tool convention, and external
-// agents can declare their own variables.
-func DetectAgentCaller() string {
+// detectAgentCaller returns a label for the agent running this command, or ""
+// when none is detected. Beyond DetectAgentSession it treats
+// GIT_TERMINAL_PROMPT=0 as a possible agent: the trust gate fails toward asking,
+// so a CI job or script that suppressed git prompts is held for approval too.
+func detectAgentCaller() string {
+	if label := DetectAgentSession(); label != "" {
+		return label
+	}
+	if os.Getenv("GIT_TERMINAL_PROMPT") == "0" {
+		return "an agent or CI (GIT_TERMINAL_PROMPT=0)"
+	}
+	return ""
+}
+
+// DetectAgentSession returns a label for the agent session running this
+// command, or "" when no agent identifies itself. Only agent-specific variables
+// count; GIT_TERMINAL_PROMPT=0 alone is not an agent, since human shells and
+// scripts set it too. CLAUDECODE is checked here because the shared sentinel
+// list omits it; AI_AGENT is the cross-tool convention, and external agents can
+// declare their own variables.
+func DetectAgentSession() string {
 	for _, name := range agent.CallerSessionEnvVars() {
 		if os.Getenv(name) != "" {
 			return agentCallerLabel(name)
@@ -281,13 +297,10 @@ func DetectAgentCaller() string {
 	if v := strings.TrimSpace(os.Getenv("AI_AGENT")); v != "" {
 		return withArticle(truncateDisplay(sanitizeDisplay(v), 40)) + " session (AI_AGENT)"
 	}
-	if os.Getenv("GIT_TERMINAL_PROMPT") == "0" {
-		return "an agent or CI (GIT_TERMINAL_PROMPT=0)"
-	}
 	return ""
 }
 
-// agentCallerNames maps the variables DetectAgentCaller checks to agent names.
+// agentCallerNames maps the variables detectAgentCaller checks to agent names.
 var agentCallerNames = map[string]string{
 	"CLAUDECODE":                "Claude Code",
 	"CLAUDE_CODE_SESSION_ID":    "Claude Code",
@@ -305,7 +318,7 @@ var agentCallerNames = map[string]string{
 	"FACTORY_ENV":               "Factory Droid",
 }
 
-// AgentCallerEnvVars lists every built-in variable DetectAgentCaller reads, so
+// AgentCallerEnvVars lists every built-in variable detectAgentCaller reads, so
 // tests can clear them all.
 func AgentCallerEnvVars() []string {
 	names := append(agent.CallerSessionEnvVars(), interactive.AgentSubprocessEnvVars()...)
