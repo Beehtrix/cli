@@ -17,6 +17,10 @@ import (
 
 const testEntireGitignore = ".entire/.gitignore"
 
+// origCommitConfigCanPrompt is the production gate, for tests that need it back
+// after stubCommitConfig stands in a terminal.
+var origCommitConfigCanPrompt = commitConfigCanPrompt
+
 // newCommitConfigRepo chdirs into a fresh repository with git isolated from
 // the developer's global and system config, commits a README unless empty is
 // set, and leaves .entire/settings.json untracked.
@@ -34,11 +38,15 @@ func newCommitConfigRepo(t *testing.T, empty bool) string {
 	return dir
 }
 
-// stubCommitConfig replaces the prompt and the commit for one test.
-func stubCommitConfig(t *testing.T, prompt func(string) (bool, error), commit func(context.Context, io.Writer, string, []string) error) {
+// stubCommitConfig replaces the prompt and the commit for one test, and
+// stands in a terminal for the output so the offer can be asked.
+func stubCommitConfig(t *testing.T, prompt func(string) (bool, error), commit func(context.Context, string, []string, string, io.Writer) error) {
 	t.Helper()
-	origPrompt, origCommit := commitConfigPrompt, commitConfigFiles
-	t.Cleanup(func() { commitConfigPrompt, commitConfigFiles = origPrompt, origCommit })
+	origPrompt, origCommit, origCanPrompt := commitConfigPrompt, commitConfigFiles, commitConfigCanPrompt
+	t.Cleanup(func() {
+		commitConfigPrompt, commitConfigFiles, commitConfigCanPrompt = origPrompt, origCommit, origCanPrompt
+	})
+	commitConfigCanPrompt = func(io.Writer) bool { return true }
 	if prompt != nil {
 		commitConfigPrompt = prompt
 	}
@@ -136,6 +144,7 @@ func TestOfferCommitConfig_ListsPendingFilesWithoutPrompting(t *testing.T) {
 				tt.prepare(t, dir)
 			}
 			stubCommitConfig(t, failOnPrompt(t), nil)
+			commitConfigCanPrompt = func(io.Writer) bool { return false }
 
 			var out bytes.Buffer
 			offerCommitConfig(context.Background(), &out, EnableOptions{})
@@ -147,7 +156,6 @@ func TestOfferCommitConfig_ListsPendingFilesWithoutPrompting(t *testing.T) {
 // Not parallel: chdirs and sets environment variables.
 func TestOfferCommitConfig_YesFlagNeverPrompts(t *testing.T) {
 	newCommitConfigRepo(t, false)
-	t.Setenv(interactive.EnvTestTTY, "1")
 	stubCommitConfig(t, failOnPrompt(t), nil)
 
 	var out bytes.Buffer
@@ -166,7 +174,6 @@ func TestOfferCommitConfig_CommitsOnlyTheConfigFiles(t *testing.T) {
 			dir := newCommitConfigRepo(t, empty)
 			testutil.WriteFile(t, dir, "staged.txt", "unrelated")
 			testutil.GitAdd(t, dir, "staged.txt")
-			t.Setenv(interactive.EnvTestTTY, "1")
 			branch := strings.TrimSpace(testutil.RunGit(t, dir, "symbolic-ref", "--short", "HEAD"))
 
 			var askedBranch string
@@ -199,7 +206,7 @@ func TestOfferCommitConfig_DeclinedOrFailedCommitListsFiles(t *testing.T) {
 	tests := []struct {
 		name   string
 		prompt func(string) (bool, error)
-		commit func(context.Context, io.Writer, string, []string) error
+		commit func(context.Context, string, []string, string, io.Writer) error
 		want   []string
 	}{
 		{
@@ -213,7 +220,7 @@ func TestOfferCommitConfig_DeclinedOrFailedCommitListsFiles(t *testing.T) {
 		{
 			name:   "commit failed",
 			prompt: func(string) (bool, error) { return true, nil },
-			commit: func(context.Context, io.Writer, string, []string) error {
+			commit: func(context.Context, string, []string, string, io.Writer) error {
 				return errors.New("git commit: exit status 1")
 			},
 			want: []string{"Could not commit them: git commit: exit status 1\n"},
@@ -223,10 +230,9 @@ func TestOfferCommitConfig_DeclinedOrFailedCommitListsFiles(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			newCommitConfigRepo(t, false)
-			t.Setenv(interactive.EnvTestTTY, "1")
 			commit := tt.commit
 			if commit == nil {
-				commit = func(context.Context, io.Writer, string, []string) error {
+				commit = func(context.Context, string, []string, string, io.Writer) error {
 					t.Error("committed after the prompt was not accepted")
 					return nil
 				}
@@ -237,6 +243,54 @@ func TestOfferCommitConfig_DeclinedOrFailedCommitListsFiles(t *testing.T) {
 			offerCommitConfig(context.Background(), &out, EnableOptions{})
 			want := append(slices.Clone(tt.want), "Make sure to commit these files", "  .entire/settings.json\n")
 			assertOutput(t, out.String(), want, []string{"✓ Committed"})
+		})
+	}
+}
+
+// Not parallel: chdirs and sets environment variables.
+func TestOfferCommitConfig_RedirectedOutputNeverPrompts(t *testing.T) {
+	newCommitConfigRepo(t, false)
+	// A controlling terminal exists, but the list is going to a buffer the
+	// developer cannot see, so asking about it would be asking blind.
+	t.Setenv(interactive.EnvTestTTY, "1")
+	stubCommitConfig(t, failOnPrompt(t), nil)
+	commitConfigCanPrompt = origCommitConfigCanPrompt
+
+	var out bytes.Buffer
+	offerCommitConfig(context.Background(), &out, EnableOptions{})
+	assertOutput(t, out.String(), []string{"Make sure to commit these files", "  .entire/settings.json\n"}, nil)
+}
+
+// Not parallel: chdirs and sets environment variables.
+func TestRunEnableOnConfiguredRepo_OffersPendingConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		settings string
+		want     string
+	}{
+		{name: "already enabled", settings: testSettingsEnabled, want: "Entire is already enabled."},
+		{name: "re-enabled", settings: testSettingsDisabled, want: "Entire is now enabled."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			newCommitConfigRepo(t, false)
+			writeSettings(t, tt.settings)
+			var asked bool
+			stubCommitConfig(t, func(string) (bool, error) {
+				asked = true
+				return false, nil
+			}, nil)
+
+			cmd := newEnableCmd()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			if err := runEnableOnConfiguredRepo(context.Background(), cmd, EnableOptions{}); err != nil {
+				t.Fatalf("runEnableOnConfiguredRepo() error = %v", err)
+			}
+			if !asked {
+				t.Error("configured-repo enable did not offer to commit the pending configuration")
+			}
+			assertOutput(t, out.String(), []string{tt.want, "Make sure to commit these files", "  .entire/settings.json\n"}, nil)
 		})
 	}
 }

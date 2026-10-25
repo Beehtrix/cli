@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os/exec"
 	"slices"
 
 	"charm.land/huh/v2"
@@ -19,18 +18,19 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 )
 
-const (
-	// configCommitMessage is the message of the commit enable offers to make.
-	configCommitMessage = "Enable Entire"
-
-	gitSubcommandAdd    = "add"
-	gitSubcommandCommit = "commit"
-)
+// configCommitMessage is the message of the commit enable offers to make.
+const configCommitMessage = "Enable Entire"
 
 // Overridable in tests.
 var (
 	commitConfigPrompt = promptCommitConfig
-	commitConfigFiles  = gitCommitConfigFiles
+	commitConfigFiles  = gitrepo.CommitPaths
+	// commitConfigCanPrompt reports whether the offer can be asked where the
+	// developer sees it: the file list goes to w, so w must be the terminal
+	// too, not only some controlling terminal behind redirected output.
+	commitConfigCanPrompt = func(w io.Writer) bool {
+		return interactive.CanPromptInteractively() && interactive.IsTerminalWriter(w)
+	}
 )
 
 // offerCommitConfig closes a completed enable by getting the configuration it
@@ -80,7 +80,7 @@ func offerCommitConfig(ctx context.Context, w io.Writer, opts EnableOptions) {
 	for _, file := range pending {
 		fmt.Fprintf(w, "  %s\n", file)
 	}
-	if opts.Yes || !interactive.CanPromptInteractively() {
+	if opts.Yes || !commitConfigCanPrompt(w) {
 		return
 	}
 
@@ -93,7 +93,7 @@ func offerCommitConfig(ctx context.Context, w io.Writer, opts EnableOptions) {
 	if !commit {
 		return
 	}
-	if err := commitConfigFiles(ctx, w, root, pending); err != nil {
+	if err := commitConfigFiles(ctx, root, pending, configCommitMessage, w); err != nil {
 		fmt.Fprintf(w, "Could not commit them: %v\n", err)
 		return
 	}
@@ -153,26 +153,4 @@ func promptCommitConfig(branch string) (bool, error) {
 		return false, fmt.Errorf("commit prompt: %w", err)
 	}
 	return commit, nil
-}
-
-// gitCommitConfigFiles stages files and commits only them, leaving anything
-// else the developer has staged out of the commit and still staged. Git runs
-// as the developer configured it — their hooks and commit signing apply — and
-// its output goes to w.
-func gitCommitConfigFiles(ctx context.Context, w io.Writer, root string, files []string) error {
-	run := func(args ...string) error {
-		args = append([]string{"--literal-pathspecs"}, args...)
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = root
-		cmd.Stdout = w
-		cmd.Stderr = w
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("git %s: %w", args[1], err)
-		}
-		return nil
-	}
-	if err := run(append([]string{gitSubcommandAdd, "--"}, files...)...); err != nil {
-		return err
-	}
-	return run(append([]string{gitSubcommandCommit, "-q", "--only", "-m", configCommitMessage, "--"}, files...)...)
 }

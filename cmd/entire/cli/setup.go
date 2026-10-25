@@ -1356,10 +1356,10 @@ func runEnableOnConfiguredRepoWithPreflight(ctx context.Context, cmd *cobra.Comm
 		if !usedSetupFlow {
 			fmt.Fprintln(w, "Entire is already enabled.")
 		}
-		printEnabledStatus(ctx, w)
+		printEnabledStatus(ctx, w, opts)
 		return nil
 	}
-	return runEnable(ctx, w, useProject)
+	return runEnable(ctx, w, useProject, opts)
 }
 
 // scopeExplicitlyDisabled reports whether the settings file for the given scope
@@ -1558,12 +1558,14 @@ func runEnableInteractive(ctx context.Context, w io.Writer, agents []agent.Agent
 	return nil
 }
 
-// printEnabledStatus prints agents and a hint about `entire agent`.
-func printEnabledStatus(ctx context.Context, w io.Writer) {
+// printEnabledStatus prints agents, a hint about `entire agent`, and the
+// configuration still to commit.
+func printEnabledStatus(ctx context.Context, w io.Writer, opts EnableOptions) {
 	if displayNames := InstalledAgentDisplayNames(ctx); len(displayNames) > 0 {
 		fmt.Fprintf(w, "Agents: %s\n", strings.Join(displayNames, ", "))
 	}
 	fmt.Fprintln(w, "\nTo add more agents, run `entire agent add <name>`.")
+	offerCommitConfig(ctx, w, opts)
 	printSetupCheckpointDestinationNote(ctx, w)
 }
 
@@ -1604,13 +1606,13 @@ func firstRunCheckpointBackendDefault() string {
 // (see setEnabledFlag). Callers resolve the scope: runEnableOnConfiguredRepo
 // uses settingsTargetFile so a bare `entire enable` targets the committed
 // settings.json when present and can recover a repo disabled there.
-func runEnable(ctx context.Context, w io.Writer, useProjectSettings bool) error {
+func runEnable(ctx context.Context, w io.Writer, useProjectSettings bool, opts EnableOptions) error {
 	if err := setEnabledFlag(ctx, true, useProjectSettings); err != nil {
 		return err
 	}
 
 	fmt.Fprintln(w, "Entire is now enabled.")
-	printEnabledStatus(ctx, w)
+	printEnabledStatus(ctx, w, opts)
 	return nil
 }
 
