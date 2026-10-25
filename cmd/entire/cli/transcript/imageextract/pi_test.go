@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
+	transcriptlib "github.com/entireio/cli/transcript"
 )
 
 // piUserImageLine returns a real-format Pi session line: a user message whose
@@ -106,5 +107,31 @@ func TestPiCodec_IgnoresNonPiImages(t *testing.T) {
 	}
 	if len(assets) != 0 || string(rewritten) != orig {
 		t.Fatalf("expected no change, got %d assets:\n%s", len(assets), rewritten)
+	}
+}
+
+// With externalization on, the stored Pi transcript carries placeholders, and
+// the converted transcript.jsonl built from it keeps the image item with the
+// placeholder rather than the base64.
+func TestPiCodec_ConvertedTranscriptKeepsPlaceholder(t *testing.T) {
+	t.Parallel()
+	b64 := piPNG("converted")
+	orig := `{"type":"session","version":3,"id":"s1","timestamp":"2026-10-20T17:02:50.000Z","cwd":"/repo"}` + "\n" +
+		`{"type":"message","id":"61c6d42a","parentId":null,"timestamp":"2026-10-20T17:02:53.673Z",` +
+		`"message":{"role":"user","content":[{"type":"image","data":"` + b64 + `","mimeType":"image/png"}],"timestamp":1792515773671}}` + "\n"
+
+	rewritten, assets, err := CodecFor(agent.AgentTypePi).ExtractImages([]byte(orig))
+	if err != nil || len(assets) != 1 {
+		t.Fatalf("ExtractImages: %d assets, err %v", len(assets), err)
+	}
+	converted, err := transcriptlib.Convert(rewritten, transcriptlib.Options{Agent: "pi"})
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	if strings.Contains(string(converted), b64) {
+		t.Errorf("converted transcript still carries the base64:\n%s", converted)
+	}
+	if !strings.Contains(string(converted), `"data":"`+placeholderPrefix+assets[0].Name+`"`) {
+		t.Errorf("converted transcript lost the image item's placeholder:\n%s", converted)
 	}
 }
