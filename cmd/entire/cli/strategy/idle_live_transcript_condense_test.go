@@ -110,17 +110,20 @@ func TestIdleSessionLinkedByLiveTranscript_ClaimsCommitFromReadOnlySession(t *te
 // hooks must agree whichever way the sibling's edit reached the session: every
 // trailer resolves, and the files the session still has waiting at home and in
 // a third worktree stay pending. With a record of the sibling, the commit is
-// judged in that record's view; with only the transcript, its sibling paths
-// lie outside the home and link nothing, so the new transcript path never
-// stands in for the home's record.
+// judged in that record's view; with only the transcript, the sibling's
+// commit links nothing, whether or not the home has files pending.
 func TestIdleSessionLinkedByLiveTranscript_SiblingWorktreeCommit(t *testing.T) {
 	for _, tt := range []struct {
-		name       string
-		recorded   bool
-		wantLinked bool
+		name        string
+		recorded    bool
+		homePending []string
+		wantLinked  bool
 	}{
-		{name: "sibling recorded", recorded: true, wantLinked: true},
-		{name: "sibling only in the transcript"},
+		{name: "sibling recorded", recorded: true, homePending: []string{"home.go"}, wantLinked: true},
+		{name: "sibling only in the transcript", homePending: []string{"home.go"}},
+		// Nothing pending at home, so the transcript is the session's only
+		// evidence and its sibling path is what decides.
+		{name: "sibling only in the transcript, nothing pending at home"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			mainDir, linkedDir := twoWorktrees(t)
@@ -131,7 +134,7 @@ func TestIdleSessionLinkedByLiveTranscript_SiblingWorktreeCommit(t *testing.T) {
 
 			chdirWorktree(t, mainDir)
 			saveIdleLiveTranscriptSession(t, mainDir, linkedDir, func(st *SessionState) {
-				st.FilesTouched = []string{"home.go"}
+				st.FilesTouched = tt.homePending
 				st.OtherWorktrees = map[string]*session.WorktreeWork{
 					thirdKey: {Path: thirdDir, FilesTouched: []string{"other.go"}, Incarnation: mark(t, thirdDir)},
 				}
@@ -155,13 +158,38 @@ func TestIdleSessionLinkedByLiveTranscript_SiblingWorktreeCommit(t *testing.T) {
 			} else {
 				require.Empty(t, ids, "sibling paths outside the home link nothing")
 			}
-			require.Equal(t, []string{"home.go"}, state.FilesTouched, "the home's pending files are untouched")
+			require.Equal(t, tt.homePending, state.FilesTouched, "the home's pending files are untouched")
 			require.Contains(t, state.OtherWorktrees, thirdKey, "the third worktree's record survived")
 			require.Equal(t, []string{"other.go"}, state.OtherWorktrees[thirdKey].FilesTouched,
 				"the files waiting in the third worktree are still pending")
 			require.NotContains(t, state.OtherWorktrees, siblingKey, "the commit took the sibling's only edit, or there was no record of it")
 		})
 	}
+}
+
+// ENT-3537's stacked worktrees: the session's transcript edited feature.go at
+// home, and a sibling worktree commits its own feature.go first. Home-relative
+// transcript paths say nothing about the sibling's files, so the sibling's
+// commit must neither link the session nor consume its work, and the home's
+// later commit of feature.go still gets a trailer that resolves.
+func TestIdleSessionLinkedByLiveTranscript_StackedSiblingCommitsSameFile(t *testing.T) {
+	mainDir, linkedDir := twoWorktrees(t)
+	chdirWorktree(t, mainDir)
+	saveIdleLiveTranscriptSession(t, mainDir, mainDir, nil)
+	s := NewManualCommitStrategy()
+
+	chdirWorktree(t, linkedDir)
+	testutil.WriteFile(t, linkedDir, "feature.go", "package feature // sibling\n")
+	testutil.GitAdd(t, linkedDir, "feature.go")
+	siblingIDs := commitThroughHooks(t, linkedDir, s, "feat: the sibling's feature\n")
+	require.Empty(t, siblingIDs, "the transcript edited the home's feature.go, not the sibling's")
+
+	chdirWorktree(t, mainDir)
+	testutil.WriteFile(t, mainDir, "feature.go", "package feature\n")
+	testutil.GitAdd(t, mainDir, "feature.go")
+	homeIDs := commitThroughHooks(t, mainDir, s, "feat: add the feature\n")
+	require.Len(t, homeIDs, 1, "the home commit holds the transcript's edit: %v", homeIDs)
+	requireFreshTrailersResolve(t, homeIDs)
 }
 
 // idleLiveTranscriptRepo is a repository with one commit, the process inside it.

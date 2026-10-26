@@ -1699,7 +1699,8 @@ func (s *ManualCommitStrategy) collectCommittedFileClaims(ctx context.Context, s
 // not run SaveStep yet, so its persisted FilesTouched is empty or left over
 // from an earlier turn; and an IDLE session with no persisted files whose new
 // work no turn end recorded (liveTranscriptCheckApplies) and whose transcript
-// grew since, which PrepareCommitMsg linked on those edits. Without this check, the read-only
+// grew since, which PrepareCommitMsg linked on those edits when the commit is
+// at its home (transcriptEditsApplyHere). Without this check, the read-only
 // gate in shouldCondenseWithOverlapCheck sees no claimant and lets a file-less
 // session (a reviewer running a background subagent) condense into the commit.
 // Callers invoke it only when persisted FilesTouched found no claimant, so an
@@ -1712,7 +1713,8 @@ func (s *ManualCommitStrategy) hasLiveTranscriptClaimant(ctx context.Context, se
 		// subagent's edits are read from its whole transcript, so without it
 		// edits a checkpoint already holds would claim the commit.
 		idleTranscriptOnly := state.Phase == session.PhaseIdle && len(state.FilesTouched) == 0 &&
-			liveTranscriptCheckApplies(ctx, state) && s.hasNewTranscriptWork(ctx, state)
+			liveTranscriptCheckApplies(ctx, state) && transcriptEditsApplyHere(ctx, state) &&
+			s.hasNewTranscriptWork(ctx, state)
 		if !state.Phase.IsActive() && !idleTranscriptOnly {
 			continue
 		}
@@ -1779,7 +1781,7 @@ func (s *ManualCommitStrategy) postCommitFilesTouchedBefore(ctx context.Context,
 		return s.resolveFilesTouched(ctx, state)
 	case len(state.FilesTouched) > 0:
 		return slices.Clone(state.FilesTouched)
-	case state.Phase == session.PhaseIdle && liveTranscriptCheckApplies(ctx, state):
+	case state.Phase == session.PhaseIdle && liveTranscriptCheckApplies(ctx, state) && transcriptEditsApplyHere(ctx, state):
 		return s.filesTouchedWithLiveTranscript(ctx, state)
 	}
 	return nil
@@ -2329,6 +2331,22 @@ func liveTranscriptCheckApplies(ctx context.Context, state *SessionState) bool {
 	return !hasTranscriptFile
 }
 
+// transcriptEditsApplyHere reports whether the live transcript's edits can
+// describe a commit in the hook's worktree: they are made relative to the
+// session's home, so in any other worktree they match only files that happen
+// to share a name (ENT-3537's stacked worktrees). A state with no recorded
+// home is judged wherever it is asked about, as before homes were recorded.
+func transcriptEditsApplyHere(ctx context.Context, state *SessionState) bool {
+	if state.WorktreePath == "" {
+		return true
+	}
+	root, err := paths.WorktreeRoot(ctx)
+	if err != nil {
+		return false
+	}
+	return committedAtHome(root, state)
+}
+
 // sessionHasNewContent checks if a session has new transcript content
 // beyond what was already condensed.
 // The opts parameter provides pre-computed values to avoid redundant work.
@@ -2351,6 +2369,13 @@ func (s *ManualCommitStrategy) sessionHasNewContent(ctx context.Context, repo *g
 			slog.String("session_id", state.SessionID),
 			slog.Int("step_count", state.StepCount),
 		)
+		// An ACTIVE session's mid-turn edits keep their existing handling.
+		if !state.Phase.IsActive() && !transcriptEditsApplyHere(ctx, state) {
+			logging.Debug(logCtx, "sessionHasNewContent: live transcript edits are relative to another worktree",
+				slog.String("session_id", state.SessionID),
+			)
+			return false, nil
+		}
 		return s.sessionHasNewContentFromLiveTranscript(ctx, state, opts.commitFiles())
 	}
 
