@@ -182,7 +182,9 @@ branch (a `message` record restores it in place if the branch comes back). A
 line that only grows the active branch is read without walking the tree, so a
 session that only grows reads in linear time. Like the JSONL adapters, it has
 no line size limit: a long line is held until its newline arrives and read
-whole.
+whole. `Convert` still fails on a Pi line of 10 MiB or more (newline
+excluded), as it always has, so the fold matches `Convert` wherever `Convert`
+succeeds.
 
 ### Record wire format v1
 

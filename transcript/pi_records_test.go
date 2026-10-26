@@ -1,7 +1,9 @@
 package transcript
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -9,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/entireio/cli/internal/transcript/pijsonl"
 )
 
 var piFoldOpts = Options{Agent: "pi", CLIVersion: "0.1"}
@@ -313,17 +317,17 @@ func feedPiRecords(data []byte, size int) []Record {
 	return append(recs, a.Flush()...)
 }
 
-// Lines have no size limit, as for Claude Code: a line past the Pi scanner's
-// 10 MiB limit (on which the legacy compactor failed) is read whole, however
-// it is chunked, and keeps its place in the tree.
+// The adapter has no line size limit, as for Claude Code: a line past the Pi
+// scanner's 10 MiB limit is read whole, however it is chunked, and keeps its
+// place in the tree.
 func TestPiAdapter_LongLinesAreReadWhole(t *testing.T) {
 	t.Parallel()
 	long := strings.Repeat("x", 11<<20)
 	data := piLines(piHdr, piUser("u1", "", "one"), piToolCall("a1", "u1", "c1"),
 		piToolResult("t1", "a1", "c1", long, false), piUser("u2", "t1", long), piAssistant("a2", "u2", "2"))
-	want, err := Convert(data, piFoldOpts)
+	want, err := Fold(feedPiRecords(data, len(data)), piFoldOpts)
 	if err != nil {
-		t.Fatalf("Convert: %v", err)
+		t.Fatalf("Fold: %v", err)
 	}
 	lines, err := Decode(want)
 	if err != nil || len(lines) != 4 {
@@ -335,16 +339,52 @@ func TestPiAdapter_LongLinesAreReadWhole(t *testing.T) {
 	if lines[2].Blocks[0].Text != long {
 		t.Errorf("long user text not kept")
 	}
-	for _, size := range []int{len(data), 3 << 20, 1 << 20} {
+	for _, size := range []int{3 << 20, 1 << 20} {
 		got, err := Fold(feedPiRecords(data, size), piFoldOpts)
 		if err != nil || !bytes.Equal(got, want) {
-			t.Errorf("%d-byte pieces: fold differs from Convert (%v)", size, err)
+			t.Errorf("%d-byte pieces: fold differs from a whole feed (%v)", size, err)
 		}
 	}
 	// An unterminated long last line is read by Flush.
 	unterminated := bytes.TrimSuffix(piLines(piHdr, piUser("u1", "", long)), []byte("\n"))
 	if recs := feedPiRecords(unterminated, 3<<20); len(recs) != 1 || recs[0].ID != "u1" {
 		t.Errorf("unterminated long line: %d records", len(recs))
+	}
+}
+
+// Convert still fails where the legacy compactor did: on a line of
+// pijsonl.MaxScannerLine bytes or more, newline excluded, terminated or not.
+func TestPiConvert_FailsOnLongLinesAsBefore(t *testing.T) {
+	t.Parallel()
+	line := func(n int) string {
+		l := piUser("u2", "u1", "x")
+		return l[:len(l)-4] + strings.Repeat(" ", n-len(l)) + l[len(l)-4:]
+	}
+	for _, tt := range []struct {
+		name string
+		data []byte
+		fail bool
+	}{
+		{"one byte under the limit", piLines(piHdr, piUser("u1", "", "one"), line(pijsonl.MaxScannerLine-1)), false},
+		{"at the limit", piLines(piHdr, piUser("u1", "", "one"), line(pijsonl.MaxScannerLine)), true},
+		{"at the limit with CR", piLines(piHdr, piUser("u1", "", "one"), line(pijsonl.MaxScannerLine-1)+"\r"), true},
+		{"unterminated, one under", []byte(piHdr + "\n" + line(pijsonl.MaxScannerLine-1)), false},
+		{"unterminated, at the limit", []byte(piHdr + "\n" + line(pijsonl.MaxScannerLine)), true},
+	} {
+		got, err := Convert(tt.data, piFoldOpts)
+		want, legacyErr := legacyCompactPi(tt.data, piFoldOpts)
+		if (legacyErr != nil) != tt.fail {
+			t.Fatalf("%s: legacy error %v, want failure %v", tt.name, legacyErr, tt.fail)
+		}
+		if tt.fail {
+			if !errors.Is(err, bufio.ErrTooLong) {
+				t.Errorf("%s: Convert error %v, want bufio.ErrTooLong", tt.name, err)
+			}
+			continue
+		}
+		if err != nil || !bytes.Equal(got, want) {
+			t.Errorf("%s: Convert (%v) differs from legacy", tt.name, err)
+		}
 	}
 }
 

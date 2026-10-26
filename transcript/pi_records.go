@@ -13,7 +13,8 @@ import (
 // records depend only on the bytes fed, not on how they were chunked.
 // Convert uses the same adapter, so after any complete line, folding every
 // record so far reproduces Convert of the bytes so far (with
-// Options.StartLine 0).
+// Options.StartLine 0), wherever Convert succeeds: it still fails on a line
+// of 10 MiB or more, which the adapter reads whole.
 //
 // Pi sessions are trees: every entry has an id and a parentId, and /tree and
 // branching continue from an earlier entry. The conversation is the active

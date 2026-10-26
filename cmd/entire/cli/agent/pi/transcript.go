@@ -24,7 +24,7 @@ var (
 // pijsonl.ResolveActiveBranch for the rationale.
 func (a *PiAgent) CalculateTokenUsage(transcriptData []byte, fromOffset int) (*agent.TokenUsage, error) {
 	usage := &agent.TokenUsage{}
-	pijsonl.ForEachActiveMessage(transcriptData, fromOffset, func(entry pijsonl.Entry) {
+	err := pijsonl.ForEachActiveMessage(transcriptData, fromOffset, func(entry pijsonl.Entry) {
 		if entry.Message.Role != pijsonl.RoleAssistant || entry.Message.Usage == nil {
 			return
 		}
@@ -34,6 +34,9 @@ func (a *PiAgent) CalculateTokenUsage(transcriptData []byte, fromOffset int) (*a
 		usage.CacheCreationTokens += entry.Message.Usage.CacheWrite
 		usage.APICallCount++
 	})
+	if err != nil {
+		return usage, fmt.Errorf("calculate token usage: %w", err)
+	}
 	return usage, nil
 }
 
@@ -45,11 +48,14 @@ func (a *PiAgent) CalculateTokenUsage(transcriptData []byte, fromOffset int) (*a
 // message carries a model.
 func (a *PiAgent) ExtractModel(transcriptData []byte) (string, error) {
 	model := ""
-	pijsonl.ForEachActiveMessage(transcriptData, 0, func(entry pijsonl.Entry) {
+	err := pijsonl.ForEachActiveMessage(transcriptData, 0, func(entry pijsonl.Entry) {
 		if entry.Message.Role == pijsonl.RoleAssistant && entry.Message.Model != "" {
 			model = entry.Message.Model
 		}
 	})
+	if err != nil {
+		return model, fmt.Errorf("extract model: %w", err)
+	}
 	return model, nil
 }
 
@@ -87,7 +93,7 @@ func (a *PiAgent) ExtractModifiedFilesFromOffset(_ context.Context, path string,
 	seen := make(map[string]bool)
 	var files []string
 
-	pijsonl.ForEachActiveMessage(data, startOffset, func(entry pijsonl.Entry) {
+	err = pijsonl.ForEachActiveMessage(data, startOffset, func(entry pijsonl.Entry) {
 		if entry.Message.Role != pijsonl.RoleAssistant {
 			return
 		}
@@ -114,6 +120,9 @@ func (a *PiAgent) ExtractModifiedFilesFromOffset(_ context.Context, path string,
 			}
 		}
 	})
+	if err != nil {
+		return files, totalLines, fmt.Errorf("extract modified files: %w", err)
+	}
 	return files, totalLines, nil
 }
 
@@ -129,7 +138,7 @@ func (a *PiAgent) ExtractPrompts(sessionRef string, fromOffset int) ([]string, e
 	}
 
 	var prompts []string
-	pijsonl.ForEachActiveMessage(data, fromOffset, func(entry pijsonl.Entry) {
+	err = pijsonl.ForEachActiveMessage(data, fromOffset, func(entry pijsonl.Entry) {
 		if entry.Message.Role != pijsonl.RoleUser {
 			return
 		}
@@ -148,5 +157,8 @@ func (a *PiAgent) ExtractPrompts(sessionRef string, fromOffset int) ([]string, e
 			}
 		}
 	})
+	if err != nil {
+		return prompts, fmt.Errorf("extract prompts: %w", err)
+	}
 	return prompts, nil
 }

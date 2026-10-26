@@ -7,9 +7,10 @@
 package pijsonl
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
-	"iter"
+	"fmt"
 )
 
 // EntryTypeMessage is the JSONL `type` value for conversational entries.
@@ -25,25 +26,16 @@ const (
 // ContentTypeText is the content-block `type` value for text blocks.
 const ContentTypeText = "text"
 
-// Lines yields each line of data without its newline or a carriage return
-// before it, as bufio.ScanLines splits lines, but with no size limit: Pi
-// tool calls and user images can make a line arbitrarily long, and data is
-// already in memory. A final line without a newline is included.
-func Lines(data []byte) iter.Seq[[]byte] {
-	return func(yield func([]byte) bool) {
-		rest := data
-		for len(rest) > 0 {
-			line := rest
-			if i := bytes.IndexByte(rest, '\n'); i >= 0 {
-				line, rest = rest[:i], rest[i+1:]
-			} else {
-				rest = nil
-			}
-			if !yield(bytes.TrimSuffix(line, []byte("\r"))) {
-				return
-			}
-		}
-	}
+// MaxScannerLine is the maximum size of a single JSONL line we will parse.
+// Pi tool calls can embed full file contents in arguments — 10 MB matches
+// what other in-tree transcript scanners use (codex, copilot, droid).
+const MaxScannerLine = 10 * 1024 * 1024
+
+// NewScanner returns a bufio.Scanner pre-configured with the Pi line-size limit.
+func NewScanner(data []byte) *bufio.Scanner {
+	s := bufio.NewScanner(bytes.NewReader(data))
+	s.Buffer(make([]byte, 0, MaxScannerLine), MaxScannerLine)
+	return s
 }
 
 // CountLines returns the number of newline-terminated (or final unterminated)
@@ -126,15 +118,18 @@ type ContentItem struct {
 // iteration starts at fromOffset, lines that fail to unmarshal or are off the
 // active branch are skipped, and only entries with type=="message" reach fn.
 // Callers apply their own role filter inside fn. Empty data is a no-op.
-func ForEachActiveMessage(data []byte, fromOffset int, fn func(Entry)) {
+func ForEachActiveMessage(data []byte, fromOffset int, fn func(Entry)) error {
 	if len(data) == 0 {
-		return
+		return nil
 	}
 
 	active := ResolveActiveBranch(data)
-	for line := range Lines(SkipLines(data, fromOffset)) {
+	content := SkipLines(data, fromOffset)
+
+	scanner := NewScanner(content)
+	for scanner.Scan() {
 		var entry Entry
-		if err := json.Unmarshal(line, &entry); err != nil {
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
 			continue
 		}
 		if entry.Type != EntryTypeMessage {
@@ -145,6 +140,10 @@ func ForEachActiveMessage(data []byte, fromOffset int, fn func(Entry)) {
 		}
 		fn(entry)
 	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan transcript: %w", err)
+	}
+	return nil
 }
 
 // ResolveActiveBranch walks a Pi transcript tree and returns the set of entry
@@ -174,9 +173,10 @@ func ResolveActiveBranch(data []byte) map[string]bool {
 	hasTree := false
 	parentOf := make(map[string]string)
 
-	for line := range Lines(data) {
+	scanner := NewScanner(data)
+	for scanner.Scan() {
 		var n node
-		if err := json.Unmarshal(line, &n); err != nil || n.ID == "" {
+		if err := json.Unmarshal(scanner.Bytes(), &n); err != nil || n.ID == "" {
 			continue
 		}
 		if n.ParentID != nil {

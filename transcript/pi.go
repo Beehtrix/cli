@@ -1,6 +1,7 @@
 package transcript
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -21,7 +22,7 @@ import (
 // active branch (root → most-recent message) so abandoned tool calls don't
 // pollute the compact transcript.
 //
-// Parsing primitives (Entry/Message/ContentItem types, Lines) are shared
+// Parsing primitives (Entry/Message/ContentItem types, NewScanner) are shared
 // with the pi agent package via internal/transcript/pijsonl so a fix applied
 // here also lands there. Compaction folds a PiAdapter's records
 // (pi_records.go), which resolves the active branch as
@@ -41,8 +42,9 @@ var piToolNameMap = map[string]string{
 // isPiFormat reports whether content looks like a Pi session JSONL file.
 // Anchored on the persisted session header that pi writes as the first line.
 func isPiFormat(content []byte) bool {
-	for line := range pijsonl.Lines(content) {
-		line = bytes.TrimSpace(line)
+	scanner := pijsonl.NewScanner(content)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
 			continue
 		}
@@ -92,6 +94,9 @@ type piCompactToolResult struct {
 // splicing still run over the whole transcript, so abandoned-branch entries
 // and orphaned tool results cannot leak into the slice.
 func compactPi(content []byte, opts Options) ([]byte, error) {
+	if err := piCheckLineLengths(content); err != nil {
+		return nil, err
+	}
 	a := NewPiAdapter()
 	records := a.Feed(content)
 	records = append(records, a.Flush()...)
@@ -113,6 +118,24 @@ func compactPi(content []byte, opts Options) ([]byte, error) {
 		}
 	}
 	return out, nil
+}
+
+// piCheckLineLengths keeps Convert failing where it always has: Pi
+// transcripts were compacted with pijsonl's scanner, which fails on a line of
+// pijsonl.MaxScannerLine bytes or more (newline excluded). PiAdapter itself
+// has no line limit.
+func piCheckLineLengths(content []byte) error {
+	for rest := content; len(rest) > 0; {
+		n := bytes.IndexByte(rest, '\n')
+		if n < 0 {
+			n = len(rest)
+		}
+		if n >= pijsonl.MaxScannerLine {
+			return fmt.Errorf("scan pi transcript: %w", bufio.ErrTooLong)
+		}
+		rest = rest[min(n+1, len(rest)):]
+	}
+	return nil
 }
 
 // piCallUsage returns the per-call usage of a Pi assistant message, or nil
