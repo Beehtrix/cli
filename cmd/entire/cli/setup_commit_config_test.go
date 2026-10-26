@@ -34,7 +34,7 @@ func newCommitConfigRepo(t *testing.T, empty bool) string {
 	return dir
 }
 
-type commitConfigPromptFunc = func(context.Context, io.Writer, []string, string, func(io.Writer) error) error
+type commitConfigPromptFunc = func(context.Context, io.Writer, []string, string, bool, func(io.Writer) error) error
 
 // stubCommitConfig replaces the prompt and, when commit is non-nil, the commit
 // for one test.
@@ -56,14 +56,15 @@ type promptedCommitConfig struct {
 	commit bool
 	err    error
 
-	asked  bool
-	errOut io.Writer
-	files  []string
-	branch string
+	asked           bool
+	errOut          io.Writer
+	files           []string
+	branch          string
+	commitByDefault bool
 }
 
-func (p *promptedCommitConfig) prompt(_ context.Context, errOut io.Writer, files []string, branch string, commitAndReport func(io.Writer) error) error {
-	p.asked, p.errOut, p.files, p.branch = true, errOut, files, branch
+func (p *promptedCommitConfig) prompt(_ context.Context, errOut io.Writer, files []string, branch string, commitByDefault bool, commitAndReport func(io.Writer) error) error {
+	p.asked, p.errOut, p.files, p.branch, p.commitByDefault = true, errOut, files, branch, commitByDefault
 	printConfigToCommit(p.render, files)
 	if p.err != nil {
 		return p.err
@@ -76,7 +77,7 @@ func (p *promptedCommitConfig) prompt(_ context.Context, errOut io.Writer, files
 
 func failOnPrompt(t *testing.T) commitConfigPromptFunc {
 	t.Helper()
-	return func(context.Context, io.Writer, []string, string, func(io.Writer) error) error {
+	return func(context.Context, io.Writer, []string, string, bool, func(io.Writer) error) error {
 		t.Error("prompted to commit when no prompt was expected")
 		return nil
 	}
@@ -326,7 +327,7 @@ func TestOfferCommitConfig_InterruptIsAnError(t *testing.T) {
 		newCommitConfigRepo(t, false)
 		t.Setenv(interactive.EnvTestTTY, "1")
 		ctx, cancel := context.WithCancel(context.Background())
-		stubCommitConfig(t, func(context.Context, io.Writer, []string, string, func(io.Writer) error) error {
+		stubCommitConfig(t, func(context.Context, io.Writer, []string, string, bool, func(io.Writer) error) error {
 			cancel() // Ctrl+C while the question is up
 			return context.Canceled
 		}, func(context.Context, string, []string, string, io.Writer) error {
@@ -405,7 +406,7 @@ func TestPromptCommitConfig_ListQuestionAndOutcomeShareTheTerminal(t *testing.T)
 
 	var redirected bytes.Buffer
 	committed := false
-	err := promptCommitConfig(t.Context(), &redirected, []string{EntireSettingsFile, ".claude/settings.json"}, "main", func(w io.Writer) error {
+	err := promptCommitConfig(t.Context(), &redirected, []string{EntireSettingsFile, ".claude/settings.json"}, "main", true, func(w io.Writer) error {
 		committed = true
 		_, err := io.WriteString(w, "hook output\n✓ Committed them to main\n")
 		return err
@@ -425,6 +426,82 @@ func TestPromptCommitConfig_ListQuestionAndOutcomeShareTheTerminal(t *testing.T)
 	}
 }
 
+// Not parallel: chdirs and sets environment variables.
+func TestOfferCommitConfig_DefaultsToNoWhenEveryFileIsTracked(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T, dir string)
+		want    bool
+	}{
+		{name: "untracked settings", want: true},
+		{
+			name: "untracked settings and modified hook config",
+			prepare: func(t *testing.T, dir string) {
+				t.Helper()
+				testutil.WriteFile(t, dir, ".claude/settings.json", "{}")
+				testutil.GitAdd(t, dir, ".claude/settings.json")
+				testutil.GitCommit(t, dir, "claude settings")
+				testutil.WriteFile(t, dir, ".claude/settings.json", `{"hooks":{}}`)
+			},
+			want: true,
+		},
+		{
+			name: "only a modified hook config",
+			prepare: func(t *testing.T, dir string) {
+				t.Helper()
+				testutil.WriteFile(t, dir, ".claude/settings.json", "{}")
+				testutil.GitAdd(t, dir, EntireSettingsFile, ".claude/settings.json")
+				testutil.GitCommit(t, dir, "configured")
+				testutil.WriteFile(t, dir, ".claude/settings.json", `{"env":{}}`)
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := newCommitConfigRepo(t, false)
+			if tt.prepare != nil {
+				tt.prepare(t, dir)
+			}
+			t.Setenv(interactive.EnvTestTTY, "1")
+			p := &promptedCommitConfig{render: &bytes.Buffer{}}
+			stubCommitConfig(t, p.prompt, nil)
+
+			runOfferCommitConfig(t, EnableOptions{})
+			if !p.asked {
+				t.Fatal("expected the commit offer")
+			}
+			if p.commitByDefault != tt.want {
+				t.Errorf("commit by default = %v, want %v (files %v)", p.commitByDefault, tt.want, p.files)
+			}
+		})
+	}
+}
+
+// Not parallel: swaps the terminal opener and sets ACCESSIBLE.
+func TestPromptCommitConfig_EnterTakesTheDefault(t *testing.T) {
+	t.Setenv("ACCESSIBLE", "1")
+	for _, commitByDefault := range []bool{true, false} {
+		terminal := &closeableTerminal{t: t}
+		prev := openPromptTerminal
+		openPromptTerminal = func() (promptTerminal, error) {
+			return promptTerminal{in: strings.NewReader("\n"), out: terminal, close: terminal.Close}, nil
+		}
+		committed := false
+		err := promptCommitConfig(t.Context(), &bytes.Buffer{}, []string{EntireSettingsFile}, "main", commitByDefault, func(io.Writer) error {
+			committed = true
+			return nil
+		})
+		openPromptTerminal = prev
+		if err != nil {
+			t.Fatalf("promptCommitConfig(default %v) error = %v", commitByDefault, err)
+		}
+		if committed != commitByDefault {
+			t.Errorf("Enter with default %v committed = %v", commitByDefault, committed)
+		}
+	}
+}
+
 // Not parallel: swaps the terminal opener and sets ACCESSIBLE.
 func TestPromptCommitConfig_AbortIsReportedOnTheTerminal(t *testing.T) {
 	// Esc/Ctrl+C inside the form is an answer: "Commit cancelled." goes to the
@@ -439,7 +516,7 @@ func TestPromptCommitConfig_AbortIsReportedOnTheTerminal(t *testing.T) {
 	}
 	t.Cleanup(func() { openPromptTerminal = prev })
 
-	err := promptCommitConfig(t.Context(), &bytes.Buffer{}, []string{EntireSettingsFile}, "main", func(io.Writer) error {
+	err := promptCommitConfig(t.Context(), &bytes.Buffer{}, []string{EntireSettingsFile}, "main", true, func(io.Writer) error {
 		t.Error("committed after an abort")
 		return nil
 	})

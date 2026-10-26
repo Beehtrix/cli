@@ -84,6 +84,10 @@ func offerCommitConfig(ctx context.Context, w io.Writer, opts EnableOptions) err
 	}
 
 	branch := currentBranchName(repo)
+	// Yes by default when setup created a file; when every listed file is
+	// already tracked, the changes may be the developer's own edits, so the
+	// default is No.
+	commitByDefault := slices.ContainsFunc(pending, func(file string) bool { return statuses[file] == "??" })
 	// Runs while the prompt's terminal is still open: git's own output (hooks,
 	// signing) and the outcome go where the question was asked.
 	commitAndReport := func(render io.Writer) error {
@@ -101,7 +105,7 @@ func offerCommitConfig(ctx context.Context, w io.Writer, opts EnableOptions) err
 		}
 		return nil
 	}
-	err = commitConfigPrompt(ctx, opts.promptErrOut(), pending, branch, commitAndReport)
+	err = commitConfigPrompt(ctx, opts.promptErrOut(), pending, branch, commitByDefault, commitAndReport)
 	// Checked before the error is classified: Ctrl+C at the question or
 	// during a slow commit hook is an interruption, which
 	// handleFormCancellation would read as an answer.
@@ -164,20 +168,20 @@ func currentBranchName(repo *git.Repository) string {
 	return head.Target().Short()
 }
 
-// promptCommitConfig lists files, asks whether to commit them to branch, and
-// on yes runs commitAndReport. The list, the question, an abort's "Commit
+// promptCommitConfig lists files, asks whether to commit them to branch, with
+// commitByDefault as the answer Enter gives, and on yes runs commitAndReport. The list, the question, an abort's "Commit
 // cancelled.", and commitAndReport's output share one writer through
 // runPromptFormThen — errOut when it is a terminal, otherwise the controlling
 // terminal, held open until all of them are written — so the developer never
 // answers about files they cannot see, and sees what came of it, whichever
 // stream is redirected. An abort inside the form is an answer and returns
 // nil; an interruption (ctx cancelled) or a form failure is returned.
-func promptCommitConfig(ctx context.Context, errOut io.Writer, files []string, branch string, commitAndReport func(io.Writer) error) error {
+func promptCommitConfig(ctx context.Context, errOut io.Writer, files []string, branch string, commitByDefault bool, commitAndReport func(io.Writer) error) error {
 	title := "Commit them now? (HEAD is detached)"
 	if branch != "" {
 		title = fmt.Sprintf("Commit them to %s now?", branch)
 	}
-	commit := true
+	commit := commitByDefault
 	form := NewAccessibleForm(
 		huh.NewGroup(
 			huh.NewConfirm().
