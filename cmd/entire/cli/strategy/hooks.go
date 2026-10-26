@@ -1199,6 +1199,10 @@ trap 'rm -f "$_entire_stdin"' EXIT
 // hook-manager line or a hook the user edited, is left as it is.
 const PrePushStdinRefsEnv = "ENTIRE_PRE_PUSH_STDIN_REFS"
 
+// prePushRefsNotSavedMessage is what the pre-push line prints when it stops a
+// push whose ref list it read but could not save.
+const prePushRefsNotSavedMessage = "[entire] could not save git's pre-push ref list (is TMPDIR full?); stopping the push so the hooks after Entire don't run without it"
+
 // prePushHookLine is the pre-push invocation, as one line so a hook manager
 // such as Husky can paste it into a script with other commands. Entire reads
 // git's ref list from stdin (PrePushStdinRefsEnv), and so does whatever runs
@@ -1216,8 +1220,6 @@ const PrePushStdinRefsEnv = "ENTIRE_PRE_PUSH_STDIN_REFS"
 // There is no trap to remove the copy if the push is interrupted: a hook
 // manager pastes this line into its own script, where a trap would replace the
 // script's. A leftover copy holds only ref names and commit IDs.
-const prePushRefsNotSavedMessage = "[entire] could not save git's pre-push ref list (is TMPDIR full?); stopping the push so the hooks after Entire don't run without it"
-
 func prePushHookLine(cmdPrefix string) string {
 	withRefs := fmt.Sprintf(`%s=1 %s hooks git pre-push "$1" < "$_entire_refs"`, PrePushStdinRefsEnv, cmdPrefix)
 	withoutRefs := cmdPrefix + ` hooks git pre-push "$1" < /dev/null`
