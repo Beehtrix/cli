@@ -653,8 +653,9 @@ func checkGitHooks(cmd *cobra.Command, force bool) error {
 
 	case strategy.GitHooksOutdated:
 		// Actionable whatever the settings say: a hook carrying Entire's marker
-		// means this repo opted in at some point, and a stale one is actively
-		// broken rather than merely missing.
+		// means this repo opted in at some point. A working-tree launcher can
+		// reject `git push`; an old pre-push hook still works but does not pass
+		// git's ref list.
 		fmt.Fprintln(w, "Git hooks: OUT OF DATE")
 		fmt.Fprintln(w, "  A hook is in a shape this version replaces. Either it runs Entire from the")
 		fmt.Fprintln(w, "  working tree, which can reject `git push` once that path is gone, or it is a")
