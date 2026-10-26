@@ -3,6 +3,8 @@ package cli
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,8 +13,8 @@ import (
 )
 
 // setupPluginUpdateCheck isolates the managed plugin dir and the global
-// config dir (where the check's cache lives), installs a manifest for
-// "brain" at v0.1.0, and stubs the remote tag listing.
+// config dir (where the check's cache lives), installs the given manifest,
+// and stubs the remote tag listing.
 func setupPluginUpdateCheck(t *testing.T, manifest *PluginManifest, tags []string, tagsErr error) *int {
 	t.Helper()
 	withPluginDir(t)
@@ -94,9 +96,27 @@ func TestPluginUpdateCheck_FetchFailureIsSilentAndStampsCache(t *testing.T) { //
 	if *calls != 1 {
 		t.Fatalf("tag listings = %d, want 1 (a failed check must not retry within 24h)", *calls)
 	}
-	state := loadPluginVersionCache().Plugins["brain"]
-	if time.Since(state.LastCheckTime) > time.Minute {
-		t.Fatalf("cache not stamped after failed fetch: %v", state.LastCheckTime)
+	if stamped := loadPluginVersionCache()["brain"]; time.Since(stamped) > time.Minute {
+		t.Fatalf("cache not stamped after failed fetch: %v", stamped)
+	}
+}
+
+// The stamp write runs before the network call and doubles as the config-dir
+// probe: where it cannot land, the check must cost zero network on every run,
+// not just the first.
+func TestPluginUpdateCheck_UnwritableConfigDirSkipsFetch(t *testing.T) { //nolint:paralleltest // mutates env
+	calls := setupPluginUpdateCheck(t, brainManifest(), []string{"v9.9.9"}, nil)
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(userdirs.EnvConfigDir, blocker)
+
+	var out strings.Builder
+	checkPluginUpdateAndNotify(t.Context(), &out, "brain")
+
+	if *calls != 0 || out.Len() != 0 {
+		t.Fatalf("unwritable config dir still fetched (%d calls) or printed %q", *calls, out.String())
 	}
 }
 

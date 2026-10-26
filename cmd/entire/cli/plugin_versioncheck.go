@@ -16,10 +16,9 @@ import (
 )
 
 // This file mirrors versioncheck.CheckAndNotify for installed plugins: a
-// post-run notice, a 24h cache stamped even when the lookup fails, and
-// silence on every error path. The latest version comes from the same tag
-// resolution `entire plugin upgrade` uses, so the notice can never name a
-// version the upgrade would not install.
+// post-run notice, a 24h cache, and silence on every error path. The latest
+// version comes from the same tag resolution `entire plugin upgrade` uses, so
+// the notice can never name a version the upgrade would not install.
 
 const (
 	// pluginCheckInterval mirrors versioncheck's checkInterval.
@@ -36,16 +35,10 @@ const (
 	pluginCacheFileName = "plugin_version_check.json"
 )
 
-// pluginVersionCache is the plugin analog of versioncheck.VersionCache,
-// keyed by plugin name. No SkippedVersion: there is no interactive prompt,
-// so there is no "skip this version" choice to remember.
-type pluginVersionCache struct {
-	Plugins map[string]pluginVersionCheckState `json:"plugins"`
-}
-
-type pluginVersionCheckState struct {
-	LastCheckTime time.Time `json:"last_check_time"`
-}
+// pluginVersionCache is the plugin analog of versioncheck.VersionCache: the
+// last check time per plugin name. No SkippedVersion: there is no interactive
+// prompt, so there is no "skip this version" choice to remember.
+type pluginVersionCache map[string]time.Time
 
 // listPluginTagsForUpdateCheck is a test seam over the tag resolution
 // `entire plugin upgrade` uses.
@@ -59,6 +52,11 @@ var listPluginTagsForUpdateCheck = listRemoteSemverTags
 // on PATH) and pinned installs are skipped — the same installs
 // `entire plugin upgrade` skips.
 func checkPluginUpdateAndNotify(ctx context.Context, w io.Writer, pluginName string) {
+	cache := loadPluginVersionCache()
+	if time.Since(cache[pluginName]) < pluginCheckInterval {
+		return
+	}
+
 	m, err := LoadPluginManifest(pluginName)
 	if err != nil || m == nil {
 		return
@@ -67,23 +65,22 @@ func checkPluginUpdateAndNotify(ctx context.Context, w io.Writer, pluginName str
 		return
 	}
 
-	cache := loadPluginVersionCache()
-	if time.Since(cache.Plugins[pluginName].LastCheckTime) < pluginCheckInterval {
+	// Stamp the cache BEFORE the network call, where versioncheck stamps
+	// after. This path differs for two reasons: a config dir that cannot be
+	// written must cost zero network — versioncheck gets that from its
+	// ensureGlobalConfigDir gate, here the stamp write itself is the probe —
+	// and plugin runs arrive in parallel from agent hooks, so the early
+	// claim keeps concurrent runs from each starting their own ls-remote.
+	cache[pluginName] = time.Now()
+	if err := savePluginVersionCache(cache); err != nil {
+		logging.Debug(ctx, "plugin version check: failed to save cache",
+			"plugin", pluginName, "error", err.Error())
 		return
 	}
 
 	tagCtx, cancel := context.WithTimeout(ctx, pluginCheckTimeout)
 	tags, err := listPluginTagsForUpdateCheck(tagCtx, m.RepoURL)
 	cancel()
-
-	// Always stamp the cache so a failing remote is not retried on every
-	// invocation.
-	cache.Plugins[pluginName] = pluginVersionCheckState{LastCheckTime: time.Now()}
-	if saveErr := savePluginVersionCache(cache); saveErr != nil {
-		logging.Debug(ctx, "plugin version check: failed to save cache",
-			"plugin", pluginName, "error", saveErr.Error())
-	}
-
 	if err != nil {
 		logging.Debug(ctx, "plugin version check: failed to list tags",
 			"plugin", pluginName, "error", err.Error())
@@ -106,54 +103,36 @@ func checkPluginUpdateAndNotify(ctx context.Context, w io.Writer, pluginName str
 // loadPluginVersionCache returns the cached per-plugin check times, or an
 // empty cache when the file is missing or unreadable — mirroring how
 // versioncheck treats its cache file.
-func loadPluginVersionCache() *pluginVersionCache {
-	empty := &pluginVersionCache{Plugins: map[string]pluginVersionCheckState{}}
+func loadPluginVersionCache() pluginVersionCache {
 	root, err := userdirs.ConfigRootForRead()
 	if err != nil {
-		return empty
+		return pluginVersionCache{}
 	}
 	data, err := osroot.ReadFileNoFollow(root, pluginCacheFileName)
 	if err != nil {
-		return empty
+		return pluginVersionCache{}
 	}
 	var cache pluginVersionCache
-	if err := json.Unmarshal(data, &cache); err != nil || cache.Plugins == nil {
-		return empty
+	if err := json.Unmarshal(data, &cache); err != nil || cache == nil {
+		return pluginVersionCache{}
 	}
-	return &cache
+	return cache
 }
 
-// savePluginVersionCache writes the cache with the same atomic
-// write-then-rename versioncheck's saveCache uses. Going through
+// savePluginVersionCache writes the cache atomically. Going through
 // userdirs.ConfigRoot also creates the config directory with private
 // permissions when this runs before first login.
-func savePluginVersionCache(cache *pluginVersionCache) error {
+func savePluginVersionCache(cache pluginVersionCache) error {
 	data, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling cache: %w", err)
 	}
-
 	root, err := userdirs.ConfigRoot()
 	if err != nil {
 		return fmt.Errorf("opening config directory: %w", err)
 	}
-
-	tmpFile, tmpName, err := jsonutil.CreateTempIn(root, pluginCacheFileName)
-	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
-	}
-	defer func() { _ = root.Remove(tmpName) }() //nolint:errcheck // best-effort; a successful rename already consumed it
-
-	if _, err := tmpFile.Write(data); err != nil {
-		_ = tmpFile.Close() // cleanup on error path
+	if err := jsonutil.WriteFileAtomicIn(root, pluginCacheFileName, data, 0o600); err != nil {
 		return fmt.Errorf("writing cache: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("closing temp file: %w", err)
-	}
-
-	if err := root.Rename(tmpName, pluginCacheFileName); err != nil {
-		return fmt.Errorf("renaming cache file: %w", err)
 	}
 	return nil
 }
