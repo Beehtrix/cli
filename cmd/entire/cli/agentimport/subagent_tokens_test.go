@@ -274,3 +274,44 @@ func TestImport_ClaudeNestedSubagentCreditedToItsParentsLaunchTurn(t *testing.T)
 		t.Errorf("summed SubagentTokens = %+v, want input=50 calls=2 (each subagent once)", sum)
 	}
 }
+
+// TestImport_ClaudeSiblingQuotedBySubagentCreditedToItsOwnLaunchTurn: a
+// subagent that quotes a sibling's "agentId:" in an ordinary tool result (here
+// a Read) did not launch it. The sibling, launched by the main transcript in a
+// later turn, belongs to that turn, not to the turn that launched the quoter.
+func TestImport_ClaudeSiblingQuotedBySubagentCreditedToItsOwnLaunchTurn(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	sf := SessionFile{Path: filepath.Join(dir, "s.jsonl"), SessionID: "s"}
+	full := []byte(strings.Join([]string{
+		`{"type":"user","uuid":"u1","message":{"role":"user","content":"first"}}`,
+		`{"type":"assistant","uuid":"a1","message":{"content":[{"type":"tool_use","id":"toolu_parent","name":"Agent","input":{"prompt":"go"}}]}}`,
+		`{"type":"user","uuid":"r1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_parent","content":"Async agent launched successfully."}]},"toolUseResult":{"status":"async_launched","agentId":"aparent0000000001"}}`,
+		`{"type":"user","uuid":"u2","message":{"role":"user","content":"second"}}`,
+		`{"type":"assistant","uuid":"a2","message":{"content":[{"type":"tool_use","id":"toolu_sibling","name":"Agent","input":{"prompt":"go"}}]}}`,
+		`{"type":"user","uuid":"r2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_sibling","content":"Async agent launched successfully."}]},"toolUseResult":{"status":"async_launched","agentId":"asibling000000001"}}`,
+	}, "\n") + "\n")
+	writeSubagentTranscript(t, sf, "aparent0000000001", strings.Join([]string{
+		`{"isSidechain":true,"agentId":"aparent0000000001","type":"assistant","message":{"id":"sm-p","usage":{"input_tokens":20,"output_tokens":10}}}`,
+		`{"isSidechain":true,"agentId":"aparent0000000001","type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_read","content":[{"type":"text","text":"log.txt: Async agent launched successfully.\nagentId: asibling000000001 (internal ID)"}]}]},"toolUseResult":{"type":"text","file":{"filePath":"/repo/log.txt"}}}`,
+	}, "\n"))
+	writeSubagentTranscript(t, sf, "asibling000000001",
+		`{"isSidechain":true,"agentId":"asibling000000001","type":"assistant","message":{"id":"sm-s","usage":{"input_tokens":30,"output_tokens":15}}}`)
+
+	turns, err := claudeImporter{}.SplitTurns(sf, full)
+	if err != nil {
+		t.Fatalf("SplitTurns: %v", err)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("want 2 turns, got %d", len(turns))
+	}
+	first := turns[0].Tokens.SubagentTokens
+	if first == nil || first.InputTokens != 20 || first.OutputTokens != 10 || first.APICallCount != 1 {
+		t.Fatalf("turn 1 SubagentTokens = %+v, want only the parent: input=20 output=10 calls=1", first)
+	}
+	second := turns[1].Tokens.SubagentTokens
+	if second == nil || second.InputTokens != 30 || second.OutputTokens != 15 || second.APICallCount != 1 {
+		t.Fatalf("turn 2 SubagentTokens = %+v, want only the sibling: input=30 output=15 calls=1", second)
+	}
+}

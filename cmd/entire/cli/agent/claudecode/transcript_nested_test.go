@@ -133,13 +133,16 @@ func TestCalculateTotalTokenUsage_NestedSubagents(t *testing.T) {
 			},
 			want: agent.TokenUsage{InputTokens: 30, OutputTokens: 3, APICallCount: 2},
 		},
-		"launched by text only": {
+		// A subagent's text can quote any agent's ID (a Read of a log, a
+		// Bash grep), so only its structured results launch: a mention in
+		// text is not followed, even when the transcript exists.
+		"named by text only": {
 			parentLines: []string{
 				subagentUsageLine(parent, "m-p", 10, 1),
 				subagentTextResultLine(parent, "toolu_p1", "done\nagentId: "+child+" (for resuming)"),
 			},
 			childLines: []string{subagentUsageLine(child, "m-c", 20, 2)},
-			want:       agent.TokenUsage{InputTokens: 30, OutputTokens: 3, APICallCount: 2},
+			want:       agent.TokenUsage{InputTokens: 10, OutputTokens: 1, APICallCount: 1},
 		},
 		"quoted ID with no transcript": {
 			parentLines: []string{
