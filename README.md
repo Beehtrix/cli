@@ -8,7 +8,7 @@
 - **Trails** — instead of reviewing a diff, get a heads-up display for every change, with customizable evals that agents score on every push. → [Trails](#trails)
 - **Continuous memory** — capture every agent session as a checkpoint linked to your commits; [entire-brain](https://docs.entire.com/guides/brain/overview) combines them with [entire-graph](https://docs.entire.com/guides/graph/overview)'s code map into project memory. → [Agent Sessions](#agent-sessions)
 
-Works with Claude Code, Codex, Cursor, Copilot CLI, OpenCode, Antigravity, Factory AI Droid, Pi, and [more](docs/architecture/external-agent-protocol.md), and extends through [plugins](#plugins). Pushes through a GitHub mirror still trigger your GitHub Actions, and Trails can also show CI results from Buildkite and Depot.
+Works with Claude Code, Codex, Cursor, Copilot CLI, OpenCode, Antigravity, Factory AI Droid, Pi, and [more](https://docs.entire.com/agents/agent-integration-protocol/overview), and extends through [plugins](#plugins). Pushes through a GitHub mirror still trigger your GitHub Actions, and Trails can also show CI results from Buildkite and Depot.
 
 Open source under the MIT license. Docs: **[docs.entire.com](https://docs.entire.com)**.
 
@@ -41,7 +41,7 @@ curl -fsSL https://entire.com/install.sh | bash -s -- --channel nightly
 iex "& {$(irm https://entire.com/install.ps1)} -Channel nightly"
 ```
 
-Requires Git on macOS, Linux, or Windows. Scoop, `go install`, and installing during a GitHub outage are covered in [Installing the Entire CLI](docs/user-guide/installation.md).
+Requires Git on macOS, Linux, or Windows. Scoop, `go install`, and installing during a GitHub outage are covered in [Installation](https://docs.entire.com/installation).
 
 ## Quick Start
 
@@ -96,7 +96,7 @@ entire repo remote add entire                           # add Entire to an exist
 
 A GitHub mirror keeps GitHub as the source of truth: clones and fetches come from Entire, and pushes are forwarded to GitHub, where your GitHub permissions, branch protection, and required checks still apply. Clones use `entire://` URLs through the `git-remote-entire` helper that ships with the packaged installs; after that, it is plain Git.
 
-See [Repositories](docs/user-guide/repositories.md) for regions, mirroring native repositories, unmirrored branches, moving a mirror off GitHub, branch protection, and access.
+See [Repositories](https://docs.entire.com/guides/repositories/overview) and [Mirrors in the CLI](https://docs.entire.com/guides/repositories/mirrors-in-cli) for regions, mirroring, unmirrored branches, moving a mirror off GitHub, branch protection, and access.
 
 ## Trails
 
@@ -134,7 +134,7 @@ entire agent add <name>               # add an agent later; entire configure for
 entire disable                        # turn capture off (--uninstall removes Entire from the repo)
 ```
 
-See [Sessions and Checkpoints](docs/user-guide/sessions-and-checkpoints.md) for how capture works, checkpoint storage, and migrating from legacy branch storage, [Configuration](docs/user-guide/configuration.md) for settings and flags, and [Where Checkpoints Are Uploaded](docs/user-guide/checkpoint-sync.md) for choosing the remote or a separate checkpoint repository.
+See [Sessions](https://docs.entire.com/guides/sessions/overview) and [Checkpoint Storage](https://docs.entire.com/guides/checkpoints/checkpoint-storage) for how capture works and migrating from legacy branch storage, [Settings](https://docs.entire.com/guides/configuration/settings-layers) and [Git Hooks](https://docs.entire.com/guides/configuration/git-hooks) for configuration, and [Checkpoint Destination](https://docs.entire.com/guides/checkpoints/checkpoint-destination) for choosing the remote or a [separate checkpoint repository](https://docs.entire.com/guides/checkpoints/store-checkpoints-in-another-repo).
 
 Checkpoints are also the raw material for continuous memory: [entire-brain](https://docs.entire.com/guides/brain/overview), installed separately, combines them with [entire-graph](https://docs.entire.com/guides/graph/overview)'s code map into project memory your agents can query. From the CLI, `entire search` and `entire checkpoint explain` are the way in.
 
@@ -160,13 +160,13 @@ entire plugin install <name>
 entire plugin list
 ```
 
-Installs from a Git host are verified against the release's `checksums.txt`. See [Plugins](docs/user-guide/plugins.md).
+Installs from a Git host are verified against the release's `checksums.txt`. See [`entire plugin`](https://docs.entire.com/cli-reference/plugin).
 
 ## Security & Privacy
 
 **Session transcripts are pushed to your Git remote** — as checkpoint refs, not commits on your branch. If that repository is public, anyone can read them. Entire redacts detected secrets before writing a checkpoint, but redaction is best effort; `entire checkpoint list --outgoing` shows what your next push will upload, and `entire checkpoint explain <id>` shows a checkpoint's contents.
 
-To keep transcripts out of a public repository, upload them to a separate private repository (`entire configure --local --checkpoint-remote github:<owner>/<repo>`) or stop uploading them (`entire configure --local --skip-push-sessions`). `entire enable` names the checkpoint destination every time it runs. See [Security and Privacy](docs/security-and-privacy.md) for redaction, scanners, deleting checkpoints, and cleaning up data from older versions.
+To keep transcripts out of a public repository, upload them to a separate private repository (`entire configure --local --checkpoint-remote github:<owner>/<repo>`) or stop uploading them (`entire configure --local --skip-push-sessions`). `entire enable` names the checkpoint destination every time it runs. See [Security](https://docs.entire.com/security) for redaction, scanners, deleting checkpoints, and cleaning up data from older versions.
 
 ## Troubleshooting
 
@@ -178,13 +178,12 @@ To keep transcripts out of a public repository, upload them to a separate privat
 | A session stuck ACTIVE, or leftover session state | Run `entire doctor`, then `entire clean --force` if it persists |
 | Anything else | Run `entire doctor`; `entire doctor bundle` produces a redacted diagnostic bundle for a bug report |
 
-Set `ENTIRE_LOG_LEVEL=debug` for debug logs, and `ACCESSIBLE=1` for screen-reader-friendly prompts. Headless servers and CI: see [Headless and CI Authentication](docs/user-guide/authentication.md).
+Set `ENTIRE_LOG_LEVEL=debug` for debug logs, and `ACCESSIBLE=1` for screen-reader-friendly prompts. Headless servers and CI: see [`entire login`](https://docs.entire.com/cli-reference/login).
 
 ## Documentation
 
 - **[docs.entire.com](https://docs.entire.com)** — guides for Entire and the CLI, including [how the CLI and entire.com fit together](https://docs.entire.com/platforms/cli-and-entire-com)
-- `entire help`, `entire <command> --help`, and the [Commands Reference](docs/user-guide/commands.md); `entire agent-help` is the version written for coding agents
-- In this repository: [Installation](docs/user-guide/installation.md) · [Repositories](docs/user-guide/repositories.md) · [Sessions and Checkpoints](docs/user-guide/sessions-and-checkpoints.md) · [Configuration](docs/user-guide/configuration.md) · [Where Checkpoints Are Uploaded](docs/user-guide/checkpoint-sync.md) · [Authentication](docs/user-guide/authentication.md) · [Plugins](docs/user-guide/plugins.md) · [Security and Privacy](docs/security-and-privacy.md)
+- `entire help`, `entire <command> --help`, and the [CLI reference](https://docs.entire.com/cli-reference); `entire agent-help` is the version written for coding agents
 - **Issues:** https://github.com/entireio/cli/issues · **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License
