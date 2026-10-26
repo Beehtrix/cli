@@ -21,7 +21,7 @@ import (
 // active branch (root → most-recent message) so abandoned tool calls don't
 // pollute the compact transcript.
 //
-// Parsing primitives (Entry/Message/ContentItem types, NewScanner) are shared
+// Parsing primitives (Entry/Message/ContentItem types, Lines) are shared
 // with the pi agent package via internal/transcript/pijsonl so a fix applied
 // here also lands there. Compaction folds a PiAdapter's records
 // (pi_records.go), which resolves the active branch as
@@ -41,9 +41,8 @@ var piToolNameMap = map[string]string{
 // isPiFormat reports whether content looks like a Pi session JSONL file.
 // Anchored on the persisted session header that pi writes as the first line.
 func isPiFormat(content []byte) bool {
-	scanner := pijsonl.NewScanner(content)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
+	for line := range pijsonl.Lines(content) {
+		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}

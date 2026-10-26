@@ -3,14 +3,25 @@ package transcript
 // This file preserves the Pi compactor that Convert used before it became
 // "PiAdapter, then fold". It is the byte-for-byte oracle for the equivalence
 // tests in pi_records_test.go. Do not edit it to match new behavior. It fails
-// on a line of pijsonl.MaxScannerLine or more, which the adapter reads whole.
+// on a line of legacyPiMaxLine or more, which the adapter reads whole.
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 
 	"github.com/entireio/cli/internal/transcript/pijsonl"
 )
+
+// legacyPiMaxLine and legacyPiScanner are the Pi scanner the compactor used.
+const legacyPiMaxLine = 10 * 1024 * 1024
+
+func legacyPiScanner(data []byte) *bufio.Scanner {
+	s := bufio.NewScanner(bytes.NewReader(data))
+	s.Buffer(make([]byte, 0, legacyPiMaxLine), legacyPiMaxLine)
+	return s
+}
 
 func legacyCompactPi(content []byte, opts Options) ([]byte, error) {
 	active := pijsonl.ResolveActiveBranch(content)
@@ -30,7 +41,7 @@ func legacyCompactPi(content []byte, opts Options) ([]byte, error) {
 	base := newTranscriptLine(opts)
 	var out []byte
 
-	scanner := pijsonl.NewScanner(emit)
+	scanner := legacyPiScanner(emit)
 	for scanner.Scan() {
 		var entry pijsonl.Entry
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
@@ -91,7 +102,7 @@ func legacyCompactPi(content []byte, opts Options) ([]byte, error) {
 
 func legacyPiCollectToolResults(data []byte, active map[string]bool) (map[string]piCompactToolResult, error) {
 	results := map[string]piCompactToolResult{}
-	scanner := pijsonl.NewScanner(data)
+	scanner := legacyPiScanner(data)
 	for scanner.Scan() {
 		var entry pijsonl.Entry
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {

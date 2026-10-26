@@ -1,6 +1,7 @@
 package pijsonl
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -66,11 +67,9 @@ func TestForEachActiveMessage(t *testing.T) {
 {"type":"message","id":"m2","parentId":"m1","message":{"role":"assistant"}}
 `)
 	var got []string
-	if err := ForEachActiveMessage(data, 0, func(e Entry) {
+	ForEachActiveMessage(data, 0, func(e Entry) {
 		got = append(got, e.ID+":"+e.Message.Role)
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	// The session header (type != "message") is filtered out.
 	want := []string{"m1:user", "m2:assistant"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
@@ -88,11 +87,9 @@ func TestForEachActiveMessage_SkipsAbandonedBranchAndHonoursOffset(t *testing.T)
 {"type":"message","id":"m3","parentId":"m1","message":{"role":"assistant"}}
 `)
 	var got []string
-	if err := ForEachActiveMessage(data, 1, func(e Entry) {
+	ForEachActiveMessage(data, 1, func(e Entry) {
 		got = append(got, e.ID)
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	want := []string{"m1", "m3"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("got %v, want %v (m2 abandoned, header skipped by offset)", got, want)
@@ -102,9 +99,7 @@ func TestForEachActiveMessage_SkipsAbandonedBranchAndHonoursOffset(t *testing.T)
 func TestForEachActiveMessage_EmptyIsNoOp(t *testing.T) {
 	t.Parallel()
 	called := false
-	if err := ForEachActiveMessage(nil, 0, func(Entry) { called = true }); err != nil {
-		t.Fatal(err)
-	}
+	ForEachActiveMessage(nil, 0, func(Entry) { called = true })
 	if called {
 		t.Error("fn should not be called for empty data")
 	}
@@ -149,19 +144,49 @@ func TestCountLines(t *testing.T) {
 	}
 }
 
-func TestNewScanner_HandlesLargeLines(t *testing.T) {
+func TestLines(t *testing.T) {
 	t.Parallel()
-	// A 5MB JSONL line — well over the legacy 1MB cap, well under the new
-	// 10MB cap. Verifies the scanner doesn't choke on file-content-bearing
-	// toolCall arguments.
-	big := `{"type":"message","id":"x","message":{"role":"user","content":"` +
-		strings.Repeat("a", 5*1024*1024) + `"}}` + "\n"
-	scanner := NewScanner([]byte(big))
-	if !scanner.Scan() {
-		t.Fatalf("scanner failed on large line: %v", scanner.Err())
+	cases := map[string][]string{
+		"":             nil,
+		"a\nb\n":       {"a", "b"},
+		"a\nb":         {"a", "b"}, // unterminated final line included
+		"a\r\n\nb\r\n": {"a", "", "b"},
+		"\n":           {""},
 	}
-	if len(scanner.Bytes()) < 5*1024*1024 {
-		t.Errorf("got truncated line: %d bytes", len(scanner.Bytes()))
+	for in, want := range cases {
+		var got []string
+		for line := range Lines([]byte(in)) {
+			got = append(got, string(line))
+		}
+		if strings.Join(got, "|") != strings.Join(want, "|") || len(got) != len(want) {
+			t.Errorf("Lines(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A line past the old 10 MiB scanner limit is read whole, and the lines
+// after it still count: the active branch and the messages reach past it.
+func TestLongLineDoesNotStopReading(t *testing.T) {
+	t.Parallel()
+	big := `{"type":"message","id":"m2","parentId":"m1","message":{"role":"user","content":"` +
+		strings.Repeat("a", 11<<20) + `"}}`
+	data := []byte(`{"type":"message","id":"m1","parentId":null,"message":{"role":"user"}}
+` + big + `
+{"type":"message","id":"m3","parentId":"m2","message":{"role":"assistant"}}
+`)
+	active := ResolveActiveBranch(data)
+	for _, id := range []string{"m1", "m2", "m3"} {
+		if !active[id] {
+			t.Errorf("expected %q in active set", id)
+		}
+	}
+	var got []string
+	ForEachActiveMessage(data, 0, func(e Entry) {
+		got = append(got, fmt.Sprint(e.ID, ":", len(e.Message.Content)))
+	})
+	want := []string{"m1:0", fmt.Sprint("m2:", 11<<20+2), "m3:0"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("got %v, want %v", got, want)
 	}
 }
 
