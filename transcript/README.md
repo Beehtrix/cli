@@ -160,19 +160,34 @@ applies records in order and returns the transcript lines.
 
 In this repository the fold is used by `Convert`: for Claude Code, Cursor and
 Droid, it runs a `JSONLAdapter` that turns the native transcript into records
-and then folds them. The other converters still write lines directly. The fold
+and then folds them, and for Pi a `PiAdapter`. The other converters still write
+lines directly. The fold
 is meant to be shared with a backend that folds the same records to show a live
 session, so that a live view and a checkpoint's `transcript.jsonl` match byte
 for byte.
 
 A live producer uses the same adapter (`NewClaudeAdapter`, `NewCursorAdapter`,
-`NewDroidAdapter`). `Feed` accepts the transcript in chunks split anywhere and
+`NewDroidAdapter`, `NewPiAdapter`). `Feed` accepts the transcript in chunks split anywhere and
 returns the records for the lines it completed; `Flush` consumes a trailing
 partial line and is called only once the transcript is final. Fold keys are
 stable only when the adapter is fed from the transcript's first line, so a
 producer that restarts replays from line 1. `Lines` reports how many source
 lines have been consumed. Records carry the transcript's bytes as fed: redact
 before feeding.
+
+The Pi adapter keys each message by its Pi entry ID and sends it whole as a
+`message` record, with its tool results spliced in; it sends the message again
+when a result it shows changes, and `drop`s it when it leaves the active
+branch (a `message` record restores it in place if the branch comes back). A
+line that only grows the active branch is read without walking the tree, so a
+session that only grows reads in linear time. A Pi line of 10 MiB or more,
+newline excluded, is oversized: its content is not read, but its `id`,
+`parentId` and `type` are read from its first 64 KiB, so it keeps its place in
+the tree and the messages before it stay on the active branch. An oversized
+message has no line (it still becomes the tip, as any message does), and an
+oversized tool result supplies no result. `Convert` reads Pi transcripts the
+same way, so such a line no longer makes it fail. A line whose head does not
+give those fields is skipped like a line that is not JSON.
 
 ### Record wire format v1
 
@@ -190,10 +205,11 @@ One JSON object per record. An omitted field and a zero-length one mean the same
 | `result` | object | `result` | The tool result object described under Blocks. Required on `result`. |
 | `usage` | object | `message`, `append`, `usage` | Optional per-call snapshot (`model`, `inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `cacheWrite5mTokens`, `cacheWrite1hTokens`, `reasoningTokens`). When present it replaces the message's whole snapshot, and the line's usage fields come from it instead of `inputTokens`/`outputTokens`. |
 | `inputTokens`, `outputTokens` | int | `message`, `append`, `usage` | A non-zero value replaces the previous one; agents report cumulative usage. |
+| `keepEmpty` | bool | `message` | Keeps an assistant message whose content is `[]` or `null` visible, printing that content: a call with usage but no visible content (Pi). Each `message` record replaces it. |
 
 What each op does to the message `id` names:
 
-- `message` creates it, or restates it: role, source ID, timestamp and content are replaced, token counts and any usage snapshot are updated, and a dropped message is restored. A message keeps the position where it was first created.
+- `message` creates it, or restates it: role, source ID, timestamp, content and `keepEmpty` are replaced, token counts and any usage snapshot are updated, and a dropped message is restored. A message keeps the position where it was first created.
 - `append` concatenates content blocks and replaces the timestamp. Appending to non-array content (a string, `null`, or none) replaces it with the appended blocks, possibly none: the result is always an array.
 - `result` sets the result of one `tool_use` block. Nothing changes when the content is not an array, when one of its blocks is not an object, or when no block matches.
 - `usage` updates token counts and, when it carries `usage`, the per-call snapshot.
@@ -205,7 +221,7 @@ Compatibility: new optional fields may be added, and readers ignore fields they 
 
 ### Incremental folding
 
-A `Folder` folds incrementally. `Apply` validates a whole batch before changing anything and returns the IDs of the messages it touched. `Line(id)` returns one message's current line, or not visible when the message is dropped or is an assistant message whose content is `[]` or `null`. An assistant message with no content at all is visible and prints `"content":null`, as `Convert` always has. A live view re-renders the touched messages and removes those that are no longer visible:
+A `Folder` folds incrementally. `Apply` validates a whole batch before changing anything and returns the IDs of the messages it touched. `Line(id)` returns one message's current line, or not visible when the message is dropped or is an assistant message whose content is `[]` or `null` and whose last `message` record did not set `keepEmpty`. An assistant message with no content at all is visible and prints `"content":null`, as `Convert` always has. A live view re-renders the touched messages and removes those that are no longer visible:
 
 ```go
 f := transcript.NewFolder(transcript.Options{Agent: "claude-code", CLIVersion: "0.5.1"})

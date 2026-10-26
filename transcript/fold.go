@@ -30,6 +30,7 @@ type message struct {
 	inputTokens  int
 	outputTokens int
 	usage        *CallUsage
+	keepEmpty    bool // an assistant message with content [] or null stays visible
 	dropped      bool
 }
 
@@ -111,7 +112,8 @@ func (f *Folder) Lines() []byte {
 
 // Line returns the compact line (without a trailing newline) for message id.
 // visible is false when the message is unknown, dropped, or an assistant
-// message whose content is [] or null; such a message has no line in Lines.
+// message whose content is [] or null and whose last message record did not
+// set KeepEmpty; such a message has no line in Lines.
 // An assistant message with no content at all is visible and prints
 // "content":null, as Convert always has.
 func (f *Folder) Line(id string) (line []byte, visible bool) {
@@ -123,7 +125,7 @@ func (f *Folder) Line(id string) (line []byte, visible bool) {
 }
 
 func (f *Folder) line(m *message) ([]byte, bool) {
-	if m.dropped || (m.role == TypeAssistant && m.isEmpty()) {
+	if m.dropped || (m.role == TypeAssistant && !m.keepEmpty && m.isEmpty()) {
 		return nil, false
 	}
 	content, err := m.content()
@@ -206,6 +208,7 @@ func (f *Folder) apply(r Record) {
 		m.role = r.Role
 		m.ts = cloneRaw(r.TS)
 		m.setContent(r.Content)
+		m.keepEmpty = r.KeepEmpty
 		m.dropped = false
 		m.setTokens(r)
 	case OpAppend:
