@@ -1184,14 +1184,17 @@ const PrePushStdinRefsEnv = "ENTIRE_PRE_PUSH_STDIN_REFS"
 // the commands after it. Entire's failure ends the script there: a later
 // command's exit status must not decide the push and lose an abort from Entire.
 //
-// Saving the list must never be what blocks a push. When the temp file cannot
-// be created or written, Entire runs without the list, as an old hook would.
-// A partly written copy is discarded, not replayed: the commands after Entire
-// then read whatever git's stdin still holds.
+// When the temp file cannot be created, nothing has read git's stdin yet, so
+// Entire runs without the list, as an old hook would. When writing it fails,
+// cat has already consumed stdin, so the commands after Entire would get an
+// empty list (for `git lfs pre-push`, a push without its objects); the push
+// stops instead.
 //
 // There is no trap to remove the copy if the push is interrupted: a hook
 // manager pastes this line into its own script, where a trap would replace the
 // script's. A leftover copy holds only ref names and commit IDs.
+const prePushRefsNotSavedMessage = "[entire] could not save git's pre-push ref list (is TMPDIR full?); stopping the push so the hooks after Entire don't run without it"
+
 func prePushHookLine(cmdPrefix string) string {
 	withRefs := fmt.Sprintf(`%s=1 %s hooks git pre-push "$1" < "$_entire_refs"`, PrePushStdinRefsEnv, cmdPrefix)
 	withoutRefs := cmdPrefix + ` hooks git pre-push "$1" < /dev/null`
@@ -1201,7 +1204,8 @@ func prePushHookLine(cmdPrefix string) string {
 		`if cat > "$_entire_refs"; then ` +
 		withRefs + ` || { _entire_status=$?; rm -f "$_entire_refs"; exit "$_entire_status"; }; ` +
 		`exec < "$_entire_refs"; rm -f "$_entire_refs"; ` +
-		`else rm -f "$_entire_refs"; ` + withoutRefs + ` || exit $?; fi; ` +
+		`else rm -f "$_entire_refs"; ` +
+		`printf '%s\n' ` + shellQuote(prePushRefsNotSavedMessage) + ` >&2; exit 1; fi; ` +
 		`else ` + withoutRefs + ` || exit $?; fi; fi`
 }
 

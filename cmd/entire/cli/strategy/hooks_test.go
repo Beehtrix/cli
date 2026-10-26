@@ -1735,9 +1735,11 @@ func TestGenerateChainedContent(t *testing.T) {
 // git's ref list on stdin after Entire has read it, and Entire's failure must
 // end the script there: otherwise a later command's status decides the push
 // and an abort from Entire is lost.
-// Saving the ref list must never be what blocks a push: when the temp file
-// cannot be created or written, Entire runs without the list (as an old hook
-// would) and the commands after it still get git's stdin, not a partial copy.
+// When the temp file cannot be created, nothing has read git's stdin yet, so
+// Entire runs without the list (as an old hook would) and the commands after it
+// still get git's stdin. When it was created but writing it fails, cat has
+// already consumed stdin and the commands after Entire would get an empty list
+// (for `git lfs pre-push`, a push without its objects), so the push stops.
 func TestPrePushHookLine_UnwritableTMPDIRFallsBack(t *testing.T) {
 	t.Parallel()
 	if runtime.GOOS == "windows" {
@@ -1746,12 +1748,10 @@ func TestPrePushHookLine_UnwritableTMPDIRFallsBack(t *testing.T) {
 	const refs = "refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222\n"
 	for _, tc := range []struct {
 		name       string
-		catFails   bool
 		entireExit int
 	}{
 		{name: "mktemp fails, entire succeeds", entireExit: 0},
 		{name: "mktemp fails, entire fails", entireExit: 3},
-		{name: "saving the list fails", catFails: true, entireExit: 0},
 	} {
 		entireExit := tc.entireExit
 		t.Run(tc.name, func(t *testing.T) {
@@ -1762,11 +1762,6 @@ func TestPrePushHookLine_UnwritableTMPDIRFallsBack(t *testing.T) {
 			require.NoError(t, os.WriteFile(filepath.Join(binDir, "entire"),
 				[]byte(fmt.Sprintf("#!/bin/sh\nenv > %q\nexit %d\n", filepath.Join(dir, "entire.env"), entireExit)), 0o755))
 			tmpDir := filepath.Join(dir, "missing")
-			if tc.catFails {
-				// A cat that fails before reading anything, as a full disk would.
-				require.NoError(t, os.WriteFile(filepath.Join(binDir, "cat"), []byte("#!/bin/sh\nexit 1\n"), 0o755))
-				tmpDir = dir
-			}
 			script := "#!/bin/sh\n" + prePushHookLine(bareEntireHookCmd) + "\n/bin/cat > " + filepath.Join(dir, "after.stdin") + "\n"
 			require.NoError(t, os.WriteFile(filepath.Join(dir, prePushHook), []byte(script), 0o755))
 
@@ -1798,6 +1793,42 @@ func TestPrePushHookLine_UnwritableTMPDIRFallsBack(t *testing.T) {
 			require.Empty(t, leftovers, "a failed copy must be removed")
 		})
 	}
+}
+
+func TestPrePushHookLine_PartlySavedListStopsPush(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("runs the generated POSIX sh script")
+	}
+	const refs = "refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222\n"
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "entire"),
+		[]byte(fmt.Sprintf("#!/bin/sh\nenv > %q\n", filepath.Join(dir, "entire.env"))), 0o755))
+	// A cat that reads git's stdin and then fails to write, as a nearly full
+	// TMPDIR would.
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "cat"), []byte("#!/bin/sh\n/bin/cat > /dev/null\nexit 1\n"), 0o755))
+	script := "#!/bin/sh\n" + prePushHookLine(bareEntireHookCmd) + "\n/bin/cat > " + filepath.Join(dir, "after.stdin") + "\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, prePushHook), []byte(script), 0o755))
+
+	cmd := exec.CommandContext(t.Context(), "sh", filepath.Join(dir, prePushHook), "origin", "url")
+	cmd.Stdin = strings.NewReader(refs)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "TMPDIR="+dir)
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr, "a push whose ref list was consumed but not saved must stop")
+	require.Equal(t, 1, exitErr.ExitCode())
+	require.Contains(t, stderr.String(), "could not save git's pre-push ref list")
+	_, entireErr := os.Stat(filepath.Join(dir, "entire.env"))
+	require.ErrorIs(t, entireErr, os.ErrNotExist, "Entire must not run")
+	_, afterErr := os.Stat(filepath.Join(dir, "after.stdin"))
+	require.ErrorIs(t, afterErr, os.ErrNotExist, "nothing may run after a lost ref list")
+	leftovers, globErr := filepath.Glob(filepath.Join(dir, "entire-pre-push.*"))
+	require.NoError(t, globErr)
+	require.Empty(t, leftovers, "a failed copy must be removed")
 }
 
 func TestPrePushHookLine_ReplaysStdinAndPropagatesFailure(t *testing.T) {
