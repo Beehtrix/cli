@@ -64,9 +64,12 @@ entire repo create <name> --project <project>
 entire repo clone /et/<project>/<name>
 ```
 
-**3. Open a Trail** for the branch you're working on:
+Then `cd` into the clone and run `entire enable` there to capture sessions in it.
+
+**3. Open a Trail** — in a repository on Entire, on the branch you're working on:
 
 ```bash
+git switch -c add-rate-limiting
 entire trail create --title "Add rate limiting"
 entire trail show
 ```
@@ -137,7 +140,7 @@ Checkpoints are also the raw material for continuous memory: [entire-brain](http
 
 - **Search** — `entire search` runs hybrid (semantic + keyword) search over checkpoints, commits, and sessions, scoped to the current repo or `--all-repos`. `--json --compact` returns a trimmed shape suited to agents, and `entire checkpoint explain <id>` fetches the full detail of a hit.
 - **Activity and dispatches** — `entire activity` shows your activity overview, repository breakdown, and recent sessions from entire.com. `entire dispatch` writes a summary of recent agent work; `--local` generates it with your locally installed agent CLI instead of the Entire server.
-- **Raw API access** — `entire api <path>` makes an authenticated request to an Entire API and prints the JSON response, like `gh api`. It attaches your token and picks the host: `--to core` (the default) reaches the control plane (orgs, projects, repos, mirrors, clusters), `--to cell` reaches your home data cell (activity, repo aggregates), and `--jurisdiction <slug>` reaches another jurisdiction's cell. `{owner}`, `{repo}`, and `{repo_id}` in the path are filled from the current repository. These endpoints are internal and can change without notice; where a purpose-built command exists, prefer it.
+- **Raw API access** — `entire api <path>` makes an authenticated request to an Entire API and prints the JSON response, like `gh api`. It attaches your token and picks the host: `--to core` (the default) reaches the control plane (orgs, projects, repos, mirrors, clusters), `--to cell` reaches your home data cell (activity, repo aggregates), and `--jurisdiction <slug>` reaches another jurisdiction's cell. `{owner}`, `{repo}`, and `{repo_id}` in the path are filled from the current repository's `origin`; `{repo_id}` needs a GitHub repository with an active Entire mirror. These endpoints are internal and can change without notice; where a purpose-built command exists, prefer it.
 
 ```bash
 entire api /api/v1/clusters
