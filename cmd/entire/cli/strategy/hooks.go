@@ -480,6 +480,9 @@ func AnyGitHookInstalled(ctx context.Context) bool {
 // An Entire hook that is current stays as it is even when its text differs from
 // what this version writes: it carries entireHookMarker, so InstallGitHook would
 // replace it without a backup, and the difference may be lines the user added.
+// Skipping it also skips refreshing copies another tool moved aside, which is
+// safe: such a copy only runs from that tool's wrapper, and a wrapper in the
+// hook's place lacks the marker, so the hook reads Absent and is reinstalled.
 func ReinstallGitHooks(ctx context.Context) (int, error) {
 	return installGitHooks(ctx, true, hookSettingsFromConfig(ctx), true)
 }
@@ -1185,6 +1188,10 @@ const PrePushStdinRefsEnv = "ENTIRE_PRE_PUSH_STDIN_REFS"
 // be created or written, Entire runs without the list, as an old hook would.
 // A partly written copy is discarded, not replayed: the commands after Entire
 // then read whatever git's stdin still holds.
+//
+// There is no trap to remove the copy if the push is interrupted: a hook
+// manager pastes this line into its own script, where a trap would replace the
+// script's. A leftover copy holds only ref names and commit IDs.
 func prePushHookLine(cmdPrefix string) string {
 	withRefs := fmt.Sprintf(`%s=1 %s hooks git pre-push "$1" < "$_entire_refs"`, PrePushStdinRefsEnv, cmdPrefix)
 	withoutRefs := cmdPrefix + ` hooks git pre-push "$1" < /dev/null`
