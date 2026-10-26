@@ -275,10 +275,10 @@ func TestPiAdapter_UsageOnlyCallIsKeptEmpty(t *testing.T) {
 		t.Fatalf("records = %+v, want 2", recs)
 	}
 	r := recs[1]
-	if r.ID != "a1" || r.SourceID != "a1" || !r.KeepEmpty || string(r.Content) != "[]" || r.Usage == nil || r.Usage.OutputTokens != 6 || r.Usage.Model != "m2" {
+	if r.ID != "a1" || r.SourceID != "a1" || string(r.Content) != "[]" || r.Usage == nil || r.Usage.OutputTokens != 6 || r.Usage.Model != "m2" {
 		t.Errorf("usage-only record = %+v", r)
 	}
-	if recs[0].KeepEmpty || recs[0].SourceID != "" {
+	if recs[0].SourceID != "" {
 		t.Errorf("user record = %+v", recs[0])
 	}
 }

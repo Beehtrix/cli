@@ -45,9 +45,9 @@ Converters fill only what the native transcript reports per call. Claude Code, C
 
 ### Per-call usage
 
-An assistant line can carry usage with empty content (`"content":[]`, for example an aborted or thinking-only call): readers that render transcripts should skip it, and readers that count usage must keep it.
+An assistant line can have no visible content (`"content":[]` or `null`, for example an aborted or thinking-only call), and can still carry usage: readers that render transcripts should skip it, and readers that count usage must keep it. Older CLI versions drop Claude Code, Cursor and Droid assistant messages with empty content instead, and move a call's usage to its first line with visible content.
 
-Claude Code (`Options.Agent` `claude-code`, and `NewClaudeAdapter`; Cursor and Droid keep legacy counts): streaming fragments of one message ID become one line carrying the whole usage row with the strictly highest `output_tokens` (earlier wins ties) and the model of the first fragment that reports one, skipping Claude Code's `<synthetic>` placeholder; `ts` is the last fragment's. The 5m/1h cache-write split is emitted only when both durations are reported. A message with no usage object on any fragment has no model or usage fields. User entries holding only tool results between fragments of one ID do not split the call: the later fragments become separate lines without usage, and the best row stays on the call's first line (the first with visible content, since a thinking-only message has no line), so a call's usage is counted once. Read per-call usage from the full converted transcript: in a checkpoint slice (`ConvertWithBoundary`), a usage row that arrives after a tool result goes to the call's first line, which can sit before the slice boundary.
+Claude Code (`Options.Agent` `claude-code`, and `NewClaudeAdapter`; Cursor and Droid keep legacy counts): streaming fragments of one message ID become one line carrying the whole usage row with the strictly highest `output_tokens` (earlier wins ties) and the model of the first fragment that reports one, skipping Claude Code's `<synthetic>` placeholder; `ts` is the last fragment's. The 5m/1h cache-write split is emitted only when both durations are reported. A message with no usage object on any fragment has no model or usage fields. User entries holding only tool results between fragments of one ID do not split the call: the later fragments become separate lines without usage, and the best row stays on the call's first line, even when that line has no visible content (a thinking-only fragment), so a call's usage is counted once. Read per-call usage from the full converted transcript: in a checkpoint slice (`ConvertWithBoundary`), a usage row that arrives after a tool result goes to the call's first line, which can sit before the slice boundary.
 
 Codex: one assistant line per model call, made of the reasoning, message and tool-call items up to the `token_count` that closes it (real order: call, output, `token_count`; outputs attach to their call by `call_id`). Usage is the difference between consecutive cumulative `info.total_token_usage` snapshots, and `ts` is the closing snapshot's when present, otherwise the last item's. Fresh input is `input - cached` clamped at zero; Codex lines carry no cache-write fields. Repeated snapshots and snapshots missing the input, cached-input or output counter are ignored, `reasoning_tokens` needs both adjacent snapshots to report it, and a decrease in any counter stops usage on later lines. A call with usage but no text or tool calls (for example reasoning-only) emits `content: []`, so consumers may see empty assistant lines; a call with neither usage nor content is omitted. Without usable `total_token_usage` snapshots (flat per-event totals are not read), no `token_count` closes a call, so consecutive assistant items merge into one line until the next user line or tool output; with usable snapshots, a tool output does not end its call. After a counter decrease, total snapshots still close calls but carry no usage, starting with the call the decrease closes. With `StartLine`, the last line before the boundary is part of the slice when its tool output or closing snapshot arrives after it (a one-line head overlap, which can repeat that call's usage); a later output for any earlier call lands only on that call's earlier line.
 
@@ -186,7 +186,7 @@ whole.
 
 ### Record wire format v1
 
-One JSON object per record. An omitted field and a zero-length one mean the same: in Go, a nil or empty `json.RawMessage` is absent. This is about the field, not its JSON value: `content` of `[]` or `null` is present, and the visibility rules below treat it differently from absent content.
+One JSON object per record. An omitted field and a zero-length one mean the same: in Go, a nil or empty `json.RawMessage` is absent. This is about the field, not its JSON value: `content` of `[]` or `null` is present, and prints as such, while absent content prints `null`.
 
 | Field | Type | Ops | Notes |
 | --- | --- | --- | --- |
@@ -200,11 +200,10 @@ One JSON object per record. An omitted field and a zero-length one mean the same
 | `result` | object | `result` | The tool result object described under Blocks. Required on `result`. |
 | `usage` | object | `message`, `append`, `usage` | Optional per-call snapshot (`model`, `inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `cacheWrite5mTokens`, `cacheWrite1hTokens`, `reasoningTokens`). When present it replaces the message's whole snapshot, and the line's usage fields come from it instead of `inputTokens`/`outputTokens`. |
 | `inputTokens`, `outputTokens` | int | `message`, `append`, `usage` | A non-zero value replaces the previous one; agents report cumulative usage. |
-| `keepEmpty` | bool | `message` | Keeps an assistant message whose content is `[]` or `null` visible, printing that content: a call with usage but no visible content (Pi). Each `message` record replaces it. |
 
 What each op does to the message `id` names:
 
-- `message` creates it, or restates it: role, source ID, timestamp, content and `keepEmpty` are replaced, token counts and any usage snapshot are updated, and a dropped message is restored. A message keeps the position where it was first created.
+- `message` creates it, or restates it: role, source ID, timestamp and content are replaced, token counts and any usage snapshot are updated, and a dropped message is restored. A message keeps the position where it was first created.
 - `append` concatenates content blocks and replaces the timestamp. Appending to non-array content (a string, `null`, or none) replaces it with the appended blocks, possibly none: the result is always an array.
 - `result` sets the result of one `tool_use` block. Nothing changes when the content is not an array, when one of its blocks is not an object, or when no block matches.
 - `usage` updates token counts and, when it carries `usage`, the per-call snapshot.
@@ -216,7 +215,7 @@ Compatibility: new optional fields may be added, and readers ignore fields they 
 
 ### Incremental folding
 
-A `Folder` folds incrementally. `Apply` validates a whole batch before changing anything and returns the IDs of the messages it touched. `Line(id)` returns one message's current line, or not visible when the message is dropped or is an assistant message whose content is `[]` or `null` and whose last `message` record did not set `keepEmpty`. An assistant message with no content at all is visible and prints `"content":null`, as `Convert` always has. A live view re-renders the touched messages and removes those that are no longer visible:
+A `Folder` folds incrementally. `Apply` validates a whole batch before changing anything and returns the IDs of the messages it touched. `Line(id)` returns one message's current line, or not visible when the message is dropped. A message with empty content (`[]` or `null`) is visible: renderers skip it, as for any such line. An assistant message with no content at all prints `"content":null`, as `Convert` always has. A live view re-renders the touched messages and removes those that are no longer visible:
 
 ```go
 f := transcript.NewFolder(transcript.Options{Agent: "claude-code", CLIVersion: "0.5.1"})

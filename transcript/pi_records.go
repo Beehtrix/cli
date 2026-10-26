@@ -28,8 +28,8 @@ import (
 // leaves it behind), and dropped (OpDrop) when it leaves the active branch.
 // An OpMessage on a dropped key restores it where it was first created, so
 // returning to an earlier branch needs no new keys. An assistant message
-// with no visible content but non-zero usage is sent with content [] and
-// KeepEmpty, so it keeps its line.
+// with no visible content but non-zero usage is sent with content [], so it
+// keeps its line.
 //
 // A line that only grows the active branch (the usual case: a message whose
 // parent is the tip, perhaps through entries that are not messages) is read
@@ -399,18 +399,20 @@ func piRecord(e pijsonl.Entry, results map[string]piCompactToolResult) (Record, 
 	var blocks []any
 	switch e.Message.Role {
 	case pijsonl.RoleUser:
-		blocks = piEmitUserContent(e.Message.Content)
+		if blocks = piEmitUserContent(e.Message.Content); len(blocks) == 0 {
+			return Record{}, false
+		}
 	case pijsonl.RoleAssistant:
 		blocks = piEmitAssistantContent(e.Message.Content, results)
 		r.SourceID = e.ID // Pi lines carry the ID on assistant lines only
 		r.Usage = piCallUsage(e.Message)
-		if len(blocks) == 0 && piUsageHasCounts(r.Usage) {
-			blocks, r.KeepEmpty = []any{}, true
+		if len(blocks) == 0 {
+			if !piUsageHasCounts(r.Usage) {
+				return Record{}, false
+			}
+			blocks = []any{}
 		}
 	default:
-		return Record{}, false
-	}
-	if len(blocks) == 0 && !r.KeepEmpty {
 		return Record{}, false
 	}
 	content, err := json.Marshal(blocks)

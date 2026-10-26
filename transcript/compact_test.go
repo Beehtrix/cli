@@ -63,8 +63,8 @@ func TestCompact_AssistantStripping(t *testing.T) {
 func TestCompact_AssistantThinkingOnly(t *testing.T) {
 	t.Parallel()
 
-	// Assistant lines with only thinking content should be dropped entirely
-	// (streaming intermediates that carry no user-visible content).
+	// An assistant line with only thinking content keeps a line with empty
+	// content: it can carry the call's usage. Renderers skip it.
 	input := []byte(`{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","requestId":"req-1","message":{"id":"msg-1","content":[{"type":"thinking","thinking":"hmm..."}]}}
 `)
 
@@ -72,7 +72,9 @@ func TestCompact_AssistantThinkingOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	assertJSONLines(t, result, nil)
+	assertJSONLines(t, result, []string{
+		`{"v":1,"agent":"claude-code","cli_version":"0.5.1","type":"assistant","ts":"2026-01-01T00:00:01Z","id":"msg-1","content":[]}`,
+	})
 }
 
 func TestCompact_UserWithToolResult(t *testing.T) {

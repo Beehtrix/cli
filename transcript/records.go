@@ -75,13 +75,6 @@ type Record struct {
 	// snapshot, zeros included. An assistant message with a snapshot ignores
 	// the token counts above.
 	Usage *CallUsage `json:"usage,omitempty"`
-
-	// KeepEmpty, on OpMessage, keeps an assistant message whose content is []
-	// or null visible: its line prints that content. Converters that write a
-	// line for a call with usage but no visible content (Pi) set it; without
-	// it such a message has no line, as Claude Code's thinking-only messages
-	// have none. Each OpMessage replaces it.
-	KeepEmpty bool `json:"keepEmpty,omitempty"`
 }
 
 // CallUsage is an authoritative per-call usage snapshot for an assistant

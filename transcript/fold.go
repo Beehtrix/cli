@@ -30,7 +30,6 @@ type message struct {
 	inputTokens  int
 	outputTokens int
 	usage        *CallUsage
-	keepEmpty    bool // an assistant message with content [] or null stays visible
 	dropped      bool
 }
 
@@ -111,10 +110,10 @@ func (f *Folder) Lines() []byte {
 }
 
 // Line returns the compact line (without a trailing newline) for message id.
-// visible is false when the message is unknown, dropped, or an assistant
-// message whose content is [] or null and whose last message record did not
-// set KeepEmpty; such a message has no line in Lines.
-// An assistant message with no content at all is visible and prints
+// visible is false when the message is unknown or dropped; such a message has
+// no line in Lines. An assistant message with empty content ([] or null) is
+// visible: it carries the call's usage, and renderers skip it. One with no
+// content at all prints
 // "content":null, as Convert always has.
 func (f *Folder) Line(id string) (line []byte, visible bool) {
 	m, ok := f.byID[id]
@@ -125,7 +124,7 @@ func (f *Folder) Line(id string) (line []byte, visible bool) {
 }
 
 func (f *Folder) line(m *message) ([]byte, bool) {
-	if m.dropped || (m.role == TypeAssistant && !m.keepEmpty && m.isEmpty()) {
+	if m.dropped {
 		return nil, false
 	}
 	content, err := m.content()
@@ -208,7 +207,6 @@ func (f *Folder) apply(r Record) {
 		m.role = r.Role
 		m.ts = cloneRaw(r.TS)
 		m.setContent(r.Content)
-		m.keepEmpty = r.KeepEmpty
 		m.dropped = false
 		m.setTokens(r)
 	case OpAppend:
@@ -334,14 +332,6 @@ func (m *message) setToolResult(toolUseID string, result *ToolResult) {
 	m.decode()
 	m.rekeyed = len(m.blocks)
 	m.blocks[i].result = cloneToolResult(result)
-}
-
-// isEmpty reports whether the content is an empty array or null.
-func (m *message) isEmpty() bool {
-	if m.decoded {
-		return len(m.blocks) == 0
-	}
-	return isEmptyContentArray(m.raw)
 }
 
 // content encodes the message's content for its line.

@@ -221,37 +221,26 @@ func TestFold_DropAndRestore(t *testing.T) {
 	)
 }
 
-func TestFold_SkipsEmptyAssistantsOnly(t *testing.T) {
+func TestFold_KeepsEmptyAssistants(t *testing.T) {
 	t.Parallel()
 
+	withUsage := assistantRecord("u", "u", `[]`)
+	withUsage.Usage = &CallUsage{OutputTokens: 3}
 	got := foldLines(t,
 		assistantRecord("a", "a", `[]`),
-		Record{Op: OpMessage, ID: "u", Role: TypeUser, Content: rawMsg(`[]`)},
+		Record{Op: OpMessage, ID: "e", Role: TypeUser, Content: rawMsg(`[]`)},
 		assistantRecord("n", "n", `null`),
 		Record{Op: OpMessage, ID: "nil", Role: TypeAssistant},
+		withUsage,
 	)
-	// A missing content prints null; a literal null counts as empty, as in compaction.
+	// Renderers skip lines with no blocks; usage counters keep them.
 	assertLines(t, got,
+		linePrefix+`"type":"assistant","ts":"t1","id":"a","content":[]}`,
 		linePrefix+`"type":"user","content":[]}`,
-		linePrefix+`"type":"assistant","content":null}`,
-	)
-}
-
-func TestFold_KeepEmptyShowsEmptyAssistant(t *testing.T) {
-	t.Parallel()
-
-	keep := assistantRecord("a", "a", `[]`)
-	keep.KeepEmpty = true
-	keep.Usage = &CallUsage{OutputTokens: 3}
-	keepNull := assistantRecord("n", "n", `null`)
-	keepNull.KeepEmpty = true
-	assertLines(t, foldLines(t, keep, keepNull),
-		linePrefix+`"type":"assistant","ts":"t1","id":"a","output_tokens":3,"content":[]}`,
 		linePrefix+`"type":"assistant","ts":"t1","id":"n","content":null}`,
+		linePrefix+`"type":"assistant","content":null}`,
+		linePrefix+`"type":"assistant","ts":"t1","id":"u","output_tokens":3,"content":[]}`,
 	)
-
-	// Each message record replaces it.
-	assertLines(t, foldLines(t, keep, assistantRecord("a", "a", `[]`)))
 }
 
 func TestFold_DerivedIDsAreOmitted(t *testing.T) {
@@ -474,7 +463,6 @@ func TestRecord_JSONRoundTrip(t *testing.T) {
 		{Op: OpUsage, ID: "m1", InputTokens: 4},
 		{Op: OpDrop, ID: "@L2"},
 		{Op: OpResult, ID: "m1", Result: &ToolResult{Status: ToolStatusSuccess, Agent: &ToolResultAgent{ID: "a1"}}},
-		{Op: OpMessage, ID: "e1", SourceID: "e1", Role: TypeAssistant, Content: rawMsg(`[]`), Usage: &CallUsage{OutputTokens: 3}, KeepEmpty: true},
 	}
 
 	data, err := json.Marshal(records)
@@ -517,10 +505,6 @@ func TestRecord_JSONRoundTrip(t *testing.T) {
 	const wantAgent = `{"op":"result","id":"m1","result":{"output":"","status":"success","agent":{"id":"a1"}}}`
 	if result, err := json.Marshal(records[8]); err != nil || string(result) != wantAgent {
 		t.Errorf("agent result record encoding = %s (%v), want %s", result, err, wantAgent)
-	}
-	const wantKeepEmpty = `{"op":"message","id":"e1","sourceId":"e1","role":"assistant","content":[],"usage":{"outputTokens":3},"keepEmpty":true}`
-	if keep, err := json.Marshal(records[9]); err != nil || string(keep) != wantKeepEmpty {
-		t.Errorf("keepEmpty record encoding = %s (%v), want %s", keep, err, wantKeepEmpty)
 	}
 }
 
