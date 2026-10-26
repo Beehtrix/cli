@@ -1,3 +1,5 @@
+<img src=".github/assets/gh-repo-cover.png" alt="Entire CLI" width="100%">
+
 # Entire CLI
 
 [Entire](https://entire.com) is a Git forge built for agent–human collaboration. This CLI is how you and your agents use Entire from the terminal — anything you do on entire.com, you can do here:
