@@ -356,8 +356,8 @@ var codexKindCases = []codexKindCase{
 
 // TestCodexItemBothEncodings decodes each case's rollout and app-server forms
 // to the same Item, and checks that the live mapping of the app-server form
-// (CodexNotificationRecords) gives the line the stored mapping gives for the
-// rollout form.
+// (CodexNotificationRecords) gives the line Convert gives for the rollout
+// form.
 func TestCodexItemBothEncodings(t *testing.T) {
 	t.Parallel()
 	const lineTS = "2030-01-01T00:00:00.745Z"
@@ -384,15 +384,17 @@ func TestCodexItemBothEncodings(t *testing.T) {
 			if c.rollout == "" || c.daemon == "" {
 				return
 			}
-			// Stored: the records of the rollout form's item.
-			it, ok := codexitem.DecodeRollout([]byte(rolloutLine))
-			if !ok {
-				t.Fatal("DecodeRollout: ok = false")
-			}
-			stored, err := Fold(codexItemRecords(it), codexItemsOpts)
+			// Stored: the item in a one-turn rollout that a user message opens
+			// (so Convert takes the item path); its lines after the user's.
+			rollout := `{"timestamp":"t","type":"session_meta","payload":{"id":"th1"}}
+{"timestamp":"t","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}
+{"timestamp":"t","type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":{"type":"UserMessage","id":"u0","content":[{"type":"text","text":"go"}]}}}
+` + rolloutLine + "\n"
+			full, err := Convert([]byte(rollout), codexItemsOpts)
 			if err != nil {
-				t.Fatalf("Fold: %v", err)
+				t.Fatalf("Convert: %v", err)
 			}
+			_, stored, _ := bytes.Cut(full, []byte("\n"))
 			recs, ok := CodexNotificationRecords("item/completed", params, CodexLive{})
 			if !ok {
 				t.Fatal("CodexNotificationRecords: ok = false")
