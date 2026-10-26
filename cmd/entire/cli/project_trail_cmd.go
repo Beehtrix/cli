@@ -88,7 +88,7 @@ func lookupProjectTrailGates(cmd *cobra.Command, target *projectTrailTarget, ite
 	}
 	ctx, cancel := context.WithTimeout(cmd.Context(), trailChangeGatesTimeout)
 	defer cancel()
-	gates, failed := lookupTrailChangeData(ctx, trailInsecureHTTP(cmd), target, trailRepoAccess{}, changes, readTrailChangeMergeability)
+	gates, failed := lookupTrailChangeData(ctx, newTrailRepoClientOpener(trailInsecureHTTP(cmd)), target, trailRepoAccess{}, changes, readTrailChangeMergeability)
 	if failed > 0 {
 		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: could not load merge gates for %d change(s)\n", failed)
 	}

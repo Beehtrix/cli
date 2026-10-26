@@ -82,15 +82,18 @@ type trailRepoAccess struct {
 func lookupTrailChangeReviews(ctx context.Context, insecure bool, target *projectTrailTarget, local trailRepoAccess, changes []api.ChangeSummary) map[string]trailChangeReviews {
 	ctx, cancel := context.WithTimeout(ctx, trailChangeReviewTimeout)
 	defer cancel()
-	out, _ := lookupTrailChangeData(ctx, insecure, target, local, changes, readTrailChangeReviews)
+	open := func(ctx context.Context, forge, owner, repo string) (*api.Client, string, error) {
+		return newTrailAPIClient(ctx, insecure, forge, owner, repo)
+	}
+	out, _ := lookupTrailChangeData(ctx, open, target, local, changes, readTrailChangeReviews)
 	return out
 }
 
 // lookupTrailChangeData reads one value per change through its repository's
-// trail route, keyed by change ID, opening each repository once. A change
+// trail route, keyed by change ID, opening each repository once through open. A change
 // whose read fails is left out and counted in failed; changes without a
 // number or beyond trailChangeReviewLimit are skipped and not counted.
-func lookupTrailChangeData[T any](ctx context.Context, insecure bool, target *projectTrailTarget, local trailRepoAccess, changes []api.ChangeSummary, read func(context.Context, *trailRepoAccess, int) (T, error)) (out map[string]T, failed int) {
+func lookupTrailChangeData[T any](ctx context.Context, open trailRepoClientOpener, target *projectTrailTarget, local trailRepoAccess, changes []api.ChangeSummary, read func(context.Context, *trailRepoAccess, int) (T, error)) (out map[string]T, failed int) {
 	var (
 		mu    sync.Mutex
 		repos = map[string]*trailRepoAccess{}
@@ -113,7 +116,7 @@ func lookupTrailChangeData[T any](ctx context.Context, insecure bool, target *pr
 		wg.Go(func() {
 			access := repos[repoID]
 			if access == nil {
-				opened, err := openTrailChangeRepo(ctx, insecure, target, items[0])
+				opened, err := openTrailChangeRepo(ctx, open, target, items[0])
 				if err != nil {
 					logging.Debug(ctx, "trail change lookup skipped", "repository_id", repoID, "error", err.Error())
 					mu.Lock()
@@ -142,11 +145,11 @@ func lookupTrailChangeData[T any](ctx context.Context, insecure bool, target *pr
 	return out, failed
 }
 
-func openTrailChangeRepo(ctx context.Context, insecure bool, target *projectTrailTarget, item api.ChangeSummary) (*trailRepoAccess, error) {
+func openTrailChangeRepo(ctx context.Context, open trailRepoClientOpener, target *projectTrailTarget, item api.ChangeSummary) (*trailRepoAccess, error) {
 	if !validTrailChangeRepoName(item.Repository) {
 		return nil, fmt.Errorf("repository name not resolved for change %s", item.ID)
 	}
-	client, repoID, err := newTrailAPIClient(ctx, insecure, target.Host, target.Project, item.Repository)
+	client, repoID, err := open(ctx, target.Host, target.Project, item.Repository)
 	if err != nil {
 		return nil, err
 	}

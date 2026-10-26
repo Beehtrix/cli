@@ -92,8 +92,17 @@ func setupProjectTrailTest(t *testing.T, handler http.HandlerFunc) (*fakeProject
 	newTrailAPIClient = func(context.Context, bool, string, string, string) (*api.Client, string, error) {
 		return nil, "", errors.New("repository client not stubbed")
 	}
+	// The shared-login opener routes through newTrailAPIClient, so a test
+	// stubs one seam for both.
+	oldOpener := newTrailRepoClientOpener
+	newTrailRepoClientOpener = func(insecure bool) trailRepoClientOpener {
+		return func(ctx context.Context, forge, owner, repo string) (*api.Client, string, error) {
+			return newTrailAPIClient(ctx, insecure, forge, owner, repo)
+		}
+	}
 	t.Cleanup(func() {
 		newProjectTrailCoreClient, newProjectTrailCellClient, newTrailAPIClient = oldCore, oldCell, oldTrail
+		newTrailRepoClientOpener = oldOpener
 	})
 	return core, server
 }
