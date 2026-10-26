@@ -13,6 +13,8 @@
 // and gets the plugin function; anything else gets {id, server, setup}
 // (OpenCode 1.3+ also accepts that object, through `server`).
 import { spawn, spawnSync } from "node:child_process"
+import { readFileSync } from "node:fs"
+import { fileURLToPath } from "node:url"
 import type { Plugin } from "@opencode-ai/plugin"
 
 /**
@@ -44,8 +46,23 @@ function parseInjectedContext(stdout: string): string | null {
   return null
 }
 
+// shadowedByLegacyCopy reports whether an Entire plugin an earlier CLI wrote
+// to .opencode/plugins sits beside this one in .opencode/plugin. OpenCode 1.0.224+
+// loads both directories, so on OpenCode 1 this copy stands down rather than
+// fire every hook twice (a teammate on an older CLI can re-create the old file).
+// OpenCode 2 cannot load the old copy, so its plugin never stands down.
+function shadowedByLegacyCopy(directory: string): boolean {
+  try {
+    if (!fileURLToPath(import.meta.url).replace(/\\/g, "/").includes("/.opencode/plugin/")) return false
+    return readFileSync(`${directory}/.opencode/plugins/entire.ts`, "utf8").includes("entire enable --agent opencode")
+  } catch {
+    return false
+  }
+}
+
 // OpenCode 1 plugin.
 const EntirePlugin: Plugin = async ({ directory }) => {
+  if (shadowedByLegacyCopy(directory)) return {}
   // Track seen user messages to fire turn-start only once per message
   const seenUserMessages = new Set<string>()
   // Track current session ID for message events (which don't include sessionID)
@@ -885,12 +902,38 @@ async function entireSetup(ctx: any) {
   }
 
   // endSession ends the session after its held stops have become detached
-  // hooks, so session-end waits for them by PID.
+  // hooks, so session-end waits for them by PID. Calls still held for its
+  // children end with it (a child whose end arrived before it was tracked
+  // would otherwise hold its call forever), and the session's state is
+  // dropped: the plugin lives as long as the shared service.
   async function endSession(sessionID: string): Promise<void> {
     endTurn(sessionID)
+    const children = [...rootOf].filter(([, root]) => root === sessionID).map(([child]) => child)
+    for (const child of children) drainBackgroundTasks(child)
     const pending = pendingStops.get(sessionID)
     if (pending && pending.size > 0) await within(Promise.all(pending), v2CleanupWaitMs - 500)
-    await runDetached(sessionID, "session-end", { session_id: sessionID })
+    const ended = runDetached(sessionID, "session-end", { session_id: sessionID })
+    forgetSession(sessionID, children)
+    await ended
+  }
+
+  function forgetSession(sessionID: string, children: string[]) {
+    const owners = new Set([sessionID, ...children])
+    const ownedKey = (key: string) => owners.has(key.slice(0, key.indexOf("\0")))
+    for (const id of owners) {
+      sessions.delete(id)
+      models.delete(id)
+      pendingInjection.delete(id)
+      rootOf.delete(id)
+      parentOf.delete(id)
+      busySessions.delete(id)
+      drainAtEnd.delete(id)
+      endedUnheld.delete(id)
+    }
+    for (const map of [taskCalls, taskStarts, liveTasks]) {
+      for (const key of map.keys()) if (ownedKey(key)) map.delete(key)
+    }
+    for (const key of stoppedBeforeStart) if (ownedKey(key)) stoppedBeforeStart.delete(key)
   }
 
   function endSessions(): Promise<void> {

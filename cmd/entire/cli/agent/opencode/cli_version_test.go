@@ -206,3 +206,25 @@ func TestWriteSession_OpenCode1DropsStoredPermissions(t *testing.T) {
 		t.Errorf("import lost session data: %s", data)
 	}
 }
+
+// When the version could not be read, the export command is a guess; an
+// OpenCode 1 that rejects OpenCode 2's command still gets exported.
+func TestRunOpenCodeExportToFile_GuessedVersionFallsBack(t *testing.T) {
+	// No t.Parallel: t.Setenv.
+	prev := detectOpenCodeCLI
+	detectOpenCodeCLI = func(context.Context) openCodeCLI { return openCodeCLI{guessed: true} }
+	t.Cleanup(func() { detectOpenCodeCLI = prev })
+	dir := t.TempDir()
+	// An OpenCode 1: rejects `session export --standalone`, accepts `export <id>`.
+	stubOpenCode(t, `if [ "$1" = export ]; then printf '{"info":{"id":"%s"},"messages":[]}' "$2"; else echo 'Unrecognized flag: --standalone' >&2; exit 1; fi`+"\n")
+	if err := runOpenCodeExportToFile(t.Context(), mustOpenRoot(t, dir), "ses_x", "staged"); err != nil {
+		t.Fatalf("export with a guessed version did not fall back: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "staged"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `{"info":{"id":"ses_x"},"messages":[]}` {
+		t.Fatalf("export = %q; want only the fallback's output", got)
+	}
+}

@@ -743,3 +743,56 @@ func TestUninstallHooks_RemovesLegacyPlugin(t *testing.T) {
 		t.Error("legacy plugin left after uninstall")
 	}
 }
+
+// On OpenCode 1, which loads .opencode/plugin and .opencode/plugins, the
+// plugin stands down while an older CLI's copy sits in .opencode/plugins, so
+// hooks do not fire twice.
+func TestPlugin_StandsDownBesideLegacyCopy(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not installed")
+	}
+	for _, tt := range []struct {
+		name   string
+		legacy bool
+		want   string
+	}{
+		{"alone", false, "hooks"},
+		{"beside a legacy copy", true, "none"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			pluginDir := filepath.Join(dir, ".opencode", pluginDirName)
+			if err := os.MkdirAll(pluginDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			pluginPath := filepath.Join(pluginDir, pluginFileName)
+			if err := os.WriteFile(pluginPath, []byte(renderPlugin()), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tt.legacy {
+				writeLegacyPlugin(t, dir, "// "+entireMarker+"\n")
+			}
+			driver := `
+import { pathToFileURL } from "node:url"
+const { default: plugin } = await import(pathToFileURL(process.argv[2]).href)
+const handlers = await plugin({ directory: process.argv[3] })
+console.log(Object.keys(handlers).length > 0 ? "hooks" : "none")
+`
+			driverPath := filepath.Join(dir, "driver.mjs")
+			if err := os.WriteFile(driverPath, []byte(driver), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.CommandContext(t.Context(), "node", "--experimental-strip-types", driverPath, pluginPath, dir)
+			cmd.Env = append(os.Environ(), "OPENCODE=1")
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("node driver failed: %v", err)
+			}
+			if got := strings.TrimSpace(string(out)); got != tt.want {
+				t.Errorf("plugin = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}

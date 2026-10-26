@@ -24,6 +24,9 @@ const openCodeCLIProbeTimeout = 5 * time.Second
 // importSessionIntoOpenCode).
 type openCodeCLI struct {
 	legacy bool // OpenCode 1.x
+	// guessed is set when the version could not be read, so legacy is a
+	// guess: an export that fails is retried with the other command.
+	guessed bool
 }
 
 func (c openCodeCLI) exportArgs(sessionID string) []string {
@@ -74,13 +77,13 @@ func probeOpenCodeCLI(ctx context.Context) (openCodeCLI, bool) {
 		logging.Warn(logging.WithComponent(ctx, "opencode"),
 			"opencode version probe failed; using OpenCode 2 session commands",
 			slog.String("error", err.Error()))
-		return openCodeCLI{}, false
+		return openCodeCLI{guessed: true}, false
 	}
 	version := openCodeVersion(string(out))
 	if version == "" {
 		logging.Debug(logging.WithComponent(ctx, "opencode"),
 			"opencode version unreadable; using OpenCode 2 session commands")
-		return openCodeCLI{}, true
+		return openCodeCLI{guessed: true}, true
 	}
 	major := semver.Major(version)
 	return openCodeCLI{legacy: major == "v0" || major == "v1"}, true

@@ -64,7 +64,35 @@ func runOpenCodeExportToFile(ctx context.Context, root *os.Root, sessionID, outp
 		}
 	}()
 
-	cmd := exec.CommandContext(ctx, "opencode", detectOpenCodeCLI(ctx).exportArgs(sessionID)...)
+	cli := detectOpenCodeCLI(ctx)
+	stderr, runErr := runOpenCodeExport(ctx, file, cli.exportArgs(sessionID))
+	if runErr != nil && cli.guessed && ctx.Err() == nil {
+		// The version could not be read, so the command was a guess; the
+		// other OpenCode's command may be the one this binary accepts.
+		if _, seekErr := file.Seek(0, 0); seekErr == nil && file.Truncate(0) == nil {
+			other := openCodeCLI{legacy: !cli.legacy}
+			if retryStderr, retryErr := runOpenCodeExport(ctx, file, other.exportArgs(sessionID)); retryErr == nil {
+				runErr = nil
+			} else {
+				stderr, runErr = retryStderr, retryErr
+			}
+		}
+	}
+	if runErr != nil {
+		return classifyOpenCodeExportError(ctx, runErr, stderr, sessionID)
+	}
+
+	if syncErr := file.Sync(); syncErr != nil {
+		return fmt.Errorf("failed to flush export file: %w", syncErr)
+	}
+
+	return nil
+}
+
+// runOpenCodeExport runs one `opencode` export command with stdout to file
+// and returns its stderr and error.
+func runOpenCodeExport(ctx context.Context, file *os.File, args []string) (string, error) {
+	cmd := exec.CommandContext(ctx, "opencode", args...)
 	// The npm launcher runs the real binary as a child that inherits stderr;
 	// killing only the launcher would leave Run waiting on that pipe past the
 	// deadline, and a commit's fetch budget depends on this cut-off. The new
@@ -79,15 +107,8 @@ func runOpenCodeExportToFile(ctx context.Context, root *os.Root, sessionID, outp
 	cmd.Stdout = file
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if runErr := cmd.Run(); runErr != nil {
-		return classifyOpenCodeExportError(ctx, runErr, stderr.String(), sessionID)
-	}
-
-	if syncErr := file.Sync(); syncErr != nil {
-		return fmt.Errorf("failed to flush export file: %w", syncErr)
-	}
-
-	return nil
+	err := cmd.Run()
+	return stderr.String(), err
 }
 
 func classifyOpenCodeExportError(ctx context.Context, err error, stderr, sessionID string) error {

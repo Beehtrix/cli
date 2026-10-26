@@ -496,3 +496,22 @@ func TestPluginV2_ShutdownWaitsForHeldStopsBehindTheirStart(t *testing.T) {
 		t.Fatalf("hooks = %v; want the held subagent-stop before session-end", got)
 	}
 }
+
+// A background child whose end arrives before the plugin tracked it leaves
+// its call held; ending the session releases it before session-end.
+func TestPluginV2_SessionEndReleasesUntrackedChildsCall(t *testing.T) {
+	t.Parallel()
+	hooks := runPluginV2Scenario(t, map[string]string{"ses_a": "", "ses_child": "ses_a"}, []map[string]any{
+		v2Prompt("ses_a", "launch"),
+		v2SubagentBefore("call_bg", true),
+		v2Execution("ses_child", "succeeded"), // not tracked yet: dropped
+		v2SubagentAfter("call_bg", "running"),
+		v2Execution("ses_a", "succeeded"),
+		v2Shutdown("$CWD"),
+	})
+	got := hookStrings(hooks)
+	stop, end := slices.Index(got, "subagent-stop:ses_a:call_bg"), slices.Index(got, "session-end:ses_a")
+	if stop < 0 || end < 0 || stop > end {
+		t.Fatalf("hooks = %v; want the held call stopped before session-end", got)
+	}
+}
