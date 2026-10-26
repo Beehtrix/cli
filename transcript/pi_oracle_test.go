@@ -3,8 +3,7 @@ package transcript
 // This file preserves the Pi compactor that Convert used before it became
 // "PiAdapter, then fold". It is the byte-for-byte oracle for the equivalence
 // tests in pi_records_test.go. Do not edit it to match new behavior. It fails
-// on a line of pijsonl.MaxScannerLine or more, which the adapter reads as an
-// oversized line instead.
+// on a line of pijsonl.MaxScannerLine or more, which the adapter reads whole.
 
 import (
 	"encoding/json"

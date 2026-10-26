@@ -180,14 +180,9 @@ The Pi adapter keys each message by its Pi entry ID and sends it whole as a
 when a result it shows changes, and `drop`s it when it leaves the active
 branch (a `message` record restores it in place if the branch comes back). A
 line that only grows the active branch is read without walking the tree, so a
-session that only grows reads in linear time. A Pi line of 10 MiB or more,
-newline excluded, is oversized: its content is not read, but its `id`,
-`parentId` and `type` are read from its first 64 KiB, so it keeps its place in
-the tree and the messages before it stay on the active branch. An oversized
-message has no line (it still becomes the tip, as any message does), and an
-oversized tool result supplies no result. `Convert` reads Pi transcripts the
-same way, so such a line no longer makes it fail. A line whose head does not
-give those fields is skipped like a line that is not JSON.
+session that only grows reads in linear time. Like the JSONL adapters, it has
+no line size limit: a long line is held until its newline arrives and read
+whole.
 
 ### Record wire format v1
 

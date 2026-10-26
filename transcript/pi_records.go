@@ -8,15 +8,6 @@ import (
 	"github.com/entireio/cli/internal/transcript/pijsonl"
 )
 
-// piMaxLine is the size, newline excluded, at which a Pi line is oversized:
-// the Pi scanner's limit. An oversized line's content is not read (see
-// PiAdapter).
-const piMaxLine = pijsonl.MaxScannerLine
-
-// piHeadMax is how much of an oversized line is kept to read its id,
-// parentId and type from. Pi writes them first.
-const piHeadMax = 64 << 10
-
 // PiAdapter turns a Pi session transcript into transcript records as it is
 // written. Feed accepts the transcript in chunks split anywhere, and the
 // records depend only on the bytes fed, not on how they were chunked.
@@ -47,20 +38,15 @@ const piHeadMax = 64 << 10
 // every line while there is no tree yet, which Pi (session version 3) has
 // only for its first line or two.
 //
-// A line of piMaxLine (10 MiB) or more, newline excluded, is oversized: only
-// its first 64 KiB is kept, and its id, parentId and type are read from it,
-// so it stays in the tree and an oversized message still becomes the tip.
-// Its content is not read, so an oversized message has no line and an
-// oversized toolResult supplies no result. If those fields are not in the
-// kept head, the line is skipped like a line that is not JSON.
+// Lines have no size limit: a long line is held whole until its newline
+// arrives, as JSONLAdapter holds one.
 //
 // Entry IDs are unique in transcripts Pi writes. A repeated ID is
 // re-read as the entry it names, which keeps its first position.
 // Records carry no redaction: redact the transcript before feeding it.
 type PiAdapter struct {
-	pending   []byte // bytes of the line being read
-	oversized bool   // the line being read is oversized; pending holds its head
-	line      int    // source lines consumed so far
+	pending []byte // bytes after the last newline fed
+	line    int    // source lines consumed so far
 
 	parent   map[string]string // every entry's parentId
 	hasTree  bool              // some entry has a non-empty parentId
@@ -119,7 +105,7 @@ func NewPiAdapter() *PiAdapter {
 }
 
 // Lines returns the number of source lines consumed so far: every
-// newline-terminated line fed, including blank, invalid and oversized ones,
+// newline-terminated line fed, including blank and invalid ones,
 // plus a partial line once Flush has consumed it. A held partial line is not
 // counted.
 func (a *PiAdapter) Lines() int {
@@ -134,18 +120,17 @@ func (a *PiAdapter) Feed(chunk []byte) []Record {
 	for len(chunk) > 0 {
 		i := bytes.IndexByte(chunk, '\n')
 		if i < 0 {
-			a.take(chunk)
+			a.pending = append(a.pending, chunk...)
 			break
 		}
-		part := chunk[:i]
-		chunk = chunk[i+1:]
-		if len(a.pending) == 0 && !a.oversized && len(part) < piMaxLine {
-			out = a.consumeLine(part, false, out)
-			continue
+		line := chunk[:i]
+		if len(a.pending) > 0 {
+			a.pending = append(a.pending, line...)
+			line = a.pending
 		}
-		a.take(part)
-		out = a.consumeLine(a.pending, a.oversized, out)
-		a.pending, a.oversized = a.pending[:0], false
+		out = a.consumeLine(line, out)
+		a.pending = a.pending[:0]
+		chunk = chunk[i+1:]
 	}
 	return out
 }
@@ -154,45 +139,20 @@ func (a *PiAdapter) Feed(chunk []byte) []Record {
 // transcript is final; while Pi is still writing, a partial line is usually
 // an unfinished write.
 func (a *PiAdapter) Flush() []Record {
-	if len(a.pending) == 0 && !a.oversized {
+	if len(a.pending) == 0 {
 		return nil
 	}
-	out := a.consumeLine(a.pending, a.oversized, nil)
-	a.pending, a.oversized = nil, false
-	return out
+	line := a.pending
+	a.pending = nil
+	return a.consumeLine(line, nil)
 }
 
-// take adds part to the line being read. Once the line reaches piMaxLine
-// only its head is kept.
-func (a *PiAdapter) take(part []byte) {
-	if !a.oversized && len(a.pending)+len(part) < piMaxLine {
-		a.pending = append(a.pending, part...)
-		return
-	}
-	if !a.oversized {
-		a.oversized = true
-		// A fresh buffer lets the one that grew toward piMaxLine go.
-		head := make([]byte, 0, piHeadMax)
-		a.pending = append(head, a.pending[:min(len(a.pending), piHeadMax)]...)
-	}
-	if room := piHeadMax - len(a.pending); room > 0 {
-		a.pending = append(a.pending, part[:min(room, len(part))]...)
-	}
-}
-
-// consumeLine reads one complete line (an oversized line's head). It keeps
-// no reference to line.
-func (a *PiAdapter) consumeLine(line []byte, oversized bool, out []Record) []Record {
+// consumeLine reads one complete line. It keeps no reference to line.
+func (a *PiAdapter) consumeLine(line []byte, out []Record) []Record {
 	a.line++
 	line = bytes.TrimSuffix(line, []byte("\r"))
 	var n piNode
-	if oversized {
-		var ok bool
-		if n, ok = piHeadNode(line); !ok {
-			return out
-		}
-		line = nil
-	} else if json.Unmarshal(line, &n) != nil || n.ID == "" {
+	if json.Unmarshal(line, &n) != nil || n.ID == "" {
 		return out
 	}
 	if recs, ok := a.grow(line, n); ok {
@@ -220,56 +180,14 @@ func (a *PiAdapter) consumeLine(line []byte, oversized bool, out []Record) []Rec
 	return append(out, a.reconcile()...)
 }
 
-// piDecodeEntry decodes a message entry; false for an oversized line (nil)
-// or one that is not a valid entry.
+// piDecodeEntry decodes a message entry; false when the line is not a valid
+// entry.
 func piDecodeEntry(line []byte) (pijsonl.Entry, bool) {
 	var e pijsonl.Entry
-	if line == nil || json.Unmarshal(line, &e) != nil {
+	if json.Unmarshal(line, &e) != nil {
 		return pijsonl.Entry{}, false
 	}
 	return e, true
-}
-
-// piHeadNode reads an oversized line's id, parentId and type from its head:
-// the leading top-level fields that are whole in it. False when the head does
-// not give an ID, or gives one of those fields with a type the whole line
-// would fail to decode.
-func piHeadNode(head []byte) (piNode, bool) {
-	dec := json.NewDecoder(bytes.NewReader(head))
-	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
-		return piNode{}, false
-	}
-	var n piNode
-	for dec.More() {
-		key, err := dec.Token() // an object key: a string
-		if err != nil {
-			break
-		}
-		var target *string
-		switch key {
-		case "type":
-			target = &n.Type
-		case "id":
-			target = &n.ID
-		case "parentId":
-			var p *string
-			if dec.Decode(&p) != nil {
-				return piNode{}, false
-			}
-			n.ParentID = p
-			continue
-		default:
-			var skip json.RawMessage
-			if dec.Decode(&skip) != nil {
-				return n, n.ID != "" // the value runs past the head
-			}
-			continue
-		}
-		if dec.Decode(target) != nil {
-			return piNode{}, false
-		}
-	}
-	return n, n.ID != ""
 }
 
 // grow reads a line that only grows the active branch, if n's is one. A
@@ -284,8 +202,8 @@ func piHeadNode(head []byte) (piNode, bool) {
 // Then only n can need sending, or, for a toolResult, the active messages
 // with its tool call ID: it supplies their result now, as the last on the
 // branch. False leaves n unread, for consumeLine to reconcile; so does a
-// message whose line is not a valid entry (or is oversized), which moves the
-// tip but has no entry.
+// message whose line is not a valid entry, which moves the tip but has no
+// entry.
 func (a *PiAdapter) grow(line []byte, n piNode) ([]Record, bool) {
 	if a.active == nil || n.ParentID == nil || a.active[n.ID] || a.entries[n.ID] != nil {
 		return nil, false

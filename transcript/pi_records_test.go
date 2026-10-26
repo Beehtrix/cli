@@ -301,13 +301,8 @@ func TestPiAdapter_LinesCountsConsumedLines(t *testing.T) {
 	}
 }
 
-func piOversized(id, parent, role string) string {
-	return fmt.Sprintf(`{"type":"message","id":%q,"parentId":%s,"timestamp":"t","message":{"role":%q,"toolCallId":"c1","content":%q}}`, id, piPar(parent), role, strings.Repeat("x", piMaxLine))
-}
-
-// feedPiOps feeds data in pieces of at most size bytes, flushes, and returns
-// the records as "op id".
-func feedPiOps(data []byte, size int) string {
+// feedPiRecords feeds data in pieces of at most size bytes, then flushes.
+func feedPiRecords(data []byte, size int) []Record {
 	a := NewPiAdapter()
 	var recs []Record
 	for len(data) > 0 {
@@ -315,116 +310,41 @@ func feedPiOps(data []byte, size int) string {
 		recs = append(recs, a.Feed(data[:n])...)
 		data = data[n:]
 	}
-	recs = append(recs, a.Flush()...)
-	ops := make([]string, len(recs))
-	for i, r := range recs {
-		ops[i] = string(r.Op) + " " + r.ID
-	}
-	return strings.Join(ops, ",")
+	return append(recs, a.Flush()...)
 }
 
-// An oversized line keeps its place in the tree: a message under it stays on
-// the active branch with everything above, rather than the walk stopping at
-// the gap and dropping the earlier messages. Only its content is lost.
-func TestPiAdapter_OversizedLineKeepsTheParentChain(t *testing.T) {
+// Lines have no size limit, as for Claude Code: a line past the Pi scanner's
+// 10 MiB limit (on which the legacy compactor failed) is read whole, however
+// it is chunked, and keeps its place in the tree.
+func TestPiAdapter_LongLinesAreReadWhole(t *testing.T) {
 	t.Parallel()
-	exact := fmt.Sprintf(`{"type":"message","id":"big","parentId":"a1","timestamp":"t","message":{"role":"user","content":%q}}`, "x")
-	exact += strings.Repeat(" ", piMaxLine-len(exact))
-	for name, long := range map[string]string{
-		"over the limit": piOversized("big", "a1", "user"),
-		"at the limit":   exact,
-	} {
-		data := piLines(piHdr, piUser("u1", "", "one"), piAssistant("a1", "u1", "1"), long, piUser("u2", "big", "two"), piAssistant("a2", "u2", "2"))
-		for _, size := range []int{len(data), 3 << 20, 1 << 20} {
-			if got, want := feedPiOps(data, size), "message u1,message a1,message u2,message a2"; got != want {
-				t.Errorf("%s, %d-byte pieces: records %s, want %s", name, size, got, want)
-			}
-		}
-		// Convert reads the line the same way: as an entry with no content.
-		got, err := Convert(data, piFoldOpts)
-		if err != nil {
-			t.Fatalf("%s: Convert: %v", name, err)
-		}
-		want, err := legacyCompactPi(piLines(piHdr, piUser("u1", "", "one"), piAssistant("a1", "u1", "1"), `{"type":"message","id":"big","parentId":"a1"}`, piUser("u2", "big", "two"), piAssistant("a2", "u2", "2")), piFoldOpts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, want) || bytes.Count(got, []byte("\n")) != 4 {
-			t.Errorf("%s: Convert:\n%s\nwant:\n%s", name, got, want)
+	long := strings.Repeat("x", 11<<20)
+	data := piLines(piHdr, piUser("u1", "", "one"), piToolCall("a1", "u1", "c1"),
+		piToolResult("t1", "a1", "c1", long, false), piUser("u2", "t1", long), piAssistant("a2", "u2", "2"))
+	want, err := Convert(data, piFoldOpts)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	lines, err := Decode(want)
+	if err != nil || len(lines) != 4 {
+		t.Fatalf("Decode: %d lines, %v", len(lines), err)
+	}
+	if r := lines[1].Blocks[1].Result; r == nil || r.Output != long {
+		t.Errorf("long tool result not spliced into a1")
+	}
+	if lines[2].Blocks[0].Text != long {
+		t.Errorf("long user text not kept")
+	}
+	for _, size := range []int{len(data), 3 << 20, 1 << 20} {
+		got, err := Fold(feedPiRecords(data, size), piFoldOpts)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Errorf("%d-byte pieces: fold differs from Convert (%v)", size, err)
 		}
 	}
-}
-
-func TestPiAdapter_OversizedLineCases(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name string
-		data []byte
-		want string
-	}{
-		{
-			// The message moves the tip, so a1's sibling branch is left.
-			name: "oversized message on a new branch is the tip",
-			data: piLines(piHdr, piUser("u1", "", "one"), piAssistant("a1", "u1", "1"), piOversized("big", "u1", "user")),
-			want: "message u1,message a1,drop a1",
-		},
-		{
-			name: "oversized tool result supplies no result",
-			data: piLines(piHdr, piUser("u1", "", "one"), piToolCall("a1", "u1", "c1"), piOversized("t1", "a1", "toolResult"), piAssistant("a2", "t1", "2")),
-			want: "message u1,message a1,message a2",
-		},
-		{
-			name: "head without an id is skipped like invalid JSON",
-			data: piLines(piHdr, piUser("u1", "", "one"), `{"pad":"`+strings.Repeat("x", piMaxLine)+`","type":"message","id":"big","parentId":"u1"}`, piAssistant("a1", "u1", "1")),
-			want: "message u1,message a1",
-		},
-		{
-			name: "oversized unterminated last line",
-			data: bytes.TrimSuffix(piLines(piHdr, piUser("u1", "", "one"), piAssistant("a1", "u1", "1"), piOversized("big", "u1", "user")), []byte("\n")),
-			want: "message u1,message a1,drop a1",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			for _, size := range []int{len(tt.data), 3 << 20} {
-				if got := feedPiOps(tt.data, size); got != tt.want {
-					t.Errorf("%d-byte pieces: records %s, want %s", size, got, tt.want)
-				}
-			}
-		})
-	}
-}
-
-func TestPiHeadNode(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		head   string
-		want   string
-		wantOK bool
-	}{
-		{`{"type":"message","id":"a","parentId":"p","timestamp":"t","message":{"role":"user","content":"xxx`, "message a p", true},
-		{`{"type":"session","id":"a","parentId":null,"x":1`, "session a <nil>", true},
-		{`{"type":"label","id":"a"}`, "label a <nil>", true},
-		{`{"type":"message","message":{"content":"xxx`, "", false},
-		{`{"type":"message","id":7`, "", false},
-		{`{"type":"message","id":"a","parentId":7`, "", false},
-		{`["type","id"]`, "", false},
-		{`not json`, "", false},
-	}
-	for _, tt := range tests {
-		n, ok := piHeadNode([]byte(tt.head))
-		got := ""
-		if ok {
-			p := "<nil>"
-			if n.ParentID != nil {
-				p = *n.ParentID
-			}
-			got = n.Type + " " + n.ID + " " + p
-		}
-		if ok != tt.wantOK || got != tt.want {
-			t.Errorf("piHeadNode(%s) = %q %v, want %q %v", tt.head, got, ok, tt.want, tt.wantOK)
-		}
+	// An unterminated long last line is read by Flush.
+	unterminated := bytes.TrimSuffix(piLines(piHdr, piUser("u1", "", long)), []byte("\n"))
+	if recs := feedPiRecords(unterminated, 3<<20); len(recs) != 1 || recs[0].ID != "u1" {
+		t.Errorf("unterminated long line: %d records", len(recs))
 	}
 }
 
