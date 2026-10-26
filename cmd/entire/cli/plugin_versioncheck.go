@@ -70,7 +70,11 @@ func checkPluginUpdateAndNotify(ctx context.Context, w io.Writer, pluginName str
 	// written must cost zero network — versioncheck gets that from its
 	// ensureGlobalConfigDir gate, here the stamp write itself is the probe —
 	// and plugin runs arrive in parallel from agent hooks, so the early
-	// claim keeps concurrent runs from each starting their own ls-remote.
+	// claim shrinks the window in which concurrent runs each start their
+	// own ls-remote from the fetch's duration to the gap between gate and
+	// write. The file stays lock-free last-writer-wins, like versioncheck's:
+	// a stamp lost to an interleaved writer costs one extra bounded lookup,
+	// which is not worth a lock.
 	cache[pluginName] = time.Now()
 	if err := savePluginVersionCache(cache); err != nil {
 		logging.Debug(ctx, "plugin version check: failed to save cache",
