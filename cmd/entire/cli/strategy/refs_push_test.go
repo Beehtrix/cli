@@ -387,6 +387,17 @@ func TestFlushCheckpointRefsQueue_SupersededRecoveriesDoNotStopTheRetry(t *testi
 	queued, err := queue.PeekEntries()
 	require.NoError(t, err)
 	assert.Len(t, queued, n, "superseded refs stay queued for the next push")
+
+	// With no concurrent write, the next push delivers every superseded ref.
+	stubRecoveryCAS(t, checkpoint.CASPersistentRef)
+	restore = captureStderr(t)
+	pushed, pushErr = flushCheckpointRefsQueue(context.Background(), repo, pushSettings{remote: bareDir})
+	output = restore()
+	require.NoError(t, pushErr, output)
+	assert.Equal(t, n, pushed)
+	queued, err = queue.PeekEntries()
+	require.NoError(t, err)
+	assert.Empty(t, queued)
 }
 
 // Superseded refs were attempted but did not fail, so the flush error counts
@@ -655,15 +666,30 @@ func TestFlushCheckpointRefsQueue_UnreadableRefStaysQueuedAndIsReported(t *testi
 	require.NoError(t, repo.Storer.SetReference(plumbing.NewSymbolicReference(loop, refs[0])))
 	queue := enqueueRefs(t, repo, refs)
 
-	stderr := captureStderrWriter(t)
 	restore := captureStderr(t)
 	pushed, pushErr := flushCheckpointRefsQueue(ctx, repo, pushSettings{remote: bareDir})
-	restore()
+	output := restore()
 
 	require.NoError(t, pushErr)
 	assert.Equal(t, 1, pushed, "the readable ref still ships")
-	assert.Contains(t, stderr.String(), "1 checkpoint ref(s) could not be read")
+	assert.Contains(t, output, "1 checkpoint ref(s) could not be read and stay queued for the next push (for example "+refs[0].String()+")",
+		"the warning names a ref so the user can find it")
 	remaining, err := queue.Drain()
 	require.NoError(t, err)
 	assert.Equal(t, []plumbing.ReferenceName{refs[0]}, remaining, "the unreadable ref stays queued")
+
+	// Once the ref is readable again, the next push delivers it.
+	head, err := repo.Head()
+	require.NoError(t, err)
+	require.NoError(t, repo.Storer.RemoveReference(loop))
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(refs[0], head.Hash())))
+	restore = captureStderr(t)
+	pushed, pushErr = flushCheckpointRefsQueue(ctx, repo, pushSettings{remote: bareDir})
+	restore()
+	require.NoError(t, pushErr)
+	assert.Equal(t, 1, pushed)
+	assert.Equal(t, head.Hash().String(), remoteRefHash(t, bareDir, refs[0]))
+	remaining, err = queue.Drain()
+	require.NoError(t, err)
+	assert.Empty(t, remaining)
 }

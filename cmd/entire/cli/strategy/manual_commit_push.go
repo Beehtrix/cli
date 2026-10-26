@@ -500,6 +500,19 @@ func partitionCheckpointRefPushes(
 	return ready, stale, unreadable
 }
 
+// warnUnreadableCheckpointRefs names one ref: a ref that stays unreadable is
+// reported on every push, and the count alone gives the user nothing to look for.
+func warnUnreadableCheckpointRefs(ctx context.Context, unreadable []checkpoint.PushQueueEntry) {
+	names := make([]string, 0, len(unreadable))
+	for _, entry := range unreadable {
+		names = append(names, entry.Ref.String())
+	}
+	logging.Warn(ctx, "git-refs push: checkpoint refs could not be read; left queued",
+		slog.Int("unreadable", len(unreadable)), slog.Any("refs", names))
+	fmt.Fprintf(os.Stderr, "[entire] %d checkpoint ref(s) could not be read and stay queued for the next push (for example %s).\n",
+		len(unreadable), names[0])
+}
+
 func checkpointRefPushTokens(refs []checkpointRefPush) []checkpoint.PushQueueEntry {
 	entries := make([]checkpoint.PushQueueEntry, 0, len(refs))
 	for _, ref := range refs {
@@ -540,9 +553,7 @@ func flushCheckpointRefsQueue(ctx context.Context, repo *git.Repository, ps push
 		}
 	}
 	if len(unreadable) > 0 {
-		logging.Warn(ctx, "git-refs push: checkpoint refs could not be read; left queued",
-			slog.Int("unreadable", len(unreadable)))
-		fmt.Fprintf(stderrWriter, "[entire] %d checkpoint ref(s) could not be read and stay queued for the next push.\n", len(unreadable))
+		warnUnreadableCheckpointRefs(ctx, unreadable)
 	}
 	if len(existing) == 0 {
 		return 0, nil
