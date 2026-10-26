@@ -67,7 +67,7 @@ not json
 	"consumed user text and images follow the assistant": `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"tool_use","id":"tu1","name":"Read","input":{}}]}}
 {"type":"user","timestamp":"t2","promptId":"p1","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"x"},{"type":"image","source":{"type":"base64","data":"AAA"}}]},"toolUseResult":{"file":{"filePath":"/a","numLines":3}}}
 `,
-	"thinking-only assistant keeps an empty line": `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"thinking","thinking":"hm"}]}}
+	"thinking-only assistant is skipped": `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"thinking","thinking":"hm"}]}}
 {"type":"user","timestamp":"t2","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"x"}]}}
 `,
 	"empty assistant before consumed user text": `{"type":"assistant","timestamp":"t1","message":{"id":"m1","content":[{"type":"thinking","thinking":"hm"}]}}
@@ -318,19 +318,17 @@ func TestJSONLAdapter_UserMessagesHaveDerivedKeysOnly(t *testing.T) {
 	}
 }
 
-// TestJSONLAdapter_EmptyAssistantBeforeConsumedUserTextIsKept pins the case
-// the legacy compactor already emitted as `"content":[]`: an empty assistant
-// whose following user entry had tool results and text. Every empty assistant
-// keeps its line now.
-func TestJSONLAdapter_EmptyAssistantBeforeConsumedUserTextIsKept(t *testing.T) {
+// TestJSONLAdapter_EmptyAssistantBeforeConsumedUserTextIsSkipped pins the one
+// intentional change from the legacy compactor, which emitted `"content":[]`
+// for an empty assistant whose following user entry had tool results and text.
+func TestJSONLAdapter_EmptyAssistantBeforeConsumedUserTextIsSkipped(t *testing.T) {
 	t.Parallel()
 
 	out, err := compactJSONL([]byte(jsonlEdgeCases["empty assistant before consumed user text"]), defaultOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"v":1,"agent":"claude-code","cli_version":"0.5.1","type":"assistant","ts":"t1","id":"m1","content":[]}` + "\n" +
-		`{"v":1,"agent":"claude-code","cli_version":"0.5.1","type":"user","ts":"t2","content":[{"text":"stop"}]}` + "\n"
+	want := `{"v":1,"agent":"claude-code","cli_version":"0.5.1","type":"user","ts":"t2","content":[{"text":"stop"}]}` + "\n"
 	if string(out) != want {
 		t.Errorf("got:\n%s\nwant:\n%s", out, want)
 	}

@@ -28,8 +28,8 @@ import (
 // leaves it behind), and dropped (OpDrop) when it leaves the active branch.
 // An OpMessage on a dropped key restores it where it was first created, so
 // returning to an earlier branch needs no new keys. An assistant message
-// with no visible content but non-zero usage is sent with content [], so it
-// keeps its line.
+// with no visible content but non-zero usage is sent with no content, which
+// the fold keeps and prints as "content":null, so its usage has a line.
 //
 // A line that only grows the active branch (the usual case: a message whose
 // parent is the tip, perhaps through entries that are not messages) is read
@@ -393,26 +393,26 @@ func (a *PiAdapter) activeBranch() map[string]bool {
 }
 
 // piRecord is entry's OpMessage, with results spliced into its tool calls;
-// false when it has no line (another role, or no content and no usage).
+// false when it has no line (another role, or no content and no usage). An
+// assistant call with usage but no visible content gets no content: the fold
+// hides content [] and null but keeps a message with none.
 func piRecord(e pijsonl.Entry, results map[string]piCompactToolResult) (Record, bool) {
 	r := Record{Op: OpMessage, ID: e.ID, Role: e.Message.Role, TS: piTimestampJSON(e.Timestamp)}
 	var blocks []any
 	switch e.Message.Role {
 	case pijsonl.RoleUser:
-		if blocks = piEmitUserContent(e.Message.Content); len(blocks) == 0 {
-			return Record{}, false
-		}
+		blocks = piEmitUserContent(e.Message.Content)
 	case pijsonl.RoleAssistant:
 		blocks = piEmitAssistantContent(e.Message.Content, results)
 		r.SourceID = e.ID // Pi lines carry the ID on assistant lines only
 		r.Usage = piCallUsage(e.Message)
-		if len(blocks) == 0 {
-			if !piUsageHasCounts(r.Usage) {
-				return Record{}, false
-			}
-			blocks = []any{}
+		if len(blocks) == 0 && piUsageHasCounts(r.Usage) {
+			return r, true
 		}
 	default:
+		return Record{}, false
+	}
+	if len(blocks) == 0 {
 		return Record{}, false
 	}
 	content, err := json.Marshal(blocks)

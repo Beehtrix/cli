@@ -221,25 +221,19 @@ func TestFold_DropAndRestore(t *testing.T) {
 	)
 }
 
-func TestFold_KeepsEmptyAssistants(t *testing.T) {
+func TestFold_SkipsEmptyAssistantsOnly(t *testing.T) {
 	t.Parallel()
 
-	withUsage := assistantRecord("u", "u", `[]`)
-	withUsage.Usage = &CallUsage{OutputTokens: 3}
 	got := foldLines(t,
 		assistantRecord("a", "a", `[]`),
-		Record{Op: OpMessage, ID: "e", Role: TypeUser, Content: rawMsg(`[]`)},
+		Record{Op: OpMessage, ID: "u", Role: TypeUser, Content: rawMsg(`[]`)},
 		assistantRecord("n", "n", `null`),
 		Record{Op: OpMessage, ID: "nil", Role: TypeAssistant},
-		withUsage,
 	)
-	// Renderers skip lines with no blocks; usage counters keep them.
+	// A missing content prints null; a literal null counts as empty, as in compaction.
 	assertLines(t, got,
-		linePrefix+`"type":"assistant","ts":"t1","id":"a","content":[]}`,
 		linePrefix+`"type":"user","content":[]}`,
-		linePrefix+`"type":"assistant","ts":"t1","id":"n","content":null}`,
 		linePrefix+`"type":"assistant","content":null}`,
-		linePrefix+`"type":"assistant","ts":"t1","id":"u","output_tokens":3,"content":[]}`,
 	)
 }
 

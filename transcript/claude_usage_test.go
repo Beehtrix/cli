@@ -105,7 +105,7 @@ func TestClaudeUsage_Convert(t *testing.T) {
 			},
 		},
 		{
-			name: "a call whose first fragment has no visible content counts its usage on that empty first line",
+			name: "a call whose first fragment has no visible content counts its usage on the first visible line",
 			input: `{"type":"assistant","timestamp":"t1","message":{"id":"m1","model":"c","content":[{"type":"thinking","thinking":"hm"}],"usage":{"input_tokens":3,"output_tokens":5}}}
 {"type":"user","timestamp":"t2","message":{"content":[{"type":"tool_result","tool_use_id":"x","content":"ok"}]}}
 {"type":"assistant","timestamp":"t3","message":{"id":"m1","content":[{"type":"thinking","thinking":"hm"}]}}
@@ -115,9 +115,7 @@ func TestClaudeUsage_Convert(t *testing.T) {
 {"type":"assistant","timestamp":"t7","message":{"id":"m1","content":[{"type":"text","text":"c"}],"usage":{"input_tokens":3,"output_tokens":9}}}
 `,
 			want: []map[string]string{
-				{"ts": `"t1"`, "model": `"c"`, "input_tokens": "3", "output_tokens": "9"},
-				{"ts": `"t3"`},
-				{"ts": `"t5"`},
+				{"ts": `"t5"`, "model": `"c"`, "input_tokens": "3", "output_tokens": "9"},
 				{"ts": `"t7"`},
 			},
 		},

@@ -83,12 +83,10 @@ func legacyCompactJSONLWith(content []byte, opts Options, preprocess linePreproc
 		switch {
 		case !out.assistant:
 			legacyEmitUser(&result, base, out.entry)
-		// Intentional divergence: the original skipped an assistant whose
-		// content was `[]` (a thinking-only message), except when a user
-		// entry with text followed its results. The fold keeps every
-		// assistant message: an empty one carries its call's usage, and
-		// renderers skip it.
-		default:
+		// Intentional divergence: the original emitted an assistant whose
+		// content was `[]` when a user entry with text followed its results.
+		// The fold skips empty assistant messages unconditionally.
+		case !legacyIsEmptyContentArray(out.entry.content):
 			legacyEmitAssistant(&result, base, out.entry)
 		}
 	}
@@ -205,6 +203,11 @@ func legacyInlineToolResults(assistant, user parsedEntry) parsedEntry {
 
 	return assistant
 }
+func legacyIsEmptyContentArray(raw json.RawMessage) bool {
+	var arr []json.RawMessage
+	return json.Unmarshal(raw, &arr) == nil && len(arr) == 0
+}
+
 func legacyHasToolResults(e parsedEntry) bool {
 	return len(e.toolResults) > 0
 }

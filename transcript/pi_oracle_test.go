@@ -73,13 +73,18 @@ func legacyCompactPi(content []byte, opts Options) ([]byte, error) {
 		case pijsonl.RoleAssistant:
 			blocks := piEmitAssistantContent(entry.Message.Content, results)
 			usage := piCallUsage(entry.Message)
+			// Intentional divergence: the original wrote a call with usage
+			// but no visible content as "content":[]. The fold hides an
+			// assistant message with content [] or null, so the adapter
+			// sends none, which the fold prints as "content":null.
+			var blocksOrNil any = blocks
 			if len(blocks) == 0 {
 				if !piUsageHasCounts(usage) {
 					continue
 				}
-				blocks = []any{}
+				blocksOrNil = nil
 			}
-			contentJSON, err := json.Marshal(blocks)
+			contentJSON, err := json.Marshal(blocksOrNil)
 			if err != nil {
 				return nil, fmt.Errorf("marshal pi assistant content: %w", err)
 			}
