@@ -865,6 +865,59 @@ func TestSummaryTimeoutValue(t *testing.T) {
 	}
 }
 
+func TestCheckpointRefListTimeoutValue(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		options map[string]any
+		want    time.Duration
+	}{
+		{"NilOptions", nil, 0},
+		{"Absent", map[string]any{"filtered_fetches": true}, 0},
+		{"WholeSeconds", map[string]any{"checkpoint_ref_list_timeout_seconds": 30.0}, 30 * time.Second},
+		{"FractionalSeconds", map[string]any{"checkpoint_ref_list_timeout_seconds": 2.5}, 2500 * time.Millisecond},
+		{"Zero", map[string]any{"checkpoint_ref_list_timeout_seconds": 0.0}, 0},
+		{"Negative", map[string]any{"checkpoint_ref_list_timeout_seconds": -5.0}, 0},
+		{"String", map[string]any{"checkpoint_ref_list_timeout_seconds": "30"}, 0},
+		{"Bool", map[string]any{"checkpoint_ref_list_timeout_seconds": true}, 0},
+		{"AtCap", map[string]any{"checkpoint_ref_list_timeout_seconds": 120.0}, maxCheckpointRefListTimeout},
+		{"AboveCap", map[string]any{"checkpoint_ref_list_timeout_seconds": 600.0}, maxCheckpointRefListTimeout},
+		// Far beyond the int64 nanosecond range: capping must happen before the
+		// float-to-Duration conversion, which would otherwise overflow.
+		{"Huge", map[string]any{"checkpoint_ref_list_timeout_seconds": 1e300}, maxCheckpointRefListTimeout},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := &EntireSettings{StrategyOptions: tc.options}
+			if got := s.CheckpointRefListTimeoutValue(); got != tc.want {
+				t.Errorf("CheckpointRefListTimeoutValue() = %v; want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_CheckpointRefListTimeoutLocalOverride reads the option through the
+// real loader: JSON numbers arrive as float64, and settings.local.json overrides
+// settings.json key by key inside strategy_options without dropping its
+// siblings.
+func TestLoad_CheckpointRefListTimeoutLocalOverride(t *testing.T) {
+	setupSettingsDir(t,
+		`{"enabled": true, "strategy_options": {"checkpoint_ref_list_timeout_seconds": 30, "filtered_fetches": true}}`,
+		`{"strategy_options": {"checkpoint_ref_list_timeout_seconds": 10}}`)
+
+	s, err := Load(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := s.CheckpointRefListTimeoutValue(); got != 10*time.Second {
+		t.Errorf("CheckpointRefListTimeoutValue() = %v; want 10s from settings.local.json", got)
+	}
+	if !s.IsFilteredFetchesEnabled() {
+		t.Error("the local override must not drop sibling strategy_options from settings.json")
+	}
+}
+
 // containsUnknownField checks if the error message indicates an unknown field
 func containsUnknownField(msg string) bool {
 	// Go's json package reports unknown fields with this message format
