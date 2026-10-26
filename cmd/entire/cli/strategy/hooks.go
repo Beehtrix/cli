@@ -587,14 +587,21 @@ func entireHookLineRunsFromWorkingTree(content string) bool {
 	return false
 }
 
-// prePushHeaderBeforeRefList and prePushChainBeforeRefList are the text of the
-// last pre-push hook Entire wrote before it passed git's ref list: the header,
-// then one Entire line, then (when a user's hook was backed up) the chain to it.
-// They are frozen copies, not rebuilt from today's generators, so changing those
-// cannot change which hooks count as Entire's own old one.
+// These are the texts of the pre-push hooks Entire released before it passed
+// git's ref list: the header, then one Entire line, then (when a user's hook
+// was backed up) the chain to it. prePushSimpleChainBeforeRefList is the chain
+// v0.4.3 through v0.11.4 wrote; prePushChainBeforeRefList is the one from
+// v0.11.5 on. They are frozen copies, not rebuilt from today's generators, so
+// changing those cannot change which hooks count as Entire's own old one.
 const (
-	prePushHeaderBeforeRefList = "#!/bin/sh\n# Entire CLI hooks\n# Pre-push hook: push session logs alongside user's push\n# $1 is the remote name (e.g., \"origin\")\n"
-	prePushChainBeforeRefList  = `_entire_status=$?
+	prePushHeaderBeforeRefList      = "#!/bin/sh\n# Entire CLI hooks\n# Pre-push hook: push session logs alongside user's push\n# $1 is the remote name (e.g., \"origin\")\n"
+	prePushSimpleChainBeforeRefList = `# Chain: run pre-existing hook
+_entire_hook_dir="$(dirname "$0")"
+if [ -x "$_entire_hook_dir/pre-push.pre-entire" ]; then
+    "$_entire_hook_dir/pre-push.pre-entire" "$@"
+fi
+`
+	prePushChainBeforeRefList = `_entire_status=$?
 if [ "$_entire_status" -ne 0 ]; then exit "$_entire_status"; fi
 # Chain: run pre-existing hook
 _entire_hook_dir="$(dirname "$0")"
@@ -623,27 +630,43 @@ func isPrePushBeforeRefList(content string) bool {
 		return false
 	}
 	line, rest, ok := strings.Cut(body, "\n")
-	if !ok || (rest != "" && rest != prePushChainBeforeRefList) {
+	if !ok || (rest != "" && rest != prePushSimpleChainBeforeRefList && rest != prePushChainBeforeRefList) {
 		return false
+	}
+	// v0.3.0 through v0.5.6 ran Entire with no availability test.
+	if prefix, ok := strings.CutSuffix(line, ` hooks git pre-push "$1" || true`); ok {
+		return isPrePushPrefixBeforeRefList(prefix)
 	}
 	line, ok = strings.CutPrefix(line, "if ")
 	if !ok {
 		return false
 	}
-	line, ok = strings.CutSuffix(line, ` hooks git pre-push "$1"; else :; fi`)
+	line, ok = strings.CutSuffix(line, "; else :; fi")
+	if !ok {
+		return false
+	}
+	// v0.6.x ignored Entire's exit status inside the test as well.
+	line = strings.TrimSuffix(line, " || true")
+	line, ok = strings.CutSuffix(line, ` hooks git pre-push "$1"`)
 	if !ok {
 		return false
 	}
 	test, prefix, ok := strings.Cut(line, "; then ")
-	if !ok {
+	if !ok || !isPrePushPrefixBeforeRefList(prefix) {
 		return false
 	}
 	if prefix == bareEntireHookCmd {
 		return test == "command -v entire >/dev/null 2>&1"
 	}
-	// An absolute prefix was always single-quoted (shellQuote).
-	quoted := len(prefix) > 2 && strings.HasPrefix(prefix, "'") && strings.HasSuffix(prefix, "'")
-	return quoted && (test == "[ -x "+prefix+" ]" || test == "[ -f "+prefix+" ]")
+	return test == "[ -x "+prefix+" ]" || test == "[ -f "+prefix+" ]"
+}
+
+// isPrePushPrefixBeforeRefList reports whether prefix is one an old pre-push
+// hook could have used: bare entire, or an absolute path, which was always
+// single-quoted (shellQuote).
+func isPrePushPrefixBeforeRefList(prefix string) bool {
+	return prefix == bareEntireHookCmd ||
+		(len(prefix) > 2 && strings.HasPrefix(prefix, "'") && strings.HasSuffix(prefix, "'"))
 }
 
 // buildHookSpecs returns the hook specifications for all managed hooks.

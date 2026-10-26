@@ -1935,6 +1935,18 @@ if [ -z "${ENTIRE_CHAINING_PRE_PUSH:-}" ]; then
 fi
 `
 	oldPrePushBareLine = `if command -v entire >/dev/null 2>&1; then entire hooks git pre-push "$1"; else :; fi` + "\n"
+
+	// The chain v0.4.3 through v0.11.4 wrote.
+	oldPrePushSimpleChain = `# Chain: run pre-existing hook
+_entire_hook_dir="$(dirname "$0")"
+if [ -x "$_entire_hook_dir/pre-push.pre-entire" ]; then
+    "$_entire_hook_dir/pre-push.pre-entire" "$@"
+fi
+`
+	// The unguarded line v0.3.0 through v0.5.6 wrote, and the guarded one v0.6.x
+	// wrote; both ignored Entire's exit status.
+	oldPrePushUnguardedLine = `entire hooks git pre-push "$1" || true` + "\n"
+	oldPrePushGuardedOrTrue = `if command -v entire >/dev/null 2>&1; then entire hooks git pre-push "$1" || true; else :; fi` + "\n"
 )
 
 // Entire's own pre-push hook from before it passed git's ref list is replaced,
@@ -1954,6 +1966,22 @@ func TestCheckGitHookState_PrePushBeforeRefList(t *testing.T) {
 		{name: "windows absolute prefix", content: oldPrePushHeader +
 			`if [ -f 'C:\Tools\entire.exe' ]; then 'C:\Tools\entire.exe' hooks git pre-push "$1"; else :; fi` + "\n", want: GitHooksOutdated},
 		{name: "chained to the user's hook", content: oldPrePushHeader + oldPrePushBareLine + oldPrePushChain, want: GitHooksOutdated},
+		{name: "v0.11.4 chained to the user's hook", content: oldPrePushHeader + oldPrePushBareLine + oldPrePushSimpleChain, want: GitHooksOutdated},
+		{name: "v0.11.4 absolute prefix chained", content: oldPrePushHeader +
+			`if [ -x '/usr/local/bin/entire' ]; then '/usr/local/bin/entire' hooks git pre-push "$1"; else :; fi` + "\n" + oldPrePushSimpleChain, want: GitHooksOutdated},
+		{name: "v0.6 line ignoring Entire's status", content: oldPrePushHeader + oldPrePushGuardedOrTrue, want: GitHooksOutdated},
+		{name: "v0.6 line chained", content: oldPrePushHeader + oldPrePushGuardedOrTrue + oldPrePushSimpleChain, want: GitHooksOutdated},
+		{name: "v0.6 windows absolute prefix", content: oldPrePushHeader +
+			`if [ -f 'C:\Tools\entire.exe' ]; then 'C:\Tools\entire.exe' hooks git pre-push "$1" || true; else :; fi` + "\n", want: GitHooksOutdated},
+		{name: "v0.5 unguarded line", content: oldPrePushHeader + oldPrePushUnguardedLine, want: GitHooksOutdated},
+		{name: "v0.5 unguarded line chained", content: oldPrePushHeader + oldPrePushUnguardedLine + oldPrePushSimpleChain, want: GitHooksOutdated},
+		{name: "v0.5 unguarded absolute prefix", content: oldPrePushHeader +
+			`'/usr/local/bin/entire' hooks git pre-push "$1" || true` + "\n", want: GitHooksOutdated},
+		{name: "a line the user added after the v0.11.4 chain", content: oldPrePushHeader + oldPrePushBareLine + oldPrePushSimpleChain + "echo done\n", want: GitHooksCurrent},
+		{name: "an unguarded line without || true", content: oldPrePushHeader + `entire hooks git pre-push "$1"` + "\n", want: GitHooksCurrent},
+		{name: "an unguarded unquoted absolute prefix", content: oldPrePushHeader +
+			`/usr/local/bin/entire hooks git pre-push "$1" || true` + "\n", want: GitHooksCurrent},
+		{name: "an unguarded line the user changed", content: oldPrePushHeader + `entire hooks git pre-push "$1" || echo failed` + "\n", want: GitHooksCurrent},
 		{name: "a line the user added", content: oldPrePushHeader + oldPrePushBareLine + "git lfs pre-push \"$@\"\n", want: GitHooksCurrent},
 		{name: "a line the user added after the chain", content: oldPrePushHeader + oldPrePushBareLine + oldPrePushChain + "echo done\n", want: GitHooksCurrent},
 		{name: "an edited Entire line", content: oldPrePushHeader +
