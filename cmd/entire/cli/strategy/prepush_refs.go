@@ -23,6 +23,10 @@ type PrePushRef struct {
 	LocalSHA  string
 	RemoteRef string
 	RemoteSHA string
+	// Truncated is set when a field was longer than maxPrePushFieldLen and was
+	// cut short. Its ref names are then not the real refs and must not be acted
+	// on by name.
+	Truncated bool
 }
 
 // maxPrePushFieldLen bounds how much of one field of a ref line is kept. Only a
@@ -35,7 +39,8 @@ const maxPrePushFieldLen = 4096
 // refs, the only ones Entire needs. It reads to the end with no size cap: a
 // `--mirror` of a repository with many tags can be large, and a truncated list
 // could hide a checkpoint ref line. For the same reason an oversized ref name
-// is cut short rather than failing the whole list. Memory stays bounded because
+// is cut short, and its line marked Truncated, rather than failing the whole
+// list. Memory stays bounded because
 // other lines are dropped as they are read and each field keeps at most
 // maxPrePushFieldLen bytes. Malformed lines are skipped; only a failed read is
 // an error.
@@ -46,6 +51,7 @@ func ParsePrePushRefs(r io.Reader) ([]PrePushRef, error) {
 	nfields := 0
 	var field []byte
 	inField := false
+	truncated := false
 	endField := func() {
 		if !inField {
 			return
@@ -60,12 +66,13 @@ func ParsePrePushRefs(r io.Reader) ([]PrePushRef, error) {
 	endLine := func() {
 		endField()
 		if nfields == len(fields) {
-			ref := PrePushRef{LocalRef: fields[0], LocalSHA: fields[1], RemoteRef: fields[2], RemoteSHA: fields[3]}
+			ref := PrePushRef{LocalRef: fields[0], LocalSHA: fields[1], RemoteRef: fields[2], RemoteSHA: fields[3], Truncated: truncated}
 			if isCheckpointRefName(ref.LocalRef) || isCheckpointRefName(ref.RemoteRef) {
 				refs = append(refs, ref)
 			}
 		}
 		nfields = 0
+		truncated = false
 	}
 	for {
 		b, err := br.ReadByte()
@@ -85,6 +92,8 @@ func ParsePrePushRefs(r io.Reader) ([]PrePushRef, error) {
 			inField = true
 			if len(field) < maxPrePushFieldLen {
 				field = append(field, b)
+			} else {
+				truncated = true
 			}
 		}
 	}

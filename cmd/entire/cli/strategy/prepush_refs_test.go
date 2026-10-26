@@ -53,7 +53,8 @@ func TestParsePrePushRefs_LongListKeepsTheLastLine(t *testing.T) {
 
 // One line with an oversized ref name must not make the whole list unknown. A
 // checkpoint ref on that line still counts, and the lines after it are still
-// read.
+// read. A line whose name was cut short is marked, so nothing acts on that
+// name as if it were the real ref.
 func TestParsePrePushRefs_OversizedRefName(t *testing.T) {
 	t.Parallel()
 	const v1 = "refs/heads/entire/checkpoints/v1"
@@ -67,12 +68,12 @@ func TestParsePrePushRefs_OversizedRefName(t *testing.T) {
 		{
 			name:  "v1 sent to an oversized remote name",
 			input: v1 + " " + testSHA1 + " " + huge + " " + zeroSHA + "\n",
-			want:  PrePushRef{LocalRef: v1, LocalSHA: testSHA1, RemoteSHA: zeroSHA},
+			want:  PrePushRef{LocalRef: v1, LocalSHA: testSHA1, RemoteSHA: zeroSHA, Truncated: true},
 		},
 		{
 			name:  "an oversized local name pushed onto v1",
 			input: huge + " " + testSHA1 + " " + v1 + " " + zeroSHA + "\n",
-			want:  PrePushRef{LocalSHA: testSHA1, RemoteRef: v1, RemoteSHA: zeroSHA},
+			want:  PrePushRef{LocalSHA: testSHA1, RemoteRef: v1, RemoteSHA: zeroSHA, Truncated: true},
 		},
 		{
 			name: "an oversized line with no checkpoint ref, then v1",
@@ -83,7 +84,7 @@ func TestParsePrePushRefs_OversizedRefName(t *testing.T) {
 		{
 			name:  "an oversized name under the checkpoint ref prefix",
 			input: hugeCheckpoint + " " + testSHA1 + " " + hugeCheckpoint + " " + zeroSHA + "\n",
-			want:  PrePushRef{LocalSHA: testSHA1, RemoteSHA: zeroSHA},
+			want:  PrePushRef{LocalSHA: testSHA1, RemoteSHA: zeroSHA, Truncated: true},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -94,6 +95,7 @@ func TestParsePrePushRefs_OversizedRefName(t *testing.T) {
 			got := refs[0]
 			require.Equal(t, tc.want.LocalSHA, got.LocalSHA)
 			require.Equal(t, tc.want.RemoteSHA, got.RemoteSHA)
+			require.Equal(t, tc.want.Truncated, got.Truncated, "a line is marked when a field was cut short")
 			if tc.want.LocalRef != "" {
 				require.Equal(t, tc.want.LocalRef, got.LocalRef)
 			}
