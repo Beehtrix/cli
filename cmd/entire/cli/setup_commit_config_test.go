@@ -187,6 +187,16 @@ func TestOfferCommitConfig_ListsPendingFilesWithoutATerminal(t *testing.T) {
 			empty: true,
 			want:  []string{"Session checkpoints require at least one commit.\nMake sure to commit these files", "  .entire/settings.json\n"},
 		},
+		{
+			name:  "empty repository with the configuration ignored",
+			empty: true,
+			prepare: func(t *testing.T, dir string) {
+				t.Helper()
+				testutil.WriteFile(t, dir, ".git/info/exclude", ".entire/\n")
+			},
+			want:    []string{"Session checkpoints require at least one commit. Make one to get started.\n"},
+			notWant: []string{"commit these files"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -217,6 +227,17 @@ func TestOfferCommitConfig_ListsWithoutPromptingWhenToldNotToAsk(t *testing.T) {
 			assertOutput(t, runOfferCommitConfig(t, opts), []string{"Make sure to commit these files", "  .entire/settings.json\n"}, nil)
 		})
 	}
+}
+
+// Not parallel: chdirs and sets environment variables.
+func TestOfferCommitConfig_ListsWithoutPromptingDuringAGitOperation(t *testing.T) {
+	dir := newCommitConfigRepo(t, false)
+	head := testutil.RunGit(t, dir, "rev-parse", "HEAD")
+	testutil.WriteFile(t, dir, ".git/MERGE_HEAD", head)
+	t.Setenv(interactive.EnvTestTTY, "1")
+	stubCommitConfig(t, failOnPrompt(t), nil)
+
+	assertOutput(t, runOfferCommitConfig(t, EnableOptions{}), []string{"Make sure to commit these files", "  .entire/settings.json\n"}, nil)
 }
 
 // Not parallel: chdirs and sets environment variables.

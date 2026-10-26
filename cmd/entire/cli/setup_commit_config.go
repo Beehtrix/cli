@@ -31,7 +31,8 @@ var (
 // offerCommitConfig closes a completed enable by getting the configuration it
 // wrote committed, so other worktrees and clones get the same setup. It finds
 // whichever of sharedConfigFiles is untracked, modified, or deleted and, in an
-// interactive terminal without --yes, offers to commit exactly those files;
+// interactive terminal without --yes and outside an in-progress merge, rebase,
+// cherry-pick, revert or bisect, offers to commit exactly those files;
 // otherwise it lists them. In an empty repository it leads with why a commit
 // is needed now. A failure to ask git skips it, and a failed commit is
 // reported; the only error it returns is an interruption (Ctrl+C), so the
@@ -66,13 +67,18 @@ func offerCommitConfig(ctx context.Context, w io.Writer, opts EnableOptions) err
 	}
 
 	fmt.Fprintln(w)
+	if len(pending) == 0 {
+		// Empty repository with the configuration ignored: any commit will do.
+		fmt.Fprintln(w, "Session checkpoints require at least one commit. Make one to get started.")
+		return nil
+	}
 	if emptyRepo {
 		fmt.Fprintln(w, "Session checkpoints require at least one commit.")
 	}
-	if len(pending) == 0 {
-		return nil
-	}
-	if opts.Yes || opts.NoCommitOffer || !interactive.CanPromptInteractively() {
+	// Mid-merge, git refuses a partial commit after staging the files, and
+	// mid-rebase the commit would land on the rebase's detached HEAD.
+	op := strategy.GitOperationInProgress(ctx)
+	if opts.Yes || opts.NoCommitOffer || op != "" || !interactive.CanPromptInteractively() {
 		printConfigToCommit(w, pending)
 		return nil
 	}

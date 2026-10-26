@@ -57,3 +57,24 @@ func TestCommitPaths_CommitsOnlyThePathsInTheEnvironmentPathStatusesUses(t *test
 	assert.Equal(t, "A  staged.txt\n", gitOut(t, dir, "status", "--porcelain"), "staged.txt should stay staged and out of the commit")
 	assert.Equal(t, otherHead, gitOut(t, other, "rev-parse", "HEAD"), "the exported GIT_DIR's repository must not change")
 }
+
+func TestCommitPaths_CommitsAStagedDeletionWithTheOtherPaths(t *testing.T) {
+	// Not parallel: isolateGitConfig uses t.Setenv.
+	isolateGitConfig(t)
+
+	dir := initGitlinkRepo(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, ".claude"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".claude", "settings.json"), []byte("{}\n"), 0o644))
+	gitIn(t, dir, "add", ".claude/settings.json")
+	gitIn(t, dir, "commit", "-q", "-m", "initial")
+	gitIn(t, dir, "rm", "-q", ".claude/settings.json")
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, ".entire"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".entire", "settings.json"), []byte("{}\n"), 0o644))
+
+	paths := []string{".claude/settings.json", ".entire/settings.json"}
+	var out bytes.Buffer
+	require.NoError(t, CommitPaths(t.Context(), dir, paths, "Enable Entire", &out), out.String())
+
+	assert.Equal(t, "D\t.claude/settings.json\nA\t.entire/settings.json\n", gitOut(t, dir, "show", "--name-status", "--no-renames", "--format=", "HEAD"))
+	assert.Empty(t, gitOut(t, dir, "status", "--porcelain"))
+}
