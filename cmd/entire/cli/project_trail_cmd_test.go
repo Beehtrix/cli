@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -85,7 +86,15 @@ func setupProjectTrailTest(t *testing.T, handler http.HandlerFunc) (*fakeProject
 		require.Equal(t, server.URL, target.BaseURL)
 		return api.NewClientWithBaseURL("project-token", target.BaseURL), nil
 	}
-	t.Cleanup(func() { newProjectTrailCoreClient, newProjectTrailCellClient = oldCore, oldCell })
+	// Repository reads (show's merge gates) fail unless a test stubs them, so
+	// no test reaches the real control plane.
+	oldTrail := newTrailAPIClient
+	newTrailAPIClient = func(context.Context, bool, string, string, string) (*api.Client, string, error) {
+		return nil, "", errors.New("repository client not stubbed")
+	}
+	t.Cleanup(func() {
+		newProjectTrailCoreClient, newProjectTrailCellClient, newTrailAPIClient = oldCore, oldCell, oldTrail
+	})
 	return core, server
 }
 
