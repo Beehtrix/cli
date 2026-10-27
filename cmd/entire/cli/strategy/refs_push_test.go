@@ -400,6 +400,22 @@ func TestFlushCheckpointRefsQueue_SupersededRecoveriesDoNotStopTheRetry(t *testi
 	assert.Empty(t, queued)
 }
 
+// A selected ref superseded during recovery is reported as changed with the
+// commit now waiting, so a caller has the version to pin next.
+func TestFlushCheckpointRefs_SupersededSelectedRefReportsItsNewTip(t *testing.T) {
+	repo, bareDir, refs, base, _ := divergeCheckpointRefs(t, 1)
+	stubRecoveryCAS(t, loseRecoveryCAS(t, base))
+	selection := checkpointRefSelection{refs: map[plumbing.ReferenceName]plumbing.Hash{refs[0]: plumbing.ZeroHash}}
+
+	restore := captureStderr(t)
+	result, err := flushCheckpointRefs(context.Background(), repo, pushSettings{remote: bareDir}, selection)
+	restore()
+	require.NoError(t, err)
+	require.Len(t, result.changed, 1)
+	assert.Equal(t, refs[0], result.changed[0].name)
+	assert.Equal(t, base, result.changed[0].hash, "the commit the concurrent write left waiting")
+}
+
 // Superseded refs were attempted but did not fail, so the flush error counts
 // only the real failures among the attempts.
 func TestFlushCheckpointRefsQueue_ReportsOnlyRealFailures(t *testing.T) {

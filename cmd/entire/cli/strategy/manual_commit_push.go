@@ -748,7 +748,12 @@ func retryCheckpointRefsIndividually(
 			// is reported as a failure.
 			logging.Info(ctx, "git-refs push: checkpoint ref changed during recovery; newer generation stays queued",
 				slog.String("ref", ref.name.String()))
-			result.failed[ref.name] = pushErr
+			// Report the generation now waiting, so a caller has a commit to pin.
+			if current, readErr := repo.Reference(ref.name, true); readErr == nil {
+				result.changed = append(result.changed, checkpointRefPush{token: ref.token, name: ref.name, hash: current.Hash()})
+			} else {
+				result.failed[ref.name] = pushErr
+			}
 			continue
 		}
 		if pushErr != nil {
