@@ -898,7 +898,7 @@ classified; a read-only group contains no writing subcommand; guidance text
 never appears in a command's `Short`/`Long`.
 
 Hidden commands opt into being advertised here by setting
-`Annotations[agentHelpAnnotation] = "true"` (e.g. `trail`). Because `agent-help`
+`Annotations[agentHelpAnnotation] = "true"` (e.g. `why`). Because `agent-help`
 renders live and lists non-hidden commands, the experimental commands appear in
 `agent-help` in developer/nightly builds and are absent in stable releases — the
 advertised surface is build-dependent, matching what `entire help` shows.
@@ -916,7 +916,7 @@ unsupported and points the agent at this passive path instead.
 Cobra-native aliases (no hint): `sessions` → `session`, `cp`/`checkpoints` →
 `checkpoint`.
 
-Hidden infrastructure commands: `hooks`, `trail`,
+Hidden infrastructure commands: `hooks`,
 `curl-bash-post-install`, `__send_analytics`, `__sweep_sessions`, `mcp` (MCP
 stdio server for MCP-host agents).
 
