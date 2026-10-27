@@ -517,10 +517,10 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 
 	message := string(content)
 
-	// A trailer prepare already stamped is kept (e.g. amend); inherited ones are links
+	// A trailer prepare already stamped is kept (the hook ran again); any
+	// other is a link
 	if existingCpID, found := stampedTrailer(ctx, message, inherited); found {
 		readCommitMessageSpan.End()
-		// Trailer already exists (e.g., amend) - keep it
 		logging.Debug(logCtx, "prepare-commit-msg: trailer already exists",
 			slog.String("strategy", "manual-commit"),
 			slog.String("source", source),
@@ -590,6 +590,9 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 		message = addCheckpointTrailerWithComment(message, checkpointID, string(agentType), displayPrompt)
 	}
 
+	if !recordStampedTrailer(ctx, checkpointID) {
+		return nil
+	}
 	logging.Info(logCtx, "prepare-commit-msg: trailer added",
 		slog.String("strategy", "manual-commit"),
 		slog.String("source", source),
@@ -870,6 +873,9 @@ func (s *ManualCommitStrategy) handleAmendCommitMsg(ctx context.Context, commitM
 
 		// Restore the trailer
 		message = addCheckpointTrailer(message, cpID)
+		if !recordStampedTrailer(ctx, cpID) {
+			return nil
+		}
 		if writeErr := os.WriteFile(commitMsgFile, []byte(message), 0o600); writeErr != nil { //nolint:gosec // path from git hook arg
 			return nil
 		}
@@ -925,6 +931,9 @@ func (s *ManualCommitStrategy) stampFreshCheckpointForAmend(ctx context.Context,
 	}
 	content, err := os.ReadFile(commitMsgFile) //nolint:gosec // commitMsgFile is provided by git hook
 	if err != nil {
+		return
+	}
+	if !recordStampedTrailer(ctx, cpID) {
 		return
 	}
 	if err := os.WriteFile(commitMsgFile, []byte(addCheckpointTrailer(string(content), cpID)), 0o600); err != nil { //nolint:gosec // path from git hook arg
@@ -1377,8 +1386,8 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 	}
 
 	// Condense into the trailer prepare stamped, never into an inherited one.
-	stamped, redone := stampedTrailersOf(ctx, commit)
-	checkpointID, targetPreexisting, found := s.condensationTarget(ctx, repo, stamped)
+	ids, stamped, redone := linkedTrailersOf(ctx, commit)
+	checkpointID, targetPreexisting, found := s.condensationTarget(ctx, repo, ids, stamped)
 	openRepoSpan.End()
 
 	if !found {
@@ -2979,12 +2988,15 @@ func (s *ManualCommitStrategy) addTrailerForAgentCommit(logCtx context.Context, 
 
 	message := string(content)
 
-	// Don't add if prepare already stamped one (inherited trailers are links)
+	// Don't add if prepare already stamped one; any other trailer is a link
 	if _, found := stampedTrailer(logCtx, message, inherited); found {
 		return nil
 	}
 
 	message = addCheckpointTrailer(message, cpID)
+	if !recordStampedTrailer(logCtx, cpID) {
+		return nil
+	}
 
 	logging.Info(logCtx, "prepare-commit-msg: agent commit trailer added",
 		slog.String("strategy", "manual-commit"),
