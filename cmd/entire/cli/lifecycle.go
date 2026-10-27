@@ -25,6 +25,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/entiredir"
 	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
@@ -1704,7 +1705,7 @@ func handleLifecycleSubagentStart(ctx context.Context, ag agent.Agent, event *ag
 		}); err != nil {
 			return fmt.Errorf("register codex subagent: %w", err)
 		}
-		if err := CapturePreTaskState(ctx, event.ToolUseID); err != nil {
+		if err := CapturePreTaskState(ctx, event.SessionID, event.ToolUseID); err != nil {
 			logging.Warn(logCtx, "best-effort codex pre-task capture failed", slog.String("error", err.Error()))
 		}
 		return nil
@@ -1715,7 +1716,7 @@ func handleLifecycleSubagentStart(ctx context.Context, ag agent.Agent, event *ag
 	}
 
 	// Capture pre-task state
-	if err := CapturePreTaskState(ctx, event.ToolUseID); err != nil {
+	if err := CapturePreTaskState(ctx, event.SessionID, event.ToolUseID); err != nil {
 		return fmt.Errorf("failed to capture pre-task state: %w", err)
 	}
 
@@ -2338,13 +2339,13 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 	// failures: over-capture steals attribution from someone else's work,
 	// which is worse and harder to notice. claimUnrecordedNewFiles narrows the
 	// shell side-effect gap for new files; see unrecordedNewFilesSinceLaunch.
+	preState, preErr := LoadPreTaskState(logCtx, event.ToolUseID)
+	if preErr != nil {
+		logging.Warn(logCtx, "failed to load pre-task state",
+			slog.String("error", preErr.Error()))
+	}
 	var changes *FileChanges
 	if !opts.analyzerFilesOnly {
-		preState, preErr := LoadPreTaskState(logCtx, event.ToolUseID)
-		if preErr != nil {
-			logging.Warn(logCtx, "failed to load pre-task state",
-				slog.String("error", preErr.Error()))
-		}
 		var preUntrackedFiles []string
 		if preState != nil {
 			preUntrackedFiles = preState.PreUntrackedFiles()
@@ -2378,7 +2379,9 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 	// filterToUncommittedFiles is the same guard the turn-end path already applies
 	// for this exact reason; it fails open, so a git error keeps the list as-is
 	// rather than silently dropping a real checkpoint.
-	relModifiedFiles := filterToUncommittedFiles(logCtx, FilterAndNormalizePaths(modifiedFiles, repoRoot), repoRoot)
+	subagentFiles := FilterAndNormalizePaths(modifiedFiles, repoRoot)
+	uncommittedSubagentFiles := filterToUncommittedFiles(logCtx, subagentFiles, repoRoot)
+	relModifiedFiles := uncommittedSubagentFiles
 	var relNewFiles, relDeletedFiles []string
 	if changes != nil {
 		// changes come from git status, so they are uncommitted by construction.
@@ -2396,9 +2399,14 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 	// transcript worth materializing, and SubagentStop is the only chance to
 	// record it (bypassNoChangesSkip is never set for the foreground
 	// launch-time path, which keeps its original skip-on-no-changes behavior).
+	// A foreground subagent that committed its own work is the exception: its
+	// record goes to that commit's checkpoint (attachTaskToCommitCheckpoint).
 	if len(relModifiedFiles) == 0 && len(relNewFiles) == 0 && len(relDeletedFiles) == 0 {
 		if !opts.bypassNoChangesSkip {
-			logging.Info(logCtx, "no file changes detected, skipping task record")
+			committedFiles := withoutFiles(subagentFiles, uncommittedSubagentFiles)
+			if !attachTaskToCommitCheckpoint(logCtx, ag, event, opts, preState, subagentTranscriptPath, committedFiles) {
+				logging.Info(logCtx, "no file changes detected, skipping task record")
+			}
 			_ = CleanupPreTaskState(logCtx, event.ToolUseID) //nolint:errcheck // best-effort cleanup
 			return nil
 		}
@@ -2412,24 +2420,7 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 	}
 
 	files := mergeUnique(mergeUnique(relModifiedFiles, relNewFiles), relDeletedFiles)
-	tokenUsage := event.TokenUsage
-	if tokenUsage == nil {
-		tokenUsage = subagentTokenUsage(logCtx, ag, event, subagentTranscriptPath)
-	}
-	usageFromTranscript := taskUsageRecountable(ag, event)
-	rec := session.TaskRecord{
-		ToolUseID:                event.ToolUseID,
-		AgentID:                  event.SubagentID,
-		StartedAt:                taskStartedAt(event),
-		Background:               opts.background,
-		SubagentType:             event.SubagentType,
-		TaskDescription:          event.TaskDescription,
-		DeclaredTranscriptPath:   subagentTranscriptPath,
-		TranscriptUnavailable:    event.SubagentTranscriptUnavailable,
-		Files:                    files,
-		TokenUsage:               tokenUsage,
-		TokenUsageFromTranscript: usageFromTranscript,
-	}
+	rec := subagentTaskRecord(logCtx, ag, event, opts.background, subagentTranscriptPath, files)
 	// Exactly-once needs an identity to be "once" about. Copilot CLI's
 	// SubagentEnd carries no correlation ID at all, so every one of its
 	// subagents keys on "" — the claim would match the first one's completed
@@ -2465,6 +2456,100 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 
 	_ = CleanupPreTaskState(logCtx, event.ToolUseID) //nolint:errcheck // best-effort cleanup
 	return nil
+}
+
+// subagentTaskRecord builds the task record a subagent capture completes.
+func subagentTaskRecord(logCtx context.Context, ag agent.Agent, event *agent.Event, background bool, transcriptPath string, files []string) session.TaskRecord {
+	tokenUsage := event.TokenUsage
+	if tokenUsage == nil {
+		tokenUsage = subagentTokenUsage(logCtx, ag, event, transcriptPath)
+	}
+	return session.TaskRecord{
+		ToolUseID:                event.ToolUseID,
+		AgentID:                  event.SubagentID,
+		StartedAt:                taskStartedAt(event),
+		Background:               background,
+		SubagentType:             event.SubagentType,
+		TaskDescription:          event.TaskDescription,
+		DeclaredTranscriptPath:   transcriptPath,
+		TranscriptUnavailable:    event.SubagentTranscriptUnavailable,
+		Files:                    files,
+		TokenUsage:               tokenUsage,
+		TokenUsageFromTranscript: taskUsageRecountable(ag, event),
+	}
+}
+
+// attachTaskToCommitCheckpoint stores a foreground subagent's record in the
+// checkpoint of a commit made while it ran, and reports whether it did. That
+// commit condensed the session before the record existed, and it left nothing
+// uncommitted for a later commit to carry, so this is the record's only chance.
+//
+// committedFiles are the files the subagent wrote that HEAD now has. A
+// subagent with none, such as a read-only one running alongside the committer,
+// is not attributed to that commit. When several commits landed during the
+// run, the record goes to the last one.
+func attachTaskToCommitCheckpoint(
+	logCtx context.Context,
+	ag agent.Agent,
+	event *agent.Event,
+	opts subagentCaptureOptions,
+	preState *PreTaskState,
+	transcriptPath string,
+	committedFiles []string,
+) bool {
+	if len(committedFiles) == 0 || preState == nil || preState.TurnCheckpointIDs == nil {
+		return false
+	}
+	state, err := strategy.LoadSessionState(logCtx, event.SessionID)
+	if err != nil || state == nil {
+		return false
+	}
+	checkpointID, ok := lastCheckpointSince(preState.TurnCheckpointIDs, state.TurnCheckpointIDs)
+	if !ok {
+		return false
+	}
+	rec := subagentTaskRecord(logCtx, ag, event, opts.background, transcriptPath, committedFiles)
+	rec.CompletedAt = time.Now()
+	if err := GetStrategy(logCtx).AttachTaskToCheckpoint(logCtx, ag, event.SessionID, rec, checkpointID); err != nil {
+		logging.Warn(logCtx, "failed to add task record to the checkpoint of the subagent's commit",
+			slog.String("session_id", event.SessionID),
+			slog.String("tool_use_id", event.ToolUseID),
+			slog.String("checkpoint_id", checkpointID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	logging.Info(logCtx, "subagent committed its own work; added task record to that commit's checkpoint",
+		slog.String("session_id", event.SessionID),
+		slog.String("tool_use_id", event.ToolUseID),
+		slog.String("checkpoint_id", checkpointID.String()))
+	return true
+}
+
+// lastCheckpointSince returns the newest checkpoint in current that is not in
+// atStart.
+func lastCheckpointSince(atStart, current []string) (id.CheckpointID, bool) {
+	for i := len(current) - 1; i >= 0; i-- {
+		if slices.Contains(atStart, current[i]) {
+			continue
+		}
+		checkpointID, err := id.NewCheckpointID(current[i])
+		if err != nil {
+			continue
+		}
+		return checkpointID, true
+	}
+	return id.EmptyCheckpointID, false
+}
+
+// withoutFiles returns the files in all that are not in remove.
+func withoutFiles(all, remove []string) []string {
+	var kept []string
+	for _, f := range all {
+		if !slices.Contains(remove, f) {
+			kept = append(kept, f)
+		}
+	}
+	return kept
 }
 
 // unrecordedNewFilesSinceLaunch returns the untracked files created since a
