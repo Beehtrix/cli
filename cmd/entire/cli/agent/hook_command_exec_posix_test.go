@@ -6,54 +6,107 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
-// entireStandIn picks what `entire` resolves to on the wrapper's PATH.
-type entireStandIn int
+// standInEnv selects how the test binary behaves when it runs as the `entire`
+// stand-in. Linking the test binary rather than writing a script avoids the
+// ETXTBSY race of exec-ing a freshly written file while parallel tests fork.
+const standInEnv = "ENTIRE_HOOK_WRAPPER_STAND_IN"
 
 const (
-	entireMissing entireStandIn = iota
-	// entireBroken is on PATH but exits non-zero, like a version-manager shim
+	// standInBroken is on PATH but cannot run, like a version-manager shim
 	// with no version selected.
-	entireBroken
-	// entireWorking echoes the hook payload from stdin, which also proves the
-	// wrapper hands its stdin through.
-	entireWorking
+	standInBroken = "broken"
+	// standInWorking echoes the hook payload from stdin to stdout.
+	standInWorking = "working"
+	// standInHookError runs, but the hook itself fails.
+	standInHookError = "hook-error"
+	// standInHang runs, and the hook never finishes.
+	standInHang = "hang"
 )
 
-// runPOSIXWrapper runs a stored hook command the way agents do: the whole
-// string handed to sh, with the hook payload on stdin. PATH holds only the
-// stand-ins, so an `entire` installed on the host can't leak in.
-func runPOSIXWrapper(t *testing.T, wrapper string, entire entireStandIn, stdin string) (string, int) {
+// hookPayload stands in for the JSON an agent writes to a hook's stdin.
+const hookPayload = `{"session_id":"s1"}`
+
+func TestMain(m *testing.M) {
+	if mode := os.Getenv(standInEnv); mode != "" && filepath.Base(os.Args[0]) == "entire" {
+		os.Exit(runEntireStandIn(mode, os.Args[1:]))
+	}
+	os.Exit(m.Run())
+}
+
+func runEntireStandIn(mode string, args []string) int {
+	if mode == standInBroken {
+		fmt.Fprintln(os.Stderr, "stand-in ERROR No version is set for shim: entire")
+		return 1
+	}
+	if len(args) == 1 && args[0] == "--version" {
+		// Drain stdin so a probe that reads the hook payload is caught by the
+		// payload pass-through case.
+		_, _ = io.Copy(io.Discard, os.Stdin) //nolint:errcheck // best effort
+		fmt.Println("Entire CLI stand-in")
+		return 0
+	}
+	switch mode {
+	case standInWorking:
+		if _, err := io.Copy(os.Stdout, os.Stdin); err != nil {
+			return 1
+		}
+		return 0
+	case standInHang:
+		time.Sleep(time.Minute)
+		return 0
+	default:
+		fmt.Fprintln(os.Stderr, "stand-in hook failed")
+		return 1
+	}
+}
+
+// wrapperCommand builds the wrapper the way agents run it: the stored string
+// handed to sh, with PATH holding only sh and, unless mode is empty, the
+// `entire` stand-in, so an `entire` installed on the host can't leak in.
+func wrapperCommand(t *testing.T, wrapper, mode string) *exec.Cmd {
 	t.Helper()
 
 	binDir := t.TempDir()
-	workDir := t.TempDir()
-	linkSystemBinary(t, binDir, "sh", "sh")
-	switch entire {
-	case entireBroken:
-		linkSystemBinary(t, binDir, "entire", "false")
-	case entireWorking:
-		// `entire hooks …` becomes `sh hooks …`, which reads the script named
-		// hooks from the working directory. sh reads it rather than exec-ing it,
-		// so writing it cannot race into ETXTBSY.
-		linkSystemBinary(t, binDir, "entire", "sh")
-		linkSystemBinary(t, binDir, "cat", "cat")
-		if err := os.WriteFile(filepath.Join(workDir, "hooks"), []byte("cat\n"), 0o600); err != nil {
-			t.Fatalf("write hooks script: %v", err)
+	shPath, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not available")
+	}
+	if err := os.Symlink(shPath, filepath.Join(binDir, "sh")); err != nil {
+		t.Fatalf("link sh: %v", err)
+	}
+	env := []string{"PATH=" + binDir}
+	if mode != "" {
+		self, err := os.Executable()
+		if err != nil {
+			t.Fatalf("os.Executable: %v", err)
 		}
-	case entireMissing:
+		if err := os.Symlink(self, filepath.Join(binDir, "entire")); err != nil {
+			t.Fatalf("link entire stand-in: %v", err)
+		}
+		env = append(env, standInEnv+"="+mode)
 	}
 
 	cmd := exec.CommandContext(context.Background(), filepath.Join(binDir, "sh"), "-c", wrapper)
-	cmd.Dir = workDir
-	cmd.Env = []string{"PATH=" + binDir}
-	cmd.Stdin = strings.NewReader(stdin)
+	cmd.Env = env
+	return cmd
+}
+
+func runWrapper(t *testing.T, wrapper, mode string) (string, int) {
+	t.Helper()
+
+	cmd := wrapperCommand(t, wrapper, mode)
+	cmd.Stdin = strings.NewReader(hookPayload)
 	out, err := cmd.Output()
 	var exitErr *exec.ExitError
 	switch {
@@ -67,24 +120,9 @@ func runPOSIXWrapper(t *testing.T, wrapper string, entire entireStandIn, stdin s
 	}
 }
 
-// linkSystemBinary symlinks rather than writes stand-ins: a freshly written
-// executable can fail with ETXTBSY when a parallel test forks while it is open.
-func linkSystemBinary(t *testing.T, dir, name, target string) {
-	t.Helper()
-
-	realPath, err := exec.LookPath(target)
-	if err != nil {
-		t.Skipf("%s not available on PATH", target)
-	}
-	if err := os.Symlink(realPath, filepath.Join(dir, name)); err != nil {
-		t.Fatalf("link %s: %v", name, err)
-	}
-}
-
 func TestWarningWrappers_Execution(t *testing.T) {
 	t.Parallel()
 
-	const payload = `{"session_id":"s1"}`
 	command := "entire hooks test-agent session-start"
 
 	jsonMessage := func(t *testing.T, stdout string) string {
@@ -114,7 +152,7 @@ func TestWarningWrappers_Execution(t *testing.T) {
 	for _, w := range wrappers {
 		t.Run(w.name+"/entire missing warns and exits 0", func(t *testing.T) {
 			t.Parallel()
-			stdout, code := runPOSIXWrapper(t, w.wrapper, entireMissing, payload)
+			stdout, code := runWrapper(t, w.wrapper, "")
 			if code != 0 {
 				t.Fatalf("exit code = %d, want 0", code)
 			}
@@ -125,7 +163,7 @@ func TestWarningWrappers_Execution(t *testing.T) {
 
 		t.Run(w.name+"/entire that cannot run warns and exits 0", func(t *testing.T) {
 			t.Parallel()
-			stdout, code := runPOSIXWrapper(t, w.wrapper, entireBroken, payload)
+			stdout, code := runWrapper(t, w.wrapper, standInBroken)
 			if code != 0 {
 				t.Fatalf("exit code = %d, want 0", code)
 			}
@@ -134,14 +172,59 @@ func TestWarningWrappers_Execution(t *testing.T) {
 			}
 		})
 
-		t.Run(w.name+"/working entire passes stdin and output through", func(t *testing.T) {
+		t.Run(w.name+"/working entire gets the payload and owns stdout", func(t *testing.T) {
 			t.Parallel()
-			stdout, code := runPOSIXWrapper(t, w.wrapper, entireWorking, payload)
+			stdout, code := runWrapper(t, w.wrapper, standInWorking)
 			if code != 0 {
 				t.Fatalf("exit code = %d, want 0", code)
 			}
-			if stdout != payload {
-				t.Fatalf("stdout = %q, want only entire's output %q", stdout, payload)
+			if stdout != hookPayload {
+				t.Fatalf("stdout = %q, want only entire's output %q", stdout, hookPayload)
+			}
+		})
+
+		t.Run(w.name+"/a failing hook keeps its exit code and gets no warning", func(t *testing.T) {
+			t.Parallel()
+			stdout, code := runWrapper(t, w.wrapper, standInHookError)
+			if code != 1 {
+				t.Fatalf("exit code = %d, want the hook's 1", code)
+			}
+			if stdout != "" {
+				t.Fatalf("stdout = %q, want nothing: the hook ran, so no install warning applies", stdout)
+			}
+		})
+
+		// Agents enforce hook timeouts by signalling the process they started.
+		// That must be entire itself, or a hung hook outlives the timeout and
+		// keeps the agent's stdout pipe open.
+		t.Run(w.name+"/signalling the hook process stops entire", func(t *testing.T) {
+			t.Parallel()
+			cmd := wrapperCommand(t, w.wrapper, standInHang)
+			cmd.Stdin = strings.NewReader(hookPayload)
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatalf("stdout pipe: %v", err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("start wrapper: %v", err)
+			}
+			t.Cleanup(func() { _ = cmd.Wait() }) //nolint:errcheck // reaped only
+
+			// Let the wrapper reach the hook before the "timeout" fires.
+			time.Sleep(time.Second)
+			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatalf("signal wrapper: %v", err)
+			}
+
+			closed := make(chan struct{})
+			go func() {
+				_, _ = io.Copy(io.Discard, stdout) //nolint:errcheck // waiting for EOF only
+				close(closed)
+			}()
+			select {
+			case <-closed:
+			case <-time.After(10 * time.Second):
+				t.Fatal("stdout still open 10s after signalling the hook process: entire outlived it")
 			}
 		})
 	}

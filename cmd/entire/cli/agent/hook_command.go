@@ -76,11 +76,10 @@ func MissingEntireWarning(format WarningFormat) string {
 	}
 }
 
-// FailedEntireWarning is shown when `entire` is on PATH but exits non-zero, such
-// as a version-manager shim with no version selected. The wrapper cannot tell
-// that apart from a hook that ran and failed, so the text covers both. It is
-// spliced into a single-quoted sh -c string, so it must not contain a single
-// quote, backtick, or dollar sign.
+// FailedEntireWarning is shown when `entire` is on PATH but cannot run, such as
+// a version-manager shim with no version selected. It is spliced into a
+// single-quoted sh -c string, so it must not contain a single quote, backtick,
+// or dollar sign.
 func FailedEntireWarning(format WarningFormat) string {
 	switch format {
 	case WarningFormatSingleLine:
@@ -167,17 +166,21 @@ func systemMessageJSON(message string) (string, error) {
 }
 
 // warningHookCommand prints missing when `entire` is not on PATH and failed when
-// it is but exits non-zero, exiting 0 either way. A version-manager shim with no
-// version selected passes `command -v` and then fails, and agents surface a
-// failing hook's stderr only in verbose views, so without the second branch
-// capture stops unnoticed. The command is not exec'd so the shell can report
-// its failure.
+// it is but `entire --version` fails, exiting 0 either way. A version-manager
+// shim with no version selected passes `command -v` and then fails, and agents
+// surface a failing hook's stderr only in verbose views, so without the probe
+// capture stops unnoticed.
+//
+// The probe runs before the hook so the hook can still be exec'd: agents enforce
+// hook timeouts by signalling the process they started, and only exec makes
+// that process entire itself. The probe reads /dev/null so the hook payload on
+// stdin reaches the hook.
 func warningHookCommand(command, missing, failed string) string {
 	return fmt.Sprintf(
-		`sh -c 'if ! command -v entire >/dev/null 2>&1; then printf "%%s\n" %q; exit 0; fi; %s || { printf "%%s\n" %q; exit 0; }'`,
+		`sh -c 'if ! command -v entire >/dev/null 2>&1; then printf "%%s\n" %q; exit 0; fi; if ! entire --version </dev/null >/dev/null 2>&1; then printf "%%s\n" %q; exit 0; fi; exec %s'`,
 		missing,
-		command,
 		failed,
+		command,
 	)
 }
 
@@ -312,14 +315,12 @@ func IsManagedHookCommand(command string) bool {
 		return true
 	}
 	if strings.HasPrefix(command, productionHookWrapperPrefix) {
-		// The silent wrapper, and warning wrappers from older versions, exec the
-		// command; current warning wrappers run it bare.
-		_, wrappedCommand, ok := strings.Cut(command, "; fi; ")
+		_, wrappedCommand, ok := strings.Cut(command, "; fi; exec ")
 		if !ok {
 			return false
 		}
 
-		return hasManagedHookPrefix(strings.TrimPrefix(wrappedCommand, "exec "))
+		return hasManagedHookPrefix(wrappedCommand)
 	}
 	if strings.HasPrefix(command, windowsProductionHookWrapperPrefix) ||
 		strings.HasPrefix(command, nestedWindowsProductionHookWrapperPrefix) {
