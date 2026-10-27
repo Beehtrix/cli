@@ -199,7 +199,10 @@ func TestWarningWrappers_Execution(t *testing.T) {
 		// keeps the agent's stdout pipe open.
 		t.Run(w.name+"/signalling the hook process stops entire", func(t *testing.T) {
 			t.Parallel()
-			cmd := wrapperCommand(t, w.wrapper, standInHang)
+			// exec drops the harness's own sh -c, which Debian's dash keeps as a
+			// parent, so the signal reaches the wrapper's sh as it would when
+			// the agent starts the wrapper directly.
+			cmd := wrapperCommand(t, "exec "+w.wrapper, standInHang)
 			cmd.Stdin = strings.NewReader(hookPayload)
 			stdout, err := cmd.StdoutPipe()
 			if err != nil {
