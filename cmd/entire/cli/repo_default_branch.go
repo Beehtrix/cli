@@ -33,8 +33,8 @@ func newDefaultBranchCmd() *cobra.Command {
 				if err != nil {
 					return "", nil, err
 				}
-				body := &coreapi.SetRepoDefaultBranchInputBody{Branch: branch}
-				out, err := c.SetRepoDefaultBranch(ctx, body, coreapi.SetRepoDefaultBranchParams{RepoId: repoID})
+				body := &coreapi.SetDefaultBranchInputBody{Branch: branch}
+				out, err := c.SetDefaultBranch(ctx, body, coreapi.SetDefaultBranchParams{RepoId: repoID})
 				if err != nil {
 					return "", nil, err
 				}
@@ -47,7 +47,7 @@ func newDefaultBranchCmd() *cobra.Command {
 	return cmd
 }
 
-func defaultBranchMessage(out *coreapi.SetRepoDefaultBranchOutputBody) string {
+func defaultBranchMessage(out *coreapi.SetDefaultBranchOutputBody) string {
 	if !out.Changed {
 		return "Default branch already " + out.Branch
 	}

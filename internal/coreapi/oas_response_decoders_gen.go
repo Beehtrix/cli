@@ -9796,7 +9796,7 @@ func decodeSetBranchProtectionResponse(resp *http.Response) (res *BranchProtecti
 	return res, errors.Wrap(defRes, "error")
 }
 
-func decodeSetPluginInstallationRepositoriesResponse(resp *http.Response) (res *PluginInstallationView, _ error) {
+func decodeSetDefaultBranchResponse(resp *http.Response) (res *SetDefaultBranchOutputBody, _ error) {
 	switch resp.StatusCode {
 	case 200:
 		// Code 200.
@@ -9812,7 +9812,7 @@ func decodeSetPluginInstallationRepositoriesResponse(resp *http.Response) (res *
 			}
 			d := jx.DecodeBytes(buf)
 
-			var response PluginInstallationView
+			var response SetDefaultBranchOutputBody
 			if err := func() error {
 				if err := response.Decode(d); err != nil {
 					return err
@@ -9879,7 +9879,7 @@ func decodeSetPluginInstallationRepositoriesResponse(resp *http.Response) (res *
 	return res, errors.Wrap(defRes, "error")
 }
 
-func decodeSetRepoDefaultBranchResponse(resp *http.Response) (res *SetRepoDefaultBranchOutputBody, _ error) {
+func decodeSetPluginInstallationRepositoriesResponse(resp *http.Response) (res *PluginInstallationView, _ error) {
 	switch resp.StatusCode {
 	case 200:
 		// Code 200.
@@ -9895,7 +9895,7 @@ func decodeSetRepoDefaultBranchResponse(resp *http.Response) (res *SetRepoDefaul
 			}
 			d := jx.DecodeBytes(buf)
 
-			var response SetRepoDefaultBranchOutputBody
+			var response PluginInstallationView
 			if err := func() error {
 				if err := response.Decode(d); err != nil {
 					return err

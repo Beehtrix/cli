@@ -388,8 +388,8 @@ func encodeSetBranchProtectionRequest(
 	return nil
 }
 
-func encodeSetPluginInstallationRepositoriesRequest(
-	req *SetPluginInstallationRepositoriesInputBody,
+func encodeSetDefaultBranchRequest(
+	req *SetDefaultBranchInputBody,
 	r *http.Request,
 ) error {
 	const contentType = "application/json"
@@ -402,8 +402,8 @@ func encodeSetPluginInstallationRepositoriesRequest(
 	return nil
 }
 
-func encodeSetRepoDefaultBranchRequest(
-	req *SetRepoDefaultBranchInputBody,
+func encodeSetPluginInstallationRepositoriesRequest(
+	req *SetPluginInstallationRepositoriesInputBody,
 	r *http.Request,
 ) error {
 	const contentType = "application/json"

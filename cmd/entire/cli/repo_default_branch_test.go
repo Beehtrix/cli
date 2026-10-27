@@ -18,10 +18,10 @@ const testDefaultBranchRepoULID = "01KS6KFJR2XS6PZ188MVYE07AP"
 
 func TestDefaultBranchMessage(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, "✓ Default branch: refs/heads/master (was refs/heads/main)", defaultBranchMessage(&coreapi.SetRepoDefaultBranchOutputBody{
+	assert.Equal(t, "✓ Default branch: refs/heads/master (was refs/heads/main)", defaultBranchMessage(&coreapi.SetDefaultBranchOutputBody{
 		Branch: "refs/heads/master", Previous: "refs/heads/main", Changed: true,
 	}))
-	assert.Equal(t, "Default branch already refs/heads/master", defaultBranchMessage(&coreapi.SetRepoDefaultBranchOutputBody{
+	assert.Equal(t, "Default branch already refs/heads/master", defaultBranchMessage(&coreapi.SetDefaultBranchOutputBody{
 		Branch: "refs/heads/master", Previous: "refs/heads/master",
 	}))
 }

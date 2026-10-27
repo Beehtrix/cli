@@ -6560,21 +6560,20 @@
         ],
         "type": "object"
       },
-      "SetRepoDefaultBranchInputBody": {
+      "SetDefaultBranchInputBody": {
         "additionalProperties": true,
         "properties": {
           "$schema": {
             "description": "A URL to the JSON Schema for this object.",
             "examples": [
-              "/api/v1/schemas/SetRepoDefaultBranchInputBody.json"
+              "/api/v1/schemas/SetDefaultBranchInputBody.json"
             ],
             "format": "uri",
             "readOnly": true,
             "type": "string"
           },
           "branch": {
-            "description": "Branch to make the default: a short name or a full refs/heads/ ref.",
-            "minLength": 1,
+            "description": "An existing branch: a short name (main) or a full ref (refs/heads/main).",
             "type": "string"
           }
         },
@@ -6583,28 +6582,25 @@
         ],
         "type": "object"
       },
-      "SetRepoDefaultBranchOutputBody": {
+      "SetDefaultBranchOutputBody": {
         "additionalProperties": true,
         "properties": {
           "$schema": {
             "description": "A URL to the JSON Schema for this object.",
             "examples": [
-              "/api/v1/schemas/SetRepoDefaultBranchOutputBody.json"
+              "/api/v1/schemas/SetDefaultBranchOutputBody.json"
             ],
             "format": "uri",
             "readOnly": true,
             "type": "string"
           },
           "branch": {
-            "description": "The default branch after the call, as a full ref.",
             "type": "string"
           },
           "changed": {
-            "description": "Whether the call moved the default branch.",
             "type": "boolean"
           },
           "previous": {
-            "description": "The default branch before the call, as a full ref.",
             "type": "string"
           },
           "repo_id": {
@@ -21839,7 +21835,7 @@
     },
     "/repos/{repoId}/default-branch": {
       "put": {
-        "operationId": "setRepoDefaultBranch",
+        "operationId": "setDefaultBranch",
         "parameters": [
           {
             "in": "path",
@@ -21855,7 +21851,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SetRepoDefaultBranchInputBody"
+                "$ref": "#/components/schemas/SetDefaultBranchInputBody"
               }
             }
           },
@@ -21866,7 +21862,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SetRepoDefaultBranchOutputBody"
+                  "$ref": "#/components/schemas/SetDefaultBranchOutputBody"
                 }
               }
             },
@@ -21967,7 +21963,7 @@
             "sessionAuth": []
           }
         ],
-        "summary": "Set a repository's default branch",
+        "summary": "Set repository default branch",
         "tags": [
           "repos"
         ]
