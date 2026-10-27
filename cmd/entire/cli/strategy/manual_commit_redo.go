@@ -129,7 +129,7 @@ func (s *ManualCommitStrategy) inheritReplacedCommitsTrailers(ctx context.Contex
 	}
 	message := string(content)
 	present := make(map[id.CheckpointID]bool)
-	for _, cpID := range trailers.ParseAllCheckpoints(message) {
+	for _, cpID := range trailers.ParseUnindentedCheckpoints(message) { // a quoted, indented copy is not present
 		present[cpID] = true
 	}
 	added := 0

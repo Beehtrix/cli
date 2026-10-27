@@ -697,8 +697,10 @@ func (s *ManualCommitStrategy) inheritSquashedCheckpointTrailers(ctx context.Con
 		return nil // nothing inherited; let ordinary matching report its own failure
 	}
 	message := string(content)
+	// An indented copy is not present: git seeds an editor squash message with
+	// the squashed commits' messages, their trailers indented in the body.
 	present := make(map[string]bool)
-	for _, cpID := range trailers.ParseAllCheckpoints(message) {
+	for _, cpID := range trailers.ParseUnindentedCheckpoints(message) {
 		present[cpID.String()] = true
 	}
 	added := 0
