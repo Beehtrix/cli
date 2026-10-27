@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1529,5 +1530,93 @@ func TestWithStallAbort(t *testing.T) {
 			env := withStallAbort([]string{"PATH=/bin", userSet})
 			assert.Equal(t, []string{"PATH=/bin", userSet}, env)
 		})
+	}
+}
+
+func TestWithSSHKeepAlive(t *testing.T) {
+	t.Parallel()
+	const keepAlive = " -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+
+	tests := []struct {
+		name  string
+		extra []string
+		want  string // expected GIT_SSH_COMMAND; empty means env is returned unchanged
+	}{
+		{name: "defaults to ssh", want: "ssh" + keepAlive},
+		{name: "extends a custom ssh command", extra: []string{"GIT_SSH_COMMAND=ssh -i /keys/id"}, want: "ssh -i /keys/id" + keepAlive},
+		{name: "extends an absolute ssh path", extra: []string{"GIT_SSH_COMMAND=/usr/bin/ssh"}, want: "/usr/bin/ssh" + keepAlive},
+		{name: "extends a windows ssh.exe", extra: []string{"GIT_SSH_COMMAND=C:/Git/usr/bin/ssh.exe"}, want: "C:/Git/usr/bin/ssh.exe" + keepAlive},
+		{name: "keeps batch mode", extra: []string{"GIT_SSH_COMMAND=ssh -o BatchMode=yes"}, want: "ssh -o BatchMode=yes" + keepAlive},
+		{name: "respects a user interval", extra: []string{"GIT_SSH_COMMAND=ssh -o ServerAliveInterval=300"}},
+		{name: "respects a user count", extra: []string{"GIT_SSH_COMMAND=ssh -oServerAliveCountMax=1"}},
+		// plink and other non-OpenSSH clients reject -o, so adding it would break the fetch.
+		{name: "leaves plink alone", extra: []string{"GIT_SSH_COMMAND=plink -batch"}},
+		{name: "leaves a GIT_SSH plink alone", extra: []string{"GIT_SSH=C:/PuTTY/plink.exe"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			in := isolatedSSHEnv(t, tt.extra...)
+			out := withSSHKeepAlive(context.Background(), "", append([]string(nil), in...))
+			if tt.want == "" {
+				assert.Equal(t, in, out)
+				return
+			}
+			count := 0
+			for _, e := range out {
+				if strings.HasPrefix(e, "GIT_SSH_COMMAND=") {
+					count++
+				}
+			}
+			assert.Equal(t, 1, count, "should not duplicate GIT_SSH_COMMAND")
+			assert.Equal(t, tt.want, envToMap(out)["GIT_SSH_COMMAND"])
+		})
+	}
+}
+
+// A stalled SSH transfer is bounded only if the keepalive options actually
+// reach ssh, so this runs a real fetch against an ssh that records its argv.
+func TestFetch_AbortStalledPassesSSHKeepAlive(t *testing.T) {
+	// Not parallel: changes PATH and the checkpoint token env var.
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ssh is a shell script")
+	}
+	testutil.IsolateGitConfigEnv(t)
+	t.Setenv(CheckpointTokenEnvVar, "")
+	// Unset, not empty: git tries to run an empty GIT_SSH_COMMAND and never
+	// reaches ssh. t.Setenv first so the originals are restored afterwards.
+	for _, key := range []string{"GIT_SSH_COMMAND", "GIT_SSH"} {
+		t.Setenv(key, "")
+		require.NoError(t, os.Unsetenv(key))
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "argv.log")
+	script := "#!/bin/sh\necho \"$*\" >> '" + logPath + "'\nexit 1\n"
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "ssh"), []byte(script), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	local := t.TempDir()
+	testutil.InitRepo(t, local)
+
+	for _, abortStalled := range []bool{true, false} {
+		require.NoError(t, os.WriteFile(logPath, nil, 0o600))
+		_, err := Fetch(context.Background(), FetchOptions{
+			Remote:       "ssh://git@example.invalid/acme/repo.git",
+			RefSpecs:     []string{"+refs/heads/main:refs/x"},
+			NoTags:       true,
+			NoFilter:     true,
+			Dir:          local,
+			AbortStalled: abortStalled,
+		})
+		require.Error(t, err, "the fake ssh always fails")
+		argv, readErr := os.ReadFile(logPath)
+		require.NoError(t, readErr)
+		require.NotEmpty(t, argv, "git must have run the fake ssh")
+		if abortStalled {
+			assert.Contains(t, string(argv), "ServerAliveInterval=15")
+		} else {
+			assert.NotContains(t, string(argv), "ServerAlive")
+		}
 	}
 }

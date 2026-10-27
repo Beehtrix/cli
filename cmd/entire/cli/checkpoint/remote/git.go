@@ -184,7 +184,8 @@ type FetchOptions struct {
 	Dir       string   // working directory (empty = CWD)
 	ExtraArgs []string // additional flags before remote (e.g., "--no-write-fetch-head")
 	// AbortStalled has git abort an HTTP transfer that stops making progress
-	// (see withStallAbort), for callers that set no deadline because the
+	// and ssh drop a connection that stops answering (see withStallAbort and
+	// withSSHKeepAlive), for callers that set no deadline because the
 	// transfer can legitimately take longer than any fixed one. It also
 	// requests --progress: without it the server sends only sparse keepalives
 	// while it prepares a large pack, which can look like a stall.
@@ -248,7 +249,7 @@ func Fetch(ctx context.Context, opts FetchOptions) ([]byte, error) {
 	}
 	disableTerminalPrompt(cmd)
 	if opts.AbortStalled {
-		cmd.Env = withStallAbort(cmd.Env)
+		cmd.Env = withSSHKeepAlive(ctx, opts.Dir, withStallAbort(cmd.Env))
 	}
 	out, err := cmd.CombinedOutput()
 
@@ -876,7 +877,7 @@ const (
 
 // withStallAbort sets git's HTTP low-speed abort (http.lowSpeedLimit and
 // http.lowSpeedTime) in env. git's default is no low-speed check at all, and it
-// covers only the HTTP transports; an SSH transfer is unaffected.
+// covers only the HTTP transports; withSSHKeepAlive bounds SSH.
 //
 // The environment variables override git config, so a user who exported either
 // one keeps their own setting: git applies the check only when both are
@@ -891,4 +892,47 @@ func withStallAbort(env []string) []string {
 		"GIT_HTTP_LOW_SPEED_LIMIT="+strconv.Itoa(stallAbortLowSpeedLimit),
 		"GIT_HTTP_LOW_SPEED_TIME="+strconv.Itoa(int(stallAbortLowSpeedTime.Seconds())),
 	)
+}
+
+// sshKeepAliveOptions has ssh drop a connection whose server stops answering
+// for about a minute: the SSH counterpart of withStallAbort. A keepalive is sent
+// only when no data has arrived, and the server's sshd answers it even while git
+// is still preparing the pack, so a working transfer is never cut off.
+const sshKeepAliveOptions = " -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+
+var serverAliveOptionRe = regexp.MustCompile(`(?i)ServerAlive(Interval|CountMax)\s*=`)
+
+// withSSHKeepAlive sets GIT_SSH_COMMAND in env to the ssh command git would use
+// (see gitremote.EffectiveSSHCommand) plus sshKeepAliveOptions.
+//
+// env is returned unchanged when the command already sets either option, or
+// when it is not OpenSSH: clients such as PuTTY's plink reject -o, and adding
+// it would fail every fetch. Options from ssh_config are overridden, since -o
+// takes precedence there; the values only add keepalives, never shorten a
+// working transfer.
+func withSSHKeepAlive(ctx context.Context, dir string, env []string) []string {
+	const key = "GIT_SSH_COMMAND="
+	base := gitremote.EffectiveSSHCommand(ctx, dir, env)
+	if !isOpenSSHCommand(base) || serverAliveOptionRe.MatchString(base) {
+		return env
+	}
+	out := make([]string, 0, len(env)+1)
+	for _, e := range env {
+		if !strings.HasPrefix(e, key) {
+			out = append(out, e)
+		}
+	}
+	return append(out, key+base+sshKeepAliveOptions)
+}
+
+// isOpenSSHCommand reports whether sshCmd runs OpenSSH, judged by its program
+// name. A quoted path is not unpicked; it reads as not OpenSSH, which only
+// means the keepalive is skipped.
+func isOpenSSHCommand(sshCmd string) bool {
+	fields := strings.Fields(sshCmd)
+	if len(fields) == 0 {
+		return false
+	}
+	name := strings.ToLower(fields[0][strings.LastIndexAny(fields[0], `/\`)+1:])
+	return name == "ssh" || name == "ssh.exe"
 }
