@@ -163,6 +163,30 @@ func TestClonePreferences_CheckpointPushPolicyWrongTypeFailsLoad(t *testing.T) {
 	require.Error(t, err)
 }
 
+// A case variant of the policy key is kept as unknown, so reading past it
+// would turn a stored manual into automatic. The policy read fails closed.
+func TestLoadCheckpointPushPolicy_CaseVariantKeyIsUnreadable(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "variant alone", content: `{"Checkpoint_Push_Policy":"manual"}`},
+		{name: "variant beside the exact key", content: `{"checkpoint_push_policy":"automatic","CHECKPOINT_PUSH_POLICY":"manual"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path := clonePreferencesTestPath(t)
+			writeClonePreferencesTestFile(t, path, tt.content)
+
+			_, err := loadCheckpointPushPolicyFromFile(path)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "checkpoint_push_policy")
+		})
+	}
+}
+
 func TestModifyClonePreferences_CheckpointPushPolicySurvivesUnrelatedWrites(t *testing.T) {
 	t.Parallel()
 	path := clonePreferencesTestPath(t)

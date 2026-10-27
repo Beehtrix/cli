@@ -359,6 +359,8 @@ func LoadCheckpointPushPolicyAt(commonDir string) (CheckpointPushPolicy, error) 
 	return loadCheckpointPushPolicyFromFile(filepath.Join(commonDir, ClonePreferencesFile))
 }
 
+const checkpointPushPolicyKey = "checkpoint_push_policy"
+
 // loadCheckpointPushPolicyFromFile reads only clone preferences, never through
 // Load: the push path treats a Load error as default settings, which would
 // turn a stored manual into automatic.
@@ -366,6 +368,13 @@ func loadCheckpointPushPolicyFromFile(path string) (CheckpointPushPolicy, error)
 	prefs, err := loadClonePreferencesFromFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read checkpoint push policy from %s: %w", path, err)
+	}
+	// A case variant of the key is kept as unknown, so reading past it would
+	// turn a stored manual into automatic.
+	for key := range prefs.unknown {
+		if strings.EqualFold(key, checkpointPushPolicyKey) {
+			return "", fmt.Errorf("read checkpoint push policy from %s: key %q must be spelled %q", path, key, checkpointPushPolicyKey)
+		}
 	}
 	policy, err := prefs.EffectiveCheckpointPushPolicy()
 	if err != nil {
