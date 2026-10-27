@@ -75,7 +75,9 @@ func ParseSession(commitMessage string) (string, bool) {
 	return "", false
 }
 
-// ParseCheckpoint extracts the checkpoint ID from a commit message.
+// ParseCheckpoint discovers the first checkpoint ID anywhere in a commit
+// message, squash history included. Code deciding which checkpoint to create,
+// join or write into reads only the last paragraph (strategy.LinkedCheckpoints).
 // Returns the CheckpointID and true if found, empty ID and false otherwise.
 func ParseCheckpoint(commitMessage string) (checkpointID.CheckpointID, bool) {
 	matches := checkpointTrailerRegex.FindStringSubmatch(commitMessage)
@@ -93,6 +95,7 @@ func ParseCheckpoint(commitMessage string) (checkpointID.CheckpointID, bool) {
 // Returns a slice of CheckpointIDs (may be empty if none found).
 // Duplicate IDs are deduplicated while preserving order.
 // This is useful for squash merge commits that contain multiple Entire-Checkpoint trailers.
+// Like ParseCheckpoint, it discovers IDs; it does not tell which one the commit links.
 func ParseAllCheckpoints(commitMessage string) []checkpointID.CheckpointID {
 	matches := checkpointTrailerRegex.FindAllStringSubmatch(commitMessage, -1)
 	if len(matches) == 0 {
@@ -110,6 +113,59 @@ func ParseAllCheckpoints(commitMessage string) []checkpointID.CheckpointID {
 					ids = append(ids, cpID)
 				}
 			}
+		}
+	}
+	return ids
+}
+
+// DefaultCommentPrefix is git's comment prefix when core.commentChar is unset.
+const DefaultCommentPrefix = "#"
+
+// checkpointLineRegex matches a line that starts with an Entire-Checkpoint
+// trailer, matched as ParseCheckpoint matches one.
+var checkpointLineRegex = regexp.MustCompile(`^` + CheckpointTrailerKey + `:\s*(` + checkpointID.CheckpointPattern + `)(?:\s|$)`)
+
+// ParseLastParagraphCheckpoints returns the checkpoint IDs of the lines that
+// start with an Entire-Checkpoint trailer in message's last paragraph,
+// deduplicated in order. Trailing blank lines and lines starting with
+// commentPrefix are skipped first (an empty commentPrefix skips none). The
+// subject paragraph never counts, and other lines in the paragraph are
+// ignored, so this reads some paragraphs as trailers that git's trailer
+// grammar would not.
+func ParseLastParagraphCheckpoints(message, commentPrefix string) []checkpointID.CheckpointID {
+	lines := strings.Split(message, "\n")
+	end := len(lines)
+	for end > 0 && (isBlankLine(lines[end-1]) || commentPrefix != "" && strings.HasPrefix(lines[end-1], commentPrefix)) {
+		end--
+	}
+	start := end
+	for start > 0 && !isBlankLine(lines[start-1]) {
+		start--
+	}
+	// Git ends the subject at the first blank line.
+	if start == 0 {
+		return nil
+	}
+	return checkpointsStartingLines(lines[start:end])
+}
+
+// ParseUnindentedCheckpoints returns the checkpoint IDs of every line in
+// message that starts with an Entire-Checkpoint trailer, deduplicated in
+// order. A squash message indents the squashed commits' trailers, which git
+// does not read as trailers.
+func ParseUnindentedCheckpoints(message string) []checkpointID.CheckpointID {
+	return checkpointsStartingLines(strings.Split(message, "\n"))
+}
+
+func checkpointsStartingLines(lines []string) []checkpointID.CheckpointID {
+	var ids []checkpointID.CheckpointID
+	for _, line := range lines {
+		match := checkpointLineRegex.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+		if cpID, err := checkpointID.NewCheckpointID(match[1]); err == nil && !slices.Contains(ids, cpID) {
+			ids = append(ids, cpID)
 		}
 	}
 	return ids

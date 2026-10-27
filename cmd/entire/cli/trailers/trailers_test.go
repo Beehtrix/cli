@@ -1,6 +1,7 @@
 package trailers
 
 import (
+	"slices"
 	"testing"
 
 	checkpointID "github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
@@ -495,4 +496,156 @@ func TestRemoveCheckpointTrailers(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseLastParagraphCheckpoints(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		message       string
+		commentPrefix string
+		want          []string
+	}{
+		{
+			name:    "trailer in the last paragraph",
+			message: "Add feature\n\nEntire-Checkpoint: a1b2c3d4e5f6\n",
+			want:    []string{"a1b2c3d4e5f6"},
+		},
+		{
+			name:    "body line above a later paragraph",
+			message: "Fix\n\nEntire-Checkpoint: a1b2c3d4e5f6\n\nSigned-off-by: Test User <test@example.com>\n",
+			want:    nil,
+		},
+		{
+			name:    "only the last paragraph counts",
+			message: "Fix\n\nEntire-Checkpoint: a1b2c3d4e5f6\n\nBody.\n\nEntire-Checkpoint: b2c3d4e5f6a1\n",
+			want:    []string{"b2c3d4e5f6a1"},
+		},
+		{
+			name:    "several deduplicated in order",
+			message: "Squash\n\nEntire-Checkpoint: a1b2c3d4e5f6\nEntire-Checkpoint: b2c3d4e5f6a1\nEntire-Checkpoint: a1b2c3d4e5f6\n",
+			want:    []string{"a1b2c3d4e5f6", "b2c3d4e5f6a1"},
+		},
+		{
+			name:    "other lines in the paragraph are ignored",
+			message: "Fix\n\nSigned-off-by: Test User <test@example.com>\nnot a trailer\nEntire-Checkpoint: a1b2c3d4e5f6\n",
+			want:    []string{"a1b2c3d4e5f6"},
+		},
+		{
+			name:    "indented line does not count",
+			message: "Fix\n\n  Entire-Checkpoint: a1b2c3d4e5f6\n",
+			want:    nil,
+		},
+		{
+			name:    "tab-indented line does not count",
+			message: "Fix\n\n\tEntire-Checkpoint: a1b2c3d4e5f6\n",
+			want:    nil,
+		},
+		{
+			name:    "mid-sentence mention does not count",
+			message: "Fix\n\nFollow-up to Entire-Checkpoint: a1b2c3d4e5f6 from last week.\n",
+			want:    nil,
+		},
+		{
+			name:    "text after the ID still links",
+			message: "Fix\n\nEntire-Checkpoint: a1b2c3d4e5f6 (from the agent)\n",
+			want:    []string{"a1b2c3d4e5f6"},
+		},
+		{
+			name:    "no space after the colon",
+			message: "Fix\n\nEntire-Checkpoint:a1b2c3d4e5f6\n",
+			want:    []string{"a1b2c3d4e5f6"},
+		},
+		{
+			name:    "longer ID-shaped value does not count",
+			message: "Fix\n\nEntire-Checkpoint: a1b2c3d4e5f6a1b2\n",
+			want:    nil,
+		},
+		{
+			name:    "subject paragraph never counts",
+			message: "Entire-Checkpoint: a1b2c3d4e5f6\n",
+			want:    nil,
+		},
+		{
+			name:          "comment lines do not lift a trailer out of the subject",
+			message:       "# note\nEntire-Checkpoint: a1b2c3d4e5f6\n",
+			commentPrefix: "#",
+			want:          nil,
+		},
+		{
+			name:    "leading blank lines leave an empty subject",
+			message: "\n\nEntire-Checkpoint: a1b2c3d4e5f6\n",
+			want:    []string{"a1b2c3d4e5f6"},
+		},
+		{
+			name:          "trailing comment lines and paragraphs are skipped",
+			message:       "Fix\n\nEntire-Checkpoint: a1b2c3d4e5f6\n# Remove the trailer above if you want.\n\n# Please enter the commit message.\n#\n",
+			commentPrefix: "#",
+			want:          []string{"a1b2c3d4e5f6"},
+		},
+		{
+			name:    "trailing comment lines count without a prefix",
+			message: "Fix\n\nEntire-Checkpoint: a1b2c3d4e5f6\n\n# Please enter the commit message.\n",
+			want:    nil,
+		},
+		{
+			name:          "configured prefix",
+			message:       "Fix\n\nEntire-Checkpoint: a1b2c3d4e5f6\n\n; Please enter the commit message.\n",
+			commentPrefix: ";",
+			want:          []string{"a1b2c3d4e5f6"},
+		},
+		{
+			name:          "another prefix's lines are content",
+			message:       "Fix\n\nEntire-Checkpoint: a1b2c3d4e5f6\n\n# Please enter the commit message.\n",
+			commentPrefix: ";",
+			want:          nil,
+		},
+		{
+			name:          "multi-character comment string",
+			message:       "Fix\n\nEntire-Checkpoint: a1b2c3d4e5f6\n\n// Please enter the commit message.\n",
+			commentPrefix: "//",
+			want:          []string{"a1b2c3d4e5f6"},
+		},
+		{
+			name:    "whitespace-only line separates paragraphs",
+			message: "Fix\n\nEntire-Checkpoint: a1b2c3d4e5f6\n   \nBody.\n",
+			want:    nil,
+		},
+		{
+			name:    "CRLF line endings",
+			message: "Fix\r\n\r\nEntire-Checkpoint: a1b2c3d4e5f6\r\n",
+			want:    []string{"a1b2c3d4e5f6"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := checkpointStrings(ParseLastParagraphCheckpoints(tt.message, tt.commentPrefix))
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("ParseLastParagraphCheckpoints(%q, %q) = %v, want %v", tt.message, tt.commentPrefix, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseUnindentedCheckpoints(t *testing.T) {
+	t.Parallel()
+
+	// git indents the squashed commits' messages in SQUASH_MSG.
+	message := "Squashed commit of the following:\n\ncommit 0123456789abcdef0123456789abcdef01234567\n\n    agent: feature\n    \n    Entire-Checkpoint: a1b2c3d4e5f6\n\nEntire-Checkpoint: b2c3d4e5f6a1\nSee Entire-Checkpoint: c3d4e5f6a1b2\n"
+	got := checkpointStrings(ParseUnindentedCheckpoints(message))
+	if want := []string{"b2c3d4e5f6a1"}; !slices.Equal(got, want) {
+		t.Errorf("ParseUnindentedCheckpoints() = %v, want %v", got, want)
+	}
+}
+
+func checkpointStrings(ids []checkpointID.CheckpointID) []string {
+	var out []string
+	for _, cpID := range ids {
+		out = append(out, cpID.String())
+	}
+	return out
 }
