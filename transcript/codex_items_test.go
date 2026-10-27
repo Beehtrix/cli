@@ -288,6 +288,34 @@ var codexKindCases = []codexKindCase{
 		}},
 	},
 	{
+		name:    "command, a non-shell program with a quoted argument",
+		rollout: `{"type":"CommandExecution","id":"e2","command":["grep","-c","two words","notes.txt"],"cwd":"file:///work/repo","status":"completed","aggregated_output":"1\n","exit_code":0}`,
+		daemon:  `{"type":"commandExecution","id":"e2","command":"grep -c 'two words' notes.txt","cwd":"/work/repo","status":"completed","aggregatedOutput":"1\n","exitCode":0}`,
+		want:    codexitem.Item{ID: "e2", Kind: codexitem.KindCommand, Status: codexitem.StatusCompleted, Command: "grep -c two words notes.txt", CWD: "/work/repo", Output: "1\n", ExitCode: codexIntp(0)},
+	},
+	{
+		name:    "command, a multi-line shell script the daemon quotes ANSI-C style",
+		rollout: `{"type":"CommandExecution","id":"e3","command":["/bin/bash","-lc","cat <<EOF\nit's\nEOF"],"cwd":"file:///work/repo","status":"completed","aggregated_output":"it's\n","exit_code":0}`,
+		daemon:  `{"type":"commandExecution","id":"e3","command":"/bin/bash -lc $'cat <<EOF\\nit\\'s\\nEOF'","cwd":"/work/repo","status":"completed","aggregatedOutput":"it's\n","exitCode":0}`,
+		want:    codexitem.Item{ID: "e3", Kind: codexitem.KindCommand, Status: codexitem.StatusCompleted, Command: "cat <<EOF\nit's\nEOF", CWD: "/work/repo", Output: "it's\n", ExitCode: codexIntp(0)},
+	},
+	{
+		// A daemon string shellWords can't split (an unterminated quote) is
+		// kept whole; the argv it stands for joins to the same text.
+		name:    "command the daemon string can't be split",
+		rollout: `{"type":"CommandExecution","id":"e4","command":["echo","'x"],"cwd":"file:///work/repo","status":"failed","aggregated_output":"","exit_code":2}`,
+		daemon:  `{"type":"commandExecution","id":"e4","command":"echo 'x","cwd":"/work/repo","status":"failed","aggregatedOutput":"","exitCode":2}`,
+		want:    codexitem.Item{ID: "e4", Kind: codexitem.KindCommand, Status: codexitem.StatusFailed, Command: "echo 'x", CWD: "/work/repo", ExitCode: codexIntp(2)},
+	},
+	{
+		name:    "fileChange delete",
+		rollout: `{"type":"FileChange","id":"f3","changes":{"/w/old.txt":{"type":"delete","content":"bye\n"}},"status":"completed"}`,
+		daemon:  `{"type":"fileChange","id":"f3","changes":[{"path":"/w/old.txt","kind":{"type":"delete"},"diff":"bye\n"}],"status":"completed"}`,
+		want: codexitem.Item{ID: "f3", Kind: codexitem.KindFileChange, Status: codexitem.StatusCompleted, Changes: []codexitem.Change{
+			{Path: "/w/old.txt", Kind: "delete", Diff: "bye\n"},
+		}},
+	},
+	{
 		name:    "fileChange update in place",
 		rollout: `{"type":"FileChange","id":"f2","changes":{"/w/b.go":{"type":"update","unified_diff":"@@ -1 +1 @@\n-a\n+b\n","move_path":null}},"status":"completed"}`,
 		daemon:  `{"type":"fileChange","id":"f2","changes":[{"path":"/w/b.go","kind":{"type":"update","move_path":null},"diff":"@@ -1 +1 @@\n-a\n+b\n"}],"status":"completed"}`,

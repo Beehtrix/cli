@@ -137,8 +137,10 @@ func decodeRolloutBody(it *Item, head rolloutItem, raw json.RawMessage) bool {
 		it.Kind, it.Status = KindFileChange, status(f.Status, StatusCompleted)
 		changes := make([]Change, 0, len(f.Changes))
 		for path, c := range f.Changes {
+			// An added or deleted file's text is in content, as the
+			// app-server's diff has it; an update has a unified diff.
 			diff := c.UnifiedDiff
-			if c.Type == "add" {
+			if c.Type == "add" || c.Type == "delete" {
 				diff = c.Content
 			}
 			changes = append(changes, Change{Path: path, Kind: c.Type, MovePath: c.MovePath, Diff: diff})

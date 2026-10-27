@@ -43,7 +43,7 @@ type Change struct {
 	Path     string
 	Kind     string // add, delete, update
 	MovePath string // update with a move
-	Diff     string // the unified diff; for add, the file's content
+	Diff     string // the unified diff; for add and delete, the file's content
 }
 
 // Item is a decoded Codex item. Only the fields of its Kind are set.

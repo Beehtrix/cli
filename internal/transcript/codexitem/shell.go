@@ -8,9 +8,10 @@ import (
 
 // scriptOfArgv and scriptOfString give the script of a command run as
 // `<shell> -lc <script>` or `<shell> -c <script>`, from the rollout's argv or
-// the daemon's string (which quotes the script as a shell word). Anything else
-// is returned whole (argv joined with spaces), including a -c of a program
-// that isn't a shell (grep -c).
+// the daemon's string (which quotes its words as a shell does). Anything else,
+// including a -c of a program that isn't a shell (grep -c), is its words
+// joined with spaces, so both encodings read the same. A daemon string that
+// shellWords can't split is returned whole.
 func scriptOfArgv(argv []string) string {
 	if len(argv) == 3 && isShell(argv[0]) && (argv[1] == "-lc" || argv[1] == "-c") {
 		return argv[2]
@@ -20,10 +21,10 @@ func scriptOfArgv(argv []string) string {
 
 func scriptOfString(cmd string) string {
 	words, ok := shellWords(cmd)
-	if ok && len(words) == 3 && isShell(words[0]) && (words[1] == "-lc" || words[1] == "-c") {
-		return words[2]
+	if !ok {
+		return cmd
 	}
-	return cmd
+	return scriptOfArgv(words)
 }
 
 // isShell reports whether program is a shell whose -c takes a script.
