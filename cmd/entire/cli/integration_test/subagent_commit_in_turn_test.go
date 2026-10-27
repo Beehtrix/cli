@@ -10,6 +10,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/session"
+	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
 
 // TestSubagentCheckpoints_CommittedMidTurn_LeavesNothingPending reproduces the
@@ -197,6 +198,223 @@ func TestSubagentCheckpoints_CommittedMidTurn_SkipsParallelReadOnlySubagent(t *t
 		CheckpointTaskFilePath(checkpointID, readerToolUseID, "task.json")); ok {
 		t.Errorf("read-only subagent %s was attached to a commit it did not make", readerToolUseID)
 	}
+}
+
+// TestSubagentCheckpoints_CommittedMidTurn_OverlappingCommittersKeepOwnCheckpoints
+// pins that two foreground subagents running together, each committing its own
+// file, are each stored in the checkpoint of their own commit, not both in the
+// newest one.
+func TestSubagentCheckpoints_CommittedMidTurn_OverlappingCommittersKeepOwnCheckpoints(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	session := env.NewSession()
+	session.CreateTranscript("run two subagents that each write and commit one file", nil)
+
+	const (
+		firstToolUseID  = "toolu_01OverlapFirst"
+		firstID         = "a4455667788990011"
+		firstFile       = "docs/first.md"
+		secondToolUseID = "toolu_01OverlapSecond"
+		secondID        = "a5566778899001122"
+		secondFile      = "docs/second.md"
+	)
+	session.CreateSubagentTranscript(firstID, []FileChange{{Path: firstFile, Content: "First.\n"}})
+	session.CreateSubagentTranscript(secondID, []FileChange{{Path: secondFile, Content: "Second.\n"}})
+
+	if err := env.SimulateUserPromptSubmitWithTranscriptPath(session.ID, session.TranscriptPath); err != nil {
+		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	}
+	for _, toolUseID := range []string{firstToolUseID, secondToolUseID} {
+		if err := env.SimulatePreTask(session.ID, session.TranscriptPath, toolUseID); err != nil {
+			t.Fatalf("SimulatePreTask(%s) failed: %v", toolUseID, err)
+		}
+	}
+
+	env.WriteFile(firstFile, "First.\n")
+	env.GitCommitWithHooksAsAgent("Add first.md", firstFile)
+	firstCheckpointID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
+	env.WriteFile(secondFile, "Second.\n")
+	env.GitCommitWithHooksAsAgent("Add second.md", secondFile)
+	secondCheckpointID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
+	if firstCheckpointID == "" || secondCheckpointID == "" || firstCheckpointID == secondCheckpointID {
+		t.Fatalf("precondition: each commit should get its own checkpoint, got %q and %q", firstCheckpointID, secondCheckpointID)
+	}
+
+	for _, input := range []PostTaskInput{
+		{SessionID: session.ID, TranscriptPath: session.TranscriptPath, ToolUseID: firstToolUseID, AgentID: firstID},
+		{SessionID: session.ID, TranscriptPath: session.TranscriptPath, ToolUseID: secondToolUseID, AgentID: secondID},
+	} {
+		if err := env.SimulatePostTask(input); err != nil {
+			t.Fatalf("SimulatePostTask(%s) failed: %v", input.ToolUseID, err)
+		}
+	}
+
+	assertTaskTranscriptInCheckpoint(t, env, firstCheckpointID, firstToolUseID, firstID, firstFile)
+	assertTaskTranscriptInCheckpoint(t, env, secondCheckpointID, secondToolUseID, secondID, secondFile)
+	for _, misplaced := range []struct{ checkpointID, toolUseID string }{
+		{firstCheckpointID, secondToolUseID},
+		{secondCheckpointID, firstToolUseID},
+	} {
+		if _, ok := env.ReadFileFromBranch(paths.MetadataBranchName,
+			CheckpointTaskFilePath(misplaced.checkpointID, misplaced.toolUseID, "task.json")); ok {
+			t.Errorf("checkpoint %s received task %s from the other subagent's commit", misplaced.checkpointID, misplaced.toolUseID)
+		}
+	}
+}
+
+// TestSubagentCheckpoints_CommittedMidTurn_AmendKeepsTask pins that a subagent
+// amending a commit made before it started still gets its task stored: the
+// amend keeps the commit's checkpoint ID, so the turn's checkpoint list repeats
+// an ID that was already there at the task's start.
+func TestSubagentCheckpoints_CommittedMidTurn_AmendKeepsTask(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	session := env.NewSession()
+
+	const (
+		taskToolUseID = "toolu_01AmendParentCommit"
+		subagentID    = "a6677889900112233"
+		parentFile    = "docs/parent.md"
+		subagentFile  = "docs/amended.md"
+	)
+	session.CreateTranscript("write docs/parent.md and commit, then have a subagent amend that commit",
+		[]FileChange{{Path: parentFile, Content: "Parent.\n"}})
+	session.CreateSubagentTranscript(subagentID, []FileChange{{Path: subagentFile, Content: "Amended.\n"}})
+
+	if err := env.SimulateUserPromptSubmitWithTranscriptPath(session.ID, session.TranscriptPath); err != nil {
+		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	}
+	env.WriteFile(parentFile, "Parent.\n")
+	env.GitCommitWithHooksAsAgent("Add parent.md", parentFile)
+	checkpointID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
+	if checkpointID == "" {
+		t.Fatal("precondition: the parent's commit should carry an Entire-Checkpoint trailer")
+	}
+
+	if err := env.SimulatePreTask(session.ID, session.TranscriptPath, taskToolUseID); err != nil {
+		t.Fatalf("SimulatePreTask failed: %v", err)
+	}
+	env.WriteFile(subagentFile, "Amended.\n")
+	env.GitCommitAmendWithHooks(testutil.RunGit(t, env.RepoDir, "log", "-1", "--format=%B"), subagentFile)
+	if amended := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash()); amended != checkpointID {
+		t.Fatalf("precondition: the amend should keep checkpoint %s, got %q", checkpointID, amended)
+	}
+	if state, err := env.GetSessionState(session.ID); err != nil || state == nil ||
+		len(state.TurnCheckpointIDs) != 2 || state.TurnCheckpointIDs[1] != checkpointID {
+		t.Fatalf("precondition: the amend should condense %s again, got state=%+v err=%v", checkpointID, state, err)
+	}
+
+	if err := env.SimulatePostTask(PostTaskInput{
+		SessionID:      session.ID,
+		TranscriptPath: session.TranscriptPath,
+		ToolUseID:      taskToolUseID,
+		AgentID:        subagentID,
+	}); err != nil {
+		t.Fatalf("SimulatePostTask failed: %v", err)
+	}
+
+	assertTaskTranscriptInCheckpoint(t, env, checkpointID, taskToolUseID, subagentID, subagentFile)
+}
+
+// TestSubagentCheckpoints_CommittedMidTurn_RetriesFailedAttachAtTurnEnd pins
+// that a task whose write into its commit's checkpoint fails at post-task is
+// kept and written at turn end, not lost.
+func TestSubagentCheckpoints_CommittedMidTurn_RetriesFailedAttachAtTurnEnd(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	session, checkpointID := subagentCommitWithUnavailableStore(t, env, "toolu_01RetryAtTurnEnd", "a7788990011223344", "docs/retry.md")
+
+	state, err := env.GetSessionState(session.ID)
+	if err != nil || state == nil || len(state.PendingTaskAttachments) != 1 {
+		t.Fatalf("a failed write should leave one pending attachment, got state=%+v err=%v", state, err)
+	}
+	if containsFile(state.FilesTouched, "docs/retry.md") || state.FindTaskRecord("toolu_01RetryAtTurnEnd") != nil {
+		t.Fatalf("a pending attachment must not become pending work for a later commit: %+v", state)
+	}
+
+	restoreCheckpointBranch(t, env)
+	if err := env.SimulateStop(session.ID, session.TranscriptPath); err != nil {
+		t.Fatalf("SimulateStop failed: %v", err)
+	}
+
+	assertTaskTranscriptInCheckpoint(t, env, checkpointID, "toolu_01RetryAtTurnEnd", "a7788990011223344", "docs/retry.md")
+	if state, err := env.GetSessionState(session.ID); err != nil || state == nil || len(state.PendingTaskAttachments) != 0 {
+		t.Errorf("turn end should clear a delivered attachment, got state=%+v err=%v", state, err)
+	}
+}
+
+// TestSubagentCheckpoints_CommittedMidTurn_GivesUpAfterRepeatedTurnEndFailures
+// pins that an attachment whose write keeps failing is dropped after a bounded
+// number of turn ends instead of being retried forever.
+func TestSubagentCheckpoints_CommittedMidTurn_GivesUpAfterRepeatedTurnEndFailures(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	session, _ := subagentCommitWithUnavailableStore(t, env, "toolu_01GivesUp", "a8899001122334455", "docs/gives-up.md")
+
+	for turn := 1; turn <= 3; turn++ {
+		if turn > 1 {
+			if err := env.SimulateUserPromptSubmitWithTranscriptPath(session.ID, session.TranscriptPath); err != nil {
+				t.Fatalf("SimulateUserPromptSubmit (turn %d) failed: %v", turn, err)
+			}
+		}
+		if err := env.SimulateStop(session.ID, session.TranscriptPath); err != nil {
+			t.Fatalf("SimulateStop (turn %d) failed: %v", turn, err)
+		}
+		state, err := env.GetSessionState(session.ID)
+		if err != nil || state == nil {
+			t.Fatalf("GetSessionState (turn %d) failed: state=%+v err=%v", turn, state, err)
+		}
+		if want := turn < 3; (len(state.PendingTaskAttachments) == 1) != want {
+			t.Fatalf("after %d failed turn-end retries, pending attachment kept = %v, want %v",
+				turn, len(state.PendingTaskAttachments) == 1, want)
+		}
+	}
+	restoreCheckpointBranch(t, env)
+}
+
+// subagentCommitWithUnavailableStore runs a foreground subagent that commits
+// its own file while the checkpoint store becomes unavailable before its
+// post-task, so the write into the commit's checkpoint fails. The store stays
+// unavailable until restoreCheckpointBranch.
+func subagentCommitWithUnavailableStore(t *testing.T, env *TestEnv, toolUseID, agentID, file string) (*Session, string) {
+	t.Helper()
+	session := env.NewSession()
+	session.CreateTranscript("use a subagent to write "+file+" and commit it", nil)
+	session.CreateSubagentTranscript(agentID, []FileChange{{Path: file, Content: "Written.\n"}})
+
+	if err := env.SimulateUserPromptSubmitWithTranscriptPath(session.ID, session.TranscriptPath); err != nil {
+		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	}
+	if err := env.SimulatePreTask(session.ID, session.TranscriptPath, toolUseID); err != nil {
+		t.Fatalf("SimulatePreTask failed: %v", err)
+	}
+	env.WriteFile(file, "Written.\n")
+	env.GitCommitWithHooksAsAgent("Add "+file, file)
+	checkpointID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
+	if checkpointID == "" {
+		t.Fatal("precondition: the subagent's commit should carry an Entire-Checkpoint trailer")
+	}
+
+	testutil.RunGit(t, env.RepoDir, "update-ref", hiddenCheckpointRef, "refs/heads/"+paths.MetadataBranchName)
+	testutil.RunGit(t, env.RepoDir, "update-ref", "-d", "refs/heads/"+paths.MetadataBranchName)
+	if err := env.SimulatePostTask(PostTaskInput{
+		SessionID:      session.ID,
+		TranscriptPath: session.TranscriptPath,
+		ToolUseID:      toolUseID,
+		AgentID:        agentID,
+	}); err != nil {
+		t.Fatalf("SimulatePostTask failed: %v", err)
+	}
+	return session, checkpointID
+}
+
+const hiddenCheckpointRef = "refs/hidden/checkpoints"
+
+// restoreCheckpointBranch undoes subagentCommitWithUnavailableStore's hiding.
+func restoreCheckpointBranch(t *testing.T, env *TestEnv) {
+	t.Helper()
+	testutil.RunGit(t, env.RepoDir, "update-ref", "refs/heads/"+paths.MetadataBranchName, hiddenCheckpointRef)
+	testutil.RunGit(t, env.RepoDir, "update-ref", "-d", hiddenCheckpointRef)
 }
 
 // assertTaskTranscriptInCheckpoint fails unless checkpointID stores the task's

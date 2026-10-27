@@ -2480,14 +2480,16 @@ func subagentTaskRecord(logCtx context.Context, ag agent.Agent, event *agent.Eve
 }
 
 // attachTaskToCommitCheckpoint stores a foreground subagent's record in the
-// checkpoint of a commit made while it ran, and reports whether it did. That
-// commit condensed the session before the record existed, and it left nothing
-// uncommitted for a later commit to carry, so this is the record's only chance.
+// checkpoint of its own commit made while it ran, and reports whether it took
+// the record. That commit condensed the session before the record existed, and
+// it left nothing uncommitted for a later commit to carry.
 //
 // committedFiles are the files the subagent wrote that HEAD now has. A
 // subagent with none, such as a read-only one running alongside the committer,
-// is not attributed to that commit. When several commits landed during the
-// run, the record goes to the last one.
+// is not attributed to any commit. Among the checkpoints condensed during the
+// run, the record goes to the newest whose commit carries one of those files.
+// When the write fails, the record waits in session state for turn end to
+// retry it.
 func attachTaskToCommitCheckpoint(
 	logCtx context.Context,
 	ag agent.Agent,
@@ -2504,41 +2506,60 @@ func attachTaskToCommitCheckpoint(
 	if err != nil || state == nil {
 		return false
 	}
-	checkpointID, ok := lastCheckpointSince(preState.TurnCheckpointIDs, state.TurnCheckpointIDs)
-	if !ok {
+	candidates := checkpointsCondensedSince(preState.TurnCheckpointIDs, state.TurnCheckpointIDs)
+	strat := GetStrategy(logCtx)
+	checkpointID := strat.TaskCheckpointForFiles(logCtx, candidates, committedFiles)
+	if checkpointID.IsEmpty() {
 		return false
 	}
 	rec := subagentTaskRecord(logCtx, ag, event, opts.background, transcriptPath, committedFiles)
 	rec.CompletedAt = time.Now()
-	if err := GetStrategy(logCtx).AttachTaskToCheckpoint(logCtx, ag, event.SessionID, rec, checkpointID); err != nil {
-		logging.Warn(logCtx, "failed to add task record to the checkpoint of the subagent's commit",
-			slog.String("session_id", event.SessionID),
-			slog.String("tool_use_id", event.ToolUseID),
-			slog.String("checkpoint_id", checkpointID.String()),
-			slog.String("error", err.Error()))
-		return false
-	}
-	logging.Info(logCtx, "subagent committed its own work; added task record to that commit's checkpoint",
+	attrs := []any{
 		slog.String("session_id", event.SessionID),
 		slog.String("tool_use_id", event.ToolUseID),
-		slog.String("checkpoint_id", checkpointID.String()))
+		slog.String("checkpoint_id", checkpointID.String()),
+	}
+	err = strat.AttachTaskToCheckpoint(logCtx, ag, state, rec, checkpointID)
+	if err == nil {
+		logging.Info(logCtx, "subagent committed its own work; added task record to that commit's checkpoint", attrs...)
+		return true
+	}
+	if errors.Is(err, strategy.ErrTaskNotStorable) {
+		return false
+	}
+	logging.Warn(logCtx, "failed to add task record to the checkpoint of the subagent's commit; will retry at turn end",
+		append(attrs, slog.String("error", err.Error()))...)
+	if mutErr := strategy.MutateSessionState(logCtx, event.SessionID, func(st *strategy.SessionState) error {
+		st.PendingTaskAttachments = append(st.PendingTaskAttachments, session.TaskAttachment{
+			CheckpointID: checkpointID.String(),
+			Record:       rec,
+		})
+		return nil
+	}); mutErr != nil {
+		logging.Warn(logCtx, "failed to keep task record for retry", append(attrs, slog.String("error", mutErr.Error()))...)
+		return false
+	}
 	return true
 }
 
-// lastCheckpointSince returns the newest checkpoint in current that is not in
-// atStart.
-func lastCheckpointSince(atStart, current []string) (id.CheckpointID, bool) {
-	for i := len(current) - 1; i >= 0; i-- {
-		if slices.Contains(atStart, current[i]) {
-			continue
-		}
-		checkpointID, err := id.NewCheckpointID(current[i])
-		if err != nil {
-			continue
-		}
-		return checkpointID, true
+// checkpointsCondensedSince returns the checkpoints condensed after atStart was
+// captured, newest first. The turn's list only grows while a foreground task
+// runs, so they are its entries past atStart. An amend condenses into its
+// commit's existing checkpoint and appends that ID again, so a repeated ID
+// counts. A list that no longer extends atStart was reset, and yields none.
+func checkpointsCondensedSince(atStart, current []string) []id.CheckpointID {
+	if len(current) <= len(atStart) || !slices.Equal(current[:len(atStart)], atStart) {
+		return nil
 	}
-	return id.EmptyCheckpointID, false
+	var condensed []id.CheckpointID
+	for i := len(current) - 1; i >= len(atStart); i-- {
+		checkpointID, err := id.NewCheckpointID(current[i])
+		if err != nil || slices.Contains(condensed, checkpointID) {
+			continue
+		}
+		condensed = append(condensed, checkpointID)
+	}
+	return condensed
 }
 
 // withoutFiles returns the files in all that are not in remove.

@@ -459,42 +459,34 @@ func taskPayload(
 	return payload, taskAssets, true
 }
 
+// ErrTaskNotStorable reports a task record whose identity cannot be stored, so
+// writing it can never succeed.
+var ErrTaskNotStorable = errors.New("task record has no storable identity")
+
 // AttachTaskToCheckpoint stores a completed task record directly in an
 // existing checkpoint, for a foreground subagent whose own commit condensed the
-// session before its record existed. The record never enters session state:
-// the checkpoint already holds it, so no later commit has anything to claim.
+// session before its record existed. The record never enters state.TaskRecords:
+// the checkpoint holds it, so no later commit has anything to claim.
 //
 // Images stay inline in the stored transcript, as they do whenever image
 // externalization is off: a checkpoint's assets belong to its session, and
 // turn-end replaces them when it rewrites that session.
-func (s *ManualCommitStrategy) AttachTaskToCheckpoint(ctx context.Context, ag agent.Agent, sessionID string, record session.TaskRecord, checkpointID id.CheckpointID) error {
+func (s *ManualCommitStrategy) AttachTaskToCheckpoint(ctx context.Context, ag agent.Agent, state *SessionState, record session.TaskRecord, checkpointID id.CheckpointID) error {
 	logCtx := logging.WithComponent(ctx, "checkpoint")
-	state, err := LoadSessionState(ctx, sessionID)
-	if err != nil {
-		return fmt.Errorf("load session state: %w", err)
-	}
-	if state == nil {
-		return ErrStateNotFound
-	}
-
 	ctx = agent.WithSubagentFetchBudget(ctx, agent.SubagentFetchBudget)
 	scoped := *state
 	scoped.TaskRecords = []session.TaskRecord{record}
 	inventoryPath := resolveInventoryTaskTranscripts(ctx, ag, &scoped)[record.AgentID]
 	payload, _, ok := taskPayload(ctx, logCtx, ag, state, record, inventoryPath, false)
 	if !ok {
-		return errors.New("task record has no storable identity")
+		return ErrTaskNotStorable
 	}
 
-	repo, err := OpenRepository(ctx)
+	stores, closeRepo, err := s.openHookStores(ctx)
 	if err != nil {
 		return err
 	}
-	defer repo.Close()
-	stores, err := cpkg.Open(ctx, repo, s.hookCheckpointStoreOptions(ctx))
-	if err != nil {
-		return fmt.Errorf("open checkpoint store: %w", err)
-	}
+	defer closeRepo()
 	if err := stores.Persistent.Write(ctx, cpkg.Tasks{
 		CheckpointID: checkpointID,
 		Tasks:        []cpkg.TaskPayload{payload},
@@ -502,6 +494,99 @@ func (s *ManualCommitStrategy) AttachTaskToCheckpoint(ctx context.Context, ag ag
 		return fmt.Errorf("add task to checkpoint %s: %w", checkpointID, err)
 	}
 	return nil
+}
+
+// TaskCheckpointForFiles picks which of candidates, newest first, holds a
+// commit carrying any of files: the first whose stored files touched include
+// one. When none matches and every candidate was readable, it returns the empty
+// ID. A candidate it cannot read could be the match, so then it returns the
+// newest candidate rather than drop the task.
+func (s *ManualCommitStrategy) TaskCheckpointForFiles(ctx context.Context, candidates []id.CheckpointID, files []string) id.CheckpointID {
+	if len(candidates) == 0 {
+		return id.EmptyCheckpointID
+	}
+	stores, closeRepo, err := s.openHookStores(ctx)
+	if err != nil {
+		return candidates[0]
+	}
+	defer closeRepo()
+	unreadable := false
+	for _, candidate := range candidates {
+		summary, err := cpkg.ReadCheckpoint(ctx, stores.Persistent, candidate)
+		if err != nil || summary == nil {
+			unreadable = true
+			continue
+		}
+		if slices.ContainsFunc(summary.FilesTouched, func(f string) bool { return slices.Contains(files, f) }) {
+			return candidate
+		}
+	}
+	if unreadable {
+		return candidates[0]
+	}
+	return id.EmptyCheckpointID
+}
+
+// maxTaskAttachmentRetries bounds how many turn ends retry a pending task
+// attachment before it is dropped.
+const maxTaskAttachmentRetries = 3
+
+// retryPendingTaskAttachments writes each pending task attachment into its
+// checkpoint, keeping the ones that fail until maxTaskAttachmentRetries turn
+// ends have failed too.
+func (s *ManualCommitStrategy) retryPendingTaskAttachments(ctx context.Context, state *SessionState) {
+	if len(state.PendingTaskAttachments) == 0 {
+		return
+	}
+	logCtx := logging.WithComponent(ctx, "checkpoint")
+	ag, err := agent.GetByAgentType(state.AgentType)
+	if err != nil {
+		logging.Warn(logCtx, "cannot retry pending task attachments: unknown agent",
+			slog.String("session_id", state.SessionID),
+			slog.String("error", err.Error()))
+		return
+	}
+	var kept []session.TaskAttachment
+	for _, attachment := range state.PendingTaskAttachments {
+		attrs := []any{
+			slog.String("session_id", state.SessionID),
+			slog.String("tool_use_id", attachment.Record.ToolUseID),
+			slog.String("checkpoint_id", attachment.CheckpointID),
+		}
+		checkpointID, err := id.NewCheckpointID(attachment.CheckpointID)
+		if err == nil {
+			err = s.AttachTaskToCheckpoint(ctx, ag, state, attachment.Record, checkpointID)
+		}
+		if err == nil {
+			logging.Info(logCtx, "added pending task record to its checkpoint", attrs...)
+			continue
+		}
+		attachment.FailedRetries++
+		if errors.Is(err, ErrTaskNotStorable) || attachment.FailedRetries >= maxTaskAttachmentRetries {
+			logging.Warn(logCtx, "dropping task record that could not be added to its checkpoint",
+				append(attrs, slog.Int("failed_retries", attachment.FailedRetries), slog.String("error", err.Error()))...)
+			continue
+		}
+		logging.Warn(logCtx, "task record still not added to its checkpoint; will retry at the next turn end",
+			append(attrs, slog.Int("failed_retries", attachment.FailedRetries), slog.String("error", err.Error()))...)
+		kept = append(kept, attachment)
+	}
+	state.PendingTaskAttachments = kept
+}
+
+// openHookStores opens the checkpoint store with the git-hook envelope. The
+// returned func closes the repository.
+func (s *ManualCommitStrategy) openHookStores(ctx context.Context) (*cpkg.Stores, func(), error) {
+	repo, err := OpenRepository(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	stores, err := cpkg.Open(ctx, repo, s.hookCheckpointStoreOptions(ctx))
+	if err != nil {
+		_ = repo.Close()
+		return nil, nil, fmt.Errorf("open checkpoint store: %w", err)
+	}
+	return stores, func() { _ = repo.Close() }, nil
 }
 
 // readTaskTranscript reads a task record's transcript: the agent-declared
