@@ -36,6 +36,18 @@ if [ -z "$tests" ]; then
   exit 1
 fi
 
+# Fail if any test escapes the enumeration.
+enumerated="$(printf '%s\n' "$tests" | wc -l | tr -d ' ')"
+declared="$(
+  find e2e/tests -name '*_test.go' -exec grep -h '^func Test' {} + |
+    grep -cv '^func TestMain('
+)"
+if [ "$enumerated" -ne "$declared" ]; then
+  echo "error: enumerated $enumerated canary tests, but e2e/tests declares $declared" >&2
+  echo "Use (t *testing.T) and keep tests in e2e/tests itself." >&2
+  exit 1
+fi
+
 # Round-robin, so every test lands in one shard.
 selected="$(printf '%s\n' "$tests" | awk -v s="$shard" -v n="$total" '(NR - 1) % n == s - 1')"
 
