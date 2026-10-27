@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -297,6 +298,80 @@ type ClonePreferences struct {
 	TrailsAgentHelpFailureRepoKey  string     `json:"trails_agent_help_failure_repo_key,omitempty"`
 	TrailsAgentHelpFailureAPIBase  string     `json:"trails_agent_help_failure_api_base,omitempty"`
 	TrailsAgentHelpFailureAuthKey  string     `json:"trails_agent_help_failure_auth_key,omitempty"`
+
+	// CheckpointPushPolicy decides whether checkpoints upload on git push or
+	// only through `entire checkpoint push`. Clone preferences rather than
+	// settings.local.json because the push queue is shared by every worktree,
+	// and a committed file must never be able to loosen it. Read it through
+	// EffectiveCheckpointPushPolicy, which rejects values this binary does not
+	// recognize instead of treating them as automatic.
+	CheckpointPushPolicy CheckpointPushPolicy `json:"checkpoint_push_policy,omitempty"`
+
+	// unknown holds keys this binary does not model, written back unchanged so
+	// a rewrite by one version does not delete another version's preferences.
+	unknown map[string]json.RawMessage
+}
+
+// CheckpointPushPolicy is the clone's choice of when checkpoints upload.
+type CheckpointPushPolicy string
+
+const (
+	// CheckpointPushPolicyAutomatic uploads queued checkpoints on git push.
+	CheckpointPushPolicyAutomatic CheckpointPushPolicy = "automatic"
+	// CheckpointPushPolicyManual uploads only what `entire checkpoint push` names.
+	CheckpointPushPolicyManual CheckpointPushPolicy = "manual"
+)
+
+// ParseCheckpointPushPolicy accepts exactly "automatic" or "manual".
+func ParseCheckpointPushPolicy(value string) (CheckpointPushPolicy, error) {
+	switch policy := CheckpointPushPolicy(value); policy {
+	case CheckpointPushPolicyAutomatic, CheckpointPushPolicyManual:
+		return policy, nil
+	default:
+		return "", fmt.Errorf("checkpoint push policy %q is not one of %q, %q",
+			value, CheckpointPushPolicyAutomatic, CheckpointPushPolicyManual)
+	}
+}
+
+// EffectiveCheckpointPushPolicy returns the stored policy, with an unset one
+// meaning automatic. An unrecognized value is an error so callers can fail
+// closed: it may be a stricter policy written by a newer binary.
+func (p *ClonePreferences) EffectiveCheckpointPushPolicy() (CheckpointPushPolicy, error) {
+	if p == nil || p.CheckpointPushPolicy == "" {
+		return CheckpointPushPolicyAutomatic, nil
+	}
+	return ParseCheckpointPushPolicy(string(p.CheckpointPushPolicy))
+}
+
+// LoadCheckpointPushPolicy reads the policy of the clone ctx resolves to.
+func LoadCheckpointPushPolicy(ctx context.Context) (CheckpointPushPolicy, error) {
+	path, err := ClonePreferencesPath(ctx)
+	if err != nil {
+		return "", fmt.Errorf("read checkpoint push policy: %w", err)
+	}
+	return loadCheckpointPushPolicyFromFile(path)
+}
+
+// LoadCheckpointPushPolicyAt reads the policy of the clone whose git common
+// dir is commonDir, for callers holding an opened repository rather than a
+// process directory to resolve from.
+func LoadCheckpointPushPolicyAt(commonDir string) (CheckpointPushPolicy, error) {
+	return loadCheckpointPushPolicyFromFile(filepath.Join(commonDir, ClonePreferencesFile))
+}
+
+// loadCheckpointPushPolicyFromFile reads only clone preferences, never through
+// Load: the push path treats a Load error as default settings, which would
+// turn a stored manual into automatic.
+func loadCheckpointPushPolicyFromFile(path string) (CheckpointPushPolicy, error) {
+	prefs, err := loadClonePreferencesFromFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read checkpoint push policy from %s: %w", path, err)
+	}
+	policy, err := prefs.EffectiveCheckpointPushPolicy()
+	if err != nil {
+		return "", fmt.Errorf("read checkpoint push policy from %s: %w", path, err)
+	}
+	return policy, nil
 }
 
 // SummaryGenerationSettings configures provider selection for on-demand
@@ -1183,17 +1258,57 @@ func loadClonePreferencesFromFile(filePath string) (*ClonePreferences, error) {
 	//      typo-silently-ignored downside is theoretical here.
 	// EntireSettings stays strict because it's committed and team-edited,
 	// where unknown keys usually mean typos worth surfacing immediately.
-	if err := json.Unmarshal(data, prefs); err != nil {
+	//
+	// Unknown keys are kept, not dropped, so saving them back is lossless.
+	// Only exact known keys reach the struct: encoding/json matches field
+	// names case-insensitively, so decoding the whole object would let a case
+	// variant set a field and also be kept as unknown.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parsing preferences file: %w", err)
+	}
+	knownKeys := clonePreferencesJSONKeys()
+	known := make(map[string]json.RawMessage, len(raw))
+	for key, value := range raw {
+		if _, ok := knownKeys[key]; ok {
+			known[key] = value
+			continue
+		}
+		if prefs.unknown == nil {
+			prefs.unknown = make(map[string]json.RawMessage)
+		}
+		prefs.unknown[key] = value
+	}
+	knownData, err := json.Marshal(known)
+	if err != nil {
+		return nil, fmt.Errorf("parsing preferences file: %w", err)
+	}
+	if err := json.Unmarshal(knownData, prefs); err != nil {
 		return nil, fmt.Errorf("parsing preferences file: %w", err)
 	}
 	return prefs, nil
+}
+
+// clonePreferencesJSONKeys returns the JSON key of every ClonePreferences
+// field, so a new field is recognized without a second list to update.
+func clonePreferencesJSONKeys() map[string]struct{} {
+	t := reflect.TypeFor[ClonePreferences]()
+	keys := make(map[string]struct{}, t.NumField())
+	for field := range t.Fields() {
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if !field.IsExported() || name == "" || name == "-" {
+			continue
+		}
+		keys[name] = struct{}{}
+	}
+	return keys
 }
 
 func saveClonePreferencesToFile(prefs *ClonePreferences, filePath string) error {
 	if prefs == nil {
 		prefs = &ClonePreferences{}
 	}
-	data, err := jsonutil.MarshalIndentWithNewline(prefs, "", "  ")
+	data, err := marshalClonePreferences(prefs)
 	if err != nil {
 		return fmt.Errorf("marshaling preferences: %w", err)
 	}
@@ -1202,6 +1317,31 @@ func saveClonePreferencesToFile(prefs *ClonePreferences, filePath string) error 
 		return fmt.Errorf("writing preferences file: %w", err)
 	}
 	return nil
+}
+
+// marshalClonePreferences writes the modeled fields and then the unknown keys
+// loaded with them. A modeled key always wins, so a field this binary cleared
+// is not brought back from the preserved keys.
+func marshalClonePreferences(prefs *ClonePreferences) ([]byte, error) {
+	if len(prefs.unknown) == 0 {
+		return jsonutil.MarshalIndentWithNewline(prefs, "", "  ") //nolint:wrapcheck // caller wraps
+	}
+	modeled, err := json.Marshal(prefs)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // caller wraps
+	}
+	merged := make(map[string]json.RawMessage, len(prefs.unknown))
+	if err := json.Unmarshal(modeled, &merged); err != nil {
+		return nil, err //nolint:wrapcheck // caller wraps
+	}
+	knownKeys := clonePreferencesJSONKeys()
+	for key, value := range prefs.unknown {
+		if _, ok := knownKeys[key]; ok {
+			continue
+		}
+		merged[key] = value
+	}
+	return jsonutil.MarshalIndentWithNewline(merged, "", "  ") //nolint:wrapcheck // caller wraps
 }
 
 // mergeReviewProfiles overlays src review profiles onto base by name, returning

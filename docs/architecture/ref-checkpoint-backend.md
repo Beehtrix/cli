@@ -102,7 +102,7 @@ Rewrites are atomic (temp file + rename under the lock) so a concurrent reader n
 `ManualCommitStrategy.PrePush` (`strategy/manual_commit_push.go`) branches on `checkpoint.PrimaryIsRefs(cfg)`. When the primary is git-refs it:
 
 1. **Drains** the queue (`DrainEntries`).
-2. **Partitions** the entries by reading each ref's current tip: refs that exist locally are ready to push at that tip, stale ones (the ref is gone) are dropped from the queue, and unreadable ones (any lookup error other than "not found") stay queued while pre-push prints one line saying how many.
+2. **Partitions** the entries by reading each ref's current tip: refs that exist locally are ready to push at that tip, stale ones (the ref is gone) are dropped from the queue, and unreadable ones (any lookup error other than "not found") stay queued while pre-push prints one line saying how many. An upload that names its refs (`entire checkpoint push`) also leaves the others **waiting**, and a named ref pinned to a commit that is no longer its tip **changed**. Waiting and changed refs stay queued and are not failures: they are not retried, rotated, or counted (see the checkpoint push policy below).
 3. **Batch-pushes** the ready refs in one network round-trip, each as the exact `hash:ref` it read (`batchPushCheckpointRefs`, `strategy/push_common.go`), so the push sends the tip it read even if a session writes the ref meanwhile.
 4. On success, **removes** the pushed entries from the queue (`RemoveEntries`).
 5. On a batch failure (typically a non-fast-forward rejection), **falls back to per-ref recovery** (`pushCheckpointRefWithRecovery`) and removes from the queue only the entries whose refs land.
@@ -128,6 +128,19 @@ The fallback is bounded. It runs under a `checkpointFlushBudget` context deadlin
 An early abort also rotates that flush's failed entries to the back of the queue (`PushQueue.Rotate`, which matches exact `(ref, hash)` entries, so a newer generation queued meanwhile keeps its place). The queue drains in first-seen order, so without it a prefix that always fails — five checkpoints blocked by a ruleset, say — is retried in the same order on every push and the healthy refs behind it are never attempted at all. Rotation is skipped after an interruption, where the failures say nothing about the refs.
 
 Two diagnostics make a wholesale failure readable. The batch error is logged before the fallback runs: the per-ref retries re-derive a *rejection* reason, but a transport failure — an unreachable remote, a stalled connection — matches none of them, so without that line the cause reached neither the terminal nor `.entire/logs`. And `remote.Fetch` now annotates its error with git's own output — redacted and capped by the same `errWithGitOutput` helper the push path uses — instead of the strategy layer substituting that output for the error, which reported a contentless `fetch failed:` per ref whenever git was killed before writing anything.
+
+### Checkpoint push policy
+
+Each clone has a checkpoint push policy, `checkpoint_push_policy` in clone preferences (`entire/preferences.json` in the git common dir), set with `entire configure --checkpoint-push-policy`:
+
+- `automatic` (also when unset): pre-push sends every queued ref, as above.
+- `manual`: pre-push sends nothing and prints how many checkpoints are waiting. `entire checkpoint push <id>[@<commit>]` or `--all` uploads the named refs through the same flush. With `@<commit>`, the ref is sent only while that commit is still its tip, so a version the user did not look at never uploads.
+
+The policy is per clone because the push queue is: a per-worktree setting would let one worktree upload what another holds back. Automatic delivery (`flushCheckpointRefsQueue`, and `PushQueuedCheckpointRefs` for the migration push) reads it from the opened repository's common dir before OPF and again inside the flush, so a new automatic caller cannot upload under `manual` by skipping the check. `entire checkpoint push` does not read it: naming the refs is the decision.
+
+The read fails closed. A value this binary does not recognize, for example from a newer version, uploads nothing on automatic paths, and pre-push names the file to fix. The policy is never read through `settings.Load`, whose callers on the push path fall back to defaults on a load error and would turn `manual` into `automatic`. A preferences file that does not parse disables Entire's git hooks entirely, because `settings.Load` reads clone preferences. Clone preference writes keep keys the running binary does not model, so a rewrite by another version does not drop the policy. Binaries released before that change still drop unknown keys, which matters only when two Entire versions run in one clone.
+
+Without a terminal, `entire checkpoint push` accepts only `<id>@<commit>`; `--all` and a bare ID need `interactive.CanPromptInteractively()`. This is a speed bump for agents, not a control: anything running as the user can edit the preferences file or push `refs/entire/*` itself.
 
 ### Non-force, fast-forward-only
 
@@ -275,6 +288,7 @@ When checkpoints *are* actively migrated from the branch into refs (a path that 
 | `checkpoint/id/id.go` | `ShardFor`, `Kind`/`KindOf`, ID generation |
 | `settings/checkpoints.go` | `checkpoints` block parsing + env override |
 | `strategy/manual_commit_push.go` | Pre-push: drain queue, batch push, per-ref recovery |
+| `strategy/checkpoint_push_policy.go` | Checkpoint push policy gate, `PushCheckpoints` for `entire checkpoint push` |
 | `strategy/push_common.go` | `batchPushCheckpointRefs`, `pushCheckpointRefWithRecovery`, fetch+replay |
 | `strategy/checkpoint_delete*.go` | `entire checkpoint delete`: read-only plan, leased per-remote deletes |
 | `checkpoint/deleted_list.go` | Local deleted-checkpoints list in the git common dir |

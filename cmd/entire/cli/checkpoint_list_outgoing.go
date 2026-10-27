@@ -11,6 +11,7 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
+	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/stringutil"
 	"github.com/entireio/cli/cmd/entire/cli/tuiutil"
@@ -24,6 +25,8 @@ type outgoingCheckpointsJSON struct {
 	SyncRemoteSource  string                   `json:"checkpoint_sync_remote_source,omitempty"`
 	SyncError         string                   `json:"checkpoint_sync_error,omitempty"`
 	PushDisabled      bool                     `json:"checkpoint_push_disabled"`
+	PushPolicy        string                   `json:"checkpoint_push_policy,omitempty"`
+	PushPolicyError   string                   `json:"checkpoint_push_policy_error,omitempty"`
 	StaleQueueEntries int                      `json:"stale_queue_entries,omitempty"`
 	Checkpoints       []outgoingCheckpointJSON `json:"checkpoints"`
 }
@@ -34,6 +37,8 @@ type outgoingCheckpointsJSON struct {
 type outgoingCheckpointJSON struct {
 	CheckpointID string   `json:"checkpoint_id,omitempty"`
 	Ref          string   `json:"ref"`
+	Commit       string   `json:"commit,omitempty"`
+	SessionIDs   []string `json:"session_ids,omitempty"`
 	CreatedAt    string   `json:"created_at,omitempty"`
 	Agent        string   `json:"agent,omitempty"`
 	SessionCount int      `json:"session_count,omitempty"`
@@ -57,6 +62,7 @@ type outgoingCheckpointRow struct {
 	createdAt    time.Time
 	agent        string
 	sessionCount int
+	sessionIDs   []string
 	prompt       string
 	summary      string
 	files        []string
@@ -149,6 +155,15 @@ func readOutgoingCheckpoint(ctx context.Context, store checkpoint.PersistentStor
 		return row
 	}
 	row.createdAt = first.CreatedAt
+	row.sessionIDs = append(row.sessionIDs, first.SessionID)
+	for i := 1; i < row.sessionCount; i++ {
+		meta, err := store.ReadSessionMetadata(ctx, oc.CheckpointID, i)
+		if err != nil {
+			row.err = fmt.Errorf("read session metadata: %w", err)
+			return row
+		}
+		row.sessionIDs = append(row.sessionIDs, meta.SessionID)
+	}
 	latest := first
 	if row.sessionCount > 1 {
 		if latest, err = store.ReadSessionMetadata(ctx, oc.CheckpointID, row.sessionCount-1); err != nil {
@@ -170,6 +185,8 @@ func (l outgoingListing) json() outgoingCheckpointsJSON {
 		SyncRemoteSource:  l.sync.Source,
 		SyncError:         l.sync.Err,
 		PushDisabled:      l.sync.PushDisabled,
+		PushPolicy:        string(l.sync.PushPolicy),
+		PushPolicyError:   l.sync.PushPolicyErr,
 		StaleQueueEntries: l.result.StaleQueueEntries,
 		Checkpoints:       make([]outgoingCheckpointJSON, 0, len(l.entries)),
 	}
@@ -177,6 +194,7 @@ func (l outgoingListing) json() outgoingCheckpointsJSON {
 		entry := outgoingCheckpointJSON{
 			CheckpointID: row.CheckpointID.String(),
 			Ref:          row.Ref.String(),
+			SessionIDs:   row.sessionIDs,
 			Agent:        row.agent,
 			SessionCount: row.sessionCount,
 			Prompt:       row.prompt,
@@ -188,6 +206,9 @@ func (l outgoingListing) json() outgoingCheckpointsJSON {
 		}
 		if !row.createdAt.IsZero() {
 			entry.CreatedAt = row.createdAt.UTC().Format(time.RFC3339)
+		}
+		if !row.Commit.IsZero() {
+			entry.Commit = row.Commit.String()
 		}
 		if row.err != nil {
 			entry.Error = row.err.Error()
@@ -241,6 +262,9 @@ func renderOutgoingListing(w io.Writer, l outgoingListing) {
 		}
 		fmt.Fprintln(w, label+tuiutil.SanitizeTerminalLabel(info.Err))
 	}
+	if info.PushPolicyErr != "" {
+		fmt.Fprintln(w, "! Checkpoint push policy unreadable: "+tuiutil.SanitizeTerminalLabel(info.PushPolicyErr))
+	}
 	if info.PushDisabled {
 		if n > 0 {
 			fmt.Fprintln(w, "Automatic checkpoint pushing is off (push_sessions=false), so 'git push' sends none of these.")
@@ -276,6 +300,12 @@ func outgoingHeadline(info checkpointSyncInfo, n int, dest string) string {
 		return fmt.Sprintf("%s %s queued for %s:", count, beVerb(n), dest)
 	case info.PushDisabled:
 		return fmt.Sprintf("%s %s queued:", count, beVerb(n))
+	case info.PushPolicyErr != "":
+		return fmt.Sprintf("'git push' sends none of these until the checkpoint push policy can be read. %s %s queued:", count, beVerb(n))
+	case info.PushPolicy == settings.CheckpointPushPolicyManual && dest != "":
+		return fmt.Sprintf("%s %s waiting for 'entire checkpoint push', which sends them to %s:", count, beVerb(n), dest)
+	case info.PushPolicy == settings.CheckpointPushPolicyManual:
+		return fmt.Sprintf("%s %s waiting for 'entire checkpoint push':", count, beVerb(n))
 	case info.Err != "":
 		return fmt.Sprintf("'git push' sends none of these until that is fixed. %s %s queued:", count, beVerb(n))
 	case dest == "":

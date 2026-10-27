@@ -48,6 +48,7 @@ const (
 	agentFlagName            = "agent"
 	flagCheckpointRemote     = "checkpoint-remote"
 	flagCheckpointBackend    = "checkpoint-backend"
+	flagCheckpointPushPolicy = "checkpoint-push-policy"
 	flagSkipPushSessions     = "skip-push-sessions"
 	flagSummarizeModel       = "summarize-model"
 	flagSummarizeAgent       = "summarize-provider"
@@ -171,7 +172,7 @@ func hasGlobalSettingsFlags(cmd *cobra.Command) bool {
 // hasConfigureSettingsFlags reports whether configure was invoked with any
 // flag that mutates settings or hooks. Bare invocation prints help instead.
 func hasConfigureSettingsFlags(cmd *cobra.Command) bool {
-	return hasStrategyFlags(cmd) || hasCheckpointBackendFlag(cmd) || hasSummaryProviderFlags(cmd) || hasSummaryTimeoutFlag(cmd) || hasGlobalSettingsFlags(cmd)
+	return hasStrategyFlags(cmd) || hasCheckpointBackendFlag(cmd) || cmd.Flags().Changed(flagCheckpointPushPolicy) || hasSummaryProviderFlags(cmd) || hasSummaryTimeoutFlag(cmd) || hasGlobalSettingsFlags(cmd)
 }
 
 // enableUsesSetupFlow reports whether `entire enable` should delegate to the
@@ -838,6 +839,7 @@ func newSetupCmd() *cobra.Command {
 	var summarizeProvider string
 	var summarizeModel string
 	var summarizeTimeoutSeconds int
+	var checkpointPushPolicy string
 
 	cmd := &cobra.Command{
 		Use:   "configure",
@@ -854,6 +856,7 @@ Examples:
   entire configure --force                        # Reinstall git hook
   entire configure --checkpoint-remote github:org/checkpoints   # or gitlab:org/checkpoints
   entire configure --checkpoint-backend refs      # Move a legacy repo to per-checkpoint git refs
+  entire configure --checkpoint-push-policy manual   # Keep checkpoints local until 'entire checkpoint push'
   entire configure --summarize-provider claude-code
   entire configure --summarize-timeout-seconds 300   # 5m deadline for explain --generate`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -879,6 +882,13 @@ Examples:
 				return NewSilentError(errors.New("entire not configured"))
 			}
 
+			// First, so an invalid value is refused before any other flag
+			// has changed anything.
+			if cmd.Flags().Changed(flagCheckpointPushPolicy) {
+				if err := updateCheckpointPushPolicy(ctx, cmd.OutOrStdout(), checkpointPushPolicy); err != nil {
+					return err
+				}
+			}
 			if hasStrategyFlags(cmd) {
 				if err := updateStrategyOptions(ctx, cmd.OutOrStdout(), opts); err != nil {
 					return err
@@ -914,6 +924,7 @@ Examples:
 	cmd.Flags().BoolVar(&opts.SkipPushSessions, flagSkipPushSessions, false, "Disable automatic pushing of session logs on git push")
 	cmd.Flags().StringVar(&opts.CheckpointRemote, flagCheckpointRemote, "", checkpointRemoteFlagUsage)
 	cmd.Flags().StringVar(&opts.CheckpointBackend, flagCheckpointBackend, "", checkpointBackendFlagUsage)
+	cmd.Flags().StringVar(&checkpointPushPolicy, flagCheckpointPushPolicy, "", "When checkpoints upload for this clone: automatic (on git push) or manual (only with 'entire checkpoint push')")
 	cmd.Flags().StringVar(&summarizeProvider, flagSummarizeAgent, "", "Set the provider used by explain --generate (e.g., claude-code, codex, antigravity, pi, opencode, cursor, copilot-cli)")
 	cmd.Flags().StringVar(&summarizeModel, flagSummarizeModel, "", "Set the model hint used by explain --generate")
 	cmd.Flags().IntVar(&summarizeTimeoutSeconds, flagSummarizeTimeout, 0, "Set the hard deadline (seconds) for explain --generate summary generation. 0 clears the setting, leaving summary generation unbounded.")
@@ -3360,4 +3371,27 @@ func removeAllShadowBranches(ctx context.Context) (deleted int, refused, bare []
 	}
 	deletedBranches, failed := strategy.DeleteLegacyShadowBranches(ctx, strict)
 	return len(deletedBranches), failed, bare, nil
+}
+
+// updateCheckpointPushPolicy saves the clone's checkpoint push policy. It is
+// a clone preference, so --local and --project do not apply: every worktree
+// shares one push queue.
+func updateCheckpointPushPolicy(ctx context.Context, w io.Writer, value string) error {
+	policy, err := settings.ParseCheckpointPushPolicy(value)
+	if err != nil {
+		return err //nolint:wrapcheck // names the value and the accepted ones
+	}
+	if err := settings.ModifyClonePreferences(ctx, func(prefs *settings.ClonePreferences) error {
+		prefs.CheckpointPushPolicy = policy
+		return nil
+	}); err != nil {
+		return fmt.Errorf("save checkpoint push policy: %w", err)
+	}
+	switch policy {
+	case settings.CheckpointPushPolicyManual:
+		fmt.Fprintln(w, "✓ Checkpoint push policy: manual. git push no longer uploads checkpoints from this clone; upload them with 'entire checkpoint push'.")
+	case settings.CheckpointPushPolicyAutomatic:
+		fmt.Fprintln(w, "✓ Checkpoint push policy: automatic. Checkpoints upload when you git push.")
+	}
+	return nil
 }

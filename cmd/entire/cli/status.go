@@ -410,6 +410,11 @@ type checkpointSyncInfo struct {
 	// when none, when counting failed, or when the count would be a lie
 	// (dedicated URL mode on the git-branch backend).
 	Unpushed int
+	// PushPolicy is the clone's checkpoint push policy, empty when
+	// PushPolicyErr reports it could not be read: an unreadable policy is
+	// neither value, and git push uploads nothing while it lasts.
+	PushPolicy    settings.CheckpointPushPolicy
+	PushPolicyErr string
 	// IgnoredRemote and IgnoredReason report a configured checkpoint_remote
 	// that the ownership check rejected as inherited with the clone. Both
 	// reads and pushes then fall back to the elected remote, and status is
@@ -481,6 +486,11 @@ func computeCheckpointSyncInfo(ctx context.Context, s *EntireSettings) checkpoin
 // checkpoints does not list them again.
 func computeCheckpointSyncInfoCounting(ctx context.Context, s *EntireSettings, countUnpushed func(ctx context.Context, remoteName string) int) checkpointSyncInfo {
 	info := checkpointSyncInfo{PushDisabled: s.IsPushSessionsDisabled()}
+	if policy, err := settings.LoadCheckpointPushPolicy(ctx); err != nil {
+		info.PushPolicyErr = err.Error()
+	} else {
+		info.PushPolicy = policy
+	}
 
 	elected, err := strategy.ResolveCheckpointSyncRemote(ctx)
 	if err != nil {
@@ -695,6 +705,10 @@ func writeCheckpointSyncLines(ctx context.Context, b *strings.Builder, s *Entire
 		b.WriteString("\n  ")
 		b.WriteString(sty.render(sty.dim, line))
 	}
+	if info.PushPolicyErr != "" {
+		b.WriteString("\n")
+		b.WriteString(sty.render(sty.yellow, "  ! git push uploads no checkpoints until the checkpoint push policy can be read: "+info.PushPolicyErr))
+	}
 }
 
 // formatUnpushedCheckpointsLine phrases the unpushed counter. Dedicated URL
@@ -723,6 +737,12 @@ func formatUnpushedCheckpointsLine(info checkpointSyncInfo) string {
 			return fmt.Sprintf("%d %s not pushed to the checkpoint remote", info.Unpushed, noun)
 		}
 		return fmt.Sprintf("%d %s not on %s", info.Unpushed, noun, info.Remote)
+	}
+	if info.PushPolicy == settings.CheckpointPushPolicyManual {
+		if info.Source == checkpointSyncSourceDedicated {
+			return fmt.Sprintf("%d %s not yet pushed; upload with 'entire checkpoint push'", info.Unpushed, noun)
+		}
+		return fmt.Sprintf("%d %s not yet on %s; upload with 'entire checkpoint push'", info.Unpushed, noun, info.Remote)
 	}
 	if info.Source == checkpointSyncSourceDedicated {
 		return fmt.Sprintf("%d %s not yet pushed", info.Unpushed, noun)
@@ -1165,6 +1185,10 @@ type statusJSON struct {
 	// not mean reads fall open to nothing.
 	CheckpointReadFallback string `json:"checkpoint_read_fallback,omitempty"`
 	UnpushedCheckpoints    int    `json:"unpushed_checkpoints,omitempty"`
+	// CheckpointPushPolicy is "automatic" or "manual"; when the policy cannot
+	// be read it is omitted and CheckpointPushPolicyError says why.
+	CheckpointPushPolicy      string `json:"checkpoint_push_policy,omitempty"`
+	CheckpointPushPolicyError string `json:"checkpoint_push_policy_error,omitempty"`
 	// CheckpointRemoteIgnored/-Reason report a configured checkpoint_remote the
 	// ownership check rejected as inherited with the clone (reads and pushes
 	// fall back to the elected remote). Mirrors the text path's warning line.
@@ -1283,6 +1307,8 @@ func runStatusJSON(ctx context.Context, w io.Writer) error {
 		result.CheckpointReadFallback = syncInfo.ReadFallback
 		result.CheckpointReadSourceUnknown = syncInfo.ReadSourceUnknown
 		result.UnpushedCheckpoints = syncInfo.Unpushed
+		result.CheckpointPushPolicy = string(syncInfo.PushPolicy)
+		result.CheckpointPushPolicyError = syncInfo.PushPolicyErr
 		result.CheckpointRemoteIgnored = syncInfo.IgnoredRemote
 		result.CheckpointRemoteIgnoredReason = syncInfo.IgnoredReason
 		result.CheckpointRemoteIgnoredRemedy = syncInfo.IgnoredRemedy
