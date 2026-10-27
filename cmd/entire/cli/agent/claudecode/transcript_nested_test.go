@@ -41,6 +41,11 @@ func subagentTextResultLine(parentID, toolUseID, text string) string {
 	return subagentLine(parentID, fmt.Sprintf(`"type":"user","message":{"role":"user","content":[{"tool_use_id":%q,"type":"tool_result","content":[{"type":"text","text":%q}]}]}`, toolUseID, text))
 }
 
+// subagentToolUseLine is subagent agentID's assistant call of tool name.
+func subagentToolUseLine(agentID, toolUseID, name string) string {
+	return subagentLine(agentID, fmt.Sprintf(`"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":%q,"name":%q,"input":{}}]}`, toolUseID, name))
+}
+
 // mainLaunchLine is the main transcript's tool result for an Agent call that
 // launched agentID in the background.
 func mainLaunchLine(toolUseID, agentID string) string {
@@ -134,12 +139,70 @@ func TestCalculateTotalTokenUsage_NestedSubagents(t *testing.T) {
 			want: agent.TokenUsage{InputTokens: 30, OutputTokens: 3, APICallCount: 2},
 		},
 		// A subagent's text can quote any agent's ID (a Read of a log, a
-		// Bash grep), so only its structured results launch: a mention in
-		// text is not followed, even when the transcript exists.
+		// Bash grep), so only its structured results and its Agent calls'
+		// results launch: a mention in other text is not followed, even
+		// when the transcript exists.
 		"named by text only": {
 			parentLines: []string{
 				subagentUsageLine(parent, "m-p", 10, 1),
 				subagentTextResultLine(parent, "toolu_p1", "done\nagentId: "+child+" (for resuming)"),
+			},
+			childLines: []string{subagentUsageLine(child, "m-c", 20, 2)},
+			want:       agent.TokenUsage{InputTokens: 10, OutputTokens: 1, APICallCount: 1},
+		},
+		// Claude Code 2.1.311 writes no toolUseResult in subagent
+		// transcripts: a nested launch is named only in the text of the
+		// Agent call's tool result.
+		"async launch named by Agent result text only": {
+			parentLines: []string{
+				subagentUsageLine(parent, "m-p", 10, 1),
+				subagentToolUseLine(parent, "toolu_p1", "Agent"),
+				subagentTextResultLine(parent, "toolu_p1", "Async agent launched successfully.\nagentId: "+child+" (internal ID - do not mention to user. Use SendMessage with to: '"+child+"' to continue this agent.)\nThe agent is working in the background."),
+			},
+			childLines: []string{subagentUsageLine(child, "m-c", 20, 2)},
+			want:       agent.TokenUsage{InputTokens: 30, OutputTokens: 3, APICallCount: 2},
+		},
+		"foreground launch named by Agent result text only": {
+			parentLines: []string{
+				subagentUsageLine(parent, "m-p", 10, 1),
+				subagentToolUseLine(parent, "toolu_p1", "Agent"),
+				subagentTextResultLine(parent, "toolu_p1", "Found two call sites.\nagentId: "+child+" (use SendMessage with to: '"+child+"' to continue this agent)"),
+			},
+			childLines: []string{subagentUsageLine(child, "m-c", 20, 2)},
+			want:       agent.TokenUsage{InputTokens: 30, OutputTokens: 3, APICallCount: 2},
+		},
+		// The launched agent's own Agent result is followed in turn.
+		"chain named by Agent result text only": {
+			parentLines: []string{
+				subagentUsageLine(parent, "m-p", 10, 1),
+				subagentToolUseLine(parent, "toolu_p1", "Agent"),
+				subagentTextResultLine(parent, "toolu_p1", "Async agent launched successfully.\nagentId: "+child+" (internal ID)"),
+			},
+			childLines: []string{
+				subagentUsageLine(child, "m-c", 20, 2),
+				subagentToolUseLine(child, "toolu_c1", "Agent"),
+				subagentTextResultLine(child, "toolu_c1", "Async agent launched successfully.\nagentId: "+other+" (internal ID)"),
+			},
+			otherLines: []string{subagentUsageLine(other, "m-o", 40, 4)},
+			want:       agent.TokenUsage{InputTokens: 70, OutputTokens: 7, APICallCount: 3},
+		},
+		// The report before the trailer can quote another agent; as in the
+		// main transcript, only the last "agentId:" names the launch.
+		"Agent result quoting another ID": {
+			parentLines: []string{
+				subagentUsageLine(parent, "m-p", 10, 1),
+				subagentToolUseLine(parent, "toolu_p1", "Agent"),
+				subagentTextResultLine(parent, "toolu_p1", "The log mentions agentId: "+other+".\nagentId: "+child+" (internal ID)"),
+			},
+			childLines: []string{subagentUsageLine(child, "m-c", 20, 2)},
+			otherLines: []string{subagentUsageLine(other, "m-o", 40, 4)},
+			want:       agent.TokenUsage{InputTokens: 30, OutputTokens: 3, APICallCount: 2},
+		},
+		"named by a Read result's text": {
+			parentLines: []string{
+				subagentUsageLine(parent, "m-p", 10, 1),
+				subagentToolUseLine(parent, "toolu_p1", "Read"),
+				subagentTextResultLine(parent, "toolu_p1", "log.txt: Async agent launched successfully.\nagentId: "+child+" (internal ID)"),
 			},
 			childLines: []string{subagentUsageLine(child, "m-c", 20, 2)},
 			want:       agent.TokenUsage{InputTokens: 10, OutputTokens: 1, APICallCount: 1},
