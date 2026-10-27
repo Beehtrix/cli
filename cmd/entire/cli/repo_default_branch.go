@@ -23,8 +23,8 @@ func newDefaultBranchCmd() *cobra.Command {
 		Example: "  entire repo default-branch /et/my-project/my-repo master",
 		Args:    cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			branch := strings.TrimSpace(args[1])
-			if branch == "" {
+			branch := args[1]
+			if strings.TrimSpace(branch) == "" {
 				cmd.SilenceUsage = true
 				return errors.New("branch must not be empty")
 			}
@@ -53,4 +53,3 @@ func defaultBranchMessage(out *coreapi.SetRepoDefaultBranchOutputBody) string {
 	}
 	return fmt.Sprintf("✓ Default branch: %s (was %s)", out.Branch, out.Previous)
 }
-
