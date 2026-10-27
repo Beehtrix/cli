@@ -395,9 +395,88 @@ func TestCheckpointPush_UnknownCheckpointIsReported(t *testing.T) {
 	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
 
 	missing := "a1b2c3d4e5f6"
-	result, err := runCheckpointPushJSON(t, env, false, missing+"@0000000000000000000000000000000000000000")
+	result, err := runCheckpointPushJSON(t, env, false, missing+"@1111111111111111111111111111111111111111")
 	require.Error(t, err)
 	require.Equal(t, "not_waiting", result.status(t, missing))
+}
+
+// The zero hash is how the strategy spells "not pinned", so accepting it as a
+// pin would let a caller without a terminal send a version it never saw.
+func TestCheckpointPush_ZeroCommitIsNotAPin(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	bareDir := env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	work := createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+
+	_, _, err := runCheckpointPush(t, env, false, work+"@0000000000000000000000000000000000000000")
+	require.Error(t, err)
+	require.Empty(t, remoteCheckpointIDs(t, bareDir))
+	outgoing, _ := listOutgoing(t, env)
+	require.Equal(t, []string{work}, outgoing.ids())
+}
+
+func TestCheckpointPush_ConflictingPinsAreRefused(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	bareDir := env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	work := createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	seen := outgoingCommit(t, env, work)
+	other := strings.TrimSpace(testutil.RunGit(t, env.RepoDir, "rev-parse", "HEAD"))
+	require.NotEqual(t, seen, other)
+
+	_, _, err := runCheckpointPush(t, env, false, work+"@"+other, work+"@"+seen)
+	require.Error(t, err, "two different versions of one checkpoint cannot both be the one to send")
+	require.Empty(t, remoteCheckpointIDs(t, bareDir))
+
+	result, err := runCheckpointPushJSON(t, env, false, work+"@"+seen, work+"@"+seen)
+	require.NoError(t, err, "naming the same version twice is not a conflict")
+	require.Equal(t, "uploaded", result.status(t, work))
+}
+
+func TestCheckpointPush_AllWithNothingWaitingStillReportsJSON(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+
+	result, err := runCheckpointPushJSON(t, env, true, "--all")
+	require.NoError(t, err)
+	require.NotNil(t, result.Results, "results must be an empty array, not missing")
+	require.Empty(t, result.Results)
+}
+
+// A queued ref that cannot be read is still waiting; reporting it as
+// not_waiting would tell the caller there is nothing left to send.
+func TestCheckpointPush_UnreadableRefIsAFailure(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root reads files regardless of their mode")
+	}
+	env := newOutgoingEnv(t)
+	bareDir := env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	work := createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	seen := outgoingCommit(t, env, work)
+
+	var ref string
+	for _, row := range listPolicyOutgoing(t, env).Checkpoints {
+		if row.CheckpointID == work {
+			ref = row.Ref
+		}
+	}
+	commonDir := strings.TrimSpace(testutil.RunGit(t, env.RepoDir, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+	refFile := filepath.Join(commonDir, filepath.FromSlash(ref))
+	require.FileExists(t, refFile, "the checkpoint ref must be loose for this test to mean anything")
+	require.NoError(t, os.Chmod(refFile, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(refFile, 0o600) }) //nolint:errcheck // best-effort restore before TempDir cleanup
+
+	result, err := runCheckpointPushJSON(t, env, false, work+"@"+seen)
+	require.Error(t, err)
+	require.Equal(t, "failed", result.status(t, work))
+	require.Contains(t, result.Results[0].Error, "read checkpoint ref", "the failure must come from the ref read, not an earlier step")
+	require.Empty(t, remoteCheckpointIDs(t, bareDir))
 }
 
 func TestCheckpointPush_RefusedWhenPushingIsDisabled(t *testing.T) {
@@ -466,4 +545,21 @@ func TestConfigure_SetsCheckpointPushPolicy(t *testing.T) {
 	_, err := env.RunCLIWithError("configure", "--checkpoint-push-policy", "approved")
 	require.Error(t, err)
 	require.Equal(t, "automatic", listPolicyOutgoing(t, env).Policy, "a rejected value changes nothing")
+}
+
+// git-branch has no per-checkpoint refs for `entire checkpoint push` to send,
+// so manual there would hold nothing back and leave no way to upload.
+func TestConfigure_ManualPolicyNeedsGitRefs(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	env.SetupBareRemote()
+
+	_, err := env.RunCLIWithError("configure", "--checkpoint-push-policy", "manual")
+	require.Error(t, err)
+	require.NoFileExists(t, clonePreferencesFile(t, env), "a refused policy saves nothing")
+
+	env.RunCLI("configure", "--checkpoint-push-policy", "automatic")
+
+	env.RunCLI("configure", "--checkpoint-backend", "git-refs", "--checkpoint-push-policy", "manual")
+	require.Equal(t, "manual", listPolicyOutgoing(t, env).Policy)
 }

@@ -885,7 +885,11 @@ Examples:
 			// First, so an invalid value is refused before any other flag
 			// has changed anything.
 			if cmd.Flags().Changed(flagCheckpointPushPolicy) {
-				if err := updateCheckpointPushPolicy(ctx, cmd.OutOrStdout(), checkpointPushPolicy); err != nil {
+				var backend string
+				if hasCheckpointBackendFlag(cmd) {
+					backend = opts.CheckpointBackend
+				}
+				if err := updateCheckpointPushPolicy(ctx, cmd.OutOrStdout(), checkpointPushPolicy, backend); err != nil {
 					return err
 				}
 			}
@@ -3375,11 +3379,26 @@ func removeAllShadowBranches(ctx context.Context) (deleted int, refused, bare []
 
 // updateCheckpointPushPolicy saves the clone's checkpoint push policy. It is
 // a clone preference, so --local and --project do not apply: every worktree
-// shares one push queue.
-func updateCheckpointPushPolicy(ctx context.Context, w io.Writer, value string) error {
+// shares one push queue. backend is this run's --checkpoint-backend, empty
+// when not given.
+//
+// manual needs git-refs: git-branch delivery does not read the policy, and
+// 'entire checkpoint push' cannot send its checkpoints.
+func updateCheckpointPushPolicy(ctx context.Context, w io.Writer, value, backend string) error {
 	policy, err := settings.ParseCheckpointPushPolicy(value)
 	if err != nil {
 		return err //nolint:wrapcheck // names the value and the accepted ones
+	}
+	if policy == settings.CheckpointPushPolicyManual {
+		refs, err := primaryBackendIsRefsAfter(ctx, backend)
+		if err != nil {
+			return err
+		}
+		if !refs {
+			return errors.New("checkpoint push policy manual needs the git-refs checkpoint backend; " +
+				"switch with 'entire configure --checkpoint-backend git-refs --checkpoint-push-policy manual' " +
+				"and convert existing checkpoints with 'entire doctor migrate-checkpoints'")
+		}
 	}
 	if err := settings.ModifyClonePreferences(ctx, func(prefs *settings.ClonePreferences) error {
 		prefs.CheckpointPushPolicy = policy

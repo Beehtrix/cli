@@ -155,6 +155,9 @@ func PushCheckpoints(ctx context.Context, targets []CheckpointPushRequest) (Chec
 
 	selection := checkpointRefSelection{refs: make(map[plumbing.ReferenceName]plumbing.Hash, len(targets))}
 	for _, target := range targets {
+		if pinned, ok := selection.refs[target.Ref]; ok && pinned != target.Commit {
+			return CheckpointPushReport{}, fmt.Errorf("%s is named with two different commits; name each checkpoint once", target.Ref)
+		}
 		selection.refs[target.Ref] = target.Commit
 	}
 	waiting, err := waitingCheckpointRefs(ctx, repo)
@@ -169,7 +172,7 @@ func PushCheckpoints(ctx context.Context, targets []CheckpointPushRequest) (Chec
 		}
 	}
 	result, flushErr := flushCheckpointRefs(ctx, repo, ps, selection)
-	report.Outcomes = checkpointPushOutcomes(targets, result)
+	report.Outcomes = checkpointPushOutcomes(targets, waiting, result, flushErr)
 	if flushErr != nil {
 		logging.Warn(ctx, "checkpoint push: delivery failed",
 			slog.String("error", flushErr.Error()))
@@ -200,7 +203,15 @@ func anyTargetWaiting(targets []CheckpointPushRequest, waiting map[plumbing.Refe
 	return false
 }
 
-func checkpointPushOutcomes(targets []CheckpointPushRequest, result checkpointFlushResult) []CheckpointPushOutcome {
+// checkpointPushOutcomes maps the flush back onto each target. A flush-wide
+// error (one with no per-ref report, such as a failed queue drain) fails every
+// waiting target the flush did not report on, rather than reading as absence.
+func checkpointPushOutcomes(
+	targets []CheckpointPushRequest,
+	waiting map[plumbing.ReferenceName]struct{},
+	result checkpointFlushResult,
+	flushErr error,
+) []CheckpointPushOutcome {
 	pushed := make(map[plumbing.ReferenceName]plumbing.Hash, len(result.pushed))
 	for _, ref := range result.pushed {
 		pushed[ref.name] = ref.hash
@@ -222,6 +233,8 @@ func checkpointPushOutcomes(targets []CheckpointPushRequest, result checkpointFl
 			if errors.Is(err, errCheckpointRefSuperseded) {
 				outcome.Status = CheckpointPushChanged
 			}
+		} else if _, queued := waiting[target.Ref]; queued && flushErr != nil {
+			outcome.Status, outcome.Err = CheckpointPushFailed, flushErr
 		} else {
 			// Not queued, or it left the queue while this command ran.
 			outcome.Status = CheckpointPushNotWaiting

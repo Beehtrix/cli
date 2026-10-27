@@ -134,7 +134,9 @@ Two diagnostics make a wholesale failure readable. The batch error is logged bef
 Each clone has a checkpoint push policy, `checkpoint_push_policy` in clone preferences (`entire/preferences.json` in the git common dir), set with `entire configure --checkpoint-push-policy`:
 
 - `automatic` (also when unset): pre-push sends every queued ref, as above.
-- `manual`: pre-push sends nothing and prints how many checkpoints are waiting. `entire checkpoint push <id>[@<commit>]` or `--all` uploads the named refs through the same flush. With `@<commit>`, the ref is sent only while that commit is still its tip, so a version the user did not look at never uploads.
+- `manual`: pre-push sends nothing and prints how many checkpoints are waiting. `entire checkpoint push <id>[@<commit>]` or `--all` uploads the named refs through the same flush. With `@<commit>`, the ref is sent only while that commit is still its tip, so a version the user did not look at never uploads. The zero hash is not a pin, and one ref named with two different commits is refused. Each named ref reports `uploaded`, `changed`, `failed` (including a queued ref that could not be read, or a flush that failed before reaching it), or `not_waiting`.
+
+`manual` needs the git-refs backend. git-branch delivery does not read the policy and `entire checkpoint push` cannot send its checkpoints, so `configure` refuses `manual` unless git-refs is the primary backend, counting a `--checkpoint-backend` given in the same run.
 
 The policy is per clone because the push queue is: a per-worktree setting would let one worktree upload what another holds back. Automatic delivery (`flushCheckpointRefsQueue`, and `PushQueuedCheckpointRefs` for the migration push) reads it from the opened repository's common dir before OPF and again inside the flush, so a new automatic caller cannot upload under `manual` by skipping the check. `entire checkpoint push` does not read it: naming the refs is the decision.
 

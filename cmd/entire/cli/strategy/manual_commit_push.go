@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"strings"
@@ -498,6 +499,8 @@ type checkpointRefPartition struct {
 	changed    []checkpointRefPush
 	stale      []checkpoint.PushQueueEntry
 	unreadable []checkpoint.PushQueueEntry
+	// readErrs holds each unreadable ref's lookup error.
+	readErrs map[plumbing.ReferenceName]error
 }
 
 // partitionCheckpointRefPushes captures each queued ref's current immutable
@@ -511,7 +514,10 @@ func partitionCheckpointRefPushes(
 	entries []checkpoint.PushQueueEntry,
 	selection checkpointRefSelection,
 ) checkpointRefPartition {
-	part := checkpointRefPartition{ready: make([]checkpointRefPush, 0, len(entries))}
+	part := checkpointRefPartition{
+		ready:    make([]checkpointRefPush, 0, len(entries)),
+		readErrs: make(map[plumbing.ReferenceName]error),
+	}
 	for _, entry := range entries {
 		ref, err := repo.Reference(entry.Ref, true)
 		if errors.Is(err, plumbing.ErrReferenceNotFound) {
@@ -520,6 +526,7 @@ func partitionCheckpointRefPushes(
 		}
 		if err != nil {
 			part.unreadable = append(part.unreadable, entry)
+			part.readErrs[entry.Ref] = fmt.Errorf("read checkpoint ref: %w", err)
 			continue
 		}
 		candidate := checkpointRefPush{token: entry, name: entry.Ref, hash: ref.Hash()}
@@ -618,6 +625,7 @@ func flushCheckpointRefs(ctx context.Context, repo *git.Repository, ps pushSetti
 	}
 	if len(part.unreadable) > 0 {
 		warnUnreadableCheckpointRefs(ctx, part.unreadable)
+		maps.Copy(result.failed, part.readErrs)
 	}
 	existing := part.ready
 	if len(existing) == 0 {

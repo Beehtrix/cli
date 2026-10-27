@@ -109,6 +109,9 @@ func runCheckpointPush(cmd *cobra.Command, args []string, flags checkpointPushFl
 	}
 	if len(requests) == 0 {
 		fmt.Fprintln(errOut, "No checkpoints are waiting to upload.")
+		if flags.json {
+			return writeCheckpointPushJSON(out, strategy.CheckpointPushReport{})
+		}
 		return nil
 	}
 
@@ -155,7 +158,8 @@ func parseCheckpointPushArgs(args []string, canPrompt bool, errOut io.Writer) ([
 		}
 		request := strategy.CheckpointPushRequest{Ref: ref}
 		if pinned {
-			if !plumbing.IsHash(rawCommit) {
+			// The zero hash is how a request says "not pinned".
+			if !plumbing.IsHash(rawCommit) || plumbing.NewHash(rawCommit).IsZero() {
 				return nil, fmt.Errorf("invalid commit %q in %q: pass the full commit from 'entire checkpoint list --outgoing --json'", rawCommit, arg)
 			}
 			request.Commit = plumbing.NewHash(rawCommit)
