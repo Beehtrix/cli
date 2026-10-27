@@ -269,11 +269,55 @@ they rely on turn start having followed or re-homed first. A sibling
 worktree's hook that runs between a move and the moved home's next hook
 still reads the stored transcript copy from the hook's own worktree.
 
+**Only the last paragraph links a saved commit** (`LinkedCheckpoints` in
+post-commit, attach and `explain --generate`). The `Entire-Checkpoint:` lines
+that start a line in the message's last paragraph link it; trailing blank
+lines and comment lines are skipped first, the subject paragraph never counts,
+and other lines in the paragraph are ignored. An ID anywhere else (pasted,
+quoted, indented, or mentioned in prose) is not the commit's link.
+
+- **Git config.** Code that writes into a checkpoint reads
+  `core.commentChar`, `core.commentString` (aliases; the last one set wins)
+  and `commit.cleanup` in one `git config` call, skipped when the message has
+  no `Entire-Checkpoint` text. Under `core.commentChar=auto`, or a cleanup
+  mode that keeps comment lines (`whitespace`, `verbatim`, `scissors`), it
+  scans the whole message instead, as linking did before: those
+  configurations can keep lines below the trailer that the last-paragraph
+  reader does not skip. Only the configured values count; the hooks cannot
+  see `git commit --cleanup=<mode>`.
+- **Read-only views.** `explain <commit>`, `explain --commit`, the branch
+  listing, the export and the review re-run guard read with `#` and no git
+  config (`CommitCheckpoint`): the last paragraph's last ID, the one attach
+  joins and `--generate` writes, or the first ID anywhere when the last
+  paragraph names none, since a squash commit can carry its squashed commits'
+  trailers in the body. `explain --checkpoint` lists a commit under every ID
+  that view reads from it (`CommitCheckpoints`). Other read-only lookups
+  (resume, status, attribution, other history listings) still scan the whole
+  message.
+- **Stamp.** Prepare-commit-msg still reads the whole draft, but an ID there
+  counts as already stamped (`stampedTrailer`) only when prepare recorded
+  stamping it: each ID it stamps (one it generates, a session's reserved one,
+  or the one an amend restores) goes into `entire-stamped-trailers.json` in
+  the per-worktree git dir until the next post-commit, which consumes it.
+  Prepare writes a trailer only once its stamp is recorded
+  (`recordStampedTrailer`). A draft that already names another ID (pasted
+  into `-m`, `-F` or a template) gets prepare's own trailer after it.
+- **Condensation target.** Post-commit condenses into the last stamped ID the
+  commit links (`pickCondensationTarget`). Without one (an amend that kept its
+  trailer, a sequence operation) it condenses only into the last linked ID
+  whose checkpoint exists, and only for the session that owns it
+  (`stampedByAnotherCommit`). It never creates a checkpoint prepare did not
+  stamp, so a teammate's checkpoint this clone has not fetched is never
+  created with local work. A message reused from another commit (`-C`, `-c`,
+  `--amend`) keeps its trailer and gets no stamp, so reusing a foreign one
+  leaves the commit unlinked; `entire attach` can link it.
+
 **Squashes inherit their trailers** (`inheritSquashedCheckpointTrailers`). A
 commit made while `git merge --squash` is in progress (SQUASH_MSG present in
 the per-worktree git dir) contains the squashed commits' work, so every
 `Entire-Checkpoint` trailer in SQUASH_MSG is carried into the message when
-missing when a staged path is one a commit Git recorded there changed; a file
+missing (a copy indented in the body, as git seeds an editor squash message,
+does not count) when a staged path is one a commit Git recorded there changed; a file
 touched up before committing still counts. An abandoned squash can leave
 SQUASH_MSG behind; staged work on other paths therefore inherits nothing, and inherited trailers in Git's seeded message are
 removed. git only reports source `squash` when its seeded message is accepted;
@@ -281,13 +325,12 @@ a squash committed with `-m` reports `message`, which used to run ordinary
 matching and either refuse or mint a fresh, empty checkpoint. Inherited
 trailers are links to checkpoints that already exist. Matching still runs, so
 work a session holds at squash time is stamped as its own trailer after the
-inherited ones, and post-commit condenses only into the trailer that has no
-checkpoint yet (`pickCondensationTarget`) among those prepare stamped: prepare
-records the inherited IDs in the per-worktree git dir, tied to the commit's
-parent (`recordInheritedTrailers`), so an inherited trailer whose checkpoint
-simply is not in this clone's store yet is never mistaken for a fresh one, rechecks whether that target appeared
-between selection and condensation, and never writes into an inherited one; a
-write into a checkpoint the session did not stamp for this commit is refused
+inherited ones, and post-commit condenses only into the trailer prepare
+stamped (`pickCondensationTarget`). Prepare also records the inherited IDs in
+the per-worktree git dir, tied to the commit's parent
+(`recordInheritedTrailers`), so post-commit never writes into an inherited
+one, even when its checkpoint is not in this clone's store yet; a write into
+a checkpoint the session did not stamp for this commit is refused
 (`stampedByAnotherCommit`). Merge commits stay unlinked by design; the
 merged commits keep their own trailers.
 
