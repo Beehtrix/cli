@@ -14,5 +14,18 @@ func TestMain(m *testing.M) {
 	// strategy package suppresses its own pre-push progress writer the
 	// same way (see strategy/global_test.go).
 	opfStderr = io.Discard
+	// Shrink shards before any test runs.
+	jsonlShardTargetBytes = 16 << 10
 	os.Exit(m.Run())
+}
+
+// The default, captured before TestMain runs.
+var shippedShardTargetBytes = jsonlShardTargetBytes
+
+// Pins the shipped shard size.
+func TestJSONLShardTargetBytes_ProductionDefault(t *testing.T) {
+	t.Parallel()
+	if shippedShardTargetBytes != 1<<20 {
+		t.Fatalf("production shard target = %d, want 1MiB", shippedShardTargetBytes)
+	}
 }
