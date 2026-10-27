@@ -50,8 +50,8 @@ func TestWrapProductionJSONWarningHookCommand(t *testing.T) {
 	if !strings.Contains(command, "Entire CLI") {
 		t.Fatalf("claude wrapper missing warning text, got %q", command)
 	}
-	if want := "exec entire hooks claude-code session-start"; !strings.Contains(command, want) {
-		t.Fatalf("claude wrapper missing exec target, got %q", command)
+	if want := "; fi; entire hooks claude-code session-start || {"; !strings.Contains(command, want) {
+		t.Fatalf("claude wrapper missing wrapped command, got %q", command)
 	}
 }
 
@@ -69,8 +69,8 @@ func TestWrapProductionPlainTextWarningHookCommand(t *testing.T) {
 	if !strings.Contains(command, "Entire CLI is enabled but not installed") {
 		t.Fatalf("plain text wrapper missing warning text, got %q", command)
 	}
-	if want := "exec entire hooks factoryai-droid session-start"; !strings.Contains(command, want) {
-		t.Fatalf("plain text wrapper missing exec target, got %q", command)
+	if want := "; fi; entire hooks factoryai-droid session-start || {"; !strings.Contains(command, want) {
+		t.Fatalf("plain text wrapper missing wrapped command, got %q", command)
 	}
 }
 
@@ -192,6 +192,22 @@ func TestIsManagedHookCommand_WrappedPrefix(t *testing.T) {
 	nestedWindowsWrapper := `cmd.exe /d /s /c "where.exe entire >nul 2>nul & if errorlevel 1 (ver>nul) else (entire hooks codex stop)"`
 	if !IsManagedHookCommand(nestedWindowsWrapper) {
 		t.Fatal("expected nested windows wrapper to remain managed")
+	}
+}
+
+// Warning wrappers written before they warned about an `entire` that cannot
+// run ended in `exec <command>`. They must still read as Entire's so an install
+// replaces them.
+func TestIsManagedHookCommand_ExecWarningWrapper(t *testing.T) {
+	t.Parallel()
+
+	execWrapper := `sh -c 'if ! command -v entire >/dev/null 2>&1; then printf "%s\n" "{\"systemMessage\":\"\\n\\nEntire CLI is enabled but not installed or not on PATH.\\nInstallation guide: https://docs.entire.io/cli/installation#installation-methods\"}"; exit 0; fi; exec entire hooks claude-code session-start'`
+	if !IsManagedHookCommand(execWrapper) {
+		t.Fatal("expected exec-form warning wrapper to remain managed")
+	}
+	current := WrapProductionJSONWarningHookCommand("entire hooks claude-code session-start", WarningFormatMultiLine)
+	if current == execWrapper {
+		t.Fatal("current wrapper should differ from the exec form so installs replace it")
 	}
 }
 

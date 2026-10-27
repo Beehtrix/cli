@@ -76,6 +76,22 @@ func MissingEntireWarning(format WarningFormat) string {
 	}
 }
 
+// FailedEntireWarning is shown when `entire` is on PATH but exits non-zero, such
+// as a version-manager shim with no version selected. The wrapper cannot tell
+// that apart from a hook that ran and failed, so the text covers both. It is
+// spliced into a single-quoted sh -c string, so it must not contain a single
+// quote, backtick, or dollar sign.
+func FailedEntireWarning(format WarningFormat) string {
+	switch format {
+	case WarningFormatSingleLine:
+		return "Entire CLI is enabled, but the entire command on PATH failed to run, so this session may not be captured. Check that entire --version works in this shell. Installation guide: https://docs.entire.io/cli/installation#installation-methods"
+	case WarningFormatMultiLine:
+		return "\n\nEntire CLI is enabled, but the entire command on PATH failed to run, so this session may not be captured.\nCheck that entire --version works in this shell.\nInstallation guide: https://docs.entire.io/cli/installation#installation-methods"
+	default:
+		return FailedEntireWarning(WarningFormatSingleLine)
+	}
+}
+
 // currentHookCommandPrefix is what every hook command Entire generates begins
 // with today: the entire binary resolved through PATH, then the `hooks`
 // subcommand.
@@ -126,22 +142,42 @@ func WrapProductionSilentHookCommand(command string) string {
 }
 
 // WrapProductionJSONWarningHookCommand emits a JSON hook response with a
-// systemMessage field on stdout when the Entire CLI is missing from PATH.
+// systemMessage field on stdout when the Entire CLI is missing from PATH or
+// fails to run.
 func WrapProductionJSONWarningHookCommand(command string, format WarningFormat) string {
-	payload, err := jsonutil.MarshalWithNoHTMLEscape(struct {
-		SystemMessage string `json:"systemMessage,omitempty"`
-	}{
-		SystemMessage: MissingEntireWarning(format),
-	})
-	if err != nil {
+	missing, missingErr := systemMessageJSON(MissingEntireWarning(format))
+	failed, failedErr := systemMessageJSON(FailedEntireWarning(format))
+	if missingErr != nil || failedErr != nil {
 		// Fallback to plain text on stdout if JSON payload construction somehow fails.
 		return WrapProductionPlainTextWarningHookCommand(command, format)
 	}
+	return warningHookCommand(command, missing, failed)
+}
 
+func systemMessageJSON(message string) (string, error) {
+	payload, err := jsonutil.MarshalWithNoHTMLEscape(struct {
+		SystemMessage string `json:"systemMessage,omitempty"`
+	}{
+		SystemMessage: message,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal hook system message: %w", err)
+	}
+	return string(payload), nil
+}
+
+// warningHookCommand prints missing when `entire` is not on PATH and failed when
+// it is but exits non-zero, exiting 0 either way. A version-manager shim with no
+// version selected passes `command -v` and then fails, and agents surface a
+// failing hook's stderr only in verbose views, so without the second branch
+// capture stops unnoticed. The command is not exec'd so the shell can report
+// its failure.
+func warningHookCommand(command, missing, failed string) string {
 	return fmt.Sprintf(
-		`sh -c 'if ! command -v entire >/dev/null 2>&1; then printf "%%s\n" %q; exit 0; fi; exec %s'`,
-		string(payload),
+		`sh -c 'if ! command -v entire >/dev/null 2>&1; then printf "%%s\n" %q; exit 0; fi; %s || { printf "%%s\n" %q; exit 0; }'`,
+		missing,
 		command,
+		failed,
 	)
 }
 
@@ -218,13 +254,9 @@ func WrapWindowsProductionPlainTextWarningHookCommand(command string, format War
 }
 
 // WrapProductionPlainTextWarningHookCommand emits the warning as plain
-// text to stdout when the Entire CLI is missing from PATH.
+// text to stdout when the Entire CLI is missing from PATH or fails to run.
 func WrapProductionPlainTextWarningHookCommand(command string, format WarningFormat) string {
-	return fmt.Sprintf(
-		`sh -c 'if ! command -v entire >/dev/null 2>&1; then printf "%%s\n" %q; exit 0; fi; exec %s'`,
-		MissingEntireWarning(format),
-		command,
-	)
+	return warningHookCommand(command, MissingEntireWarning(format), FailedEntireWarning(format))
 }
 
 const productionHookWrapperPrefix = `sh -c 'if ! command -v entire >/dev/null 2>&1; then `
@@ -280,12 +312,14 @@ func IsManagedHookCommand(command string) bool {
 		return true
 	}
 	if strings.HasPrefix(command, productionHookWrapperPrefix) {
-		_, wrappedCommand, ok := strings.Cut(command, "; fi; exec ")
+		// The silent wrapper, and warning wrappers from older versions, exec the
+		// command; current warning wrappers run it bare.
+		_, wrappedCommand, ok := strings.Cut(command, "; fi; ")
 		if !ok {
 			return false
 		}
 
-		return hasManagedHookPrefix(wrappedCommand)
+		return hasManagedHookPrefix(strings.TrimPrefix(wrappedCommand, "exec "))
 	}
 	if strings.HasPrefix(command, windowsProductionHookWrapperPrefix) ||
 		strings.HasPrefix(command, nestedWindowsProductionHookWrapperPrefix) {
