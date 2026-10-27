@@ -781,6 +781,11 @@ type SetPluginInstallationRepositoriesParams struct {
 	ID string
 }
 
+// SetRepoDefaultBranchParams is parameters of setRepoDefaultBranch operation.
+type SetRepoDefaultBranchParams struct {
+	RepoId string
+}
+
 // SetRepoVisibilityParams is parameters of setRepoVisibility operation.
 type SetRepoVisibilityParams struct {
 	RepoId string

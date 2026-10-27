@@ -6177,6 +6177,65 @@
         ],
         "type": "object"
       },
+      "SetRepoDefaultBranchInputBody": {
+        "additionalProperties": true,
+        "properties": {
+          "$schema": {
+            "description": "A URL to the JSON Schema for this object.",
+            "examples": [
+              "/api/v1/schemas/SetRepoDefaultBranchInputBody.json"
+            ],
+            "format": "uri",
+            "readOnly": true,
+            "type": "string"
+          },
+          "branch": {
+            "description": "Branch to make the default: a short name or a full refs/heads/ ref.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "branch"
+        ],
+        "type": "object"
+      },
+      "SetRepoDefaultBranchOutputBody": {
+        "additionalProperties": true,
+        "properties": {
+          "$schema": {
+            "description": "A URL to the JSON Schema for this object.",
+            "examples": [
+              "/api/v1/schemas/SetRepoDefaultBranchOutputBody.json"
+            ],
+            "format": "uri",
+            "readOnly": true,
+            "type": "string"
+          },
+          "branch": {
+            "description": "The default branch after the call, as a full ref.",
+            "type": "string"
+          },
+          "changed": {
+            "description": "Whether the call moved the default branch.",
+            "type": "boolean"
+          },
+          "previous": {
+            "description": "The default branch before the call, as a full ref.",
+            "type": "string"
+          },
+          "repo_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_id",
+          "branch",
+          "previous",
+          "changed"
+        ],
+        "type": "object"
+      },
       "SetRepoVisibilityInputBody": {
         "additionalProperties": true,
         "properties": {
@@ -12634,6 +12693,66 @@
           }
         ],
         "summary": "List repo collaborators",
+        "tags": [
+          "repos"
+        ]
+      }
+    },
+    "/repos/{repoId}/default-branch": {
+      "put": {
+        "operationId": "setRepoDefaultBranch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "repoId",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetRepoDefaultBranchInputBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetRepoDefaultBranchOutputBody"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorModel"
+                }
+              }
+            },
+            "description": "Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionAuth": []
+          }
+        ],
+        "summary": "Set a repository's default branch",
         "tags": [
           "repos"
         ]

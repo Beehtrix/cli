@@ -161,6 +161,11 @@ the ENT-3417 contract spliced in from the live spec: `MirrorSyncBlock`,
 **Fix upstream:** nothing — the pieces are verbatim from the published spec.
 The next full refresh carries them on its own, and this entry goes.
 
+`PUT /repos/{repoId}/default-branch` and its two bodies
+(`SetRepoDefaultBranchInputBody`, `SetRepoDefaultBranchOutputBody`) are spliced
+the same way, from the agreed contract ahead of the core release. Check the
+operation and schema names against the live spec on the next refresh.
+
 **Workaround:** none in `normalize.go` beyond the `ResyncMirrorOutputBody.status`
 enum loosening. entiredb#4961 is on main and in prod, so any refresh from a
 current core keeps the three schemas and the route.

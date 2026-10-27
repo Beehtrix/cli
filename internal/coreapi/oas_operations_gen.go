@@ -119,6 +119,7 @@ const (
 	RotateOrgCIBuildkiteInboundSecretOperation   OperationName = "RotateOrgCIBuildkiteInboundSecret"
 	SetBranchProtectionOperation                 OperationName = "SetBranchProtection"
 	SetPluginInstallationRepositoriesOperation   OperationName = "SetPluginInstallationRepositories"
+	SetRepoDefaultBranchOperation                OperationName = "SetRepoDefaultBranch"
 	SetRepoVisibilityOperation                   OperationName = "SetRepoVisibility"
 	UpdateBranchProtectionOperation              OperationName = "UpdateBranchProtection"
 	UpdateOrgMemberRoleOperation                 OperationName = "UpdateOrgMemberRole"

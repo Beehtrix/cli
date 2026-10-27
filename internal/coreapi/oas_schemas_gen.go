@@ -22406,6 +22406,141 @@ func (s *SetPluginInstallationRepositoriesInputBodyRepositorySelection) Unmarsha
 	}
 }
 
+// Ref: #/components/schemas/SetRepoDefaultBranchInputBody
+type SetRepoDefaultBranchInputBody struct {
+	// A URL to the JSON Schema for this object.
+	Schema OptURI `json:"$schema"`
+	// Branch to make the default: a short name or a full refs/heads/ ref.
+	Branch          string `json:"branch"`
+	AdditionalProps SetRepoDefaultBranchInputBodyAdditional
+}
+
+// GetSchema returns the value of Schema.
+func (s *SetRepoDefaultBranchInputBody) GetSchema() OptURI {
+	return s.Schema
+}
+
+// GetBranch returns the value of Branch.
+func (s *SetRepoDefaultBranchInputBody) GetBranch() string {
+	return s.Branch
+}
+
+// GetAdditionalProps returns the value of AdditionalProps.
+func (s *SetRepoDefaultBranchInputBody) GetAdditionalProps() SetRepoDefaultBranchInputBodyAdditional {
+	return s.AdditionalProps
+}
+
+// SetSchema sets the value of Schema.
+func (s *SetRepoDefaultBranchInputBody) SetSchema(val OptURI) {
+	s.Schema = val
+}
+
+// SetBranch sets the value of Branch.
+func (s *SetRepoDefaultBranchInputBody) SetBranch(val string) {
+	s.Branch = val
+}
+
+// SetAdditionalProps sets the value of AdditionalProps.
+func (s *SetRepoDefaultBranchInputBody) SetAdditionalProps(val SetRepoDefaultBranchInputBodyAdditional) {
+	s.AdditionalProps = val
+}
+
+type SetRepoDefaultBranchInputBodyAdditional map[string]jx.Raw
+
+func (s *SetRepoDefaultBranchInputBodyAdditional) init() SetRepoDefaultBranchInputBodyAdditional {
+	m := *s
+	if m == nil {
+		m = map[string]jx.Raw{}
+		*s = m
+	}
+	return m
+}
+
+// Ref: #/components/schemas/SetRepoDefaultBranchOutputBody
+type SetRepoDefaultBranchOutputBody struct {
+	// A URL to the JSON Schema for this object.
+	Schema OptURI `json:"$schema"`
+	// The default branch after the call, as a full ref.
+	Branch string `json:"branch"`
+	// Whether the call moved the default branch.
+	Changed bool `json:"changed"`
+	// The default branch before the call, as a full ref.
+	Previous        string `json:"previous"`
+	RepoID          string `json:"repo_id"`
+	AdditionalProps SetRepoDefaultBranchOutputBodyAdditional
+}
+
+// GetSchema returns the value of Schema.
+func (s *SetRepoDefaultBranchOutputBody) GetSchema() OptURI {
+	return s.Schema
+}
+
+// GetBranch returns the value of Branch.
+func (s *SetRepoDefaultBranchOutputBody) GetBranch() string {
+	return s.Branch
+}
+
+// GetChanged returns the value of Changed.
+func (s *SetRepoDefaultBranchOutputBody) GetChanged() bool {
+	return s.Changed
+}
+
+// GetPrevious returns the value of Previous.
+func (s *SetRepoDefaultBranchOutputBody) GetPrevious() string {
+	return s.Previous
+}
+
+// GetRepoID returns the value of RepoID.
+func (s *SetRepoDefaultBranchOutputBody) GetRepoID() string {
+	return s.RepoID
+}
+
+// GetAdditionalProps returns the value of AdditionalProps.
+func (s *SetRepoDefaultBranchOutputBody) GetAdditionalProps() SetRepoDefaultBranchOutputBodyAdditional {
+	return s.AdditionalProps
+}
+
+// SetSchema sets the value of Schema.
+func (s *SetRepoDefaultBranchOutputBody) SetSchema(val OptURI) {
+	s.Schema = val
+}
+
+// SetBranch sets the value of Branch.
+func (s *SetRepoDefaultBranchOutputBody) SetBranch(val string) {
+	s.Branch = val
+}
+
+// SetChanged sets the value of Changed.
+func (s *SetRepoDefaultBranchOutputBody) SetChanged(val bool) {
+	s.Changed = val
+}
+
+// SetPrevious sets the value of Previous.
+func (s *SetRepoDefaultBranchOutputBody) SetPrevious(val string) {
+	s.Previous = val
+}
+
+// SetRepoID sets the value of RepoID.
+func (s *SetRepoDefaultBranchOutputBody) SetRepoID(val string) {
+	s.RepoID = val
+}
+
+// SetAdditionalProps sets the value of AdditionalProps.
+func (s *SetRepoDefaultBranchOutputBody) SetAdditionalProps(val SetRepoDefaultBranchOutputBodyAdditional) {
+	s.AdditionalProps = val
+}
+
+type SetRepoDefaultBranchOutputBodyAdditional map[string]jx.Raw
+
+func (s *SetRepoDefaultBranchOutputBodyAdditional) init() SetRepoDefaultBranchOutputBodyAdditional {
+	m := *s
+	if m == nil {
+		m = map[string]jx.Raw{}
+		*s = m
+	}
+	return m
+}
+
 // Ref: #/components/schemas/SetRepoVisibilityInputBody
 type SetRepoVisibilityInputBody struct {
 	// A URL to the JSON Schema for this object.
