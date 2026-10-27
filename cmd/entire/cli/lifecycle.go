@@ -2394,17 +2394,24 @@ func completeSubagentTaskRecord(logCtx context.Context, ag agent.Agent, event *a
 	}
 	relModifiedFiles, relNewFiles, relDeletedFiles = strategy.FilterTrackableChanges(logCtx, repoRoot, relModifiedFiles, relNewFiles, relDeletedFiles)
 
+	// A foreground subagent that committed some of its own work gets its record
+	// in that commit's checkpoint (attachTaskToCommitCheckpoint). Whatever it
+	// left uncommitted still completes a record below, for the commit that
+	// later carries it.
+	attachedToCommit := false
+	if !opts.bypassNoChangesSkip {
+		committedFiles := withoutFiles(subagentFiles, uncommittedSubagentFiles)
+		attachedToCommit = attachTaskToCommitCheckpoint(logCtx, ag, event, opts, preState, subagentTranscriptPath, committedFiles)
+	}
+
 	// If no changes, skip — unless this is a Final (SubagentStop) capture: a
 	// read-only background subagent (e.g. a reviewer) still produced a
 	// transcript worth materializing, and SubagentStop is the only chance to
 	// record it (bypassNoChangesSkip is never set for the foreground
 	// launch-time path, which keeps its original skip-on-no-changes behavior).
-	// A foreground subagent that committed its own work is the exception: its
-	// record goes to that commit's checkpoint (attachTaskToCommitCheckpoint).
 	if len(relModifiedFiles) == 0 && len(relNewFiles) == 0 && len(relDeletedFiles) == 0 {
 		if !opts.bypassNoChangesSkip {
-			committedFiles := withoutFiles(subagentFiles, uncommittedSubagentFiles)
-			if !attachTaskToCommitCheckpoint(logCtx, ag, event, opts, preState, subagentTranscriptPath, committedFiles) {
+			if !attachedToCommit {
 				logging.Info(logCtx, "no file changes detected, skipping task record")
 			}
 			_ = CleanupPreTaskState(logCtx, event.ToolUseID) //nolint:errcheck // best-effort cleanup
@@ -2481,8 +2488,8 @@ func subagentTaskRecord(logCtx context.Context, ag agent.Agent, event *agent.Eve
 
 // attachTaskToCommitCheckpoint stores a foreground subagent's record in the
 // checkpoint of its own commit made while it ran, and reports whether it took
-// the record. That commit condensed the session before the record existed, and
-// it left nothing uncommitted for a later commit to carry.
+// the record. That commit condensed the session before the record existed, so
+// no later commit would carry the transcript for the files it holds.
 //
 // committedFiles are the files the subagent wrote that HEAD now has. A
 // subagent with none, such as a read-only one running alongside the committer,

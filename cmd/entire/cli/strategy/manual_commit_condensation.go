@@ -505,23 +505,33 @@ func (s *ManualCommitStrategy) TaskCheckpointForFiles(ctx context.Context, candi
 	if len(candidates) == 0 {
 		return id.EmptyCheckpointID
 	}
+	logCtx := logging.WithComponent(ctx, "checkpoint")
 	stores, closeRepo, err := s.openHookStores(ctx)
 	if err != nil {
+		logging.Warn(logCtx, "cannot check which checkpoint holds the task's commit; using the newest",
+			slog.Any("candidates", candidates),
+			slog.String("error", err.Error()))
 		return candidates[0]
 	}
 	defer closeRepo()
-	unreadable := false
+	var unreadable []id.CheckpointID
+	var readErr error
 	for _, candidate := range candidates {
 		summary, err := cpkg.ReadCheckpoint(ctx, stores.Persistent, candidate)
-		if err != nil || summary == nil {
-			unreadable = true
+		if err != nil {
+			unreadable = append(unreadable, candidate)
+			readErr = err
 			continue
 		}
 		if slices.ContainsFunc(summary.FilesTouched, func(f string) bool { return slices.Contains(files, f) }) {
 			return candidate
 		}
 	}
-	if unreadable {
+	if len(unreadable) > 0 {
+		logging.Warn(logCtx, "could not read every candidate checkpoint for the task's commit; using the newest",
+			slog.Any("candidates", candidates),
+			slog.Any("unreadable", unreadable),
+			slog.String("error", readErr.Error()))
 		return candidates[0]
 	}
 	return id.EmptyCheckpointID

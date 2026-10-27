@@ -94,6 +94,68 @@ func TestSubagentCheckpoints_CommittedMidTurn_LeavesNothingPending(t *testing.T)
 	assertTaskTranscriptInCheckpoint(t, env, checkpointID, taskToolUseID, subagentID, editedFile)
 }
 
+// TestSubagentCheckpoints_CommittedMidTurn_PartialCommitStoresTaskInBoth pins
+// that a subagent committing only some of its files gets its task in that
+// commit's checkpoint, and again in the checkpoint of the commit that later
+// carries the rest.
+func TestSubagentCheckpoints_CommittedMidTurn_PartialCommitStoresTaskInBoth(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	session := env.NewSession()
+	session.CreateTranscript("use a subagent to write two files and commit one", nil)
+
+	const (
+		taskToolUseID = "toolu_01PartialCommit"
+		subagentID    = "a9900112233445566"
+		committedFile = "docs/committed.md"
+		laterFile     = "docs/later.md"
+	)
+	session.CreateSubagentTranscript(subagentID, []FileChange{
+		{Path: committedFile, Content: "Committed.\n"},
+		{Path: laterFile, Content: "Later.\n"},
+	})
+
+	if err := env.SimulateUserPromptSubmitWithTranscriptPath(session.ID, session.TranscriptPath); err != nil {
+		t.Fatalf("SimulateUserPromptSubmit failed: %v", err)
+	}
+	if err := env.SimulatePreTask(session.ID, session.TranscriptPath, taskToolUseID); err != nil {
+		t.Fatalf("SimulatePreTask failed: %v", err)
+	}
+	env.WriteFile(committedFile, "Committed.\n")
+	env.WriteFile(laterFile, "Later.\n")
+	env.GitCommitWithHooksAsAgent("Add committed.md", committedFile)
+	firstCheckpointID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
+	if firstCheckpointID == "" {
+		t.Fatal("precondition: the subagent's commit should carry an Entire-Checkpoint trailer")
+	}
+
+	if err := env.SimulatePostTask(PostTaskInput{
+		SessionID:      session.ID,
+		TranscriptPath: session.TranscriptPath,
+		ToolUseID:      taskToolUseID,
+		AgentID:        subagentID,
+	}); err != nil {
+		t.Fatalf("SimulatePostTask failed: %v", err)
+	}
+	assertTaskTranscriptInCheckpoint(t, env, firstCheckpointID, taskToolUseID, subagentID, committedFile)
+
+	state, err := env.GetSessionState(session.ID)
+	if err != nil || state == nil {
+		t.Fatalf("GetSessionState failed: state=%+v err=%v", state, err)
+	}
+	rec := state.FindTaskRecord(taskToolUseID)
+	if rec == nil || !containsFile(rec.Files, laterFile) || containsFile(rec.Files, committedFile) {
+		t.Fatalf("the uncommitted rest should stay pending as a record listing only %s, got %+v", laterFile, rec)
+	}
+
+	env.GitCommitWithHooksAsAgent("Add later.md", laterFile)
+	secondCheckpointID := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
+	if secondCheckpointID == "" || secondCheckpointID == firstCheckpointID {
+		t.Fatalf("precondition: the later commit should get its own checkpoint, got %q (first %q)", secondCheckpointID, firstCheckpointID)
+	}
+	assertTaskTranscriptInCheckpoint(t, env, secondCheckpointID, taskToolUseID, subagentID, laterFile)
+}
+
 // TestSubagentCheckpoints_CommittedMidTurn_SkipsEarlierParentCheckpoint pins
 // that only checkpoints condensed while the subagent ran receive its task: the
 // parent's own commit earlier in the same turn keeps its contents.
