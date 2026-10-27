@@ -563,3 +563,21 @@ func TestConfigure_ManualPolicyNeedsGitRefs(t *testing.T) {
 	env.RunCLI("configure", "--checkpoint-backend", "git-refs", "--checkpoint-push-policy", "manual")
 	require.Equal(t, "manual", listPolicyOutgoing(t, env).Policy)
 }
+
+// The policy is saved only once the other flags have applied: a failed
+// backend switch must not leave manual on a git-branch clone.
+func TestConfigure_PolicyNotSavedWhenBackendSwitchFails(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into read-only directories")
+	}
+	env := NewFeatureBranchEnv(t)
+	env.SetupBareRemote()
+	entireDir := filepath.Join(env.RepoDir, ".entire")
+	require.NoError(t, os.Chmod(entireDir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(entireDir, 0o750) }) //nolint:errcheck // best-effort restore before TempDir cleanup
+
+	_, err := env.RunCLIWithError("configure", "--checkpoint-backend", "git-refs", "--checkpoint-push-policy", "manual")
+	require.Error(t, err, "the backend save must fail for this test to mean anything")
+	require.NoFileExists(t, clonePreferencesFile(t, env), "manual must not be saved when the backend switch failed")
+}
