@@ -32,6 +32,11 @@ import (
 // prompt does, rather than an error.
 var ErrOPFAbortedByUser = errors.New("OPF prompt aborted by user; push cancelled")
 
+// ErrCheckpointPushHeldByPolicy is returned by PushQueuedCheckpointRefs when
+// the clone's checkpoint push policy is manual: the refs stay queued for
+// `entire checkpoint push`, which is not the same as an empty queue.
+var ErrCheckpointPushHeldByPolicy = errors.New("checkpoint push policy is manual; refs stay queued")
+
 var opfPrePushProgressWriter io.Writer = os.Stderr
 
 // PrePush is called by the git pre-push hook before pushing to a remote.
@@ -463,7 +468,8 @@ func (s *ManualCommitStrategy) prePushCheckpointRefs(ctx context.Context, ps pus
 // pushing is disabled in settings — a distinct signal from pushed==0 with
 // pushing enabled (an empty queue), so callers can report the two accurately.
 // Like the pre-push paths, an OPF rewrite that cannot run when OPF is enabled
-// errors with the refs left queued. Currently used by the checkpoint migration
+// errors with the refs left queued, and a manual policy returns
+// ErrCheckpointPushHeldByPolicy. Currently used by the checkpoint migration
 // command's opt-in "push now".
 func PushQueuedCheckpointRefs(ctx context.Context, repo *git.Repository, remote string) (pushed int, pushDisabled bool, err error) {
 	ps := resolvePushSettings(ctx, remote)
@@ -473,7 +479,7 @@ func PushQueuedCheckpointRefs(ctx context.Context, repo *git.Repository, remote 
 	if automatic, policyErr := automaticCheckpointDelivery(repo); policyErr != nil {
 		return 0, false, fmt.Errorf("checkpoint refs stay queued: %w", policyErr)
 	} else if !automatic {
-		return 0, false, nil
+		return 0, false, ErrCheckpointPushHeldByPolicy
 	}
 	if opfErr := opfGateForCheckpointRefs(ctx, repo); opfErr != nil {
 		// Names no cause, matching flushCheckpointRefsQueue's retry message

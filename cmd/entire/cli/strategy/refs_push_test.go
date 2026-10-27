@@ -557,6 +557,34 @@ func TestPushQueuedCheckpointRefs_PushDisabled(t *testing.T) {
 	assert.ElementsMatch(t, refs, remaining, "disabled push leaves refs queued")
 }
 
+// Under manual, the queue is held, not empty: the caller must be able to tell
+// the two apart to report why nothing was pushed.
+func TestPushQueuedCheckpointRefs_ManualPolicyHoldsRefs(t *testing.T) {
+	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
+	t.Chdir(workDir)
+	paths.ClearWorktreeRootCache()
+	require.NoError(t, os.MkdirAll(filepath.Join(workDir, ".git", "entire"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(workDir, ".git", "entire", "preferences.json"),
+		[]byte(`{"checkpoint_push_policy":"manual"}`),
+		0o600,
+	))
+
+	repo, err := git.PlainOpen(workDir)
+	require.NoError(t, err)
+	queue := enqueueRefs(t, repo, refs)
+
+	pushed, pushDisabled, err := PushQueuedCheckpointRefs(context.Background(), repo, bareDir)
+	require.ErrorIs(t, err, ErrCheckpointPushHeldByPolicy)
+	assert.False(t, pushDisabled)
+	assert.Equal(t, 0, pushed)
+
+	assert.Empty(t, strings.TrimSpace(testutil.RunGit(t, bareDir, "for-each-ref", "refs/entire/")), "manual must not push")
+	remaining, err := queue.Drain()
+	require.NoError(t, err)
+	assert.ElementsMatch(t, refs, remaining, "held refs stay queued")
+}
+
 func TestPushQueuedCheckpointRefs_FailureLeavesRefsQueued(t *testing.T) {
 	workDir, _, refs := setupRepoWithCheckpointRefs(t)
 	t.Chdir(workDir)
