@@ -170,7 +170,12 @@ func TestJSONLContent_SplitConcatenationEquivalence(t *testing.T) {
 
 	prefix := buildJSONLFixture(t, 2*jsonlShardTargetBytes)
 	require.True(t, strings.HasSuffix(prefix, "\n"), "prefix must end on a line boundary")
-	suffix := buildJSONLFixture(t, jsonlShardTargetBytes/16)
+	suffix := buildJSONLFixture(t, 3*jsonlShardTargetBytes/4)
+	// One shard, line path, all four line types.
+	require.True(t, IsLineDelimited([]byte(suffix)), "suffix must take the line path")
+	require.Len(t, shardLineBounds(strings.Split(suffix, "\n"), jsonlShardTargetBytes), 1,
+		"suffix must stay in one shard")
+	require.Contains(t, suffix, "not json at all", "suffix must include every line type")
 
 	whole, err := JSONLContent(prefix + suffix)
 	require.NoError(t, err)
