@@ -315,7 +315,7 @@ func TestRepoMirrorResync(t *testing.T) {
 type blockedDirectory struct {
 	repos      []coreapi.RepoIndexEntry
 	syncStatus int // >= 400 fails the mirror read with a problem
-	onSync     func()
+	onSync     func(*http.Request)
 	syncReads  int
 	mu         sync.Mutex
 }
@@ -334,7 +334,7 @@ func (d *blockedDirectory) serve(t *testing.T) {
 			d.syncReads++
 			d.mu.Unlock()
 			if d.onSync != nil {
-				d.onSync()
+				d.onSync(r)
 			}
 			if d.syncStatus >= 400 {
 				writeCoreProblem(t, w, d.syncStatus, "mirror unavailable")
@@ -445,7 +445,12 @@ func TestRepoView_SyncBlock(t *testing.T) {
 
 	t.Run("an interruption during the read fails the view", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
-		(&blockedDirectory{repos: web, onSync: cancel}).serve(t)
+		// Answer only after the client gives up.
+		interrupt := func(r *http.Request) {
+			cancel()
+			<-r.Context().Done()
+		}
+		(&blockedDirectory{repos: web, onSync: interrupt}).serve(t)
 		cmd := newRepoCmd()
 		var out, errW strings.Builder
 		cmd.SetOut(&out)
