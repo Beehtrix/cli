@@ -1489,3 +1489,45 @@ func TestErrWithGitOutput_KeepsCauseWhenGitIsSilent(t *testing.T) {
 	require.ErrorIs(t, detailed, sentinel, "detail must annotate the cause, not replace it")
 	assert.Contains(t, detailed.Error(), "couldn't find remote ref")
 }
+
+// --progress output overwrites each progress line in place with \r. Folding all
+// of it into an error buries git's verdict under hundreds of stale percentages,
+// so only what a terminal would finally show for each line may remain.
+func TestErrWithGitOutput_DropsOverwrittenProgress(t *testing.T) {
+	t.Parallel()
+	output := "remote: Counting objects:  50% (1/2)\rremote: Counting objects: 100% (2/2), done.\n" +
+		"Receiving objects:  10% (1/10)\rReceiving objects:  20% (2/10)\r" +
+		"error: RPC failed; curl 28 Operation too slow\n" +
+		"fatal: early EOF\n"
+
+	err := errWithGitOutput(errors.New("exit status 128"), []byte(output), "origin")
+
+	assert.Contains(t, err.Error(), "Counting objects: 100% (2/2), done.")
+	assert.Contains(t, err.Error(), "curl 28 Operation too slow")
+	assert.Contains(t, err.Error(), "fatal: early EOF")
+	assert.NotContains(t, err.Error(), "50% (1/2)")
+	assert.NotContains(t, err.Error(), "Receiving objects")
+}
+
+func TestWithStallAbort(t *testing.T) {
+	t.Parallel()
+	limitKey, timeKey := "GIT_HTTP_LOW_SPEED_LIMIT=", "GIT_HTTP_LOW_SPEED_TIME="
+
+	t.Run("sets both when unset", func(t *testing.T) {
+		t.Parallel()
+		env := withStallAbort([]string{"PATH=/bin"})
+		assert.Contains(t, env, "PATH=/bin")
+		assert.Contains(t, env, limitKey+strconv.Itoa(stallAbortLowSpeedLimit))
+		assert.Contains(t, env, timeKey+strconv.Itoa(int(stallAbortLowSpeedTime.Seconds())))
+	})
+
+	// git applies the check only when both are positive, so a user who set
+	// either one owns the setting; filling in the other would change it.
+	for _, userSet := range []string{limitKey + "50", timeKey + "600"} {
+		t.Run("respects user "+userSet, func(t *testing.T) {
+			t.Parallel()
+			env := withStallAbort([]string{"PATH=/bin", userSet})
+			assert.Equal(t, []string{"PATH=/bin", userSet}, env)
+		})
+	}
+}

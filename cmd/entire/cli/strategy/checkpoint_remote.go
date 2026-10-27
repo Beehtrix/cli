@@ -6,11 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/remote"
+	"github.com/entireio/cli/cmd/entire/cli/gitdir"
+	"github.com/entireio/cli/cmd/entire/cli/interactive"
+	"github.com/entireio/cli/cmd/entire/cli/internal/flock"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 
@@ -21,16 +25,24 @@ import (
 // push hot path, where the user's own `git push` is blocked for the duration.
 const checkpointRemoteFetchTimeout = 30 * time.Second
 
-// checkpointRemoteForegroundFetchTimeout bounds checkpoint-remote fetches made
-// by user-initiated foreground commands (enable, resume, explain). It matches
-// the origin-side metadata fetch budget in the cli package.
-//
-// Splitting the two fixes a backwards asymmetry: origin-side fetches already had
-// two minutes while the checkpoint remote — which by definition holds strictly
-// more checkpoint history than origin does — was held to the push hot path's 30
-// seconds. A checkpoint archive too large to transfer in 30s was therefore
-// unreadable, and each attempt failed the same way with nothing to show for it.
-const checkpointRemoteForegroundFetchTimeout = 2 * time.Minute
+// checkpointFetchMode selects how a checkpoint-remote fetch is bounded.
+type checkpointFetchMode int
+
+const (
+	// hotPathFetch bounds the fetch by checkpointRemoteFetchTimeout.
+	hotPathFetch checkpointFetchMode = iota
+	// foregroundFetch is for user-initiated commands (enable, resume, explain,
+	// delete), which fetch the whole transcript archive. No fixed deadline
+	// suits that: one the archive outgrows discards the partial transfer, the
+	// ref never lands, and every later command restarts the same fetch from
+	// zero. So these run until done and abort only a stalled transfer, under a
+	// per-repository lock so concurrent commands transfer the archive once.
+	foregroundFetch
+)
+
+// checkpointRemoteFetchLockName is the lock file, in the git common dir, that
+// serializes foreground checkpoint-remote fetches across processes.
+const checkpointRemoteFetchLockName = "entire-checkpoint-remote-fetch.lock"
 
 // pushSettings holds the resolved push configuration from a single settings load.
 type pushSettings struct {
@@ -139,14 +151,14 @@ func resolvePushSettings(ctx context.Context, pushRemoteName string) pushSetting
 // where the local branch may be stale).
 //
 // The fetch is unfiltered (NoFilter: true) because resume needs blob content
-// (transcripts, metadata JSON) — not just tree objects, and it runs on the
-// foreground budget for the same reason: it is the call that actually moves the
+// (transcripts, metadata JSON) — not just tree objects, and it runs as a
+// foregroundFetch for the same reason: it is the call that actually moves the
 // transcript archive.
 func FetchMetadataBranch(ctx context.Context, remoteURL string) error {
-	return fetchMetadataBranchWithin(ctx, remoteURL, checkpointRemoteForegroundFetchTimeout)
+	return fetchMetadataBranchWithin(ctx, remoteURL, foregroundFetch)
 }
 
-func fetchMetadataBranchWithin(ctx context.Context, remoteURL string, timeout time.Duration) error {
+func fetchMetadataBranchWithin(ctx context.Context, remoteURL string, mode checkpointFetchMode) error {
 	refs := checkpoint.ResolveRefs(ctx)
 	if !refs.Primary.IsBranch() {
 		return fmt.Errorf("primary metadata ref %s is not a branch", refs.Primary)
@@ -155,7 +167,11 @@ func fetchMetadataBranchWithin(ctx context.Context, remoteURL string, timeout ti
 	tmpRef := FetchTmpRefPrefix + branchName
 	srcRef := refs.Primary.String()
 
-	if err := fetchURLIntoTmpRef(ctx, "", remoteURL, srcRef, tmpRef, "metadata branch", true, timeout); err != nil {
+	if mode == foregroundFetch {
+		release := acquireCheckpointRemoteFetchLock(ctx, "")
+		defer release()
+	}
+	if err := fetchURLIntoTmpRef(ctx, "", remoteURL, srcRef, tmpRef, "metadata branch", true, mode); err != nil {
 		return err
 	}
 	if err := PromoteTmpRefSafely(ctx, plumbing.ReferenceName(tmpRef), refs.Primary, branchName); err != nil {
@@ -188,20 +204,23 @@ func fetchMetadataBranchWithin(ctx context.Context, remoteURL string, timeout ti
 //
 // The parameter is kept rather than inlined so the contract stays explicit at
 // each call site.
-// timeout bounds the fetch: pass checkpointRemoteFetchTimeout on the push hot
-// path and checkpointRemoteForegroundFetchTimeout from user-initiated commands.
-func fetchURLIntoTmpRef(ctx context.Context, dir, remoteURL, srcRef, tmpRef, label string, noFilter bool, timeout time.Duration) error { //nolint:unparam // every caller needs blob content today; see the doc above for why the filtered variant is unsafe here
-	fetchCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	refSpec := fmt.Sprintf("+%s:%s", srcRef, tmpRef)
-	_, fetchErr := remote.Fetch(fetchCtx, remote.FetchOptions{
+// mode bounds the fetch: hotPathFetch on the push hot path, foregroundFetch from
+// user-initiated commands.
+func fetchURLIntoTmpRef(ctx context.Context, dir, remoteURL, srcRef, tmpRef, label string, noFilter bool, mode checkpointFetchMode) error { //nolint:unparam // every caller needs blob content today; see the doc above for why the filtered variant is unsafe here
+	opts := remote.FetchOptions{
 		Remote:   remoteURL,
-		RefSpecs: []string{refSpec},
+		RefSpecs: []string{fmt.Sprintf("+%s:%s", srcRef, tmpRef)},
 		NoTags:   true,
 		NoFilter: noFilter,
 		Dir:      dir,
-	})
+	}
+	fetchCtx, cancel := boundFetch(ctx, mode, &opts)
+	defer cancel()
+	if mode == foregroundFetch && interactive.IsTerminalWriter(os.Stderr) {
+		fmt.Fprintf(os.Stderr, "[entire] Fetching checkpoints from %s\n", remote.RedactURL(remoteURL))
+	}
+
+	_, fetchErr := remote.Fetch(fetchCtx, opts)
 	if fetchErr == nil {
 		return nil
 	}
@@ -210,6 +229,51 @@ func fetchURLIntoTmpRef(ctx context.Context, dir, remoteURL, srcRef, tmpRef, lab
 	// capped; splicing it again printed the same text twice.
 	redactedURL := remote.RedactURL(remoteURL)
 	return fmt.Errorf("fetch %s from %s failed: %w", label, redactedURL, fetchErr)
+}
+
+// boundFetch applies mode to a fetch, returning the context it runs under.
+func boundFetch(ctx context.Context, mode checkpointFetchMode, opts *remote.FetchOptions) (context.Context, context.CancelFunc) {
+	if mode == foregroundFetch {
+		opts.AbortStalled = true
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, checkpointRemoteFetchTimeout)
+}
+
+// acquireCheckpointRemoteFetchLock waits for any other foreground
+// checkpoint-remote fetch in this repository to finish. The waiter's own fetch
+// then negotiates against the objects the first one landed and transfers only
+// what is new.
+//
+// Callers that fetch into the shared metadata tmp ref hold the lock until that
+// ref is promoted and removed: released after the fetch alone, a finishing
+// caller's cleanup can delete the ref out from under the next caller's fetch.
+//
+// Best-effort: failing to take the lock logs and lets the caller run
+// unserialized, as every fetch did before the lock existed. dir is the worktree
+// to resolve the git common dir from; empty means the current repository.
+func acquireCheckpointRemoteFetchLock(ctx context.Context, dir string) (release func()) {
+	noop := func() {}
+	var root *os.Root
+	var err error
+	if dir == "" {
+		root, err = gitdir.Open(ctx)
+	} else {
+		var commonDir string
+		if commonDir, err = gitdir.CommonDirForWorktree(ctx, dir); err == nil {
+			root, err = gitdir.OpenAt(commonDir)
+		}
+	}
+	if err == nil {
+		release, err = flock.AcquireContextIn(ctx, root, checkpointRemoteFetchLockName)
+	}
+	if err != nil {
+		logging.Warn(ctx, "checkpoint-remote: fetch lock unavailable; fetching unserialized",
+			slog.String("error", err.Error()),
+		)
+		return noop
+	}
+	return release
 }
 
 // fetchMetadataBranchIfMissing fetches the primary metadata ref from a URL only if it doesn't exist locally.
@@ -262,7 +326,7 @@ func fetchMetadataBranchIfMissing(ctx context.Context, remoteURL string) error {
 		return nil
 	}
 
-	if err := fetchMetadataBranchWithin(ctx, remoteURL, checkpointRemoteFetchTimeout); err != nil {
+	if err := fetchMetadataBranchWithin(ctx, remoteURL, hotPathFetch); err != nil {
 		return err
 	}
 

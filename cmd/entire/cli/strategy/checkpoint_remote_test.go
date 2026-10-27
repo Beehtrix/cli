@@ -7,8 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/remote"
+	"github.com/entireio/cli/cmd/entire/cli/gitdir"
+	"github.com/entireio/cli/cmd/entire/cli/internal/flock"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
@@ -1525,4 +1528,109 @@ func TestEnsurePrimaryRef_SkipsEmptyOrphanHealUnderGitRefsPrimary(t *testing.T) 
 	// heal fetch was skipped rather than attempted and failed.
 	assert.Equal(t, orphanTip, checkpointRemoteRevParse(t, localDir, paths.MetadataBranchName),
 		"enable must not heal the v1 orphan from the checkpoint remote under git-refs primary")
+}
+
+// The fetch lock only saves bandwidth for concurrent fetches; failing to take it
+// must not cost the user the fetch itself.
+//
+// Not parallel: uses t.Chdir()
+func TestFetchMetadataBranch_ProceedsWhenFetchLockUnavailable(t *testing.T) {
+	ctx := context.Background()
+
+	remoteDir := t.TempDir()
+	testutil.InitRepo(t, remoteDir)
+	testutil.WriteFile(t, remoteDir, "f.txt", "init")
+	testutil.GitAdd(t, remoteDir, "f.txt")
+	testutil.GitCommit(t, remoteDir, "init")
+	testutil.RunGit(t, remoteDir, "branch", "entire/checkpoints/v1")
+
+	localDir := t.TempDir()
+	testutil.InitRepo(t, localDir)
+	testutil.WriteFile(t, localDir, "f.txt", "init")
+	testutil.GitAdd(t, localDir, "f.txt")
+	testutil.GitCommit(t, localDir, "init")
+	// A directory where the lock file belongs makes every lock attempt fail.
+	require.NoError(t, os.MkdirAll(filepath.Join(localDir, ".git", checkpointRemoteFetchLockName), 0o750))
+
+	t.Chdir(localDir)
+
+	require.NoError(t, FetchMetadataBranch(ctx, remoteDir))
+	assert.True(t, testutil.BranchExists(t, localDir, "entire/checkpoints/v1"))
+}
+
+func TestBoundFetch(t *testing.T) {
+	t.Parallel()
+
+	// A deadline here is the bug this mode exists to prevent: the archive
+	// outgrows it, the partial transfer is discarded, and every later command
+	// restarts the same fetch from zero.
+	t.Run("foreground has no deadline and aborts stalls instead", func(t *testing.T) {
+		t.Parallel()
+		var opts remote.FetchOptions
+		ctx, cancel := boundFetch(context.Background(), foregroundFetch, &opts)
+		defer cancel()
+		_, hasDeadline := ctx.Deadline()
+		assert.False(t, hasDeadline)
+		assert.True(t, opts.AbortStalled)
+	})
+
+	t.Run("hot path keeps its deadline", func(t *testing.T) {
+		t.Parallel()
+		var opts remote.FetchOptions
+		ctx, cancel := boundFetch(context.Background(), hotPathFetch, &opts)
+		defer cancel()
+		deadline, hasDeadline := ctx.Deadline()
+		require.True(t, hasDeadline)
+		assert.WithinDuration(t, time.Now().Add(checkpointRemoteFetchTimeout), deadline, 5*time.Second)
+		assert.False(t, opts.AbortStalled)
+	})
+}
+
+// Concurrent commands must not each transfer the archive: a foreground fetch
+// waits for one already running in the same repository, and lands nothing
+// until it has the lock.
+//
+// Not parallel: uses t.Chdir()
+func TestFetchMetadataBranch_WaitsForConcurrentFetch(t *testing.T) {
+	ctx := context.Background()
+
+	remoteDir := t.TempDir()
+	testutil.InitRepo(t, remoteDir)
+	testutil.WriteFile(t, remoteDir, "f.txt", "init")
+	testutil.GitAdd(t, remoteDir, "f.txt")
+	testutil.GitCommit(t, remoteDir, "init")
+	testutil.RunGit(t, remoteDir, "branch", "entire/checkpoints/v1")
+
+	localDir := t.TempDir()
+	testutil.InitRepo(t, localDir)
+	testutil.WriteFile(t, localDir, "f.txt", "init")
+	testutil.GitAdd(t, localDir, "f.txt")
+	testutil.GitCommit(t, localDir, "init")
+	t.Chdir(localDir)
+
+	root, err := gitdir.Open(ctx)
+	require.NoError(t, err)
+	release, err := flock.AcquireIn(root, checkpointRemoteFetchLockName)
+	require.NoError(t, err)
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- FetchMetadataBranch(ctx, remoteDir) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("fetch finished while another fetch held the lock (err: %v)", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	assert.False(t, testutil.BranchExists(t, localDir, "entire/checkpoints/v1"), "nothing may land while another fetch holds the lock")
+
+	release()
+	released = true
+	require.NoError(t, <-done)
+	assert.True(t, testutil.BranchExists(t, localDir, "entire/checkpoints/v1"))
 }

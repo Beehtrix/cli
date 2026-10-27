@@ -183,6 +183,12 @@ type FetchOptions struct {
 	Depth     int
 	Dir       string   // working directory (empty = CWD)
 	ExtraArgs []string // additional flags before remote (e.g., "--no-write-fetch-head")
+	// AbortStalled has git abort an HTTP transfer that stops making progress
+	// (see withStallAbort), for callers that set no deadline because the
+	// transfer can legitimately take longer than any fixed one. It also
+	// requests --progress: without it the server sends only sparse keepalives
+	// while it prepares a large pack, which can look like a stall.
+	AbortStalled bool
 }
 
 // Fetch runs git fetch with checkpoint token injection and optional
@@ -198,6 +204,9 @@ func Fetch(ctx context.Context, opts FetchOptions) ([]byte, error) {
 		args = append(args, "--no-tags")
 	}
 	args = append(args, opts.ExtraArgs...)
+	if opts.AbortStalled {
+		args = append(args, "--progress")
+	}
 	switch {
 	case opts.Shallow:
 		args = append(args, "--depth=1")
@@ -238,6 +247,9 @@ func Fetch(ctx context.Context, opts FetchOptions) ([]byte, error) {
 		cmd.Dir = opts.Dir
 	}
 	disableTerminalPrompt(cmd)
+	if opts.AbortStalled {
+		cmd.Env = withStallAbort(cmd.Env)
+	}
 	out, err := cmd.CombinedOutput()
 
 	if stampCandidate && !existedBefore {
@@ -466,11 +478,30 @@ func formatGitPushError(ctx context.Context, err error, output []byte, remote st
 // Returns "" when git produced no output — which is what a process killed by a
 // cancelled context or an exhausted budget does.
 func gitOutputDetail(output []byte, remote string) string {
-	detail := strings.TrimSpace(string(output))
+	detail := strings.TrimSpace(finalProgressText(string(output)))
 	if detail == "" || remote == "" {
 		return detail
 	}
 	return strings.ReplaceAll(detail, remote, RedactURLOrPath(remote))
+}
+
+// finalProgressText keeps, for each line, only what a terminal would end up
+// showing: git's progress meters redraw a line in place with \r, so everything
+// before a line's last \r was overwritten. A trailing \r is a CRLF line ending,
+// not a redraw.
+func finalProgressText(output string) string {
+	if !strings.Contains(output, "\r") {
+		return output
+	}
+	lines := strings.Split(output, "\n")
+	for i, line := range lines {
+		line = strings.TrimSuffix(line, "\r")
+		if j := strings.LastIndexByte(line, '\r'); j >= 0 {
+			line = line[j+1:]
+		}
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n")
 }
 
 // errWithGitOutput annotates err with git's own output, or returns err unchanged
@@ -832,4 +863,32 @@ func disableTerminalPrompt(cmd *exec.Cmd) {
 		cmd.Env = os.Environ()
 	}
 	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0")
+}
+
+// stallAbortLowSpeedLimit and stallAbortLowSpeedTime abort a transfer that
+// averages under 1 byte/s for a minute: in effect, one that has stopped. The
+// limit is deliberately not a "too slow to be useful" threshold, because while
+// the server prepares a large pack the only traffic is its progress messages.
+const (
+	stallAbortLowSpeedLimit = 1
+	stallAbortLowSpeedTime  = time.Minute
+)
+
+// withStallAbort sets git's HTTP low-speed abort (http.lowSpeedLimit and
+// http.lowSpeedTime) in env. git's default is no low-speed check at all, and it
+// covers only the HTTP transports; an SSH transfer is unaffected.
+//
+// The environment variables override git config, so a user who exported either
+// one keeps their own setting: git applies the check only when both are
+// positive, so filling in the missing one would change what they chose.
+func withStallAbort(env []string) []string {
+	for _, e := range env {
+		if strings.HasPrefix(e, "GIT_HTTP_LOW_SPEED_LIMIT=") || strings.HasPrefix(e, "GIT_HTTP_LOW_SPEED_TIME=") {
+			return env
+		}
+	}
+	return append(env,
+		"GIT_HTTP_LOW_SPEED_LIMIT="+strconv.Itoa(stallAbortLowSpeedLimit),
+		"GIT_HTTP_LOW_SPEED_TIME="+strconv.Itoa(int(stallAbortLowSpeedTime.Seconds())),
+	)
 }
