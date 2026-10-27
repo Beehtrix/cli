@@ -31,7 +31,6 @@ type fakeDefaultBranchServer struct {
 	mu       sync.Mutex
 	status   int    // PUT status; 0 means 200
 	detail   string // problem detail on a non-200 PUT
-	provider string // GET /repos/{id} provider
 	previous string
 	bodies   []map[string]any
 }
@@ -41,15 +40,6 @@ func (f *fakeDefaultBranchServer) handler(t *testing.T) http.HandlerFunc {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/"+testDefaultBranchRepoULID:
-			repo := &coreapi.Repo{ID: testDefaultBranchRepoULID, Name: "web", OwningProjectId: testProjectULID}
-			if f.provider != "" {
-				repo.Provider = coreapi.NewOptString(f.provider)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			if err := printJSON(w, repo); err != nil {
-				t.Errorf("encode repo: %v", err)
-			}
 		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/repos/"+testDefaultBranchRepoULID+"/default-branch":
 			raw, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -125,19 +115,18 @@ func TestRepoDefaultBranch_Unchanged(t *testing.T) {
 // Not parallel: runCoreCmd swaps a package seam.
 func TestRepoDefaultBranch_Errors(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		status   int
-		detail   string
-		provider string
-		want     string
+		name   string
+		status int
+		detail string
+		want   string
 	}{
-		{name: "github mirror", status: http.StatusConflict, detail: "repo is a mirror", provider: repoProviderGitHub, want: defaultBranchMirrorMsg},
-		{name: "native mirror placement", status: http.StatusConflict, detail: "not the primary placement", provider: repoProviderEntire, want: "not the primary placement"},
+		{name: "github mirror", status: http.StatusConflict, detail: "a GitHub mirror follows GitHub's default branch", want: "a GitHub mirror follows GitHub's default branch"},
+		{name: "native mirror placement", status: http.StatusConflict, detail: "not the primary placement", want: "not the primary placement"},
 		{name: "missing branch", status: http.StatusNotFound, detail: "branch does not exist", want: "branch does not exist"},
 		{name: "forbidden", status: http.StatusForbidden, detail: "permission denied", want: "permission denied"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fake := &fakeDefaultBranchServer{status: tc.status, detail: tc.detail, provider: tc.provider}
+			fake := &fakeDefaultBranchServer{status: tc.status, detail: tc.detail}
 			srvURL := newDefaultBranchServer(t, fake)
 
 			_, _, err := runCoreCmd(t, newDefaultBranchCmd, srvURL, testDefaultBranchRepoULID, "master")

@@ -4,15 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/entireio/cli/internal/coreapi"
 )
-
-const defaultBranchMirrorMsg = "GitHub mirrors follow GitHub's default branch"
 
 func newDefaultBranchCmd() *cobra.Command {
 	var project string
@@ -39,7 +36,7 @@ func newDefaultBranchCmd() *cobra.Command {
 				body := &coreapi.SetRepoDefaultBranchInputBody{Branch: branch}
 				out, err := c.SetRepoDefaultBranch(ctx, body, coreapi.SetRepoDefaultBranchParams{RepoId: repoID})
 				if err != nil {
-					return "", nil, defaultBranchError(ctx, c, repoID, err)
+					return "", nil, err
 				}
 				return defaultBranchMessage(out), out, nil
 			})
@@ -57,14 +54,3 @@ func defaultBranchMessage(out *coreapi.SetRepoDefaultBranchOutputBody) string {
 	return fmt.Sprintf("✓ Default branch: %s (was %s)", out.Branch, out.Previous)
 }
 
-// A 409 also means a native-mirror placement.
-func defaultBranchError(ctx context.Context, c *coreapi.Client, repoID string, err error) error {
-	if coreapi.APIErrorStatus(err) != http.StatusConflict {
-		return err
-	}
-	repo, getErr := c.GetRepo(ctx, coreapi.GetRepoParams{RepoId: repoID})
-	if getErr != nil || repo.Response.Provider.Or("") != repoProviderGitHub {
-		return err
-	}
-	return errors.New(defaultBranchMirrorMsg)
-}
