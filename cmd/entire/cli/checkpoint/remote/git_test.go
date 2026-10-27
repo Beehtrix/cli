@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
@@ -1174,6 +1175,13 @@ func TestWithBatchModeSSH(t *testing.T) {
 			want: "/usr/local/bin/custom-ssh -o BatchMode=yes",
 		},
 		{
+			name: "GIT_SSH path is quoted for the shell git runs GIT_SSH_COMMAND through",
+			in: func(t *testing.T) []string {
+				return isolatedSSHEnv(t, `GIT_SSH=C:\Program Files\it's\ssh.exe`)
+			},
+			want: `'C:\Program Files\it'\''s\ssh.exe' -o BatchMode=yes`,
+		},
+		{
 			name: "unrelated substring containing BatchMode-like text does not count as explicit",
 			in: func(t *testing.T) []string {
 				return isolatedSSHEnv(t, `GIT_SSH_COMMAND=ssh -o ProxyCommand="connect -H proxy NoBatchModeHereEither"`)
@@ -1510,113 +1518,137 @@ func TestErrWithGitOutput_DropsOverwrittenProgress(t *testing.T) {
 	assert.NotContains(t, err.Error(), "Receiving objects")
 }
 
-func TestWithStallAbort(t *testing.T) {
-	t.Parallel()
-	limitKey, timeKey := "GIT_HTTP_LOW_SPEED_LIMIT=", "GIT_HTTP_LOW_SPEED_TIME="
-
-	t.Run("sets both when unset", func(t *testing.T) {
-		t.Parallel()
-		env := withStallAbort([]string{"PATH=/bin"})
-		assert.Contains(t, env, "PATH=/bin")
-		assert.Contains(t, env, limitKey+strconv.Itoa(stallAbortLowSpeedLimit))
-		assert.Contains(t, env, timeKey+strconv.Itoa(int(stallAbortLowSpeedTime.Seconds())))
-	})
-
-	// git applies the check only when both are positive, so a user who set
-	// either one owns the setting; filling in the other would change it.
-	for _, userSet := range []string{limitKey + "50", timeKey + "600"} {
-		t.Run("respects user "+userSet, func(t *testing.T) {
-			t.Parallel()
-			env := withStallAbort([]string{"PATH=/bin", userSet})
-			assert.Equal(t, []string{"PATH=/bin", userSet}, env)
-		})
-	}
-}
-
-func TestWithSSHKeepAlive(t *testing.T) {
-	t.Parallel()
-	const keepAlive = " -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
-
-	tests := []struct {
-		name  string
-		extra []string
-		want  string // expected GIT_SSH_COMMAND; empty means env is returned unchanged
-	}{
-		{name: "defaults to ssh", want: "ssh" + keepAlive},
-		{name: "extends a custom ssh command", extra: []string{"GIT_SSH_COMMAND=ssh -i /keys/id"}, want: "ssh -i /keys/id" + keepAlive},
-		{name: "extends an absolute ssh path", extra: []string{"GIT_SSH_COMMAND=/usr/bin/ssh"}, want: "/usr/bin/ssh" + keepAlive},
-		{name: "extends a windows ssh.exe", extra: []string{"GIT_SSH_COMMAND=C:/Git/usr/bin/ssh.exe"}, want: "C:/Git/usr/bin/ssh.exe" + keepAlive},
-		{name: "keeps batch mode", extra: []string{"GIT_SSH_COMMAND=ssh -o BatchMode=yes"}, want: "ssh -o BatchMode=yes" + keepAlive},
-		{name: "respects a user interval", extra: []string{"GIT_SSH_COMMAND=ssh -o ServerAliveInterval=300"}},
-		{name: "respects a user count", extra: []string{"GIT_SSH_COMMAND=ssh -oServerAliveCountMax=1"}},
-		// plink and other non-OpenSSH clients reject -o, so adding it would break the fetch.
-		{name: "leaves plink alone", extra: []string{"GIT_SSH_COMMAND=plink -batch"}},
-		{name: "leaves a GIT_SSH plink alone", extra: []string{"GIT_SSH=C:/PuTTY/plink.exe"}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			in := isolatedSSHEnv(t, tt.extra...)
-			out := withSSHKeepAlive(context.Background(), "", append([]string(nil), in...))
-			if tt.want == "" {
-				assert.Equal(t, in, out)
-				return
-			}
-			count := 0
-			for _, e := range out {
-				if strings.HasPrefix(e, "GIT_SSH_COMMAND=") {
-					count++
-				}
-			}
-			assert.Equal(t, 1, count, "should not duplicate GIT_SSH_COMMAND")
-			assert.Equal(t, tt.want, envToMap(out)["GIT_SSH_COMMAND"])
-		})
-	}
-}
-
-// A stalled SSH transfer is bounded only if the keepalive options actually
-// reach ssh, so this runs a real fetch against an ssh that records its argv.
-func TestFetch_AbortStalledPassesSSHKeepAlive(t *testing.T) {
-	// Not parallel: changes PATH and the checkpoint token env var.
+// fakeSSH installs script as the ssh git runs for an ssh:// remote and returns
+// that remote. GIT_SSH is unset, not empty, so git takes GIT_SSH_COMMAND.
+func fakeSSH(t *testing.T, script string) string {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("fake ssh is a shell script")
 	}
 	testutil.IsolateGitConfigEnv(t)
 	t.Setenv(CheckpointTokenEnvVar, "")
-	// Unset, not empty: git tries to run an empty GIT_SSH_COMMAND and never
-	// reaches ssh. t.Setenv first so the originals are restored afterwards.
-	for _, key := range []string{"GIT_SSH_COMMAND", "GIT_SSH"} {
-		t.Setenv(key, "")
-		require.NoError(t, os.Unsetenv(key))
-	}
+	t.Setenv("GIT_SSH", "")
+	require.NoError(t, os.Unsetenv("GIT_SSH"))
+	path := filepath.Join(t.TempDir(), "ssh")
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o755))
+	t.Setenv("GIT_SSH_COMMAND", path)
+	return "ssh://git@example.invalid/acme/repo.git"
+}
 
-	binDir := t.TempDir()
-	logPath := filepath.Join(binDir, "argv.log")
+func abortStalledFetch(t *testing.T, remote string) (time.Duration, error) {
+	t.Helper()
+	local := t.TempDir()
+	testutil.InitRepo(t, local)
+	start := time.Now()
+	_, err := Fetch(context.Background(), FetchOptions{
+		Remote:       remote,
+		RefSpecs:     []string{"+refs/heads/main:refs/x"},
+		NoTags:       true,
+		NoFilter:     true,
+		Dir:          local,
+		AbortStalled: true,
+	})
+	return time.Since(start), err
+}
+
+// Every transport reports progress through git's stderr, so silence is the one
+// stall signal that covers them all, including ones with no timeout of their own.
+//
+// Not parallel: sets stallAbortIdle and env vars.
+func TestFetch_AbortStalledKillsSilentFetch(t *testing.T) {
+	remote := fakeSSH(t, "echo connected >&2\nexec sleep 600\n")
+	orig := stallAbortIdle
+	stallAbortIdle = 500 * time.Millisecond
+	t.Cleanup(func() { stallAbortIdle = orig })
+
+	elapsed, err := abortStalledFetch(t, remote)
+	require.ErrorIs(t, err, errFetchStalled)
+	assert.Less(t, elapsed, 30*time.Second)
+}
+
+// A slow transfer that keeps reporting progress must run as long as it needs.
+//
+// Not parallel: sets stallAbortIdle and env vars.
+func TestFetch_AbortStalledLetsProgressingFetchRun(t *testing.T) {
+	remote := fakeSSH(t, "for i in 1 2 3 4 5 6 7 8; do echo progress $i >&2; sleep 0.2; done\nexit 1\n")
+	orig := stallAbortIdle
+	stallAbortIdle = 1 * time.Second
+	t.Cleanup(func() { stallAbortIdle = orig })
+
+	elapsed, err := abortStalledFetch(t, remote)
+	require.Error(t, err, "the fake ssh always fails")
+	require.NotErrorIs(t, err, errFetchStalled)
+	assert.Greater(t, elapsed, stallAbortIdle, "the fetch must outlive the idle window")
+	assert.Contains(t, err.Error(), "progress 8")
+}
+
+// GIT_SSH names a program git runs without a shell; once it is carried into
+// GIT_SSH_COMMAND, as batch mode does, it goes through sh, so a path sh would
+// mangle must still run.
+func TestFetch_BatchModeRunsGITSSHPathWithBackslash(t *testing.T) {
+	// Not parallel: changes the GIT_SSH env vars and the checkpoint token env var.
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ssh is a shell script")
+	}
+	testutil.IsolateGitConfigEnv(t)
+	t.Setenv(CheckpointTokenEnvVar, "")
+	t.Setenv("GIT_SSH_COMMAND", "")
+	require.NoError(t, os.Unsetenv("GIT_SSH_COMMAND"))
+
+	binDir := filepath.Join(t.TempDir(), `a\b c`)
+	require.NoError(t, os.MkdirAll(binDir, 0o750))
+	logPath := filepath.Join(t.TempDir(), "argv.log")
 	script := "#!/bin/sh\necho \"$*\" >> '" + logPath + "'\nexit 1\n"
-	require.NoError(t, os.WriteFile(filepath.Join(binDir, "ssh"), []byte(script), 0o755))
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	sshPath := filepath.Join(binDir, "ssh")
+	require.NoError(t, os.WriteFile(sshPath, []byte(script), 0o755))
+	t.Setenv("GIT_SSH", sshPath)
 
 	local := t.TempDir()
 	testutil.InitRepo(t, local)
 
+	_, err := Fetch(WithNonInteractiveSSH(context.Background()), FetchOptions{
+		Remote:   "ssh://git@example.invalid/acme/repo.git",
+		RefSpecs: []string{"+refs/heads/main:refs/x"},
+		NoTags:   true,
+		NoFilter: true,
+		Dir:      local,
+	})
+	require.Error(t, err, "the fake ssh always fails")
+	argv, readErr := os.ReadFile(logPath)
+	require.NoError(t, readErr, "git must have run the GIT_SSH program")
+	assert.Contains(t, string(argv), "BatchMode=yes")
+}
+
+// The stall watchdog reads silence as a stall, and git prints nothing to a pipe
+// unless asked, so AbortStalled must request --progress.
+func TestFetch_AbortStalledRequestsProgress(t *testing.T) {
+	// Not parallel: changes the checkpoint token env var.
+	testutil.IsolateGitConfigEnv(t)
+	t.Setenv(CheckpointTokenEnvVar, "")
+
+	src := t.TempDir()
+	testutil.InitRepo(t, src)
+	testutil.WriteFile(t, src, "f.txt", "data")
+	testutil.GitAdd(t, src, "f.txt")
+	testutil.GitCommit(t, src, "init")
+	head := strings.TrimSpace(testutil.RunGit(t, src, "rev-parse", "HEAD"))
+
 	for _, abortStalled := range []bool{true, false} {
-		require.NoError(t, os.WriteFile(logPath, nil, 0o600))
-		_, err := Fetch(context.Background(), FetchOptions{
-			Remote:       "ssh://git@example.invalid/acme/repo.git",
-			RefSpecs:     []string{"+refs/heads/main:refs/x"},
+		local := t.TempDir()
+		testutil.InitRepo(t, local)
+		out, err := Fetch(context.Background(), FetchOptions{
+			Remote:       "file://" + filepath.ToSlash(src),
+			RefSpecs:     []string{"+" + head + ":refs/x"},
 			NoTags:       true,
 			NoFilter:     true,
 			Dir:          local,
 			AbortStalled: abortStalled,
 		})
-		require.Error(t, err, "the fake ssh always fails")
-		argv, readErr := os.ReadFile(logPath)
-		require.NoError(t, readErr)
-		require.NotEmpty(t, argv, "git must have run the fake ssh")
+		require.NoError(t, err)
 		if abortStalled {
-			assert.Contains(t, string(argv), "ServerAliveInterval=15")
+			assert.Contains(t, string(out), "objects", "git must report progress")
 		} else {
-			assert.NotContains(t, string(argv), "ServerAlive")
+			assert.NotContains(t, string(out), "objects")
 		}
 	}
 }

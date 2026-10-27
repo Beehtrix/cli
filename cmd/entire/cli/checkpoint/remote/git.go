@@ -1,6 +1,7 @@
 package remote
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -183,12 +184,10 @@ type FetchOptions struct {
 	Depth     int
 	Dir       string   // working directory (empty = CWD)
 	ExtraArgs []string // additional flags before remote (e.g., "--no-write-fetch-head")
-	// AbortStalled has git abort an HTTP transfer that stops making progress
-	// and ssh drop a connection that stops answering (see withStallAbort and
-	// withSSHKeepAlive), for callers that set no deadline because the
-	// transfer can legitimately take longer than any fixed one. It also
-	// requests --progress: without it the server sends only sparse keepalives
-	// while it prepares a large pack, which can look like a stall.
+	// AbortStalled kills a fetch that goes stallAbortIdle without git printing
+	// anything, for callers that set no deadline because the transfer can
+	// legitimately take longer than any fixed one. It requests --progress, so
+	// a working fetch on any transport keeps printing.
 	AbortStalled bool
 }
 
@@ -243,21 +242,29 @@ func Fetch(ctx context.Context, opts FetchOptions) ([]byte, error) {
 		existedBefore = gitRemoteSectionExists(ctx, opts.Dir, stampURL)
 	}
 
-	cmd := newCommand(ctx, args...)
+	cmdCtx, cancelCmd := context.WithCancelCause(ctx)
+	defer cancelCmd(nil)
+	cmd := newCommand(cmdCtx, args...)
 	if opts.Dir != "" {
 		cmd.Dir = opts.Dir
 	}
 	disableTerminalPrompt(cmd)
+	var out []byte
+	var err error
 	if opts.AbortStalled {
-		cmd.Env = withSSHKeepAlive(ctx, opts.Dir, withStallAbort(cmd.Env))
+		out, err = runAbortingStalls(cmd, cancelCmd)
+	} else {
+		out, err = cmd.CombinedOutput()
 	}
-	out, err := cmd.CombinedOutput()
 
 	if stampCandidate && !existedBefore {
 		stampNewlyCreatedRemote(ctx, opts.Dir, stampURL)
 	}
 
 	if err != nil {
+		if cause := context.Cause(cmdCtx); errors.Is(cause, errFetchStalled) {
+			err = cause
+		}
 		return out, errWithGitOutput(fmt.Errorf("git fetch: %w", err), out, opts.Remote)
 	}
 	return out, nil
@@ -866,73 +873,68 @@ func disableTerminalPrompt(cmd *exec.Cmd) {
 	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0")
 }
 
-// stallAbortLowSpeedLimit and stallAbortLowSpeedTime abort a transfer that
-// averages under 1 byte/s for a minute: in effect, one that has stopped. The
-// limit is deliberately not a "too slow to be useful" threshold, because while
-// the server prepares a large pack the only traffic is its progress messages.
-const (
-	stallAbortLowSpeedLimit = 1
-	stallAbortLowSpeedTime  = time.Minute
-)
+// stallAbortIdle is how long an AbortStalled fetch may print nothing before it
+// is killed. With --progress, git reports the server preparing the pack and the
+// objects arriving on every transport, including remote helpers, so this long a
+// silence means the transfer has stopped.
+var stallAbortIdle = 5 * time.Minute
 
-// withStallAbort sets git's HTTP low-speed abort (http.lowSpeedLimit and
-// http.lowSpeedTime) in env. git's default is no low-speed check at all, and it
-// covers only the HTTP transports; withSSHKeepAlive bounds SSH.
-//
-// The environment variables override git config, so a user who exported either
-// one keeps their own setting: git applies the check only when both are
-// positive, so filling in the missing one would change what they chose.
-func withStallAbort(env []string) []string {
-	for _, e := range env {
-		if strings.HasPrefix(e, "GIT_HTTP_LOW_SPEED_LIMIT=") || strings.HasPrefix(e, "GIT_HTTP_LOW_SPEED_TIME=") {
-			return env
-		}
+var errFetchStalled = errors.New("fetch stalled")
+
+// runAbortingStalls runs cmd like CombinedOutput, but calls cancel, which must
+// cancel cmd's context, once cmd has printed nothing for stallAbortIdle.
+func runAbortingStalls(cmd *exec.Cmd, cancel context.CancelCauseFunc) ([]byte, error) {
+	w := &activityWriter{last: time.Now()}
+	cmd.Stdout, cmd.Stderr = w, w
+	if err := cmd.Start(); err != nil {
+		return nil, err //nolint:wrapcheck // Fetch wraps the error
 	}
-	return append(env,
-		"GIT_HTTP_LOW_SPEED_LIMIT="+strconv.Itoa(stallAbortLowSpeedLimit),
-		"GIT_HTTP_LOW_SPEED_TIME="+strconv.Itoa(int(stallAbortLowSpeedTime.Seconds())),
-	)
+	idle := stallAbortIdle
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(idle / 10)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if time.Since(w.lastWrite()) >= idle {
+					cancel(fmt.Errorf("%w: no progress for %s", errFetchStalled, idle))
+					return
+				}
+			}
+		}
+	}()
+	err := cmd.Wait()
+	close(done)
+	<-stopped
+	return w.output(), err
 }
 
-// sshKeepAliveOptions has ssh drop a connection whose server stops answering
-// for about a minute: the SSH counterpart of withStallAbort. A keepalive is sent
-// only when no data has arrived, and the server's sshd answers it even while git
-// is still preparing the pack, so a working transfer is never cut off.
-const sshKeepAliveOptions = " -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
-
-var serverAliveOptionRe = regexp.MustCompile(`(?i)ServerAlive(Interval|CountMax)\s*=`)
-
-// withSSHKeepAlive sets GIT_SSH_COMMAND in env to the ssh command git would use
-// (see gitremote.EffectiveSSHCommand) plus sshKeepAliveOptions.
-//
-// env is returned unchanged when the command already sets either option, or
-// when it is not OpenSSH: clients such as PuTTY's plink reject -o, and adding
-// it would fail every fetch. Options from ssh_config are overridden, since -o
-// takes precedence there; the values only add keepalives, never shorten a
-// working transfer.
-func withSSHKeepAlive(ctx context.Context, dir string, env []string) []string {
-	const key = "GIT_SSH_COMMAND="
-	base := gitremote.EffectiveSSHCommand(ctx, dir, env)
-	if !isOpenSSHCommand(base) || serverAliveOptionRe.MatchString(base) {
-		return env
-	}
-	out := make([]string, 0, len(env)+1)
-	for _, e := range env {
-		if !strings.HasPrefix(e, key) {
-			out = append(out, e)
-		}
-	}
-	return append(out, key+base+sshKeepAliveOptions)
+// activityWriter collects a command's output and when it last wrote.
+type activityWriter struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	last time.Time
 }
 
-// isOpenSSHCommand reports whether sshCmd runs OpenSSH, judged by its program
-// name. A quoted path is not unpicked; it reads as not OpenSSH, which only
-// means the keepalive is skipped.
-func isOpenSSHCommand(sshCmd string) bool {
-	fields := strings.Fields(sshCmd)
-	if len(fields) == 0 {
-		return false
-	}
-	name := strings.ToLower(fields[0][strings.LastIndexAny(fields[0], `/\`)+1:])
-	return name == "ssh" || name == "ssh.exe"
+func (w *activityWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.last = time.Now()
+	return w.buf.Write(p) //nolint:wrapcheck // bytes.Buffer never fails
+}
+
+func (w *activityWriter) lastWrite() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.last
+}
+
+func (w *activityWriter) output() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Bytes()
 }

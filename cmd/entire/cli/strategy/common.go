@@ -982,7 +982,10 @@ func bootstrapPrimaryFromCheckpointRemote(ctx context.Context, repo *git.Reposit
 	// resolves the recovery tier never fires again, so a blob-filtered bootstrap
 	// would leave `checkpoint list` permanently showing bare IDs with no prompt,
 	// date, or counts.
-	release := acquireCheckpointRemoteFetchLock(ctx, worktreeRoot)
+	release, err := acquireCheckpointRemoteFetchLock(ctx, worktreeRoot)
+	if err != nil {
+		return false
+	}
 	defer release()
 	if err := fetchURLIntoTmpRef(ctx, worktreeRoot, url, primary.String(), tmpRefName.String(), "metadata branch", true, foregroundFetch); err != nil {
 		// Warn, not Debug: `entire enable` is an explicit user action, and this
@@ -1088,7 +1091,10 @@ func healEmptyOrphanFromCheckpointRemote(ctx context.Context, repo *git.Reposito
 
 	tmpRefName := plumbing.ReferenceName(FetchTmpRefPrefix + primary.Short())
 	// Taken before the cleanup defer so the lock outlives the tmp ref.
-	release := acquireCheckpointRemoteFetchLock(ctx, worktreeRoot)
+	release, err := acquireCheckpointRemoteFetchLock(ctx, worktreeRoot)
+	if err != nil {
+		return false, err
+	}
 	defer release()
 	defer func() { _ = repo.Storer.RemoveReference(tmpRefName) }() //nolint:errcheck // cleanup is best-effort
 

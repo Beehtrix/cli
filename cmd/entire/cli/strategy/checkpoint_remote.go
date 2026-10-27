@@ -44,6 +44,12 @@ const (
 // serializes foreground checkpoint-remote fetches across processes.
 const checkpointRemoteFetchLockName = "entire-checkpoint-remote-fetch.lock"
 
+// checkpointRemoteFetchLockWait bounds how long a foreground fetch waits for
+// another to finish before fetching unserialized. It is well above the ~11
+// minutes a multi-gigabyte archive took to transfer, so a working fetch is
+// waited out, while one that hangs cannot block every later command forever.
+const checkpointRemoteFetchLockWait = 30 * time.Minute
+
 // pushSettings holds the resolved push configuration from a single settings load.
 type pushSettings struct {
 	// remote is the git remote name to use for pushing (the user's push remote).
@@ -165,10 +171,18 @@ func fetchMetadataBranchWithin(ctx context.Context, remoteURL string, mode check
 	}
 	branchName := refs.Primary.Short()
 	tmpRef := FetchTmpRefPrefix + branchName
+	if mode == hotPathFetch {
+		// The hot path skips the fetch lock rather than stall a push behind a
+		// long foreground fetch, so it must not share that fetch's tmp ref.
+		tmpRef = FetchTmpRefPrefix + "push/" + branchName
+	}
 	srcRef := refs.Primary.String()
 
 	if mode == foregroundFetch {
-		release := acquireCheckpointRemoteFetchLock(ctx, "")
+		release, err := acquireCheckpointRemoteFetchLock(ctx, "")
+		if err != nil {
+			return err
+		}
 		defer release()
 	}
 	if err := fetchURLIntoTmpRef(ctx, "", remoteURL, srcRef, tmpRef, "metadata branch", true, mode); err != nil {
@@ -216,8 +230,8 @@ func fetchURLIntoTmpRef(ctx context.Context, dir, remoteURL, srcRef, tmpRef, lab
 	}
 	fetchCtx, cancel := boundFetch(ctx, mode, &opts)
 	defer cancel()
-	if mode == foregroundFetch && interactive.IsTerminalWriter(os.Stderr) {
-		fmt.Fprintf(os.Stderr, "[entire] Fetching checkpoints from %s\n", remote.RedactURL(remoteURL))
+	if mode == foregroundFetch {
+		printFetchStatus("Fetching checkpoints from " + remote.RedactURLOrPath(remoteURL))
 	}
 
 	_, fetchErr := remote.Fetch(fetchCtx, opts)
@@ -229,6 +243,19 @@ func fetchURLIntoTmpRef(ctx context.Context, dir, remoteURL, srcRef, tmpRef, lab
 	// capped; splicing it again printed the same text twice.
 	redactedURL := remote.RedactURL(remoteURL)
 	return fmt.Errorf("fetch %s from %s failed: %w", label, redactedURL, fetchErr)
+}
+
+// printFetchStatus tells a terminal user why a foreground command is paused.
+// These fetches run under spinners owned by the calling command, so on a
+// terminal that renders ANSI the line is cleared first: the message takes the
+// spinner's row and the spinner redraws below it.
+func printFetchStatus(msg string) {
+	switch {
+	case interactive.ShouldStyle(os.Stderr):
+		fmt.Fprintf(os.Stderr, "\r\033[K[entire] %s\n", msg)
+	case interactive.IsTerminalWriter(os.Stderr):
+		fmt.Fprintf(os.Stderr, "[entire] %s\n", msg)
+	}
 }
 
 // boundFetch applies mode to a fetch, returning the context it runs under.
@@ -245,17 +272,19 @@ func boundFetch(ctx context.Context, mode checkpointFetchMode, opts *remote.Fetc
 // then negotiates against the objects the first one landed and transfers only
 // what is new.
 //
-// Callers that fetch into the shared metadata tmp ref hold the lock until that
-// ref is promoted and removed: released after the fetch alone, a finishing
-// caller's cleanup can delete the ref out from under the next caller's fetch.
+// Callers that fetch into the shared metadata tmp ref (FetchTmpRefPrefix plus
+// the primary branch) hold the lock until that ref is promoted and removed:
+// released after the fetch alone, a finishing caller's cleanup can delete the
+// ref out from under the next caller's fetch. The push hot path does not take
+// the lock and uses its own tmp ref instead.
 //
-// Best-effort: failing to take the lock logs and lets the caller run
-// unserialized, as every fetch did before the lock existed. dir is the worktree
-// to resolve the git common dir from; empty means the current repository.
-func acquireCheckpointRemoteFetchLock(ctx context.Context, dir string) (release func()) {
-	noop := func() {}
+// The wait says why the command is paused, stops when ctx is cancelled, and
+// gives up after checkpointRemoteFetchLockWait. Giving up, or failing to take
+// the lock at all, logs and lets the caller fetch unserialized; only ctx's own
+// error is returned. dir is the worktree to resolve the git common dir from;
+// empty means the current repository.
+func acquireCheckpointRemoteFetchLock(ctx context.Context, dir string) (release func(), err error) {
 	var root *os.Root
-	var err error
 	if dir == "" {
 		root, err = gitdir.Open(ctx)
 	} else {
@@ -265,15 +294,37 @@ func acquireCheckpointRemoteFetchLock(ctx context.Context, dir string) (release 
 		}
 	}
 	if err == nil {
-		release, err = flock.AcquireContextIn(ctx, root, checkpointRemoteFetchLockName)
+		release, err = acquireFetchLockIn(ctx, root)
 	}
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("wait for checkpoint fetch lock: %w", ctxErr)
+		}
 		logging.Warn(ctx, "checkpoint-remote: fetch lock unavailable; fetching unserialized",
 			slog.String("error", err.Error()),
 		)
-		return noop
+		return func() {}, nil
 	}
-	return release
+	return release, nil
+}
+
+// acquireFetchLockIn takes the fetch lock in root, announcing the wait when
+// another process holds it. flock only polls, and so only honors cancellation,
+// under a deadline: an already-expired one makes the first attempt a
+// non-blocking probe.
+func acquireFetchLockIn(ctx context.Context, root *os.Root) (func(), error) {
+	probeCtx, cancelProbe := context.WithDeadline(ctx, time.Now())
+	release, err := flock.AcquireContextIn(probeCtx, root, checkpointRemoteFetchLockName)
+	cancelProbe()
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		return release, err //nolint:wrapcheck // flock errors are already wrapped
+	}
+
+	printFetchStatus("Waiting for another entire command to finish fetching checkpoints...")
+	logging.Info(ctx, "checkpoint-remote: waiting for another fetch to release the fetch lock")
+	waitCtx, cancel := context.WithTimeout(ctx, checkpointRemoteFetchLockWait)
+	defer cancel()
+	return flock.AcquireContextIn(waitCtx, root, checkpointRemoteFetchLockName) //nolint:wrapcheck // flock errors are already wrapped
 }
 
 // fetchMetadataBranchIfMissing fetches the primary metadata ref from a URL only if it doesn't exist locally.

@@ -1634,3 +1634,83 @@ func TestFetchMetadataBranch_WaitsForConcurrentFetch(t *testing.T) {
 	require.NoError(t, <-done)
 	assert.True(t, testutil.BranchExists(t, localDir, "entire/checkpoints/v1"))
 }
+
+// The push hot path does not take the fetch lock, so it must not use the tmp
+// ref a lock-holding foreground fetch is writing: its promote would remove that
+// ref and fail the other fetch's ref update.
+//
+// Not parallel: uses t.Chdir()
+func TestFetchBranchIfMissing_LeavesForegroundTmpRefAlone(t *testing.T) {
+	ctx := context.Background()
+
+	remoteDir := t.TempDir()
+	testutil.InitRepo(t, remoteDir)
+	testutil.WriteFile(t, remoteDir, "f.txt", "remote")
+	testutil.GitAdd(t, remoteDir, "f.txt")
+	testutil.GitCommit(t, remoteDir, "remote")
+	testutil.RunGit(t, remoteDir, "branch", "entire/checkpoints/v1")
+
+	localDir := t.TempDir()
+	testutil.InitRepo(t, localDir)
+	testutil.WriteFile(t, localDir, "f.txt", "local")
+	testutil.GitAdd(t, localDir, "f.txt")
+	testutil.GitCommit(t, localDir, "local")
+	t.Chdir(localDir)
+
+	root, err := gitdir.Open(ctx)
+	require.NoError(t, err)
+	release, err := flock.AcquireIn(root, checkpointRemoteFetchLockName)
+	require.NoError(t, err)
+	defer release()
+
+	foregroundTmpRef := FetchTmpRefPrefix + "entire/checkpoints/v1"
+	inFlight := strings.TrimSpace(testutil.RunGit(t, localDir, "rev-parse", "HEAD"))
+	testutil.RunGit(t, localDir, "update-ref", foregroundTmpRef, inFlight)
+
+	require.NoError(t, fetchMetadataBranchIfMissing(ctx, remoteDir))
+
+	assert.True(t, testutil.BranchExists(t, localDir, "entire/checkpoints/v1"))
+	assert.Equal(t, inFlight, strings.TrimSpace(testutil.RunGit(t, localDir, "rev-parse", foregroundTmpRef)),
+		"the hot path must not overwrite or remove the foreground fetch's tmp ref")
+}
+
+// A command waiting behind another fetch must stop on Ctrl-C rather than wait
+// out the other fetch, and must not then fetch on the cancelled context.
+//
+// Not parallel: uses t.Chdir()
+func TestFetchMetadataBranch_CancelWhileWaitingForFetchLock(t *testing.T) {
+	remoteDir := t.TempDir()
+	testutil.InitRepo(t, remoteDir)
+	testutil.WriteFile(t, remoteDir, "f.txt", "init")
+	testutil.GitAdd(t, remoteDir, "f.txt")
+	testutil.GitCommit(t, remoteDir, "init")
+	testutil.RunGit(t, remoteDir, "branch", "entire/checkpoints/v1")
+
+	localDir := t.TempDir()
+	testutil.InitRepo(t, localDir)
+	testutil.WriteFile(t, localDir, "f.txt", "init")
+	testutil.GitAdd(t, localDir, "f.txt")
+	testutil.GitCommit(t, localDir, "init")
+	t.Chdir(localDir)
+
+	root, err := gitdir.Open(context.Background())
+	require.NoError(t, err)
+	release, err := flock.AcquireIn(root, checkpointRemoteFetchLockName)
+	require.NoError(t, err)
+	defer release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- FetchMetadataBranch(ctx, remoteDir) }()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch kept waiting for the lock after its context was cancelled")
+	}
+	assert.False(t, testutil.BranchExists(t, localDir, "entire/checkpoints/v1"), "a cancelled waiter must not fetch")
+}
