@@ -3,7 +3,9 @@
 //
 // By default it delegates to the OS keyring (macOS Keychain, Linux Secret
 // Service, etc.). Set ENTIRE_TOKEN_STORE=file to use a JSON file instead,
-// which is useful in CI environments that lack a keyring daemon.
+// which is useful in CI environments that lack a keyring daemon. Without
+// the variable, "token_store": "file" in the per-user config.json does the
+// same, e.g. once in /root/.config/entire for root's unattended jobs.
 //
 // When using the file backend the tokens are stored in
 // $ENTIRE_TOKEN_STORE_PATH (default: tokens.json in the per-user config
@@ -105,8 +107,13 @@ const (
 // FileBackendSelected reports whether the environment selects the file
 // backend — the single predicate shared by backend resolution, provenance
 // wording, and login's headless hint, so they can never disagree.
+//
+// A set ENTIRE_TOKEN_STORE wins over config.json.
 func FileBackendSelected() bool {
-	return os.Getenv(BackendEnvVar) == "file"
+	if v, ok := os.LookupEnv(BackendEnvVar); ok {
+		return v == "file"
+	}
+	return configTokenStore() == "file"
 }
 
 // BackendDescription names the credential backend the current environment
