@@ -17,6 +17,7 @@ package userdirs
 import (
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 
@@ -108,6 +109,19 @@ func CacheDirChecked() (string, error) {
 	return cacheDir()
 }
 
+// geteuid is swapped out by tests.
+var geteuid = os.Geteuid
+
+// homeDir uses passwd for root, unset HOME.
+func homeDir() (string, error) {
+	if runtime.GOOS != "windows" && (geteuid() == 0 || os.Getenv("HOME") == "") {
+		if u, err := user.Current(); err == nil && u.HomeDir != "" {
+			return u.HomeDir, nil
+		}
+	}
+	return os.UserHomeDir() //nolint:wrapcheck // callers fall back on any error
+}
+
 // configDir is Config with the override check, for the callers that can report.
 func configDir() (string, error) {
 	if dir := os.Getenv(EnvConfigDir); dir != "" {
@@ -116,7 +130,7 @@ func configDir() (string, error) {
 	if dir, ok := testdirs.Dir("config"); ok {
 		return dir, nil
 	}
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil {
 		// nil error deliberately: a machine with no resolvable home is not a
 		// user error to report, and ownFallbackDir returns something usable.
@@ -140,7 +154,7 @@ func cacheDir() (string, error) {
 	if dir, ok := testdirs.Dir("cache"); ok {
 		return filepath.Join(dir, "entire"), nil
 	}
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil {
 		// See configDir: the fallback is usable, so there is nothing to report.
 		return ownFallbackDir(".cache", "entire"), nil //nolint:nilerr // see ownFallbackDir
