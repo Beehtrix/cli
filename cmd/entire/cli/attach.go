@@ -323,6 +323,10 @@ func runAttach(ctx context.Context, w, errW io.Writer, sessionID string, agentNa
 		if plan.remote == "" || checkpointOnRemote(ctx, plan.remote, cp.id) {
 			return nil
 		}
+		// Under manual nothing is sent, so there is nothing to confirm.
+		if held, heldErr := strategy.CheckpointsHeldForManualPush(ctx); heldErr == nil && held {
+			return redeliverAttachedCheckpoint(ctx, w, errW, plan, cp.id)
+		}
 		warning := []string{
 			fmt.Sprintf("Checkpoint %s, which holds session %s, isn't on %s yet.", cp.id, sessionID, plan.remote),
 			"Pending checkpoints, including this one with the session transcript, are pushed to " + plan.remote + " now.",
@@ -581,7 +585,10 @@ func attachWarning(ctx context.Context, plan attachLinkPlan, sessionID string, c
 		lines = append(lines, rewriteWarning(ctx, plan.rewrite, plan.checkedRemotes)...)
 		lines = append(lines, fmt.Sprintf("Session %s goes into a new checkpoint linked by that trailer.", sessionID))
 	}
-	if plan.remote != "" {
+	// An unreadable policy uploads nothing either, so it must not promise to.
+	if held, heldErr := strategy.CheckpointsHeldForManualPush(ctx); held || heldErr != nil {
+		lines = append(lines, "The checkpoint, including the session transcript, stays on this machine until you upload it with 'entire checkpoint push'.")
+	} else if plan.remote != "" {
 		lines = append(lines, "Pending checkpoints, including this one with the session transcript, are pushed to "+plan.remote+" now.")
 	} else {
 		lines = append(lines, "The checkpoint, including the session transcript, is pushed with your next git push.")
@@ -1021,11 +1028,20 @@ func attachLinkRepo(ctx context.Context, remote string) string {
 // and no later git push of that commit will carry it, so an undelivered push is
 // an error rather than a note. Uses the pre-push path, which honors
 // push_sessions, checkpoint_remote and the privacy filter; that path is
-// fail-soft, so delivery is checked against the remote afterwards.
+// fail-soft, so delivery is checked against the remote afterwards. Under the
+// manual checkpoint push policy the checkpoint waits like any other.
 func pushAttachedCheckpoint(ctx context.Context, w io.Writer, remote string, checkpointID id.CheckpointID) error {
 	target, disabled := strategy.CheckpointPushTarget(ctx, remote)
 	if disabled {
 		return fmt.Errorf("checkpoint %s was written locally but not pushed: push_sessions is turned off in settings, so the link stays invisible to others until the checkpoint is pushed", checkpointID)
+	}
+	held, err := strategy.CheckpointsHeldForManualPush(ctx)
+	if err != nil {
+		return fmt.Errorf("checkpoint %s was written locally but not pushed: %w", checkpointID, err)
+	}
+	if held {
+		fmt.Fprintf(w, "  Checkpoint %s is waiting; upload it with: entire checkpoint push %s\n", checkpointID, checkpointID)
+		return nil
 	}
 	if err := strategy.NewManualCommitStrategy().PrePush(ctx, remote); err != nil {
 		return fmt.Errorf("checkpoint %s was written locally but could not be pushed to %s: %w", checkpointID, remote, err)

@@ -142,7 +142,13 @@ The policy is per clone because the push queue is: a per-worktree setting would 
 
 The read fails closed. A value this binary does not recognize, for example from a newer version, or the key spelled with different capitalization, uploads nothing on automatic paths, and pre-push names the file to fix. The policy is never read through `settings.Load`, whose callers on the push path fall back to defaults on a load error and would turn `manual` into `automatic`. A preferences file that does not parse disables Entire's git hooks entirely, because `settings.Load` reads clone preferences. Clone preference writes keep keys the running binary does not model, so a rewrite by another version does not drop the policy. Binaries released before that change still drop unknown keys, which matters only when two Entire versions run in one clone.
 
-Without a terminal, `entire checkpoint push` accepts only `<id>@<commit>`; `--all` and a bare ID need `interactive.CanPromptInteractively()`. This is a speed bump for agents, not a control: anything running as the user can edit the preferences file or push `refs/entire/*` itself.
+Under `manual`, `entire attach` on a pushed commit prints the `entire checkpoint push <id>` line instead of uploading. On the git-branch backend the policy does not apply.
+
+Under `manual`, or when the policy cannot be read, pre-push also refuses a user's own push that sends checkpoint content itself: `--mirror`, an explicit `refs/entire/checkpoints/*` refspec, or `entire/checkpoints/v1`. Git has already chosen what to send when the hook runs, so the whole push is aborted and the error names one ref. Deleting a remote checkpoint ref sends nothing and is allowed. The check runs before `push_sessions` and the checkpoint sync remote gate, because it concerns what the user's push sends, to any remote. It needs the ref list git passes on the hook's stdin; a pre-push line that predates it cannot be checked, and pre-push says so while checkpoints are waiting. `git push --no-verify` skips the hook and so bypasses the refusal.
+
+Without a terminal, `entire checkpoint push` accepts only `<id>@<commit>`; `--all` and a bare ID need `interactive.CanPromptInteractively()`. This is a speed bump for agents, not a control: anything running as the user can edit the preferences file or push `refs/entire/*` with `--no-verify`.
+
+With OPF enabled, `entire checkpoint push <id>` still runs the OPF gate over the whole queue, not only the named refs. A large checkpoint that was not named can then trip an OPF cap and keep the named one from uploading. This affects only OPF users (deprecated) on `manual`.
 
 ### Non-force, fast-forward-only
 

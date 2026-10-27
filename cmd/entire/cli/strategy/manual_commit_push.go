@@ -74,6 +74,12 @@ func (s *ManualCommitStrategy) prePush(ctx context.Context, remote string, prote
 	// non-interactive SSH helper).
 	ctx = checkpointremote.WithNonInteractiveSSH(ctx)
 
+	// Before push_sessions and the sync-remote gate: those decide what Entire
+	// sends, while this is about what the user's own push sends, to any remote.
+	if err := checkOuterPushUnderManualPolicy(ctx); err != nil {
+		return err
+	}
+
 	// Load settings once for remote resolution and push_sessions check.
 	// Spanned because checkpoint-remote resolution can perform a one-time
 	// network fetch of the metadata branch (fetchMetadataBranchIfMissing),

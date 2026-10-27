@@ -268,7 +268,8 @@ func newHooksGitPrePushCmd() *cobra.Command {
 			// returns errors for privacy-critical failures (OPF rewrite —
 			// e.g., V1DivergedError, BootstrapTooLargeError,
 			// V1RefMovedError, OPFRuntimeFailedError,
-			// OPFNoCategoriesError); transient
+			// OPFNoCategoriesError, or a push carrying checkpoint refs
+			// under the manual push policy); transient
 			// checkpoint-push failures are logged and swallowed before
 			// reaching this point. See strategy/manual_commit_push.go
 			// for the contract. We wrap with a short "pre-push:" prefix

@@ -29,6 +29,13 @@ type PrePushRef struct {
 	Truncated bool
 }
 
+// sends reports whether the line sends content: not a deletion, and not a ref
+// the remote already has at that commit.
+func (r PrePushRef) sends() bool {
+	local := plumbing.NewHash(r.LocalSHA)
+	return !local.IsZero() && local != plumbing.NewHash(r.RemoteSHA)
+}
+
 // maxPrePushFieldLen bounds how much of one field of a ref line is kept. Only a
 // ref name can be longer, and its first bytes already decide whether it is a
 // checkpoint ref: longer than the v1 name, or under the per-checkpoint prefix.
@@ -100,6 +107,38 @@ func ParsePrePushRefs(r io.Reader) ([]PrePushRef, error) {
 }
 
 type prePushRefsKey struct{}
+
+// prePushRefsKnown reports whether the hook passed the ref list, which an old
+// hook script or an old hook-manager line does not.
+func prePushRefsKnown(ctx context.Context) bool {
+	_, ok := ctx.Value(prePushRefsKey{}).([]PrePushRef)
+	return ok
+}
+
+// warnPrePushRefsUnknown tells a user whose pre-push line predates the ref list
+// that a push sending checkpoint refs itself cannot be checked. Callers warn
+// only when checkpoints are being held back, the one moment it matters.
+func warnPrePushRefsUnknown(ctx context.Context, w io.Writer) {
+	if prePushRefsKnown(ctx) {
+		return
+	}
+	fmt.Fprintln(w, "[entire] Warning: this pre-push hook does not pass the refs being pushed, so a push that "+
+		"includes Entire's checkpoint refs itself (e.g. `git push --mirror`) cannot be checked. If you use a hook "+
+		"manager such as Husky, replace its Entire pre-push line with the one `entire enable` prints; otherwise run "+
+		"`entire enable` to update the hook.")
+}
+
+// outerPushCheckpointRef returns the first line of the user's own push that
+// sends checkpoint content (see PrePushRef.sends), if the hook passed the list.
+func outerPushCheckpointRef(ctx context.Context) (PrePushRef, bool) {
+	refs, _ := ctx.Value(prePushRefsKey{}).([]PrePushRef) //nolint:errcheck // absent means "not known"
+	for _, r := range refs {
+		if r.sends() && (isCheckpointRefName(r.LocalRef) || isCheckpointRefName(r.RemoteRef)) {
+			return r, true
+		}
+	}
+	return PrePushRef{}, false
+}
 
 // WithPrePushRefsFrom parses git's pre-push ref list from r and records it. A
 // list that cannot be read leaves the refs unknown, as with an old hook, and

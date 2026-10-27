@@ -15,6 +15,7 @@ import (
 	checkpointid "github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/interactive"
 	"github.com/entireio/cli/cmd/entire/cli/session"
+	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/entireio/cli/cmd/entire/cli/trailers"
 
@@ -216,6 +217,107 @@ func TestAttachCommit_PushedHeadIsDeliveredOnGitRefs(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("no local ref names checkpoint %s:\n%s", cpID, local)
+	}
+}
+
+func setAttachCheckpointPushPolicy(t *testing.T, policy string) {
+	t.Helper()
+	dir := filepath.Join(mustGetwd(t), ".git", "entire")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "preferences.json"), []byte(`{"checkpoint_push_policy":"`+policy+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func remoteCheckpointRefs(t *testing.T, remote string) string {
+	t.Helper()
+	return strings.TrimSpace(testutil.RunGit(t, remote, "for-each-ref", "--format=%(refname)", "refs/entire"))
+}
+
+// Under manual, a checkpoint linked to a pushed commit waits for
+// `entire checkpoint push` like any other: attach sends nothing, says so, and
+// succeeds. A rerun finds it still waiting and has nothing to confirm.
+// Not parallel: sets ENTIRE_CHECKPOINTS_PRIMARY.
+func TestAttachCommit_PushedHeadWaitsUnderManualPolicy(t *testing.T) {
+	t.Setenv("ENTIRE_CHECKPOINTS_PRIMARY", "git-refs")
+	setupAttachTestRepo(t)
+	commitAt(t, "work.txt")
+	remote := pushToOrigin(t)
+	setAttachCheckpointPushPolicy(t, "manual")
+	const sessionID = "attach-pushed-head-manual"
+
+	out, err := attachHeadless(t, sessionID, attachOptions{})
+	if err != nil {
+		t.Fatalf("runAttach under manual: %v\n%s", err, out)
+	}
+	state, err := loadAttachState(t, sessionID)
+	if err != nil || state == nil {
+		t.Fatalf("load state: %v, %v", state, err)
+	}
+	cpID := state.LastCheckpointID.String()
+	if want := "entire checkpoint push " + cpID; !strings.Contains(out, want) || strings.Contains(out, "Pushed checkpoint metadata") {
+		t.Fatalf("expected the waiting line naming %q, got:\n%s", want, out)
+	}
+	if refs := remoteCheckpointRefs(t, remote); refs != "" {
+		t.Fatalf("manual attach uploaded checkpoint refs:\n%s", refs)
+	}
+	outgoing, err := strategy.ListOutgoingCheckpoints(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outgoing.Checkpoints) != 1 || outgoing.Checkpoints[0].CheckpointID.String() != cpID {
+		t.Fatalf("checkpoint %s should still be outgoing: %+v", cpID, outgoing.Checkpoints)
+	}
+
+	var rerun bytes.Buffer
+	if err := runAttach(context.Background(), &rerun, &rerun, sessionID, agent.AgentNameClaudeCode, attachOptions{}); err != nil {
+		t.Fatalf("rerun without confirmation must succeed, since it sends nothing: %v\n%s", err, rerun.String())
+	}
+	if !strings.Contains(rerun.String(), "entire checkpoint push "+cpID) {
+		t.Fatalf("rerun should say the checkpoint is still waiting:\n%s", rerun.String())
+	}
+	if refs := remoteCheckpointRefs(t, remote); refs != "" {
+		t.Fatalf("rerun uploaded checkpoint refs:\n%s", refs)
+	}
+}
+
+// The confirmation must not promise an upload that manual will not make.
+// Not parallel: sets ENTIRE_CHECKPOINTS_PRIMARY.
+func TestAttachCommit_ManualConfirmationSaysTheCheckpointWaits(t *testing.T) {
+	t.Setenv("ENTIRE_CHECKPOINTS_PRIMARY", "git-refs")
+	setupAttachTestRepo(t)
+	commitAt(t, "work.txt")
+	pushToOrigin(t)
+	setAttachCheckpointPushPolicy(t, "manual")
+	const sessionID = "attach-manual-unconfirmed"
+	setupClaudeTranscript(t, sessionID, attachCommitTranscript)
+
+	var out, errOut bytes.Buffer
+	if err := runAttach(context.Background(), &out, &errOut, sessionID, agent.AgentNameClaudeCode, attachOptions{}); err == nil {
+		t.Fatalf("attach without confirmation succeeded:\n%s", out.String())
+	}
+	if strings.Contains(errOut.String(), "pushed to origin now") || !strings.Contains(errOut.String(), "entire checkpoint push") {
+		t.Errorf("expected the warning to say the checkpoint waits, got:\n%s", errOut.String())
+	}
+}
+
+// An unreadable policy is not automatic: attach uploads nothing and names the
+// file to fix. Not parallel: sets ENTIRE_CHECKPOINTS_PRIMARY.
+func TestAttachCommit_UnreadablePolicyIsAnError(t *testing.T) {
+	t.Setenv("ENTIRE_CHECKPOINTS_PRIMARY", "git-refs")
+	setupAttachTestRepo(t)
+	commitAt(t, "work.txt")
+	remote := pushToOrigin(t)
+	setAttachCheckpointPushPolicy(t, "approved")
+
+	out, err := attachHeadless(t, "attach-unreadable-policy", attachOptions{})
+	if err == nil || !strings.Contains(err.Error(), "preferences.json") {
+		t.Fatalf("expected an error naming preferences.json, got %v\n%s", err, out)
+	}
+	if refs := remoteCheckpointRefs(t, remote); refs != "" {
+		t.Fatalf("an unreadable policy uploaded checkpoint refs:\n%s", refs)
 	}
 }
 
