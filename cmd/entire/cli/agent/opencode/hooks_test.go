@@ -805,3 +805,12 @@ console.log(Object.keys(handlers).length > 0 ? "hooks" : "none")
 		})
 	}
 }
+
+// OpenCode children are sessions of their own, so their usage is credited to
+// the parent at completion, including by the SessionEnd sweep.
+func TestOpenCodeIsChildSessionSubagents(t *testing.T) {
+	t.Parallel()
+	if _, ok := agent.AsChildSessionSubagents(NewOpenCodeAgent()); !ok {
+		t.Fatal("OpenCode must be agent.ChildSessionSubagents")
+	}
+}
