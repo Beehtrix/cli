@@ -935,9 +935,6 @@ func normalizeFindingPath(p string) string {
 	return path.Clean(filepath.ToSlash(strings.TrimSpace(p)))
 }
 
-// createTrailReviewFinding posts a single finding through the current API flow:
-// start a review session, then submit a one-item comment batch under it. It
-// returns the created (or already-existing) finding.
 func prepareTrailReviewCommentInputsForCreate(worktreeRoot string, inputs []api.TrailReviewCommentInput) []api.TrailReviewCommentInput {
 	out := make([]api.TrailReviewCommentInput, len(inputs))
 	copy(out, inputs)
@@ -950,9 +947,8 @@ func prepareTrailReviewCommentInputsForCreate(worktreeRoot string, inputs []api.
 func prepareTrailReviewLocationForCreate(worktreeRoot string, loc api.TrailReviewLocationCreateRequest) api.TrailReviewLocationCreateRequest {
 	switch loc.Granularity {
 	case reviewTrailGranularityLine, reviewTrailGranularityRange:
-		if loc.SelectedText != nil && strings.TrimSpace(*loc.SelectedText) != "" && withinPostedFindingCap(*loc.SelectedText) {
-			return loc
-		}
+		// selected_text is always the worktree's text: a supplied value is an
+		// unverified quote the trail would show as code from this file.
 		filePath := ""
 		if loc.FilePath != nil {
 			filePath = strings.TrimSpace(*loc.FilePath)
@@ -1035,6 +1031,9 @@ func readWorktreeFileSafely(worktreeRoot, filePath string) ([]byte, bool) {
 	return data, true
 }
 
+// createTrailReviewFinding posts a single finding through the current API flow:
+// start a review session, then submit a one-item comment batch under it. It
+// returns the created (or already-existing) finding.
 func createTrailReviewFinding(ctx context.Context, client *api.Client, trailID string, input api.TrailReviewCommentInput) (api.TrailReviewComment, error) {
 	findings, err := createTrailReviewFindings(ctx, client, trailID, []api.TrailReviewCommentInput{input})
 	if err != nil {

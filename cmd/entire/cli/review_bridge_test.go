@@ -53,7 +53,10 @@ func TestReviewTrailFindingInputsSplitsTopLevelBullets(t *testing.T) {
   - nested detail stays with second
 - **[Low] Third issue:** remove the note from daytona-command-native-plan.md:1`
 
-	inputs := reviewTrailFindingInputs("general", cliReview.TrailReport{Prose: verdict})
+	inputs := reviewTrailFindingInputs("general", cliReview.TrailReport{
+		Prose:        verdict,
+		ChangedFiles: changedFileSet("sandbox-runs-queue.ts", "daytona.ts", "daytona-command-native-plan.md"),
+	})
 	if len(inputs) != 3 {
 		t.Fatalf("inputs = %d, want 3", len(inputs))
 	}
@@ -96,7 +99,10 @@ func TestReviewTrailFindingInputsSplitsTopLevelMarkedFindings(t *testing.T) {
 		"Additional detail for the first issue.\n\n" +
 		"**[MEDIUM] PATCH thread route missing requestBody** — `api/src/routes/trails.ts:2802`. Generated clients cannot send updates.\n"
 
-	inputs := reviewTrailFindingInputs("general", cliReview.TrailReport{Prose: verdict})
+	inputs := reviewTrailFindingInputs("general", cliReview.TrailReport{
+		Prose:        verdict,
+		ChangedFiles: changedFileSet("api/src/lib/planetscale/trails.ts", "api/src/routes/trails.ts"),
+	})
 	if len(inputs) != 2 {
 		t.Fatalf("inputs = %d, want 2", len(inputs))
 	}
@@ -122,9 +128,9 @@ func TestReviewTrailFindingInputsMapsStructuredComments(t *testing.T) {
 	t.Parallel()
 	confidence, lowConfidence := 0.92, 0.7
 	report := cliReview.TrailReport{Comments: []cliReview.TrailComment{
-		{Severity: "high", Confidence: &confidence, Body: "`daytona.ts` rejects public repos without a token; allow public clones or mint a token.", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "daytona.ts", StartLine: 901, SelectedText: "return err"}},
+		{Severity: "high", Confidence: &confidence, Body: "`daytona.ts` rejects public repos without a token; allow public clones or mint a token.", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "daytona.ts", StartLine: 901}},
 		{Severity: "P2", Confidence: &lowConfidence, Body: "Delete failures are swallowed, orphaning provider snapshots.", Location: cliReview.TrailLocation{Granularity: "range", FilePath: "daytona.ts", StartLine: 966, EndLine: 970}},
-	}}
+	}, ChangedFiles: changedFileSet("daytona.ts")}
 
 	inputs := reviewTrailFindingInputs("general", report)
 	if len(inputs) != 2 {
@@ -141,9 +147,6 @@ func TestReviewTrailFindingInputsMapsStructuredComments(t *testing.T) {
 	}
 	if inputs[0].Location.Granularity != reviewTrailGranularityLine || inputs[0].Location.FilePath == nil || *inputs[0].Location.FilePath != "daytona.ts" || inputs[0].Location.StartLine == nil || *inputs[0].Location.StartLine != 901 {
 		t.Fatalf("location[0] = %+v, want daytona.ts:901", inputs[0].Location)
-	}
-	if inputs[0].Location.SelectedText == nil || *inputs[0].Location.SelectedText != "return err" {
-		t.Fatalf("selected_text[0] = %v, want preserved JSON selected_text", inputs[0].Location.SelectedText)
 	}
 	if inputs[1].Severity == nil || *inputs[1].Severity != "medium" {
 		t.Fatalf("severity[1] = %v, want normalized medium", inputs[1].Severity)
@@ -631,8 +634,8 @@ func TestShortenReviewTrailFindingBodyClosesOpenCodeFence(t *testing.T) {
 }
 
 // selected_text has no server limit, so an oversized one would leave a
-// finding's request unbounded. A reviewer-supplied one over the cap gives way
-// to the worktree span, and a span over the cap posts at file granularity.
+// finding's request unbounded. A worktree span over the cap posts at file
+// granularity, while a short span keeps its line and worktree text.
 func TestPostReviewToTrailCapsSelectedText(t *testing.T) {
 	fake := setupReviewPostTrail(t)
 	long := strings.Repeat("x", wantMaxPostedBodyRunes+100)
@@ -641,10 +644,10 @@ func TestPostReviewToTrailCapsSelectedText(t *testing.T) {
 
 	comments := []cliReview.TrailComment{
 		{Severity: "low", Body: "range over a huge line", Location: cliReview.TrailLocation{Granularity: reviewTrailGranularityRange, FilePath: "app.go", StartLine: 1, EndLine: 2}},
-		{Severity: "low", Body: "oversized supplied text", Location: cliReview.TrailLocation{Granularity: reviewTrailGranularityLine, FilePath: "app.go", StartLine: 3, SelectedText: long}},
+		{Severity: "low", Body: "short line", Location: cliReview.TrailLocation{Granularity: reviewTrailGranularityLine, FilePath: "app.go", StartLine: 3}},
 	}
 	var out bytes.Buffer
-	if err := postReviewToTrail(t.Context(), &out, "default", cliReview.TrailReport{Comments: comments}); err != nil {
+	if err := postReviewToTrail(t.Context(), &out, "default", cliReview.TrailReport{Comments: comments, ChangedFiles: changedFileSet("app.go")}); err != nil {
 		t.Fatalf("postReviewToTrail: %v\noutput:\n%s", err, out.String())
 	}
 
@@ -664,6 +667,102 @@ func TestPostReviewToTrailCapsSelectedText(t *testing.T) {
 		t.Errorf("range over a huge span = %+v, want file granularity on app.go with no selected_text", loc)
 	}
 	if loc := posted[1].Location; loc.Granularity != reviewTrailGranularityLine || loc.SelectedText == nil || *loc.SelectedText != "var three = 3" {
-		t.Errorf("oversized supplied selected_text = granularity %q, want line 3 with its worktree text", loc.Granularity)
+		t.Errorf("short line = granularity %q, want line 3 with its worktree text", loc.Granularity)
+	}
+}
+
+func changedFileSet(paths ...string) map[string]struct{} {
+	set := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		set[p] = struct{}{}
+	}
+	return set
+}
+
+// A reviewer's location decides which worktree lines are uploaded as the
+// finding's snippet, so only files the reviewed change touches may keep a
+// line anchor, and only for a bounded span.
+func TestReviewTrailFindingInputsRestrictsLineAnchorsToChangedFiles(t *testing.T) {
+	t.Parallel()
+	changed := changedFileSet("src/app.go")
+	tests := []struct {
+		name            string
+		report          cliReview.TrailReport
+		wantGranularity string
+		wantFile        string
+	}{
+		{
+			name:            "line in a file outside the change",
+			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "leak", Location: cliReview.TrailLocation{Granularity: "range", FilePath: ".env", StartLine: 1, EndLine: 2}}}},
+			wantGranularity: reviewTrailGranularityFile,
+			wantFile:        ".env",
+		},
+		{
+			name:            "line in git metadata",
+			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "leak", Location: cliReview.TrailLocation{Granularity: "line", FilePath: ".git/config", StartLine: 1}}}},
+			wantGranularity: reviewTrailGranularityFile,
+			wantFile:        ".git/config",
+		},
+		{
+			name:            "prose location outside the change",
+			report:          cliReview.TrailReport{Prose: "request changes\n\n- [high] secrets in deploy/prod.env:1 — rotate them"},
+			wantGranularity: reviewTrailGranularityFile,
+			wantFile:        "deploy/prod.env",
+		},
+		{
+			name:            "range over the line cap",
+			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "too wide", Location: cliReview.TrailLocation{Granularity: "range", FilePath: "src/app.go", StartLine: 1, EndLine: maxReviewTrailAnchorLines + 1}}}},
+			wantGranularity: reviewTrailGranularityFile,
+			wantFile:        "src/app.go",
+		},
+		{
+			name:            "range at the line cap",
+			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "ok", Location: cliReview.TrailLocation{Granularity: "range", FilePath: "src/app.go", StartLine: 1, EndLine: maxReviewTrailAnchorLines}}}},
+			wantGranularity: reviewTrailGranularityRange,
+			wantFile:        "src/app.go",
+		},
+		{
+			name:            "uncleaned path to a changed file",
+			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "ok", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "./src/app.go", StartLine: 3}}}},
+			wantGranularity: reviewTrailGranularityLine,
+			wantFile:        "./src/app.go",
+		},
+		{
+			name:            "parent traversal back into a changed file",
+			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "ok", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "src/../.env", StartLine: 1}}}},
+			wantGranularity: reviewTrailGranularityFile,
+			wantFile:        "src/../.env",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			report := tt.report
+			report.ChangedFiles = changed
+			inputs := reviewTrailFindingInputs("", report)
+			if len(inputs) != 1 {
+				t.Fatalf("inputs = %d, want 1", len(inputs))
+			}
+			loc := inputs[0].Location
+			if loc.Granularity != tt.wantGranularity || loc.FilePath == nil || *loc.FilePath != tt.wantFile {
+				t.Fatalf("location = %+v, want %s on %s", loc, tt.wantGranularity, tt.wantFile)
+			}
+			if loc.Granularity == reviewTrailGranularityFile && (loc.StartLine != nil || loc.EndLine != nil) {
+				t.Fatalf("file location kept a line span: %+v", loc)
+			}
+			if loc.SelectedText != nil {
+				t.Fatalf("selected_text = %q, want none before the worktree read", *loc.SelectedText)
+			}
+		})
+	}
+}
+
+func TestReviewTrailFindingInputsWithoutChangedFilesDropsLineAnchors(t *testing.T) {
+	t.Parallel()
+	inputs := reviewTrailFindingInputs("", cliReview.TrailReport{Comments: []cliReview.TrailComment{
+		{Body: "b", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "src/app.go", StartLine: 3}},
+	}})
+	if loc := inputs[0].Location; loc.Granularity != reviewTrailGranularityFile {
+		t.Fatalf("location = %+v, want file granularity when the changed set is unknown", loc)
 	}
 }

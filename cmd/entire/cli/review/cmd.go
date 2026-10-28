@@ -1367,7 +1367,7 @@ func runSingleAgentPath(
 	summary, waitErr := Run(runCtx, reviewer, runCfg, sinks)
 	printBlockedTools(cmd.ErrOrStderr(), profileName, summary)
 	writePostReviewManifest(ctx, out, worktreeRoot, headSHA, summary, "", runCfg.TrailFindingsJSON)
-	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, summary, "")
+	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, worktreeRoot, scopeBaseRef, summary, "")
 	if waitErr != nil && runCtx.Err() == nil && ctx.Err() == nil {
 		// Non-cancellation error: surface to caller.
 		return fmt.Errorf("review run: %w", waitErr)
@@ -1560,7 +1560,7 @@ func runMultiAgentPath(
 		return multiReviewFailureError(waitErr)
 	}
 	writePostReviewManifest(ctx, out, worktreeRoot, headSHA, summary, aggregateOutput, outputMode == ReviewOutputTrail)
-	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, summary, aggregateOutput)
+	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, worktreeRoot, scopeBaseRef, summary, aggregateOutput)
 	// The judge produces the review's primary deliverable — the consolidated
 	// verdict. If it was attempted but failed (provider error or timeout), the
 	// run produced no verdict, so exit non-zero instead of reporting success.
@@ -1751,6 +1751,7 @@ func maybePostReviewToTrail(
 	out io.Writer,
 	deps Deps,
 	outputMode, profileName string,
+	worktreeRoot, scopeBaseRef string,
 	summary reviewtypes.RunSummary,
 	aggregateOutput string,
 ) {
@@ -1770,6 +1771,7 @@ func maybePostReviewToTrail(
 		fmt.Fprintln(out, "Trail output is not available here; the review was kept local.")
 		return
 	}
+	report.ChangedFiles = changedFiles(ctx, worktreeRoot, scopeBaseRef)
 	// On success the hook prints its own confirmation and trail link.
 	if err := deps.PostReviewToTrail(ctx, out, profileName, report); err != nil {
 		if !userMessageAlreadyPrinted(err) {

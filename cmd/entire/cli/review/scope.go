@@ -12,10 +12,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/gitexec"
+	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 )
@@ -228,15 +230,83 @@ func countCommits(ctx context.Context, repoRoot, baseRef string) (int, error) {
 // modified on mainline since the branch was cut would appear as a
 // "removed" change in the diff, inflating the banner's file count.
 func countFilesChanged(ctx context.Context, repoRoot, baseRef string) (int, error) {
-	out, err := runGit(ctx, repoRoot, "diff", "--name-only", baseRef+"...HEAD")
+	files, err := listFilesChanged(ctx, repoRoot, baseRef)
 	if err != nil {
 		return 0, err
 	}
-	trimmed := strings.TrimSpace(out)
-	if trimmed == "" {
-		return 0, nil
+	return len(files), nil
+}
+
+// listFilesChanged returns the repo-relative paths countFilesChanged counts.
+func listFilesChanged(ctx context.Context, repoRoot, baseRef string) ([]string, error) {
+	out, err := runGit(ctx, repoRoot, "diff", "--name-only", "-z", baseRef+"...HEAD")
+	if err != nil {
+		return nil, err
 	}
-	return len(strings.Split(trimmed, "\n")), nil
+	return splitNUL(out), nil
+}
+
+// listUncommitted returns the repo-relative paths of every staged, unstaged,
+// and untracked (but not ignored) file, listing files inside untracked
+// directories individually.
+func listUncommitted(ctx context.Context, repoRoot string) ([]string, error) {
+	out, err := runGit(ctx, repoRoot, "--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all")
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	entries := splitNUL(out)
+	for i := 0; i < len(entries); i++ {
+		entry := entries[i]
+		if len(entry) < 4 {
+			continue
+		}
+		files = append(files, entry[3:])
+		// A rename or copy entry is followed by its source path.
+		if strings.ContainsAny(entry[:2], "RC") {
+			i++
+		}
+	}
+	return files, nil
+}
+
+// changedFiles returns the files a review scoped to baseRef covers: those
+// changed on the branch since it diverged from baseRef, plus every
+// uncommitted change. With no baseRef only uncommitted files count. Any git
+// failure yields an empty set, so callers that use it to decide what may be
+// quoted from the worktree fail closed.
+func changedFiles(ctx context.Context, repoRoot, baseRef string) map[string]struct{} {
+	if repoRoot == "" {
+		return nil
+	}
+	var files []string
+	if baseRef != "" {
+		branch, err := listFilesChanged(ctx, repoRoot, baseRef)
+		if err != nil {
+			logging.Debug(ctx, "review changed files: branch diff failed", slog.String("error", err.Error()))
+			return nil
+		}
+		files = branch
+	}
+	uncommitted, err := listUncommitted(ctx, repoRoot)
+	if err != nil {
+		logging.Debug(ctx, "review changed files: status failed", slog.String("error", err.Error()))
+		return nil
+	}
+	files = append(files, uncommitted...)
+	set := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		set[f] = struct{}{}
+	}
+	return set
+}
+
+func splitNUL(out string) []string {
+	out = strings.TrimRight(out, "\x00")
+	if out == "" {
+		return nil
+	}
+	return strings.Split(out, "\x00")
 }
 
 // countUncommitted returns the number of lines in `git status --porcelain`

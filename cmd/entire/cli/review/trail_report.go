@@ -32,11 +32,10 @@ type TrailComment struct {
 
 // TrailLocation anchors a TrailComment to the change.
 type TrailLocation struct {
-	Granularity  string `json:"granularity"`
-	FilePath     string `json:"file_path,omitempty"`
-	StartLine    int    `json:"start_line,omitempty"`
-	EndLine      int    `json:"end_line,omitempty"`
-	SelectedText string `json:"selected_text,omitempty"`
+	Granularity string `json:"granularity"`
+	FilePath    string `json:"file_path,omitempty"`
+	StartLine   int    `json:"start_line,omitempty"`
+	EndLine     int    `json:"end_line,omitempty"`
 }
 
 // TrailReport is what a trail-mode run posts: structured comments from
@@ -45,6 +44,9 @@ type TrailLocation struct {
 type TrailReport struct {
 	Comments []TrailComment
 	Prose    string
+	// ChangedFiles holds the repo-relative paths the reviewed change touches.
+	// Posting quotes worktree lines only from these files; nil means none.
+	ChangedFiles map[string]struct{}
 }
 
 // trailReportFor decides what a trail-mode run posts. It returns post=false

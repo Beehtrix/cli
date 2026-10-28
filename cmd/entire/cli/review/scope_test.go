@@ -518,3 +518,61 @@ func TestFallbackScopeRef_IgnoresLookalikeRefs(t *testing.T) {
 		t.Errorf("displayRef = %q, want origin/main", got)
 	}
 }
+
+// changedFiles bounds which files a posted finding may quote, so it must cover
+// exactly the review's scope: branch commits since the merge base plus every
+// uncommitted change, but not upstream-only or ignored files.
+func TestChangedFiles(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	initRepoOnMain(t, dir)
+	commitFile(t, dir, ".gitignore", "*.log\n", "init")
+	commitFile(t, dir, "root.go", "package main", "root")
+	commitFile(t, dir, "old.go", "package main", "old")
+
+	testutil.GitCheckoutNewBranch(t, dir, "feat/x")
+	commitFile(t, dir, "feat.go", "package main", "feat-only change")
+	testutil.RunGit(t, dir, "checkout", defaultBranchName)
+	commitFile(t, dir, "main-only.go", "package main", "post-branch main change")
+	testutil.RunGit(t, dir, "checkout", "feat/x")
+
+	testutil.WriteFile(t, dir, "root.go", "package main\n// modified")
+	testutil.WriteFile(t, dir, "staged.go", "package main")
+	testutil.GitAdd(t, dir, "staged.go")
+	testutil.RunGit(t, dir, "mv", "old.go", "renamed.go")
+	testutil.WriteFile(t, dir, "new/dir/with space.go", "package dir")
+	testutil.WriteFile(t, dir, "debug.log", "ignored")
+
+	ctx := context.Background()
+	requireFileSet(t, changedFiles(ctx, dir, defaultBranchName),
+		[]string{"feat.go", "root.go", "staged.go", "renamed.go", "new/dir/with space.go"},
+		[]string{"main-only.go", "debug.log", ".gitignore"})
+
+	t.Run("without a base ref only uncommitted files count", func(t *testing.T) {
+		t.Parallel()
+		requireFileSet(t, changedFiles(ctx, dir, ""),
+			[]string{"root.go", "staged.go", "renamed.go", "new/dir/with space.go"},
+			[]string{"feat.go"})
+	})
+
+	t.Run("an unresolvable base ref yields no files", func(t *testing.T) {
+		t.Parallel()
+		if got := changedFiles(ctx, dir, "no-such-ref"); len(got) != 0 {
+			t.Fatalf("changedFiles = %v, want empty", got)
+		}
+	})
+}
+
+func requireFileSet(t *testing.T, got map[string]struct{}, want, notWant []string) {
+	t.Helper()
+	for _, p := range want {
+		if _, ok := got[p]; !ok {
+			t.Errorf("changed files %v missing %q", got, p)
+		}
+	}
+	for _, p := range notWant {
+		if _, ok := got[p]; ok {
+			t.Errorf("changed files %v include %q", got, p)
+		}
+	}
+}
