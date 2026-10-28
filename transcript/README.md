@@ -76,7 +76,7 @@ Pi, one native message per call (no fragments to merge): `model` is `message.mod
   by the converters.
 
 Codex: rollouts from Codex versions that record items (the first turn has a
-user or agent message `item_completed` event) convert item by item: each
+user message `item_completed` event) convert item by item: each
 `item_completed` item becomes its own line or lines.
 Commands are `Bash` tool uses whose input is the script inside `<shell> -lc`
 or `<shell> -c` (other commands are shown whole), with the command's output;
@@ -87,7 +87,11 @@ wrapper calls no longer appear. Lines carry their item's time (RFC 3339 UTC
 with milliseconds), and usage is per model call (see Per-call usage).
 Items it can't read (such as one without an ID) or doesn't map (reasoning,
 plans such as `update_plan`, compaction and other items) are skipped and
-add no line. Older rollouts keep the `response_item` path.
+add no line. Older rollouts keep the `response_item` path, and so do
+rollouts whose first turn has its prompt only as a `response_item` (a
+guardian sub-session, whose agent message is an item) and thread_spawn
+sub-agent rollouts (no items in the first turn, the task prompt as a
+`response_item`).
 `CodexNotificationRecords` maps a Codex app-server `item/started` or
 `item/completed` notification to records with the same mapping, so a live
 stream of a Codex session shows a completed item exactly as it is stored.

@@ -29,11 +29,14 @@ func codexEventOf(line []byte) (codexEvent, bool) {
 }
 
 // hasCodexItems reports whether a Codex rollout's first turn (from its first
-// task_started event to the next) has a user or agent message item_completed
-// event: rollouts written by Codex versions that record their messages as
-// items. Other items alone (a sub-agent's activity, reasoning) don't count,
-// since older rollouts record those too and the item path would drop their
-// messages. Decided on the whole content, before any slicing, so Convert and
+// task_started event to the next) has a user message item_completed event:
+// rollouts written by Codex versions that record the user's prompts as items.
+// Other items alone don't count. Older rollouts record a sub-agent's activity
+// and reasoning as items too, and Codex can write a prompt only as a
+// response_item while the turn's agent message is an item (guardian
+// sub-sessions); the item path would drop those prompts. A thread_spawn
+// sub-agent's rollout has no items in its first turn and gets its task prompt
+// as a response_item, so it keeps the response_item path as well. Decided on the whole content, before any slicing, so Convert and
 // ConvertWithBoundary always take the same path; a rollout begun on an older
 // Codex keeps the old path.
 func hasCodexItems(content []byte) bool {
@@ -47,7 +50,7 @@ func hasCodexItems(content []byte) bool {
 		switch {
 		case !bytes.Contains(line, []byte(`"event_msg"`)):
 		case inFirstTurn && bytes.Contains(line, []byte(`"item_completed"`)):
-			if it, ok := codexitem.DecodeRollout(line); ok && (it.Kind == codexitem.KindUser || it.Kind == codexitem.KindAgent) {
+			if it, ok := codexitem.DecodeRollout(line); ok && it.Kind == codexitem.KindUser {
 				return true
 			}
 		case bytes.Contains(line, []byte(`"task_started"`)):

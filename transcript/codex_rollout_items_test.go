@@ -32,7 +32,8 @@ func TestHasCodexItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	item := `{"timestamp":"t","type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":{"type":"AgentMessage","id":"m1","content":[{"type":"Text","text":"hi"}]}}}` + "\n"
+	item := `{"timestamp":"t","type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"hi"}]}}}` + "\n"
+	agent := `{"timestamp":"t","type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":{"type":"AgentMessage","id":"m1","content":[{"type":"Text","text":"hi"}]}}}` + "\n"
 	started := `{"timestamp":"t","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}` + "\n"
 	subagent := `{"timestamp":"t","type":"event_msg","payload":{"type":"item_completed","item":{"type":"SubAgentActivity","id":"call_1","kind":"started","agent_thread_id":"th2","agent_path":"/root/a"}}}` + "\n"
 	old := `{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}` + "\n"
@@ -47,6 +48,7 @@ func TestHasCodexItems(t *testing.T) {
 		{"first turn without items", []byte(started + old + started + item), false},
 		{"first turn with items", []byte(started + old + item + started + old), true},
 		{"first turn with only a sub-agent item", []byte(started + old + subagent + started + old + item), false},
+		{"first turn with only an agent message item", []byte(started + old + agent + started + old + item), false},
 	}
 	for _, c := range cases {
 		if got := hasCodexItems(c.content); got != c.want {
@@ -172,5 +174,54 @@ func TestConvertCodexItemsCallUsage(t *testing.T) {
 `
 	if string(out) != want {
 		t.Errorf("Convert:\n got %s\nwant %s", out, want)
+	}
+}
+
+// A prompt Codex records only as a response_item, with the turn's agent
+// message as an item, keeps the response_item path, so the prompt is kept.
+func TestConvertCodexPromptOnlyAsResponseItem(t *testing.T) {
+	t.Parallel()
+	content := `{"timestamp":"t0","type":"session_meta","payload":{"id":"s1"}}
+{"timestamp":"t1","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}
+{"timestamp":"t2","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"FIRST PROMPT"}]}}
+{"timestamp":"t3","type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":{"type":"AgentMessage","id":"m1","content":[{"type":"Text","text":"Hello"}]}}}
+{"timestamp":"t4","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}
+`
+	if hasCodexItems([]byte(content)) {
+		t.Fatal("hasCodexItems = true, want false")
+	}
+	out, err := Convert([]byte(content), codexItemsOpts)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	if !strings.Contains(string(out), `"type":"user","ts":"t2","content":[{"text":"FIRST PROMPT"}]`) {
+		t.Errorf("the prompt was dropped:\n%s", out)
+	}
+}
+
+// A thread_spawn sub-agent's rollout has no items in its first turn and gets
+// its task prompt as a response_item: it keeps the response_item path and
+// its user lines.
+func TestConvertCodexSubAgentRollout(t *testing.T) {
+	t.Parallel()
+	content := `{"timestamp":"t0","type":"session_meta","payload":{"id":"s2","source":{"subagent":{"thread_spawn":{"parent_thread_id":"s1","depth":1}}}}}
+{"timestamp":"t1","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}
+{"timestamp":"t2","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Ready."}]}}
+{"timestamp":"t3","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}
+{"timestamp":"t4","type":"event_msg","payload":{"type":"task_started","turn_id":"t2"}}
+{"timestamp":"t5","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"check the tests"}]}}
+{"timestamp":"t6","type":"event_msg","payload":{"type":"item_completed","turn_id":"t2","item":{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"check the tests"}]}}}
+{"timestamp":"t7","type":"event_msg","payload":{"type":"item_completed","turn_id":"t2","item":{"type":"AgentMessage","id":"m1","content":[{"type":"Text","text":"They pass."}]}}}
+{"timestamp":"t8","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"They pass."}]}}
+`
+	if hasCodexItems([]byte(content)) {
+		t.Fatal("hasCodexItems = true, want false")
+	}
+	out, err := Convert([]byte(content), codexItemsOpts)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	if n := strings.Count(string(out), `"type":"user"`); n != 1 || !strings.Contains(string(out), `"text":"check the tests"`) {
+		t.Errorf("want the one task prompt as a user line, got %d user lines:\n%s", n, out)
 	}
 }
