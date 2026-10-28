@@ -811,6 +811,14 @@ func TestProjectAgentTune_SharedCopySelectsOnlyThisRepository(t *testing.T) {
 	if posts[0].Body["name"] != "Style (widget)" {
 		t.Errorf("copy name = %v", posts[0].Body["name"])
 	}
+	triggers, _ := posts[0].Body["triggers"].([]any) //nolint:errcheck // asserted
+	if len(triggers) != 1 {
+		t.Fatalf("copy triggers = %v, want the original's one trigger", triggers)
+	}
+	tr, _ := triggers[0].(map[string]any) //nolint:errcheck // asserted
+	if _, hasID := tr["id"]; hasID || tr["kind"] != "push" || tr["when"] != "ready" {
+		t.Errorf("copy trigger = %v, want the original's filters without its id", tr)
+	}
 }
 
 // Not parallel: chdirs and replaces package-level resolvers.

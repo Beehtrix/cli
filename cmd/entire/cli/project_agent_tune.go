@@ -632,6 +632,7 @@ func saveTunedAgents(ctx context.Context, w, errW io.Writer, t *projectAgentTarg
 			body.Name = uniqueAgentName(c.agent.Name, " ("+scope.repoName+")", taken)
 			body.IsEnabled = false
 			body.RepositoryIDs = []string{scope.repoID}
+			body.Triggers = freshTriggers(c.agent.Triggers)
 			a, err := t.createAgent(ctx, body)
 			if err != nil {
 				return fmt.Errorf("add tuned copy of %s: %w", c.agent.Name, err)
@@ -660,6 +661,19 @@ func saveTunedAgents(ctx context.Context, w, errW io.Writer, t *projectAgentTarg
 		fmt.Fprintf(errW, "The %d converted agent(s) no longer follow their preset and run only once the project's payer is enrolled in billing.\n", converted)
 	}
 	return nil
+}
+
+// freshTriggers are triggers for a new agent: the same filters without the
+// original's ids, which name its triggers and push history. Push history is
+// keyed by agent too, so reuse would not collide, but a copy starts its own;
+// each id then defaults to the trigger's kind.
+func freshTriggers(triggers []api.ProjectAgentTrigger) []api.ProjectAgentTrigger {
+	out := make([]api.ProjectAgentTrigger, len(triggers))
+	for i, tr := range triggers {
+		tr.ID = ""
+		out[i] = tr
+	}
+	return out
 }
 
 // copyFollowUp says how to hand this repository's reviews from original to
