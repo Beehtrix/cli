@@ -324,18 +324,22 @@ quoted, indented, or mentioned in prose) is not the commit's link.
 
 **Squashes inherit their trailers** (`inheritSquashedCheckpointTrailers`). A
 commit made while `git merge --squash` is in progress (SQUASH_MSG present in
-the per-worktree git dir) contains the squashed commits' work, so every
-`Entire-Checkpoint` trailer in SQUASH_MSG is carried into the message when
-missing (a copy indented in the body, as git seeds an editor squash message,
-does not count) when a staged path is one a commit Git recorded there changed; a file
-touched up before committing still counts. An abandoned squash can leave
+the per-worktree git dir) contains the squashed commits' work, so the
+checkpoints the squashed commits link are carried into the message's last
+paragraph when missing (a copy indented in the body, as git seeds an editor
+squash message, does not count) when a staged path is one a squashed commit
+changed; a file touched up before committing still counts. The squashed commits
+are the ones SQUASH_MSG's unindented `commit <sha>` headers name (git indents
+their messages, so a body line naming a commit is not one), and each one's
+checkpoints are read from the recorded commit as `LinkedCheckpoints` reads it,
+so a checkpoint its body only mentions is not inherited. An abandoned squash can leave
 SQUASH_MSG behind; staged work on other paths therefore inherits nothing, and inherited trailers in Git's seeded message are
 removed. git only reports source `squash` when its seeded message is accepted;
 a squash committed with `-m` reports `message`, which used to run ordinary
 matching and either refuse or mint a fresh, empty checkpoint. Inherited
 trailers are links to checkpoints that already exist. Matching still runs, so
-work a session holds at squash time is stamped as its own trailer after the
-inherited ones, and post-commit condenses only into the trailer prepare
+work a session holds at squash time is stamped as its own trailer, joined to
+the inherited ones so they stay in the last paragraph, and post-commit condenses only into the trailer prepare
 stamped (`pickCondensationTarget`). Prepare also records the inherited IDs in
 the per-worktree git dir, tied to the commit's parent
 (`recordInheritedTrailers`), so post-commit never writes into an inherited
@@ -352,7 +356,8 @@ last real reset left is where the dropped work starts. Dropped means only that
 tip reaches it: commits HEAD, a remote or another branch still reach (merged-in
 main, a teammate's commit an undone rebase brought in) are never inherited,
 while a backup branch pointing at the tip itself does not count. A dropped
-commit's trailers are carried into the new message when every staged file it
+commit's checkpoints, read as `LinkedCheckpoints` reads them, are carried into
+the new message's last paragraph when every staged file it
 changed has exactly the content it had at that tip (read from the index git is
 preparing the commit in, so `git commit -a` and path-limited commits compare
 what they commit), so an agent's ten commits
