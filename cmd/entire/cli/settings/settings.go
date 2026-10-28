@@ -1366,7 +1366,7 @@ func marshalClonePreferences(prefs *ClonePreferences) ([]byte, error) {
 // result is always a fresh, non-nil map (empty when both inputs are empty), so
 // callers never receive nil from a non-nil input.
 func mergeReviewProfiles(base, src map[string]ReviewProfileConfig) map[string]ReviewProfileConfig {
-	out := make(map[string]ReviewProfileConfig, len(base)+len(src))
+	out := make(map[string]ReviewProfileConfig, len(base))
 	for name, cfg := range base {
 		out[name] = cfg
 	}
