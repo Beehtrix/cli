@@ -228,6 +228,18 @@ Describe 'PATH entry handling' {
     It 'recognises an unexpanded first entry' {
         Test-PathIsFirst -PathValue ";%ENTIRE_TEST_ROOT%/sub;other" -Directory (Join-Path $TestDrive 'sub') | Should -BeTrue
     }
+
+    It 'treats a quoted entry as the same path' {
+        $target = Join-Path $TestDrive 'sub'
+        Test-SamePath -Left "`"$target`"" -Right $target | Should -BeTrue
+        Test-PathContains -PathValue "other;`"$target`"" -Directory $target | Should -BeTrue
+    }
+
+    It 'moves a quoted entry to the front as stored' {
+        $other = Join-Path $TestDrive 'other'
+        $target = Join-Path $TestDrive 'sub'
+        Get-PathWithDirectoryFirst -PathValue "$other;`"$target`"" -Directory $target | Should -Be "`"$target`";$other"
+    }
 }
 
 Describe 'User environment registry' -Skip:($env:OS -ne 'Windows_NT') {
@@ -558,6 +570,7 @@ Describe 'Scoop or archive selection' {
         Mock Write-Info {}
         Mock Install-EntireWithScoop {}
         Mock Get-PlatformArchitecture { 'amd64' }
+        Mock Get-MachineEnvironmentValue { $null }
         # The archive branch's first step after the directory is resolved; stop there.
         Mock Get-ReleaseVersion { throw 'stop-here' }
     }
@@ -694,6 +707,8 @@ Describe 'Denied writes' {
 Describe 'Get-EntireCopy' {
     BeforeAll {
         . (Join-Path (Split-Path -Parent $PSScriptRoot) 'install.ps1')
+        # Ignore the host's machine PATH.
+        Mock Get-MachineEnvironmentValue { $null }
     }
 
     It 'adds copies that are only on the stored user PATH and lists shared ones once' {
