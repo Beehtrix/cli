@@ -1321,6 +1321,7 @@ func runSingleAgentPath(
 		cmd.SilenceUsage = true
 		return scopeErr
 	}
+	quotableFiles := trailQuotableFiles(ctx, outputMode, worktreeRoot, scopeBaseRef)
 	checkpointContext := ""
 	if deps.ReviewCheckpointContext != nil {
 		checkpointContext = deps.ReviewCheckpointContext(ctx, worktreeRoot, scopeBaseRef)
@@ -1367,7 +1368,7 @@ func runSingleAgentPath(
 	summary, waitErr := Run(runCtx, reviewer, runCfg, sinks)
 	printBlockedTools(cmd.ErrOrStderr(), profileName, summary)
 	writePostReviewManifest(ctx, out, worktreeRoot, headSHA, summary, "", runCfg.TrailFindingsJSON)
-	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, worktreeRoot, scopeBaseRef, summary, "")
+	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, quotableFiles, summary, "")
 	if waitErr != nil && runCtx.Err() == nil && ctx.Err() == nil {
 		// Non-cancellation error: surface to caller.
 		return fmt.Errorf("review run: %w", waitErr)
@@ -1456,6 +1457,7 @@ func runMultiAgentPath(
 		cmd.SilenceUsage = true
 		return scopeErr
 	}
+	quotableFiles := trailQuotableFiles(ctx, outputMode, worktreeRoot, scopeBaseRef)
 	checkpointContext := ""
 	if deps.ReviewCheckpointContext != nil {
 		checkpointContext = deps.ReviewCheckpointContext(ctx, worktreeRoot, scopeBaseRef)
@@ -1560,7 +1562,7 @@ func runMultiAgentPath(
 		return multiReviewFailureError(waitErr)
 	}
 	writePostReviewManifest(ctx, out, worktreeRoot, headSHA, summary, aggregateOutput, outputMode == ReviewOutputTrail)
-	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, worktreeRoot, scopeBaseRef, summary, aggregateOutput)
+	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, quotableFiles, summary, aggregateOutput)
 	// The judge produces the review's primary deliverable — the consolidated
 	// verdict. If it was attempted but failed (provider error or timeout), the
 	// run produced no verdict, so exit non-zero instead of reporting success.
@@ -1742,6 +1744,16 @@ func multiReviewFailureError(waitErr error) error {
 	return errors.New("review run: all reviewers failed")
 }
 
+// trailQuotableFiles returns the files a trail-mode review's findings may
+// quote, computed before any reviewer runs so files a reviewer writes during
+// the run stay out. It returns nil when the review is not posted to a trail.
+func trailQuotableFiles(ctx context.Context, outputMode, worktreeRoot, scopeBaseRef string) map[string]struct{} {
+	if outputMode != ReviewOutputTrail {
+		return nil
+	}
+	return changedFiles(ctx, worktreeRoot, scopeBaseRef)
+}
+
 // maybePostReviewToTrail delivers the final review output to the branch's trail
 // when the profile selects the "trail" destination. It never fails the run:
 // the review already happened, so a posting error (or a missing hook) is
@@ -1751,7 +1763,7 @@ func maybePostReviewToTrail(
 	out io.Writer,
 	deps Deps,
 	outputMode, profileName string,
-	worktreeRoot, scopeBaseRef string,
+	quotableFiles map[string]struct{},
 	summary reviewtypes.RunSummary,
 	aggregateOutput string,
 ) {
@@ -1771,7 +1783,7 @@ func maybePostReviewToTrail(
 		fmt.Fprintln(out, "Trail output is not available here; the review was kept local.")
 		return
 	}
-	report.ChangedFiles = changedFiles(ctx, worktreeRoot, scopeBaseRef)
+	report.ChangedFiles = quotableFiles
 	// On success the hook prints its own confirmation and trail link.
 	if err := deps.PostReviewToTrail(ctx, out, profileName, report); err != nil {
 		if !userMessageAlreadyPrinted(err) {

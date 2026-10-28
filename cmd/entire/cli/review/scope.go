@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/gitexec"
+	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -230,51 +231,56 @@ func countCommits(ctx context.Context, repoRoot, baseRef string) (int, error) {
 // modified on mainline since the branch was cut would appear as a
 // "removed" change in the diff, inflating the banner's file count.
 func countFilesChanged(ctx context.Context, repoRoot, baseRef string) (int, error) {
-	files, err := listFilesChanged(ctx, repoRoot, baseRef)
+	out, err := runGit(ctx, repoRoot, "diff", "--name-only", baseRef+"...HEAD")
 	if err != nil {
 		return 0, err
 	}
-	return len(files), nil
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" {
+		return 0, nil
+	}
+	return len(strings.Split(trimmed, "\n")), nil
 }
 
-// listFilesChanged returns the repo-relative paths countFilesChanged counts.
+// listFilesChanged returns the repo-relative paths HEAD adds or modifies
+// since its merge base with baseRef. Deleted paths are left out.
 func listFilesChanged(ctx context.Context, repoRoot, baseRef string) ([]string, error) {
-	out, err := runGit(ctx, repoRoot, "diff", "--name-only", "-z", baseRef+"...HEAD")
+	out, err := runGit(ctx, repoRoot, "diff", "--name-only", "-z", "--diff-filter=d", baseRef+"...HEAD")
 	if err != nil {
 		return nil, err
 	}
-	return splitNUL(out), nil
+	out = strings.TrimRight(out, "\x00")
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\x00"), nil
 }
 
 // listUncommitted returns the repo-relative paths of every staged, unstaged,
 // and untracked (but not ignored) file, listing files inside untracked
-// directories individually.
+// directories individually. Deleted paths and rename sources are left out.
 func listUncommitted(ctx context.Context, repoRoot string) ([]string, error) {
-	out, err := runGit(ctx, repoRoot, "--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all")
+	out, err := runGit(ctx, repoRoot, "--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	if err != nil {
 		return nil, err
 	}
-	var files []string
-	entries := splitNUL(out)
-	for i := 0; i < len(entries); i++ {
-		entry := entries[i]
-		if len(entry) < 4 {
-			continue
-		}
-		files = append(files, entry[3:])
-		// A rename or copy entry is followed by its source path.
-		if strings.ContainsAny(entry[:2], "RC") {
-			i++
+	codes := make(map[string]string)
+	gitrepo.ParsePorcelainV1Z([]byte(out), codes)
+	files := make([]string, 0, len(codes))
+	for file, code := range codes {
+		if !strings.Contains(code, "D") {
+			files = append(files, file)
 		}
 	}
 	return files, nil
 }
 
 // changedFiles returns the files a review scoped to baseRef covers: those
-// changed on the branch since it diverged from baseRef, plus every
-// uncommitted change. With no baseRef only uncommitted files count. Any git
-// failure yields an empty set, so callers that use it to decide what may be
-// quoted from the worktree fail closed.
+// added or modified on the branch since it diverged from baseRef, plus every
+// uncommitted change. Deleted paths are left out, since an ignored local file
+// can sit at one. With no baseRef only uncommitted files count. It returns nil
+// when repoRoot is empty or any git call fails, which callers treat as no
+// files, so line anchors fail closed.
 func changedFiles(ctx context.Context, repoRoot, baseRef string) map[string]struct{} {
 	if repoRoot == "" {
 		return nil
@@ -299,14 +305,6 @@ func changedFiles(ctx context.Context, repoRoot, baseRef string) map[string]stru
 		set[f] = struct{}{}
 	}
 	return set
-}
-
-func splitNUL(out string) []string {
-	out = strings.TrimRight(out, "\x00")
-	if out == "" {
-		return nil
-	}
-	return strings.Split(out, "\x00")
 }
 
 // countUncommitted returns the number of lines in `git status --porcelain`

@@ -694,20 +694,22 @@ func TestReviewTrailFindingInputsRestrictsLineAnchorsToChangedFiles(t *testing.T
 		{
 			name:            "line in a file outside the change",
 			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "leak", Location: cliReview.TrailLocation{Granularity: "range", FilePath: ".env", StartLine: 1, EndLine: 2}}}},
-			wantGranularity: reviewTrailGranularityFile,
-			wantFile:        ".env",
+			wantGranularity: reviewTrailGranularityWholeChange,
 		},
 		{
 			name:            "line in git metadata",
 			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "leak", Location: cliReview.TrailLocation{Granularity: "line", FilePath: ".git/config", StartLine: 1}}}},
-			wantGranularity: reviewTrailGranularityFile,
-			wantFile:        ".git/config",
+			wantGranularity: reviewTrailGranularityWholeChange,
 		},
 		{
 			name:            "prose location outside the change",
 			report:          cliReview.TrailReport{Prose: "request changes\n\n- [high] secrets in deploy/prod.env:1 — rotate them"},
-			wantGranularity: reviewTrailGranularityFile,
-			wantFile:        "deploy/prod.env",
+			wantGranularity: reviewTrailGranularityWholeChange,
+		},
+		{
+			name:            "absolute path outside the repository",
+			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "leak", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "/etc/passwd", StartLine: 1}}}},
+			wantGranularity: reviewTrailGranularityWholeChange,
 		},
 		{
 			name:            "range over the line cap",
@@ -728,10 +730,15 @@ func TestReviewTrailFindingInputsRestrictsLineAnchorsToChangedFiles(t *testing.T
 			wantFile:        "./src/app.go",
 		},
 		{
-			name:            "parent traversal back into a changed file",
-			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "ok", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "src/../.env", StartLine: 1}}}},
+			name:            "uncleaned path over the line cap posts the cleaned file",
+			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "too wide", Location: cliReview.TrailLocation{Granularity: "range", FilePath: "./src/app.go", StartLine: 1, EndLine: maxReviewTrailAnchorLines + 1}}}},
 			wantGranularity: reviewTrailGranularityFile,
-			wantFile:        "src/../.env",
+			wantFile:        "src/app.go",
+		},
+		{
+			name:            "parent traversal out of a changed directory",
+			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "leak", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "src/../.env", StartLine: 1}}}},
+			wantGranularity: reviewTrailGranularityWholeChange,
 		},
 	}
 	for _, tt := range tests {
@@ -744,11 +751,15 @@ func TestReviewTrailFindingInputsRestrictsLineAnchorsToChangedFiles(t *testing.T
 				t.Fatalf("inputs = %d, want 1", len(inputs))
 			}
 			loc := inputs[0].Location
-			if loc.Granularity != tt.wantGranularity || loc.FilePath == nil || *loc.FilePath != tt.wantFile {
-				t.Fatalf("location = %+v, want %s on %s", loc, tt.wantGranularity, tt.wantFile)
+			gotFile := ""
+			if loc.FilePath != nil {
+				gotFile = *loc.FilePath
 			}
-			if loc.Granularity == reviewTrailGranularityFile && (loc.StartLine != nil || loc.EndLine != nil) {
-				t.Fatalf("file location kept a line span: %+v", loc)
+			if loc.Granularity != tt.wantGranularity || gotFile != tt.wantFile {
+				t.Fatalf("location = %+v, want %s on %q", loc, tt.wantGranularity, tt.wantFile)
+			}
+			if loc.Granularity != reviewTrailGranularityLine && loc.Granularity != reviewTrailGranularityRange && (loc.StartLine != nil || loc.EndLine != nil) {
+				t.Fatalf("%s location kept a line span: %+v", loc.Granularity, loc)
 			}
 			if loc.SelectedText != nil {
 				t.Fatalf("selected_text = %q, want none before the worktree read", *loc.SelectedText)
@@ -762,7 +773,10 @@ func TestReviewTrailFindingInputsWithoutChangedFilesDropsLineAnchors(t *testing.
 	inputs := reviewTrailFindingInputs("", cliReview.TrailReport{Comments: []cliReview.TrailComment{
 		{Body: "b", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "src/app.go", StartLine: 3}},
 	}})
-	if loc := inputs[0].Location; loc.Granularity != reviewTrailGranularityFile {
-		t.Fatalf("location = %+v, want file granularity when the changed set is unknown", loc)
+	if len(inputs) != 1 {
+		t.Fatalf("inputs = %d, want 1", len(inputs))
+	}
+	if loc := inputs[0].Location; loc.Granularity != reviewTrailGranularityWholeChange || loc.FilePath != nil {
+		t.Fatalf("location = %+v, want whole_change when the changed set is unknown", loc)
 	}
 }

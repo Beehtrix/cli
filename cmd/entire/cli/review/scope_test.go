@@ -2,6 +2,7 @@ package review
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -521,7 +522,8 @@ func TestFallbackScopeRef_IgnoresLookalikeRefs(t *testing.T) {
 
 // changedFiles bounds which files a posted finding may quote, so it must cover
 // exactly the review's scope: branch commits since the merge base plus every
-// uncommitted change, but not upstream-only or ignored files.
+// uncommitted change, but not upstream-only or ignored files. A deleted path
+// is left out: once untracked and ignored, a local file can sit at it.
 func TestChangedFiles(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -529,9 +531,17 @@ func TestChangedFiles(t *testing.T) {
 	commitFile(t, dir, ".gitignore", "*.log\n", "init")
 	commitFile(t, dir, "root.go", "package main", "root")
 	commitFile(t, dir, "old.go", "package main", "old")
+	commitFile(t, dir, "gone.go", "package main", "gone")
+	testutil.WriteFile(t, dir, "untracked-on-branch.log", "API_KEY=placeholder")
+	testutil.RunGit(t, dir, "add", "-f", "untracked-on-branch.log")
+	testutil.WriteFile(t, dir, "untracked-in-index.log", "API_KEY=placeholder")
+	testutil.RunGit(t, dir, "add", "-f", "untracked-in-index.log")
+	testutil.RunGit(t, dir, "commit", "-q", "-m", "track placeholder secrets")
 
 	testutil.GitCheckoutNewBranch(t, dir, "feat/x")
 	commitFile(t, dir, "feat.go", "package main", "feat-only change")
+	testutil.RunGit(t, dir, "rm", "-q", "--cached", "untracked-on-branch.log")
+	testutil.RunGit(t, dir, "commit", "-q", "-m", "stop tracking a secret")
 	testutil.RunGit(t, dir, "checkout", defaultBranchName)
 	commitFile(t, dir, "main-only.go", "package main", "post-branch main change")
 	testutil.RunGit(t, dir, "checkout", "feat/x")
@@ -542,17 +552,23 @@ func TestChangedFiles(t *testing.T) {
 	testutil.RunGit(t, dir, "mv", "old.go", "renamed.go")
 	testutil.WriteFile(t, dir, "new/dir/with space.go", "package dir")
 	testutil.WriteFile(t, dir, "debug.log", "ignored")
+	testutil.RunGit(t, dir, "rm", "-q", "--cached", "untracked-in-index.log")
+	testutil.WriteFile(t, dir, "untracked-on-branch.log", "API_KEY=real")
+	testutil.WriteFile(t, dir, "untracked-in-index.log", "API_KEY=real")
+	if err := os.Remove(filepath.Join(dir, "gone.go")); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx := context.Background()
 	requireFileSet(t, changedFiles(ctx, dir, defaultBranchName),
 		[]string{"feat.go", "root.go", "staged.go", "renamed.go", "new/dir/with space.go"},
-		[]string{"main-only.go", "debug.log", ".gitignore"})
+		[]string{"main-only.go", "debug.log", ".gitignore", "old.go", "gone.go", "untracked-on-branch.log", "untracked-in-index.log"})
 
 	t.Run("without a base ref only uncommitted files count", func(t *testing.T) {
 		t.Parallel()
 		requireFileSet(t, changedFiles(ctx, dir, ""),
 			[]string{"root.go", "staged.go", "renamed.go", "new/dir/with space.go"},
-			[]string{"feat.go"})
+			[]string{"feat.go", "old.go", "gone.go", "untracked-in-index.log"})
 	})
 
 	t.Run("an unresolvable base ref yields no files", func(t *testing.T) {

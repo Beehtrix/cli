@@ -221,9 +221,11 @@ func openCodeFence(text string) string {
 // reviewTrailFindingInputs turns a trail report into trail findings.
 // Structured comments map directly; prose falls back to splitting top-level
 // markdown bullets, which keeps custom judge prompts that ignore the JSON
-// contract structurally correct.
+// contract structurally correct. Every line or range location is then
+// restricted to report.ChangedFiles by restrictReviewTrailLocation.
 func reviewTrailFindingInputs(profileName string, report cliReview.TrailReport) []api.TrailReviewCommentInput {
-	inputs := append(reviewTrailFindingInputsFromComments(report.Comments), reviewTrailFindingInputsFromProse(profileName, report.Prose)...)
+	inputs := reviewTrailFindingInputsFromComments(report.Comments)
+	inputs = append(inputs, reviewTrailFindingInputsFromProse(profileName, report.Prose)...)
 	for i := range inputs {
 		inputs[i].Location = restrictReviewTrailLocation(inputs[i].Location, report.ChangedFiles)
 	}
@@ -249,10 +251,12 @@ func reviewTrailFindingInputsFromProse(profileName, verdict string) []api.TrailR
 	return inputs
 }
 
-// restrictReviewTrailLocation posts a line or range location against its file
-// when the file is outside the reviewed change or the span exceeds
-// maxReviewTrailAnchorLines. The location comes from the model, and posting
-// uploads the worktree text at a line location as its quoted snippet.
+// restrictReviewTrailLocation keeps a line or range location only when its
+// file is in the reviewed change and the span is at most
+// maxReviewTrailAnchorLines. A wider span in a changed file is posted against
+// that file; a file outside the change is posted against the whole change. The
+// location comes from the model, and posting uploads the worktree text at a
+// line location as its quoted snippet.
 func restrictReviewTrailLocation(loc api.TrailReviewLocationCreateRequest, changedFiles map[string]struct{}) api.TrailReviewLocationCreateRequest {
 	if loc.Granularity != reviewTrailGranularityLine && loc.Granularity != reviewTrailGranularityRange {
 		return loc
@@ -260,12 +264,14 @@ func restrictReviewTrailLocation(loc api.TrailReviewLocationCreateRequest, chang
 	if loc.FilePath == nil || loc.StartLine == nil {
 		return loc
 	}
-	_, inChange := changedFiles[normalizeFindingPath(*loc.FilePath)]
-	withinCap := loc.EndLine == nil || *loc.EndLine-*loc.StartLine < maxReviewTrailAnchorLines
-	if inChange && withinCap {
-		return loc
+	filePath := normalizeFindingPath(*loc.FilePath)
+	if _, inChange := changedFiles[filePath]; !inChange {
+		return api.TrailReviewLocationCreateRequest{Granularity: reviewTrailGranularityWholeChange}
 	}
-	return api.TrailReviewLocationCreateRequest{Granularity: reviewTrailGranularityFile, FilePath: loc.FilePath}
+	if loc.EndLine != nil && *loc.EndLine-*loc.StartLine >= maxReviewTrailAnchorLines {
+		return api.TrailReviewLocationCreateRequest{Granularity: reviewTrailGranularityFile, FilePath: &filePath}
+	}
+	return loc
 }
 
 func reviewTrailFindingInputsFromComments(comments []cliReview.TrailComment) []api.TrailReviewCommentInput {

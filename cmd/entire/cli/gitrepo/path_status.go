@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 )
 
 // PathStatuses returns the porcelain v1 status code ("XY", e.g. " M", "A ",
@@ -32,15 +33,15 @@ func PathStatuses(ctx context.Context, repoRoot string, paths []string) (map[str
 		if err != nil {
 			return found, fmt.Errorf("git status: %w", err)
 		}
-		parsePorcelainV1Z(out, found)
+		ParsePorcelainV1Z(out, found)
 	}
 	return found, nil
 }
 
-// parsePorcelainV1Z adds each "XY <path>" record of NUL-terminated porcelain v1
-// output to found. A rename or copy record is followed by its origin path,
-// which is skipped (--no-renames should make that unreachable).
-func parsePorcelainV1Z(out []byte, found map[string]string) {
+// ParsePorcelainV1Z adds each "XY <path>" record of `git status
+// --porcelain=v1 -z` output to found, keyed by path with its "XY" code. A
+// rename or copy record is followed by its origin path, which is skipped.
+func ParsePorcelainV1Z(out []byte, found map[string]string) {
 	records := bytes.Split(out, []byte{0})
 	for i := 0; i < len(records); i++ {
 		record := records[i]
@@ -49,7 +50,7 @@ func parsePorcelainV1Z(out []byte, found map[string]string) {
 		}
 		code := string(record[:2])
 		found[string(record[3:])] = code
-		if code[0] == 'R' || code[0] == 'C' {
+		if strings.ContainsAny(code, "RC") {
 			i++ // origin path
 		}
 	}
