@@ -799,21 +799,30 @@ function Get-EntireCopy {
     }
 
     $stored = @(
-        (Get-UserEnvironmentValue -Name 'Path'),
-        [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        @{ Scope = 'user'; Value = (Get-UserEnvironmentValue -Name 'Path') },
+        @{ Scope = 'machine'; Value = [Environment]::GetEnvironmentVariable('Path', 'Machine') }
     )
 
-    foreach ($value in $stored) {
-        if ([string]::IsNullOrWhiteSpace($value)) {
+    foreach ($path in $stored) {
+        if ([string]::IsNullOrWhiteSpace($path.Value)) {
             continue
         }
-        foreach ($entry in ($value -split ';')) {
-            $directory = [Environment]::ExpandEnvironmentVariables($entry.Trim())
+        foreach ($entry in ($path.Value -split ';')) {
+            # cmd.exe accepts quoted entries; strip them.
+            $directory = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"'))
             if ([string]::IsNullOrWhiteSpace($directory)) {
                 continue
             }
-            $candidate = Join-Path $directory 'entire.exe'
-            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            # Junk entries throw; warn and skip.
+            try {
+                $candidate = Join-Path $directory 'entire.exe'
+                $exists = Test-Path -LiteralPath $candidate -PathType Leaf
+            }
+            catch {
+                Write-InstallerWarning "Skipped unreadable $($path.Scope) PATH entry: '$entry'"
+                continue
+            }
+            if (-not $exists) {
                 continue
             }
             $known = $false

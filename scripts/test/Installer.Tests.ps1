@@ -727,6 +727,42 @@ Describe 'Get-EntireCopy' {
         $copies = Get-EntireCopy
         @($copies | Where-Object { $_.Source -like "*$TestDrive*" }) | Should -HaveCount 1
     }
+
+    It 'finds copies in quoted stored PATH entries' {
+        $processDir = Join-Path $TestDrive 'proc3'
+        $storedDir = Join-Path $TestDrive 'quoted dir'
+        foreach ($dir in $processDir, $storedDir) {
+            [IO.Directory]::CreateDirectory($dir) | Out-Null
+            Set-Content -LiteralPath (Join-Path $dir 'entire.exe') -Value 'x' -NoNewline
+        }
+        Mock Get-EntireOnPath { @([pscustomobject]@{ Source = (Join-Path $processDir 'entire.exe') }) }
+        Mock Get-UserEnvironmentValue { "`"$storedDir`"" }
+
+        $copies = Get-EntireCopy
+        @($copies) | Should -HaveCount 2
+        $copies[1].Source | Should -Be (Join-Path $storedDir 'entire.exe')
+    }
+
+    # reg query output pasted into PATH.
+    It 'warns and skips a stored PATH entry with no such drive' -Skip:($env:OS -ne 'Windows_NT') {
+        $processDir = Join-Path $TestDrive 'proc4'
+        $storedDir = Join-Path $TestDrive 'stored4'
+        foreach ($dir in $processDir, $storedDir) {
+            [IO.Directory]::CreateDirectory($dir) | Out-Null
+            Set-Content -LiteralPath (Join-Path $dir 'entire.exe') -Value 'x' -NoNewline
+        }
+        $junk = 'REG_SZ    C:\Users\someone\bin'
+        Mock Get-EntireOnPath { @([pscustomobject]@{ Source = (Join-Path $processDir 'entire.exe') }) }
+        Mock Get-UserEnvironmentValue { "$junk;$storedDir" }
+        Mock Write-InstallerWarning {}
+
+        $copies = Get-EntireCopy
+        @($copies) | Should -HaveCount 2
+        $copies[1].Source | Should -Be (Join-Path $storedDir 'entire.exe')
+        Should -Invoke Write-InstallerWarning -Times 1 -Exactly -ParameterFilter {
+            $Message -eq "Skipped unreadable user PATH entry: '$junk'"
+        }
+    }
 }
 
 Describe 'Get-PlatformArchitecture' {
