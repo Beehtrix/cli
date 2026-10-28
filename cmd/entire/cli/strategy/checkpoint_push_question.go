@@ -118,26 +118,25 @@ func firstPushPromptFor(prefs *settings.ClonePreferences, now time.Time, opfEnab
 // askCheckpointPushPolicyOnFirstPush asks a person at a terminal, once, which
 // checkpoint push policy this clone uses, when the policy is unset and
 // checkpoints are waiting to upload. It runs before the policy is read for this
-// push, so an answer of manual already holds it. It reports whether this push
-// must hold checkpoints although the policy file does not say so: manual was
-// chosen but could not be saved.
-func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repository) bool {
+// push, so an answer of manual already holds it. It returns the answer, "not
+// now" when nothing was asked, and whether that answer was saved.
+func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repository) (checkpointPushQuestionAnswer, bool) {
 	if !interactive.CanPromptInteractively() {
-		return false
+		return checkpointPushAnswerNotNow, false
 	}
 	// The policy read refuses files a plain preferences load accepts, such as
 	// a case-variant key; announceCheckpointPushPolicy reports those.
 	if _, err := settings.LoadCheckpointPushPolicy(ctx); err != nil {
-		return false
+		return checkpointPushAnswerNotNow, false
 	}
 	prefs, err := settings.LoadClonePreferences(ctx)
 	if err != nil {
-		return false
+		return checkpointPushAnswerNotNow, false
 	}
 	now := time.Now()
 	prompt := firstPushPromptFor(prefs, now, redact.OPFEnabled())
 	if prompt == firstPushPromptNone || waitingCheckpointCount(ctx, repo) == 0 {
-		return false
+		return checkpointPushAnswerNotNow, false
 	}
 
 	if prompt == firstPushPromptOPFNotice {
@@ -148,13 +147,13 @@ func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repositor
 		}); err != nil {
 			logging.Warn(ctx, "pre-push: could not record the OPF deprecation notice", slog.String("error", err.Error()))
 		}
-		return false
+		return checkpointPushAnswerNotNow, false
 	}
 
 	logging.Info(ctx, CheckpointPushQuestionLogMsg)
-	answer := askCheckpointPushQuestionTTY()
+	answer := askCheckpointPushQuestion()
 	if answer == checkpointPushAnswerNotNow {
-		return false
+		return answer, false
 	}
 	if err := settings.ModifyClonePreferences(ctx, func(p *settings.ClonePreferences) error {
 		recordCheckpointPushQuestionAnswer(p, answer, now)
@@ -163,9 +162,8 @@ func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repositor
 		logging.Warn(ctx, "pre-push: could not save the checkpoint push policy answer", slog.String("error", err.Error()))
 		if answer == checkpointPushAnswerManual {
 			fmt.Fprintf(stderrWriter, "[entire] No checkpoints were pushed: could not save the checkpoint push policy: %v\n", err)
-			return true
 		}
-		return false
+		return answer, false
 	}
 	switch answer {
 	case checkpointPushAnswerManual:
@@ -174,8 +172,12 @@ func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repositor
 		fmt.Fprintln(stderrWriter, "[entire] Checkpoint push policy: automatic. Change it with: entire configure --checkpoint-push-policy manual")
 	case checkpointPushAnswerNotNow, checkpointPushAnswerTimedOut:
 	}
-	return false
+	return answer, true
 }
+
+// askCheckpointPushQuestion shows the question and returns the answer; tests
+// replace it because under test the real question reads nothing.
+var askCheckpointPushQuestion = askCheckpointPushQuestionTTY
 
 // askCheckpointPushQuestionTTY shows the question on the controlling terminal,
 // like askConfirmTTY. Callers check interactive.CanPromptInteractively first.

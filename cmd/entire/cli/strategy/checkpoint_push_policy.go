@@ -78,12 +78,10 @@ var ErrOuterPushCarriesHeldCheckpoints = errors.New("refusing to push checkpoint
 // to send, so the whole push is refused. A deletion sends nothing and passes.
 // Without the hook's ref list there is nothing to check; pre-push warns then.
 func checkOuterPushUnderManualPolicy(ctx context.Context) error {
-	outer, ok := outerPushCheckpointRef(ctx)
+	name, ok := outerPushCheckpointRefName(ctx)
 	if !ok || !primaryIsGitRefs(ctx) {
 		return nil
 	}
-	name := outer.checkpointRefName()
-
 	repo, err := OpenRepository(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: this push includes %s, and the checkpoint push policy could not be read (open repository: %w). %s",
@@ -98,24 +96,38 @@ func checkOuterPushUnderManualPolicy(ctx context.Context) error {
 	if automatic {
 		return nil
 	}
-	return fmt.Errorf("%w: this push includes %s, and this clone's checkpoint push policy is manual. %s",
-		ErrOuterPushCarriesHeldCheckpoints, name, outerPushHowTo)
+	return outerPushUnderManualError(name)
 }
 
 const outerPushHowTo = "Leave checkpoint refs out of this push (avoid --mirror) and upload checkpoints with 'entire checkpoint push'. " +
 	"To push them anyway, run git push with --no-verify"
+
+// refuseOuterPushAfterManualAnswer refuses the user's push when it sends
+// checkpoint content itself and manual was just chosen for it. It takes the
+// answer rather than reading the policy, which may not have been saved.
+func refuseOuterPushAfterManualAnswer(ctx context.Context) error {
+	if name, ok := outerPushCheckpointRefName(ctx); ok {
+		return outerPushUnderManualError(name)
+	}
+	return nil
+}
+
+func outerPushUnderManualError(name string) error {
+	return fmt.Errorf("%w: this push includes %s, and this clone's checkpoint push policy is manual. %s",
+		ErrOuterPushCarriesHeldCheckpoints, name, outerPushHowTo)
+}
 
 // CheckOuterPushWithUnloadableSettings refuses the user's push when it sends
 // checkpoint content and Entire's settings could not be loaded, which turns
 // its git hooks off. Neither the backend nor the policy is known then, so the
 // push may be publishing checkpoints that manual holds back.
 func CheckOuterPushWithUnloadableSettings(ctx context.Context, loadErr error) error {
-	outer, ok := outerPushCheckpointRef(ctx)
+	name, ok := outerPushCheckpointRefName(ctx)
 	if !ok {
 		return nil
 	}
 	return fmt.Errorf("%w: this push includes %s, and Entire's settings could not be read (%w). %s",
-		ErrOuterPushCarriesHeldCheckpoints, outer.checkpointRefName(), loadErr, outerPushHowTo)
+		ErrOuterPushCarriesHeldCheckpoints, name, loadErr, outerPushHowTo)
 }
 
 // warnOuterPushUncheckable warns, under manual with checkpoints waiting, that
@@ -157,6 +169,15 @@ func CheckpointWaiting(ctx context.Context, checkpointID id.CheckpointID) (bool,
 	}
 	_, ok := waiting[ref]
 	return ok, nil
+}
+
+// outerPushCheckpointRefName names a checkpoint ref the user's own push sends.
+func outerPushCheckpointRefName(ctx context.Context) (string, bool) {
+	outer, ok := outerPushCheckpointRef(ctx)
+	if !ok {
+		return "", false
+	}
+	return outer.checkpointRefName(), true
 }
 
 // announceCheckpointPushPolicy is the pre-push hook's view of the policy. It

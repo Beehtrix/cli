@@ -435,8 +435,18 @@ func (s *ManualCommitStrategy) prePushCheckpointRefs(ctx context.Context, ps pus
 	}
 	defer repo.Close()
 
-	if fromGitHook && askCheckpointPushPolicyOnFirstPush(ctx, repo) {
-		return nil
+	if fromGitHook {
+		answer, saved := askCheckpointPushPolicyOnFirstPush(ctx, repo)
+		if answer == checkpointPushAnswerManual {
+			// checkOuterPushUnderManualPolicy ran before the question, while the
+			// policy was unset, so this push's own checkpoint refs are checked again.
+			if err := refuseOuterPushAfterManualAnswer(ctx); err != nil {
+				return err
+			}
+			if !saved {
+				return nil
+			}
+		}
 	}
 
 	// Before OPF, so a manual clone's queue is never scanned on git push:
