@@ -51,10 +51,14 @@ function parseInjectedContext(stdout: string): string | null {
 // loads both directories, so on OpenCode 1 this copy stands down rather than
 // fire every hook twice (a teammate on an older CLI can re-create the old file).
 // OpenCode 2 cannot load the old copy, so its plugin never stands down.
-function shadowedByLegacyCopy(directory: string): boolean {
+// The old copy is looked up beside this file, not under the session
+// directory: OpenCode finds .opencode by searching up from the directory it
+// was started in, so that directory can be a subdirectory of the one holding
+// both copies.
+function shadowedByLegacyCopy(): boolean {
   try {
     if (!fileURLToPath(import.meta.url).replace(/\\/g, "/").includes("/.opencode/plugin/")) return false
-    return readFileSync(`${directory}/.opencode/plugins/entire.ts`, "utf8").includes("entire enable --agent opencode")
+    return readFileSync(new URL("../plugins/entire.ts", import.meta.url), "utf8").includes("entire enable --agent opencode")
   } catch {
     return false
   }
@@ -62,7 +66,7 @@ function shadowedByLegacyCopy(directory: string): boolean {
 
 // OpenCode 1 plugin.
 const EntirePlugin: Plugin = async ({ directory }) => {
-  if (shadowedByLegacyCopy(directory)) return {}
+  if (shadowedByLegacyCopy()) return {}
   // Track seen user messages to fire turn-start only once per message
   const seenUserMessages = new Set<string>()
   // Track current session ID for message events (which don't include sessionID)

@@ -746,7 +746,9 @@ func TestUninstallHooks_RemovesLegacyPlugin(t *testing.T) {
 
 // On OpenCode 1, which loads .opencode/plugin and .opencode/plugins, the
 // plugin stands down while an older CLI's copy sits in .opencode/plugins, so
-// hooks do not fire twice.
+// hooks do not fire twice. OpenCode finds .opencode by searching up from the
+// directory it was started in, so that also holds when it is started in a
+// subdirectory.
 func TestPlugin_StandsDownBesideLegacyCopy(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("node"); err != nil {
@@ -755,10 +757,13 @@ func TestPlugin_StandsDownBesideLegacyCopy(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
 		legacy bool
+		subdir string
 		want   string
 	}{
-		{"alone", false, "hooks"},
-		{"beside a legacy copy", true, "none"},
+		{"alone", false, "", "hooks"},
+		{"beside a legacy copy", true, "", "none"},
+		{"started in a subdirectory", false, "cmd", "hooks"},
+		{"beside a legacy copy, started in a subdirectory", true, "cmd", "none"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -784,7 +789,11 @@ console.log(Object.keys(handlers).length > 0 ? "hooks" : "none")
 			if err := os.WriteFile(driverPath, []byte(driver), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			cmd := exec.CommandContext(t.Context(), "node", "--experimental-strip-types", driverPath, pluginPath, dir)
+			directory := filepath.Join(dir, tt.subdir)
+			if err := os.MkdirAll(directory, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.CommandContext(t.Context(), "node", "--experimental-strip-types", driverPath, pluginPath, directory)
 			cmd.Env = append(os.Environ(), "OPENCODE=1")
 			out, err := cmd.Output()
 			if err != nil {
