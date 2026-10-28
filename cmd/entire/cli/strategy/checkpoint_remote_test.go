@@ -3,6 +3,7 @@ package strategy
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1561,10 +1562,11 @@ func TestFetchMetadataBranch_ProceedsWhenFetchLockUnavailable(t *testing.T) {
 func TestBoundFetch(t *testing.T) {
 	t.Parallel()
 
-	// A deadline here is the bug this mode exists to prevent: the archive
-	// outgrows it, the partial transfer is discarded, and every later command
-	// restarts the same fetch from zero.
-	t.Run("foreground has no deadline and aborts stalls instead", func(t *testing.T) {
+	// A fixed per-fetch deadline here is the bug this mode exists to prevent:
+	// the archive outgrows it, the partial transfer is discarded, and every
+	// later command restarts the same fetch from zero. The only bound is the
+	// caller's overall budget from startForegroundFetch.
+	t.Run("foreground adds no deadline and aborts stalls instead", func(t *testing.T) {
 		t.Parallel()
 		var opts remote.FetchOptions
 		ctx, cancel := boundFetch(context.Background(), foregroundFetch, &opts)
@@ -1713,4 +1715,118 @@ func TestFetchMetadataBranch_CancelWhileWaitingForFetchLock(t *testing.T) {
 		t.Fatal("fetch kept waiting for the lock after its context was cancelled")
 	}
 	assert.False(t, testutil.BranchExists(t, localDir, "entire/checkpoints/v1"), "a cancelled waiter must not fetch")
+}
+
+func TestParseForegroundFetchBudget(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "unset uses the default", value: "", want: defaultForegroundFetchBudget},
+		{name: "duration", value: "45m", want: 45 * time.Minute},
+		{name: "surrounding space", value: " 2h ", want: 2 * time.Hour},
+		{name: "not a duration", value: "30", want: defaultForegroundFetchBudget, wantErr: true},
+		{name: "zero", value: "0s", want: defaultForegroundFetchBudget, wantErr: true},
+		{name: "negative", value: "-5m", want: defaultForegroundFetchBudget, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := parseForegroundFetchBudget(tt.value)
+			assert.Equal(t, tt.want, got)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// A waiter whose budget runs out must give up, not fetch unserialized: parallel
+// callers that each fall back to their own transfer move the archive N times.
+//
+// Not parallel: uses t.Chdir() and t.Setenv()
+func TestFetchMetadataBranch_BudgetExpiresWhileWaitingForFetchLock(t *testing.T) {
+	t.Setenv(foregroundFetchBudgetEnvVar, "300ms")
+	remoteDir, localDir := setupCheckpointFetchRepos(t)
+	t.Chdir(localDir)
+
+	root, err := gitdir.Open(context.Background())
+	require.NoError(t, err)
+	release, err := flock.AcquireIn(root, checkpointRemoteFetchLockName)
+	require.NoError(t, err)
+	defer release()
+
+	done := make(chan error, 1)
+	go func() { done <- FetchMetadataBranch(context.Background(), remoteDir) }()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errForegroundFetchBudget)
+		assert.Contains(t, err.Error(), foregroundFetchBudgetEnvVar, "the error must name the setting that raises the budget")
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch kept waiting for the lock after its budget ran out")
+	}
+	assert.False(t, testutil.BranchExists(t, localDir, "entire/checkpoints/v1"), "a waiter out of budget must not fetch")
+}
+
+// The budget covers the transfer too: a server that accepts the connection and
+// never answers prints nothing, so only the budget ends the fetch before the
+// stall window does.
+//
+// Not parallel: uses t.Chdir() and t.Setenv()
+func TestFetchMetadataBranch_BudgetBoundsTheFetch(t *testing.T) {
+	t.Setenv(foregroundFetchBudgetEnvVar, "1s")
+	t.Setenv(remote.CheckpointTokenEnvVar, "")
+	_, localDir := setupCheckpointFetchRepos(t)
+	t.Chdir(localDir)
+
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- FetchMetadataBranch(context.Background(), "http://"+ln.Addr().String()+"/repo.git") }()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errForegroundFetchBudget)
+		assert.Contains(t, err.Error(), foregroundFetchBudgetEnvVar)
+	case <-time.After(30 * time.Second):
+		t.Fatal("fetch outlived its budget")
+	}
+}
+
+// setupCheckpointFetchRepos returns a remote with a checkpoint branch and a
+// local repository without one.
+func setupCheckpointFetchRepos(t *testing.T) (remoteDir, localDir string) {
+	t.Helper()
+	remoteDir = t.TempDir()
+	testutil.InitRepo(t, remoteDir)
+	testutil.WriteFile(t, remoteDir, "f.txt", "init")
+	testutil.GitAdd(t, remoteDir, "f.txt")
+	testutil.GitCommit(t, remoteDir, "init")
+	testutil.RunGit(t, remoteDir, "branch", "entire/checkpoints/v1")
+
+	localDir = t.TempDir()
+	testutil.InitRepo(t, localDir)
+	testutil.WriteFile(t, localDir, "f.txt", "init")
+	testutil.GitAdd(t, localDir, "f.txt")
+	testutil.GitCommit(t, localDir, "init")
+	return remoteDir, localDir
 }

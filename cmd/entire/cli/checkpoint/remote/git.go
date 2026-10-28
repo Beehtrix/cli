@@ -185,9 +185,9 @@ type FetchOptions struct {
 	Dir       string   // working directory (empty = CWD)
 	ExtraArgs []string // additional flags before remote (e.g., "--no-write-fetch-head")
 	// AbortStalled kills a fetch that goes stallAbortIdle without git printing
-	// anything, for callers that set no deadline because the transfer can
-	// legitimately take longer than any fixed one. It requests --progress, so
-	// a working fetch on any transport keeps printing.
+	// anything, for callers whose transfer can legitimately take longer than a
+	// fixed per-fetch deadline. It requests --progress so git reports objects
+	// as they arrive.
 	AbortStalled bool
 }
 
@@ -874,10 +874,11 @@ func disableTerminalPrompt(cmd *exec.Cmd) {
 }
 
 // stallAbortIdle is how long an AbortStalled fetch may print nothing before it
-// is killed. With --progress, git reports the server preparing the pack and the
-// objects arriving on every transport, including remote helpers, so this long a
-// silence means the transfer has stopped.
-var stallAbortIdle = 5 * time.Minute
+// is killed. git redraws its receive progress only as each object completes,
+// so a single large object (a transcript chunk up to agent.MaxChunkSize, or an
+// extracted image) arrives in silence. The window must outlast that transfer
+// on a slow link; callers bound the total time separately.
+var stallAbortIdle = 10 * time.Minute
 
 var errFetchStalled = errors.New("fetch stalled")
 

@@ -35,8 +35,9 @@ const (
 	// delete), which fetch the whole transcript archive. No fixed deadline
 	// suits that: one the archive outgrows discards the partial transfer, the
 	// ref never lands, and every later command restarts the same fetch from
-	// zero. So these run until done and abort only a stalled transfer, under a
-	// per-repository lock so concurrent commands transfer the archive once.
+	// zero. So these abort a stalled transfer, run under a per-repository lock
+	// so concurrent commands transfer the archive once, and are bounded only by
+	// the overall budget (see startForegroundFetch).
 	foregroundFetch
 )
 
@@ -44,11 +45,17 @@ const (
 // serializes foreground checkpoint-remote fetches across processes.
 const checkpointRemoteFetchLockName = "entire-checkpoint-remote-fetch.lock"
 
-// checkpointRemoteFetchLockWait bounds how long a foreground fetch waits for
-// another to finish before fetching unserialized. It is well above the ~11
-// minutes a multi-gigabyte archive took to transfer, so a working fetch is
-// waited out, while one that hangs cannot block every later command forever.
-const checkpointRemoteFetchLockWait = 30 * time.Minute
+// defaultForegroundFetchBudget bounds a foreground fetch, lock wait included.
+// It is well above the ~11 minutes a multi-gigabyte archive took to transfer,
+// so a working fetch finishes, while a caller still gets an answer eventually.
+const defaultForegroundFetchBudget = 30 * time.Minute
+
+// foregroundFetchBudgetEnvVar overrides defaultForegroundFetchBudget with a Go
+// duration such as "45m". It is read from the environment so programs that run
+// entire as a subprocess can set it for every command they start.
+const foregroundFetchBudgetEnvVar = "ENTIRE_CHECKPOINT_FETCH_TIMEOUT"
+
+var errForegroundFetchBudget = errors.New("checkpoint fetch budget exhausted")
 
 // pushSettings holds the resolved push configuration from a single settings load.
 type pushSettings struct {
@@ -178,14 +185,17 @@ func fetchMetadataBranchWithin(ctx context.Context, remoteURL string, mode check
 	}
 	srcRef := refs.Primary.String()
 
+	fetchCtx := ctx
 	if mode == foregroundFetch {
-		release, err := acquireCheckpointRemoteFetchLock(ctx, "")
+		var release func()
+		var err error
+		fetchCtx, release, err = startForegroundFetch(ctx, "")
 		if err != nil {
 			return err
 		}
 		defer release()
 	}
-	if err := fetchURLIntoTmpRef(ctx, "", remoteURL, srcRef, tmpRef, "metadata branch", true, mode); err != nil {
+	if err := fetchURLIntoTmpRef(fetchCtx, "", remoteURL, srcRef, tmpRef, "metadata branch", true, mode); err != nil {
 		return err
 	}
 	if err := PromoteTmpRefSafely(ctx, plumbing.ReferenceName(tmpRef), refs.Primary, branchName); err != nil {
@@ -242,6 +252,9 @@ func fetchURLIntoTmpRef(ctx context.Context, dir, remoteURL, srcRef, tmpRef, lab
 	// remote.Fetch already folds git's output into fetchErr, redacted and
 	// capped; splicing it again printed the same text twice.
 	redactedURL := remote.RedactURL(remoteURL)
+	if cause := context.Cause(fetchCtx); errors.Is(cause, errForegroundFetchBudget) {
+		return fmt.Errorf("fetch %s from %s failed: %w: %w", label, redactedURL, cause, fetchErr)
+	}
 	return fmt.Errorf("fetch %s from %s failed: %w", label, redactedURL, fetchErr)
 }
 
@@ -267,10 +280,11 @@ func boundFetch(ctx context.Context, mode checkpointFetchMode, opts *remote.Fetc
 	return context.WithTimeout(ctx, checkpointRemoteFetchTimeout)
 }
 
-// acquireCheckpointRemoteFetchLock waits for any other foreground
-// checkpoint-remote fetch in this repository to finish. The waiter's own fetch
-// then negotiates against the objects the first one landed and transfers only
-// what is new.
+// startForegroundFetch starts a foreground fetch's budget, then waits for any
+// other foreground checkpoint-remote fetch in this repository to finish. The
+// waiter's own fetch then negotiates against the objects the first one landed
+// and transfers only what is new. Run the fetch under the returned context,
+// which carries the budget, and call release when done with the fetched ref.
 //
 // Callers that fetch into the shared metadata tmp ref (FetchTmpRefPrefix plus
 // the primary branch) hold the lock until that ref is promoted and removed:
@@ -278,11 +292,54 @@ func boundFetch(ctx context.Context, mode checkpointFetchMode, opts *remote.Fetc
 // ref out from under the next caller's fetch. The push hot path does not take
 // the lock and uses its own tmp ref instead.
 //
-// The wait says why the command is paused, stops when ctx is cancelled, and
-// gives up after checkpointRemoteFetchLockWait. Giving up, or failing to take
-// the lock at all, logs and lets the caller fetch unserialized; only ctx's own
-// error is returned. dir is the worktree to resolve the git common dir from;
-// empty means the current repository.
+// The wait says why the command is paused and stops when ctx is cancelled or
+// the budget runs out, returning that cause; a waiter never falls back to its
+// own transfer, which would move the archive once per waiter. Failing to take
+// the lock at all logs and lets the caller fetch unserialized. dir is the
+// worktree to resolve the git common dir from; empty means the current
+// repository.
+func startForegroundFetch(ctx context.Context, dir string) (context.Context, func(), error) {
+	budget, parseErr := parseForegroundFetchBudget(os.Getenv(foregroundFetchBudgetEnvVar))
+	if parseErr != nil {
+		logging.Warn(ctx, "checkpoint-remote: ignoring invalid fetch budget",
+			slog.String("env", foregroundFetchBudgetEnvVar),
+			slog.String("error", parseErr.Error()),
+		)
+	}
+	fetchCtx, cancel := context.WithTimeoutCause(ctx, budget,
+		fmt.Errorf("%w after %s (set %s to allow longer)", errForegroundFetchBudget, budget, foregroundFetchBudgetEnvVar))
+	unlock, err := acquireCheckpointRemoteFetchLock(fetchCtx, dir)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return fetchCtx, func() {
+		unlock()
+		cancel()
+	}, nil
+}
+
+// parseForegroundFetchBudget returns the budget a foregroundFetchBudgetEnvVar
+// value sets: the default when it is empty, and the default with an error when
+// it is not a positive duration.
+func parseForegroundFetchBudget(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultForegroundFetchBudget, nil
+	}
+	budget, err := time.ParseDuration(value)
+	if err != nil {
+		return defaultForegroundFetchBudget, fmt.Errorf("parse %s: %w", foregroundFetchBudgetEnvVar, err)
+	}
+	if budget <= 0 {
+		return defaultForegroundFetchBudget, fmt.Errorf("%s must be positive, got %q", foregroundFetchBudgetEnvVar, value)
+	}
+	return budget, nil
+}
+
+// acquireCheckpointRemoteFetchLock takes the fetch lock for startForegroundFetch,
+// whose budget gives ctx the deadline the wait needs. Only ctx's own cause is
+// returned as an error.
 func acquireCheckpointRemoteFetchLock(ctx context.Context, dir string) (release func(), err error) {
 	var root *os.Root
 	if dir == "" {
@@ -297,8 +354,8 @@ func acquireCheckpointRemoteFetchLock(ctx context.Context, dir string) (release 
 		release, err = acquireFetchLockIn(ctx, root)
 	}
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, fmt.Errorf("wait for checkpoint fetch lock: %w", ctxErr)
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("wait for checkpoint fetch lock: %w", context.Cause(ctx))
 		}
 		logging.Warn(ctx, "checkpoint-remote: fetch lock unavailable; fetching unserialized",
 			slog.String("error", err.Error()),
@@ -310,8 +367,8 @@ func acquireCheckpointRemoteFetchLock(ctx context.Context, dir string) (release 
 
 // acquireFetchLockIn takes the fetch lock in root, announcing the wait when
 // another process holds it. flock only polls, and so only honors cancellation,
-// under a deadline: an already-expired one makes the first attempt a
-// non-blocking probe.
+// under a deadline: ctx must carry one, and an already-expired one makes the
+// first attempt a non-blocking probe.
 func acquireFetchLockIn(ctx context.Context, root *os.Root) (func(), error) {
 	probeCtx, cancelProbe := context.WithDeadline(ctx, time.Now())
 	release, err := flock.AcquireContextIn(probeCtx, root, checkpointRemoteFetchLockName)
@@ -322,9 +379,7 @@ func acquireFetchLockIn(ctx context.Context, root *os.Root) (func(), error) {
 
 	printFetchStatus("Waiting for another entire command to finish fetching checkpoints...")
 	logging.Info(ctx, "checkpoint-remote: waiting for another fetch to release the fetch lock")
-	waitCtx, cancel := context.WithTimeout(ctx, checkpointRemoteFetchLockWait)
-	defer cancel()
-	return flock.AcquireContextIn(waitCtx, root, checkpointRemoteFetchLockName) //nolint:wrapcheck // flock errors are already wrapped
+	return flock.AcquireContextIn(ctx, root, checkpointRemoteFetchLockName) //nolint:wrapcheck // flock errors are already wrapped
 }
 
 // fetchMetadataBranchIfMissing fetches the primary metadata ref from a URL only if it doesn't exist locally.

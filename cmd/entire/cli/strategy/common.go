@@ -982,12 +982,12 @@ func bootstrapPrimaryFromCheckpointRemote(ctx context.Context, repo *git.Reposit
 	// resolves the recovery tier never fires again, so a blob-filtered bootstrap
 	// would leave `checkpoint list` permanently showing bare IDs with no prompt,
 	// date, or counts.
-	release, err := acquireCheckpointRemoteFetchLock(ctx, worktreeRoot)
-	if err != nil {
-		return false
+	fetchCtx, release, err := startForegroundFetch(ctx, worktreeRoot)
+	if err == nil {
+		defer release()
+		err = fetchURLIntoTmpRef(fetchCtx, worktreeRoot, url, primary.String(), tmpRefName.String(), "metadata branch", true, foregroundFetch)
 	}
-	defer release()
-	if err := fetchURLIntoTmpRef(ctx, worktreeRoot, url, primary.String(), tmpRefName.String(), "metadata branch", true, foregroundFetch); err != nil {
+	if err != nil {
 		// Warn, not Debug: `entire enable` is an explicit user action, and this
 		// failure means existing checkpoints stay unreachable until a read
 		// re-fetches them. At Debug the command looked like it had simply
@@ -1091,7 +1091,7 @@ func healEmptyOrphanFromCheckpointRemote(ctx context.Context, repo *git.Reposito
 
 	tmpRefName := plumbing.ReferenceName(FetchTmpRefPrefix + primary.Short())
 	// Taken before the cleanup defer so the lock outlives the tmp ref.
-	release, err := acquireCheckpointRemoteFetchLock(ctx, worktreeRoot)
+	fetchCtx, release, err := startForegroundFetch(ctx, worktreeRoot)
 	if err != nil {
 		return false, err
 	}
@@ -1101,7 +1101,7 @@ func healEmptyOrphanFromCheckpointRemote(ctx context.Context, repo *git.Reposito
 	// Unfiltered, for the same reason as the bootstrap fetch above: this heal
 	// replaces a data-free orphan with the real branch, which readers then treat
 	// as the checkpoint store.
-	if err := fetchURLIntoTmpRef(ctx, worktreeRoot, url, primary.String(), tmpRefName.String(), "metadata branch", true, foregroundFetch); err != nil {
+	if err := fetchURLIntoTmpRef(fetchCtx, worktreeRoot, url, primary.String(), tmpRefName.String(), "metadata branch", true, foregroundFetch); err != nil {
 		// Warn for the same reason as the bootstrap fetch: this only runs from an
 		// explicit setup flow, and failing leaves the repo on a data-free orphan.
 		logging.Warn(ctx, "checkpoint-remote: empty-orphan heal fetch failed; keeping local orphan",

@@ -517,11 +517,11 @@ func isStaleLease(output string) bool {
 func deleteFromRemoteV1(ctx context.Context, root string, cid id.CheckpointID, target CheckpointDeleteTarget) (DeleteOutcome, string, plumbing.Hash) {
 	tmpRef := plumbing.ReferenceName(FetchTmpRefPrefix + "checkpoint-delete/" + cid.String())
 	// The tmp ref is this delete's own, so the lock need only cover the transfer.
-	release, err := acquireCheckpointRemoteFetchLock(ctx, root)
+	fetchCtx, release, err := startForegroundFetch(ctx, root)
 	if err != nil {
 		return DeleteOutcomeFailed, err.Error(), plumbing.ZeroHash
 	}
-	fetchErr := fetchURLIntoTmpRef(ctx, root, target.URL, v1BranchRef.String(), tmpRef.String(), "checkpoint branch", true, foregroundFetch)
+	fetchErr := fetchURLIntoTmpRef(fetchCtx, root, target.URL, v1BranchRef.String(), tmpRef.String(), "checkpoint branch", true, foregroundFetch)
 	release()
 	if fetchErr != nil {
 		return DeleteOutcomeFailed, fetchErr.Error(), plumbing.ZeroHash
