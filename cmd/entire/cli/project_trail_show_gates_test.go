@@ -116,48 +116,64 @@ func TestProjectTrailShowTextIncludesChangeGates(t *testing.T) {
 }
 
 // The change a trail is reached through gets its gates even once merged, so
-// `trail show <repo>/<number>` still shows why it was mergeable.
+// `trail show <repo>/<number>` still shows why it was mergeable. Its gates
+// are read through the repository client the lookup already opened, so a
+// one-repository trail resolves that repository once.
 func TestProjectTrailShowCurrentMergedChangeGates(t *testing.T) {
-	setupProjectTrailTest(t, func(w http.ResponseWriter, _ *http.Request) {
-		item := projectTrailTestResource()
-		item.Changes[0].Repository, item.Changes[0].RepositoryID, item.Changes[0].Status = "", "repo-widget", "merged"
-		assert.NoError(t, json.NewEncoder(w).Encode(item))
-	})
-	repoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/trails/gh/acme/widget":
-			assert.NoError(t, json.NewEncoder(w).Encode(api.TrailListResponse{Trails: []api.TrailResource{{
-				ID: projectTrailTestChange, Number: 7, Branch: "feature/a",
-				Parent: &api.TrailParentReference{ID: projectTrailTestID, Number: 42, ProjectID: projectTrailTestProject,
-					Host: "gh", Project: "acme", Path: projectTrailTestPath, Jurisdiction: "eu", PrimaryProcessingCell: "project-cell"},
-			}}}))
-		case "/api/v1/trails/gh/acme/widget/7":
-			assert.NoError(t, json.NewEncoder(w).Encode(api.TrailResource{ID: projectTrailTestChange, Number: 7, Mergeability: json.RawMessage(projectTrailGatesFixture)}))
-		default:
-			t.Errorf("unexpected repository request: %s", r.URL.Path)
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(repoServer.Close)
-	old := newTrailAPIClient
-	newTrailAPIClient = func(context.Context, bool, string, string, string) (*api.Client, string, error) {
-		return api.NewClientWithBaseURL("repo-token", repoServer.URL), "repo-widget", nil
-	}
-	t.Cleanup(func() { newTrailAPIClient = old })
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"branch", []string{"--repo", "gh/acme/widget", "--branch", "feature/a"}},
+		{"change selector", []string{"widget/7", "--project", "gh/acme"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupProjectTrailTest(t, func(w http.ResponseWriter, _ *http.Request) {
+				item := projectTrailTestResource()
+				item.Changes[0].Repository, item.Changes[0].RepositoryID, item.Changes[0].Status = "", "repo-widget", "merged"
+				assert.NoError(t, json.NewEncoder(w).Encode(item))
+			})
+			parent := &api.TrailParentReference{ID: projectTrailTestID, Number: 42, ProjectID: projectTrailTestProject,
+				Host: "gh", Project: "acme", Path: projectTrailTestPath, Jurisdiction: "eu", PrimaryProcessingCell: "project-cell"}
+			repoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v1/trails/gh/acme/widget":
+					assert.NoError(t, json.NewEncoder(w).Encode(api.TrailListResponse{Trails: []api.TrailResource{{
+						ID: projectTrailTestChange, Number: 7, Branch: "feature/a", Parent: parent,
+					}}}))
+				case "/api/v1/trails/gh/acme/widget/7":
+					assert.NoError(t, json.NewEncoder(w).Encode(api.TrailResource{ID: projectTrailTestChange, Number: 7, Branch: "feature/a",
+						Parent: parent, Mergeability: json.RawMessage(projectTrailGatesFixture)}))
+				default:
+					t.Errorf("unexpected repository request: %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(repoServer.Close)
+			opens := 0
+			old := newTrailAPIClient
+			newTrailAPIClient = func(context.Context, bool, string, string, string) (*api.Client, string, error) {
+				opens++
+				return api.NewClientWithBaseURL("repo-token", repoServer.URL), "repo-widget", nil
+			}
+			t.Cleanup(func() { newTrailAPIClient = old })
 
-	out, errOut, err := executeProjectTrailTest(t, "show", "--repo", "gh/acme/widget", "--branch", "feature/a", "--json")
-	require.NoError(t, err)
-	require.Empty(t, errOut)
-	var item struct {
-		Changes []struct {
-			Current      bool                   `json:"current"`
-			Mergeability *trailMergeabilityJSON `json:"mergeability"`
-		} `json:"changes"`
+			out, errOut, err := executeProjectTrailTest(t, append([]string{"show", "--json"}, tc.args...)...)
+			require.NoError(t, err)
+			require.Empty(t, errOut)
+			var item struct {
+				Changes []struct {
+					Current      bool                   `json:"current"`
+					Mergeability *trailMergeabilityJSON `json:"mergeability"`
+				} `json:"changes"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(out), &item))
+			require.Len(t, item.Changes, 1)
+			require.True(t, item.Changes[0].Current)
+			require.NotNil(t, item.Changes[0].Mergeability, "the current change is read by the name the CLI resolved it in")
+			assert.Equal(t, 1, opens, "the gates reuse the repository client the lookup opened")
+		})
 	}
-	require.NoError(t, json.Unmarshal([]byte(out), &item))
-	require.Len(t, item.Changes, 1)
-	require.True(t, item.Changes[0].Current)
-	require.NotNil(t, item.Changes[0].Mergeability, "the current change is read by the name the CLI resolved it in")
 }
 
 // Commands that print a project trail without reading gates omit the key
