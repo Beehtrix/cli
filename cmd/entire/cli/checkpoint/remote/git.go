@@ -262,7 +262,7 @@ func Fetch(ctx context.Context, opts FetchOptions) ([]byte, error) {
 	}
 
 	if err != nil {
-		if cause := context.Cause(cmdCtx); errors.Is(cause, errFetchStalled) {
+		if cause := context.Cause(cmdCtx); errors.Is(cause, ErrFetchStalled) {
 			err = cause
 		}
 		return out, errWithGitOutput(fmt.Errorf("git fetch: %w", err), out, opts.Remote)
@@ -881,7 +881,8 @@ func disableTerminalPrompt(cmd *exec.Cmd) {
 // time separately.
 var stallAbortIdle = 10 * time.Minute
 
-var errFetchStalled = errors.New("fetch stalled")
+// ErrFetchStalled is the cause of a fetch AbortStalled killed.
+var ErrFetchStalled = errors.New("fetch stalled")
 
 // runAbortingStalls runs cmd like CombinedOutput, but calls cancel, which must
 // cancel cmd's context, once cmd has printed nothing for stallAbortIdle.
@@ -903,7 +904,7 @@ func runAbortingStalls(cmd *exec.Cmd, cancel context.CancelCauseFunc) ([]byte, e
 				return
 			case <-ticker.C:
 				if time.Since(w.lastWrite()) >= idle {
-					cancel(fmt.Errorf("%w: no progress for %s", errFetchStalled, idle))
+					cancel(fmt.Errorf("%w: no progress for %s", ErrFetchStalled, idle))
 					return
 				}
 			}

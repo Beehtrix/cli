@@ -1562,7 +1562,7 @@ func TestFetch_AbortStalledKillsSilentFetch(t *testing.T) {
 	t.Cleanup(func() { stallAbortIdle = orig })
 
 	elapsed, err := abortStalledFetch(t, remote)
-	require.ErrorIs(t, err, errFetchStalled)
+	require.ErrorIs(t, err, ErrFetchStalled)
 	assert.Less(t, elapsed, 30*time.Second)
 }
 
@@ -1577,7 +1577,7 @@ func TestFetch_AbortStalledLetsProgressingFetchRun(t *testing.T) {
 
 	elapsed, err := abortStalledFetch(t, remote)
 	require.Error(t, err, "the fake ssh always fails")
-	require.NotErrorIs(t, err, errFetchStalled)
+	require.NotErrorIs(t, err, ErrFetchStalled)
 	assert.Greater(t, elapsed, stallAbortIdle, "the fetch must outlive the idle window")
 	assert.Contains(t, err.Error(), "progress 8")
 }

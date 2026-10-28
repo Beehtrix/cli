@@ -3,6 +3,7 @@ package strategy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,7 +16,9 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/gitdir"
 	"github.com/entireio/cli/cmd/entire/cli/interactive"
 	"github.com/entireio/cli/cmd/entire/cli/internal/flock"
+	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
+	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 
 	"github.com/go-git/go-git/v6/plumbing"
@@ -44,6 +47,18 @@ const (
 // checkpointRemoteFetchLockName is the lock file, in the git common dir, that
 // serializes foreground checkpoint-remote fetches across processes.
 const checkpointRemoteFetchLockName = "entire-checkpoint-remote-fetch.lock"
+
+// checkpointRemoteFetchFailureName is the file, next to the fetch lock, that
+// records the last foreground fetch that stalled or ran out of budget.
+const checkpointRemoteFetchFailureName = "entire-checkpoint-remote-fetch-failure.json"
+
+// recentSlowFetchFailureWindow is how long after a slow failure foreground
+// fetches from the same remote fail fast. A stalled remote costs every fetch a
+// full stall window, so without it commands queued on the fetch lock each pay
+// that window in turn, and so does every new process started meanwhile.
+const recentSlowFetchFailureWindow = 2 * time.Minute
+
+var errRecentSlowFetchFailure = errors.New("checkpoint remote failed recently")
 
 // defaultForegroundFetchBudget bounds a foreground fetch, lock wait included.
 // It is well above the ~11 minutes a multi-gigabyte archive took to transfer,
@@ -240,22 +255,115 @@ func fetchURLIntoTmpRef(ctx context.Context, dir, remoteURL, srcRef, tmpRef, lab
 	}
 	fetchCtx, cancel := boundFetch(ctx, mode, &opts)
 	defer cancel()
+	redactedURL := remote.RedactURL(remoteURL)
 	if mode == foregroundFetch {
+		if err := recentSlowFetchFailure(ctx, dir, remoteURL, srcRef); err != nil {
+			return fmt.Errorf("fetch %s from %s skipped: %w", label, redactedURL, err)
+		}
 		printFetchStatus("Fetching checkpoints from " + remote.RedactURLOrPath(remoteURL))
 	}
 
 	_, fetchErr := remote.Fetch(fetchCtx, opts)
-	if fetchErr == nil {
-		return nil
-	}
-
 	// remote.Fetch already folds git's output into fetchErr, redacted and
 	// capped; splicing it again printed the same text twice.
-	redactedURL := remote.RedactURL(remoteURL)
-	if cause := context.Cause(fetchCtx); errors.Is(cause, errForegroundFetchBudget) {
-		return fmt.Errorf("fetch %s from %s failed: %w: %w", label, redactedURL, cause, fetchErr)
+	var err error
+	switch cause := context.Cause(fetchCtx); {
+	case fetchErr == nil:
+	case errors.Is(cause, errForegroundFetchBudget):
+		err = fmt.Errorf("fetch %s from %s failed: %w: %w", label, redactedURL, cause, fetchErr)
+	default:
+		err = fmt.Errorf("fetch %s from %s failed: %w", label, redactedURL, fetchErr)
 	}
-	return fmt.Errorf("fetch %s from %s failed: %w", label, redactedURL, fetchErr)
+	if mode == foregroundFetch {
+		recordForegroundFetchOutcome(ctx, dir, remoteURL, srcRef, err)
+	}
+	return err
+}
+
+// slowFetchFailure is the record checkpointRemoteFetchFailureName holds.
+type slowFetchFailure struct {
+	Remote string    `json:"remote"` // redacted
+	Ref    string    `json:"ref"`
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
+}
+
+// recentSlowFetchFailure returns an errRecentSlowFetchFailure error when a
+// foreground fetch of srcRef from remoteURL stalled or ran out of budget within
+// recentSlowFetchFailureWindow. Commands waiting on the fetch lock check it once
+// they hold the lock, so they fail together with the fetch they waited for.
+func recentSlowFetchFailure(ctx context.Context, dir, remoteURL, srcRef string) error {
+	f, ok := readSlowFetchFailure(ctx, dir, remoteURL, srcRef)
+	if !ok {
+		return nil
+	}
+	age := time.Since(f.At)
+	if age < 0 || age >= recentSlowFetchFailureWindow {
+		return nil
+	}
+	return fmt.Errorf("%w: a fetch %s ago failed (%s); retry after %s",
+		errRecentSlowFetchFailure, age.Round(time.Second), f.Reason, (recentSlowFetchFailureWindow - age).Round(time.Second))
+}
+
+// recordForegroundFetchOutcome records a fetch that stalled or ran out of
+// budget for recentSlowFetchFailure, and clears the record when a fetch of the
+// same ref from the same remote succeeds. Other failures are not recorded: they
+// end quickly, so a retry costs little, and refusing it would hide a fix such
+// as new credentials. Best-effort: a failed write only logs.
+func recordForegroundFetchOutcome(ctx context.Context, dir, remoteURL, srcRef string, fetchErr error) {
+	var reason string
+	switch {
+	case fetchErr == nil:
+	case errors.Is(fetchErr, remote.ErrFetchStalled):
+		reason = remote.ErrFetchStalled.Error()
+	case errors.Is(fetchErr, errForegroundFetchBudget):
+		reason = errForegroundFetchBudget.Error()
+	default:
+		return
+	}
+	root, err := openFetchLockRoot(ctx, dir)
+	if err == nil {
+		if reason == "" {
+			if _, ok := readSlowFetchFailure(ctx, dir, remoteURL, srcRef); ok {
+				err = root.Remove(checkpointRemoteFetchFailureName)
+			}
+		} else {
+			err = writeSlowFetchFailure(root, slowFetchFailure{
+				Remote: remote.RedactURL(remoteURL),
+				Ref:    srcRef,
+				Reason: reason,
+				At:     time.Now(),
+			})
+		}
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		logging.Warn(ctx, "checkpoint-remote: could not record fetch outcome",
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// readSlowFetchFailure returns the recorded failure when it is for srcRef from
+// remoteURL. An unreadable record reads as none.
+func readSlowFetchFailure(ctx context.Context, dir, remoteURL, srcRef string) (slowFetchFailure, bool) {
+	root, err := openFetchLockRoot(ctx, dir)
+	if err != nil {
+		return slowFetchFailure{}, false
+	}
+	var f slowFetchFailure
+	data, err := osroot.ReadFileNoFollow(root, checkpointRemoteFetchFailureName)
+	if err != nil || json.Unmarshal(data, &f) != nil {
+		return slowFetchFailure{}, false
+	}
+	return f, f.Remote == remote.RedactURL(remoteURL) && f.Ref == srcRef
+}
+
+func writeSlowFetchFailure(root *os.Root, f slowFetchFailure) error {
+	data, err := json.Marshal(f)
+	if err != nil {
+		return fmt.Errorf("marshal fetch failure: %w", err)
+	}
+	return jsonutil.WriteFileAtomicIn(root, checkpointRemoteFetchFailureName, data, 0o600) //nolint:wrapcheck // already names the file
 }
 
 // printFetchStatus tells a terminal user why a foreground command is paused.
@@ -341,15 +449,7 @@ func parseForegroundFetchBudget(value string) (time.Duration, error) {
 // whose budget gives ctx the deadline the wait needs. Only ctx's own cause is
 // returned as an error.
 func acquireCheckpointRemoteFetchLock(ctx context.Context, dir string) (release func(), err error) {
-	var root *os.Root
-	if dir == "" {
-		root, err = gitdir.Open(ctx)
-	} else {
-		var commonDir string
-		if commonDir, err = gitdir.CommonDirForWorktree(ctx, dir); err == nil {
-			root, err = gitdir.OpenAt(commonDir)
-		}
-	}
+	root, err := openFetchLockRoot(ctx, dir)
 	if err == nil {
 		release, err = acquireFetchLockIn(ctx, root)
 	}
@@ -363,6 +463,19 @@ func acquireCheckpointRemoteFetchLock(ctx context.Context, dir string) (release 
 		return func() {}, nil
 	}
 	return release, nil
+}
+
+// openFetchLockRoot opens the git common dir that holds the fetch lock. dir is
+// the worktree to resolve it from; empty means the current repository.
+func openFetchLockRoot(ctx context.Context, dir string) (*os.Root, error) {
+	if dir == "" {
+		return gitdir.Open(ctx) //nolint:wrapcheck // gitdir errors name the path
+	}
+	commonDir, err := gitdir.CommonDirForWorktree(ctx, dir)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // gitdir errors name the path
+	}
+	return gitdir.OpenAt(commonDir) //nolint:wrapcheck // gitdir errors name the path
 }
 
 // acquireFetchLockIn takes the fetch lock in root, announcing the wait when

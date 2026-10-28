@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1785,23 +1786,10 @@ func TestFetchMetadataBranch_BudgetBoundsTheFetch(t *testing.T) {
 	t.Setenv(remote.CheckpointTokenEnvVar, "")
 	_, localDir := setupCheckpointFetchRepos(t)
 	t.Chdir(localDir)
-
-	var lc net.ListenConfig
-	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			t.Cleanup(func() { _ = conn.Close() })
-		}
-	}()
+	url, _ := silentHTTPRemote(t)
 
 	done := make(chan error, 1)
-	go func() { done <- FetchMetadataBranch(context.Background(), "http://"+ln.Addr().String()+"/repo.git") }()
+	go func() { done <- FetchMetadataBranch(context.Background(), url) }()
 
 	select {
 	case err := <-done:
@@ -1810,6 +1798,141 @@ func TestFetchMetadataBranch_BudgetBoundsTheFetch(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("fetch outlived its budget")
 	}
+}
+
+// A remote that stalls costs each command that tries it a full stall window.
+// Right after one slow failure, the next foreground fetch from the same remote
+// fails fast without contacting it.
+//
+// Not parallel: uses t.Chdir() and t.Setenv()
+func TestFetchMetadataBranch_FailsFastAfterSlowFailure(t *testing.T) {
+	t.Setenv(foregroundFetchBudgetEnvVar, "1s")
+	t.Setenv(remote.CheckpointTokenEnvVar, "")
+	_, localDir := setupCheckpointFetchRepos(t)
+	t.Chdir(localDir)
+	url, conns := silentHTTPRemote(t)
+
+	require.ErrorIs(t, FetchMetadataBranch(context.Background(), url), errForegroundFetchBudget)
+	dialed := conns.Load()
+	require.Positive(t, dialed)
+
+	start := time.Now()
+	err := FetchMetadataBranch(context.Background(), url)
+	require.ErrorIs(t, err, errRecentSlowFetchFailure)
+	assert.Less(t, time.Since(start), 500*time.Millisecond)
+	assert.Equal(t, dialed, conns.Load(), "a fail-fast fetch must not contact the remote")
+}
+
+// Commands queued on the fetch lock behind a fetch that stalls must fail
+// together when it does, not each pay the stall window in turn.
+//
+// Not parallel: uses t.Chdir() and t.Setenv()
+func TestFetchMetadataBranch_WaiterFailsFastWhenHolderStalls(t *testing.T) {
+	t.Setenv(remote.CheckpointTokenEnvVar, "")
+	_, localDir := setupCheckpointFetchRepos(t)
+	t.Chdir(localDir)
+	url, conns := silentHTTPRemote(t)
+	ctx := context.Background()
+
+	root, err := gitdir.Open(ctx)
+	require.NoError(t, err)
+	release, err := flock.AcquireIn(root, checkpointRemoteFetchLockName)
+	require.NoError(t, err)
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- FetchMetadataBranch(ctx, url) }()
+	time.Sleep(200 * time.Millisecond)
+
+	recordForegroundFetchOutcome(ctx, "", url, "refs/heads/"+paths.MetadataBranchName,
+		fmt.Errorf("git fetch: %w: no progress for 10m0s", remote.ErrFetchStalled))
+	release()
+	released = true
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errRecentSlowFetchFailure)
+		assert.Contains(t, err.Error(), remote.ErrFetchStalled.Error(), "the error must say why the earlier fetch failed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter fetched again after the lock holder stalled")
+	}
+	assert.Zero(t, conns.Load(), "the waiter must not contact the remote")
+}
+
+// The fail-fast is scoped to the remote that failed, expires, and only follows
+// slow failures: a fast failure such as a missing repository costs little to
+// retry, and blocking the retry would hide the fix.
+//
+// Not parallel: uses t.Chdir()
+func TestFetchMetadataBranch_SlowFailureScope(t *testing.T) {
+	srcRef := "refs/heads/" + paths.MetadataBranchName
+	stalled := fmt.Errorf("git fetch: %w", remote.ErrFetchStalled)
+
+	t.Run("another remote still fetches", func(t *testing.T) {
+		remoteDir, localDir := setupCheckpointFetchRepos(t)
+		t.Chdir(localDir)
+		ctx := context.Background()
+		recordForegroundFetchOutcome(ctx, "", "https://example.invalid/other.git", srcRef, stalled)
+
+		require.NoError(t, FetchMetadataBranch(ctx, remoteDir))
+		assert.True(t, testutil.BranchExists(t, localDir, paths.MetadataBranchName))
+	})
+
+	t.Run("an expired failure is retried and a success clears it", func(t *testing.T) {
+		remoteDir, localDir := setupCheckpointFetchRepos(t)
+		t.Chdir(localDir)
+		ctx := context.Background()
+		root, err := gitdir.Open(ctx)
+		require.NoError(t, err)
+		require.NoError(t, writeSlowFetchFailure(root, slowFetchFailure{
+			Remote: remote.RedactURL(remoteDir),
+			Ref:    srcRef,
+			Reason: remote.ErrFetchStalled.Error(),
+			At:     time.Now().Add(-recentSlowFetchFailureWindow - time.Second),
+		}))
+
+		require.NoError(t, FetchMetadataBranch(ctx, remoteDir))
+		_, err = root.Stat(checkpointRemoteFetchFailureName)
+		assert.ErrorIs(t, err, os.ErrNotExist, "a successful fetch must clear the recorded failure")
+	})
+
+	t.Run("a fast failure is not recorded", func(t *testing.T) {
+		_, localDir := setupCheckpointFetchRepos(t)
+		t.Chdir(localDir)
+		missing := filepath.Join(t.TempDir(), "missing.git")
+
+		require.Error(t, FetchMetadataBranch(context.Background(), missing))
+		err := FetchMetadataBranch(context.Background(), missing)
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, errRecentSlowFetchFailure)
+	})
+}
+
+// silentHTTPRemote returns the URL of a server that accepts connections and
+// never answers, and a count of the connections it accepted.
+func silentHTTPRemote(t *testing.T) (string, *atomic.Int32) {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	conns := &atomic.Int32{}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conns.Add(1)
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+	}()
+	return "http://" + ln.Addr().String() + "/repo.git", conns
 }
 
 // setupCheckpointFetchRepos returns a remote with a checkpoint branch and a
