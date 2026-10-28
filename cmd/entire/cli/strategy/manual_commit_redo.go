@@ -64,9 +64,10 @@ func (s *ManualCommitStrategy) inheritReplacedCommitsTrailers(ctx context.Contex
 	matched := make([][]string, len(replaced))
 	trailerIDs := make([][]id.CheckpointID, len(replaced))
 	var candidates []id.CheckpointID
+	linked := linkedCheckpointsReader(ctx)
 	for i := range replaced {
 		if matched[i] = recommitsFilesOf(changes[i], tipTree, staged); len(matched[i]) > 0 {
-			trailerIDs[i] = trailers.ParseAllCheckpoints(replaced[i].Message)
+			trailerIDs[i] = linked(replaced[i].Message)
 			candidates = append(candidates, trailerIDs[i]...)
 		}
 	}

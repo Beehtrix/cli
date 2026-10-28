@@ -73,6 +73,7 @@ func TestTrailerAuthority_RealGitCommits(t *testing.T) {
 		runGit(env, git, "reset", "-q", "--soft", "HEAD~1")
 		return firstID
 	}
+	bodyMention := []string{"-m", "Side work", "-m", "Entire-Checkpoint: " + advForeignCheckpoint, "-m", "More body."}
 	amendLinked := func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
 		commitLinked(env, git, "first.txt")
 		return nil, nil
@@ -104,8 +105,14 @@ func TestTrailerAuthority_RealGitCommits(t *testing.T) {
 		{name: "merge --squash then -m", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
 			return []string{squashOf(env, git)}, nil
 		}, commit: []string{"-m", "Squash side"}},
+		{name: "merge --squash of a commit whose body names a checkpoint", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
+			return []string{squashOf(env, git, bodyMention...)}, []string{advForeignCheckpoint}
+		}, editor: keep},
 		{name: "redo after reset --soft then editor", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
 			return []string{redoOf(env, git)}, nil
+		}, editor: typeSubject},
+		{name: "redo of a commit whose body names a checkpoint", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
+			return []string{redoOf(env, git, bodyMention...)}, []string{advForeignCheckpoint}
 		}, editor: typeSubject},
 		{name: "editor with ; comments", config: map[string]string{"core.commentChar": ";"}, editor: typeSubject, prefix: ";"},
 		{name: "editor with whitespace cleanup", config: map[string]string{"commit.cleanup": "whitespace"}, editor: typeSubject, wholeMessage: true},

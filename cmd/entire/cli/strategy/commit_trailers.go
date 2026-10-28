@@ -64,10 +64,24 @@ func (r trailerRules) checkpoints(message string) []id.CheckpointID {
 // paragraph may not be the one holding the trailer. Code that writes into a
 // checkpoint resolves a commit with it; read-only views use CommitCheckpoints.
 func LinkedCheckpoints(ctx context.Context, message string) []id.CheckpointID {
-	if !strings.Contains(message, trailers.CheckpointTrailerKey) {
-		return nil // nothing to link, and no git config to read
+	return linkedCheckpointsReader(ctx)(message)
+}
+
+// linkedCheckpointsReader returns LinkedCheckpoints for resolving several
+// commits, such as the ones a squash or redo inherits from: git config is read
+// once, and only when a message names a checkpoint.
+func linkedCheckpointsReader(ctx context.Context) func(message string) []id.CheckpointID {
+	var rules *trailerRules
+	return func(message string) []id.CheckpointID {
+		if !strings.Contains(message, trailers.CheckpointTrailerKey) {
+			return nil // nothing to link, and no git config to read
+		}
+		if rules == nil {
+			read := readTrailerRules(ctx)
+			rules = &read
+		}
+		return rules.checkpoints(message)
 	}
-	return readTrailerRules(ctx).checkpoints(message)
 }
 
 // CommitCheckpoints returns the checkpoints a read-only view shows for a saved
