@@ -671,6 +671,27 @@ func TestCheckpointPushPolicy_UnloadableSettingsRefuseExplicitCheckpointPush(t *
 	}
 }
 
+// A checkpoints block that settings.Load accepts but the backend loader
+// rejects leaves the backend unknown. That must not read as "not git-refs",
+// which would let the push send checkpoint refs manual holds back.
+func TestCheckpointPushPolicy_UnreadableBackendRefusesExplicitCheckpointPush(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	bareDir := env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	env.CheckpointStore = ""
+	env.PatchSettings(map[string]any{
+		"checkpoints": map[string]any{"primary": map[string]any{"type": ""}},
+	})
+
+	output, err := gitPushArgs(t, env, "--mirror", "origin")
+
+	require.Error(t, err, "an unreadable backend must not let checkpoint refs through: %s", output)
+	require.Contains(t, output, "checkpoints.primary.type", "the refusal names the problem")
+	require.Empty(t, remoteCheckpointIDs(t, bareDir))
+}
+
 // Deleting a remote checkpoint ref sends no checkpoint content.
 func TestCheckpointPushPolicy_ManualAllowsDeletingARemoteCheckpoint(t *testing.T) {
 	t.Parallel()
