@@ -113,11 +113,10 @@ func FileBackendSelected() bool {
 	return chooseBackend().file
 }
 
-// backendChoice is the backend and its source.
+// backendChoice is the backend, or why not.
 type backendChoice struct {
-	file       bool
-	fromConfig bool
-	err        error
+	file bool
+	err  error
 }
 
 // chooseBackend: bad config fails; then variable wins.
@@ -129,7 +128,7 @@ func chooseBackend() backendChoice {
 	if v, ok := os.LookupEnv(BackendEnvVar); ok {
 		return backendChoice{file: v == "file"}
 	}
-	return backendChoice{file: ts == "file", fromConfig: ts == "file"}
+	return backendChoice{file: ts == "file"}
 }
 
 // BackendDescription names the credential backend the current environment
@@ -142,8 +141,6 @@ func BackendDescription() string {
 	switch {
 	case c.err != nil:
 		return c.err.Error()
-	case c.fromConfig:
-		return "file " + FileBackendPath() + " (token_store in " + ConfigFilePath() + ")"
 	case c.file:
 		return "file " + FileBackendPath()
 	}

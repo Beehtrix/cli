@@ -81,12 +81,3 @@ func TestResolveBackend_BadConfigFailsLoudly(t *testing.T) {
 		t.Errorf("BackendDescription() = %q, want the config error", BackendDescription())
 	}
 }
-
-// Status names config.json as the source.
-func TestBackendDescription_FromConfig(t *testing.T) {
-	dir := setupConfig(t, "unset", `{"token_store": "file"}`)
-	want := "file " + filepath.Join(dir, "tokens.json") + " (token_store in " + filepath.Join(dir, configFileName) + ")"
-	if got := BackendDescription(); got != want {
-		t.Errorf("BackendDescription() = %q, want %q", got, want)
-	}
-}
