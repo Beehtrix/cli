@@ -231,7 +231,7 @@ func TestProjectTrailShowGatesCapKeepsCurrent(t *testing.T) {
 
 	out, errOut, err := executeProjectTrailTest(t, "show", "--repo", "gh/acme/widget", "--branch", "feature/a", "--json")
 	require.NoError(t, err)
-	assert.Equal(t, fmt.Sprintf("Merge gates are shown for the first %d open changes; %d more were not read.\n", trailChangeReviewLimit, extra+1), errOut)
+	assert.Equal(t, fmt.Sprintf("Merge gates are shown for the first %d changes; %d more were not read.\n", trailChangeReviewLimit, extra+1), errOut)
 	var item struct {
 		Changes []struct {
 			Current      bool                   `json:"current"`

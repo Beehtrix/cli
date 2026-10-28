@@ -93,7 +93,7 @@ func lookupProjectTrailGates(cmd *cobra.Command, target *projectTrailTarget, ite
 		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: could not load merge gates for %d change(s)\n", failed)
 	}
 	if skipped := len(changes) - trailChangeReviewLimit; skipped > 0 {
-		fmt.Fprintf(cmd.ErrOrStderr(), "Merge gates are shown for the first %d open changes; %d more were not read.\n", trailChangeReviewLimit, skipped)
+		fmt.Fprintf(cmd.ErrOrStderr(), "Merge gates are shown for the first %d changes; %d more were not read.\n", trailChangeReviewLimit, skipped)
 	}
 	return gates
 }
