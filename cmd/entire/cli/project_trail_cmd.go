@@ -131,10 +131,13 @@ type projectTrailChangeJSON struct {
 	URL     string `json:"url,omitempty"`
 	Current bool   `json:"current,omitempty"`
 	// Mergeability is the change's merge gates snapshot, set only by `trail
-	// show`. There it is always present and null when not loaded (a merged or
-	// closed change, or a failed read), so a missing verdict never reads as
-	// "mergeable": false; commands that do not read gates omit the key, which
-	// is why it points to a possibly nil snapshot.
+	// show`. There it is always present and null when there is no snapshot: a
+	// merged or closed change that was not read, a failed read (which also
+	// warns on stderr), or a read whose server has no snapshot yet (no
+	// warning; the repository trail's own --json prints null for it too). A
+	// missing verdict so never reads as "mergeable": false; commands that do
+	// not read gates omit the key, which is why it points to a possibly nil
+	// snapshot.
 	Mergeability **trailMergeabilityJSON `json:"mergeability,omitempty"`
 
 	// gates is the snapshot for the human view; gatesLoaded tells a change

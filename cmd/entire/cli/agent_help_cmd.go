@@ -286,8 +286,10 @@ var agentHelpProjectTrailGuidance = map[string]string{
 		"them silently. A change's merge state is changes[].mergeability: its\n" +
 		"gates (approvals, checks, findings, up_to_date) are under .gates and\n" +
 		"its CI runs, with details_url links, under .checks.runs. mergeability\n" +
-		"is null for merged or closed changes other than the current one, and\n" +
-		"when it could not be read.",
+		"is null for merged or closed changes other than the current one, when\n" +
+		"the server has no snapshot yet, and when it could not be read; only a\n" +
+		"failed read prints a warning on stderr. Null is unknown, never\n" +
+		"mergeable.",
 }
 
 // agentHelpTrailSandboxGuidance is shared by both trail models. Agent sandboxes

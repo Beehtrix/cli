@@ -266,3 +266,39 @@ func TestProjectTrailShowGatesCapKeepsCurrent(t *testing.T) {
 	}
 	assert.Equal(t, trailChangeReviewLimit, read)
 }
+
+// A change read successfully whose server has no snapshot yet is null in
+// --json, like the repository trail's own --json, but unlike a failed read it
+// raises no warning; the text view shows it as unknown.
+func TestProjectTrailShowServedNullGates(t *testing.T) {
+	setupProjectTrailTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		item := projectTrailTestResource()
+		item.Changes = []api.ChangeSummary{{ID: "01ARZ3NDEKTSV4RRFFQ69G5FB1", RepositoryID: "repo-widget", Repository: "widget", Number: 7, Branch: "feature/a", Status: "open"}}
+		assert.NoError(t, json.NewEncoder(w).Encode(item))
+	})
+	repoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/trails/gh/acme/widget/7", r.URL.Path)
+		assert.NoError(t, json.NewEncoder(w).Encode(api.TrailResource{ID: "trail", Number: 7, Mergeability: json.RawMessage("null")}))
+	}))
+	t.Cleanup(repoServer.Close)
+	old := newTrailAPIClient
+	newTrailAPIClient = func(context.Context, bool, string, string, string) (*api.Client, string, error) {
+		return api.NewClientWithBaseURL("repo-token", repoServer.URL), "repo-widget", nil
+	}
+	t.Cleanup(func() { newTrailAPIClient = old })
+
+	out, errOut, err := executeProjectTrailTest(t, "show", "42", "--project", "gh/acme", "--json")
+	require.NoError(t, err)
+	assert.Empty(t, errOut, "no snapshot is not a failed read")
+	var raw struct {
+		Changes []map[string]json.RawMessage `json:"changes"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &raw))
+	require.Len(t, raw.Changes, 1)
+	assert.JSONEq(t, "null", string(raw.Changes[0]["mergeability"]))
+
+	out, errOut, err = executeProjectTrailTest(t, "show", "42", "--project", "gh/acme")
+	require.NoError(t, err)
+	assert.Empty(t, errOut)
+	assert.Contains(t, out, "  Gates for widget/7:\n    Mergeable: unknown\n")
+}
