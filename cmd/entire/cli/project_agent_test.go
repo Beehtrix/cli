@@ -37,6 +37,8 @@ type fakeAgentsAPI struct {
 	// forbidReplace answers every replace 403, as for a caller without push
 	// on a repository of the agent's selection.
 	forbidReplace bool
+	// url is the fake's base URL, for tests that build their own target.
+	url string
 	// created replays creates by Idempotency-Key, as the API does.
 	created map[string]fakeCreate
 }
@@ -206,6 +208,7 @@ func stubProjectAgentAPI(t *testing.T, fake *fakeAgentsAPI) {
 	fake.t = t
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
+	fake.url = srv.URL
 
 	oldTarget, oldRepo := resolveProjectAgentTarget, resolveProjectAgentRepoID
 	t.Cleanup(func() { resolveProjectAgentTarget, resolveProjectAgentRepoID = oldTarget, oldRepo })
@@ -523,6 +526,35 @@ func TestProjectAgentAdd_DisabledSendsAnExplicitFalse(t *testing.T) {
 	}
 	if v, ok := posts[0].Body["is_enabled"]; !ok || v != false {
 		t.Errorf("is_enabled = %v (sent: %v), want an explicit false", v, ok)
+	}
+}
+
+// Not parallel: replaces the package-level API resolvers.
+func TestProjectAgentAdd_MembershipIsTheProjectsNotTheNamespace(t *testing.T) {
+	fake := &fakeAgentsAPI{presets: []api.ProjectAgentPreset{samplePreset("risk")}, envs: []api.ProjectEnvironment{{ID: "01JENV0000000000000000000", Name: "Default"}}}
+	stubProjectAgentAPI(t, fake)
+	// The project is et/acme while the repository's remote is gh/acme/widget.
+	resolveProjectAgentTarget = func(*cobra.Command) (*projectAgentTarget, error) {
+		return &projectAgentTarget{
+			client: api.NewClientWithBaseURL("token", fake.url), projectID: "01JPROJ",
+			host: "gh", project: "acme", base: agentTestBase,
+			repoForge: "et", repoOwner: "acme", repoName: "widget",
+		}, nil
+	}
+
+	// Listed among the project's repositories: a member despite the namespace.
+	if _, _, err := executeProjectAgent(t, "add", "risk"); err != nil {
+		t.Fatalf("listed repository refused: %v", err)
+	}
+
+	// Not listed (or the list is unreadable): refused before any write.
+	resolveProjectRepoNames = func(context.Context, string) map[string]string { return map[string]string{} }
+	before := len(fake.writesTo(http.MethodPost))
+	if _, _, err := executeProjectAgent(t, "add", "risk"); err == nil || !strings.Contains(err.Error(), "is not in project") {
+		t.Fatalf("err = %v, want a membership refusal", err)
+	}
+	if len(fake.writesTo(http.MethodPost)) != before {
+		t.Error("a refused repository was written")
 	}
 }
 

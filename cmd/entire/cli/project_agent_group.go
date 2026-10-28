@@ -130,12 +130,18 @@ func (t *projectAgentTarget) currentRepoID(cmd *cobra.Command) (id, label string
 		}
 	}
 	label = forge + "/" + owner + "/" + repo
-	if forge != t.host || !strings.EqualFold(owner, t.project) {
-		return "", "", fmt.Errorf("repository %s is not in project %s", label, t.label())
-	}
 	id, err = resolveProjectAgentRepoID(cmd.Context(), insecureHTTPRequested(cmd), forge, owner, repo)
 	if err != nil {
 		return "", "", renderDataAPIAuthError(cmd.Context(), cmd.ErrOrStderr(), owner+"/"+repo, err)
+	}
+	// A repository addressed under the project's own namespace belongs to it.
+	// Otherwise the namespace proves nothing either way, so the project's own
+	// repository list decides; an unreadable list cannot confirm membership.
+	if forge == t.host && strings.EqualFold(owner, t.project) {
+		return id, label, nil
+	}
+	if _, ok := resolveProjectRepoNames(cmd.Context(), t.projectID)[id]; !ok {
+		return "", "", fmt.Errorf("repository %s is not in project %s (or its repositories could not be listed)", label, t.label())
 	}
 	return id, label, nil
 }
