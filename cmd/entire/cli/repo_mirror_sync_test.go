@@ -448,7 +448,11 @@ func TestRepoView_SyncBlock(t *testing.T) {
 		// Answer only after the client gives up.
 		interrupt := func(r *http.Request) {
 			cancel()
-			<-r.Context().Done()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+				t.Error("the client never cancelled the mirror read")
+			}
 		}
 		(&blockedDirectory{repos: web, onSync: interrupt}).serve(t)
 		cmd := newRepoCmd()
