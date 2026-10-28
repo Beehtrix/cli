@@ -671,6 +671,27 @@ func TestCheckpointPushPolicy_UnloadableSettingsRefuseExplicitCheckpointPush(t *
 	}
 }
 
+// A checkpoints block that settings.Load accepts but the backend loader
+// rejects leaves the backend unknown. That must not read as "not git-refs",
+// which would let the push send checkpoint refs manual holds back.
+func TestCheckpointPushPolicy_UnreadableBackendRefusesExplicitCheckpointPush(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	bareDir := env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	env.CheckpointStore = ""
+	env.PatchSettings(map[string]any{
+		"checkpoints": map[string]any{"primary": map[string]any{"type": ""}},
+	})
+
+	output, err := gitPushArgs(t, env, "--mirror", "origin")
+
+	require.Error(t, err, "an unreadable backend must not let checkpoint refs through: %s", output)
+	require.Contains(t, output, "checkpoints.primary.type", "the refusal names the problem")
+	require.Empty(t, remoteCheckpointIDs(t, bareDir))
+}
+
 // Deleting a remote checkpoint ref sends no checkpoint content.
 func TestCheckpointPushPolicy_ManualAllowsDeletingARemoteCheckpoint(t *testing.T) {
 	t.Parallel()
@@ -780,4 +801,22 @@ func TestConfigure_ManualPolicyNeedsGitRefs(t *testing.T) {
 
 	env.RunCLI("configure", "--checkpoint-backend", "git-refs", "--checkpoint-push-policy", "manual")
 	require.Equal(t, "manual", listPolicyOutgoing(t, env).Policy)
+}
+
+// The policy is saved only once the other flags have applied: a failed
+// backend switch must not leave manual on a git-branch clone.
+func TestConfigure_PolicyNotSavedWhenBackendSwitchFails(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into read-only directories")
+	}
+	env := NewFeatureBranchEnv(t)
+	env.SetupBareRemote()
+	entireDir := filepath.Join(env.RepoDir, ".entire")
+	require.NoError(t, os.Chmod(entireDir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(entireDir, 0o750) }) //nolint:errcheck // best-effort restore before TempDir cleanup
+
+	_, err := env.RunCLIWithError("configure", "--checkpoint-backend", "git-refs", "--checkpoint-push-policy", "manual")
+	require.Error(t, err, "the backend save must fail for this test to mean anything")
+	require.NoFileExists(t, clonePreferencesFile(t, env), "manual must not be saved when the backend switch failed")
 }

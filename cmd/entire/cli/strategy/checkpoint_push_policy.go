@@ -50,9 +50,13 @@ func automaticCheckpointDelivery(repo *git.Repository) (bool, error) {
 // CheckpointsHeldForManualPush reports whether new checkpoints wait for
 // `entire checkpoint push` instead of uploading now: the git-refs backend under
 // any policy but automatic. The policy does not apply to the git-branch
-// backend. An unreadable policy is an error naming the file.
+// backend. An unreadable policy or checkpoint backend config is an error.
 func CheckpointsHeldForManualPush(ctx context.Context) (bool, error) {
-	if !primaryIsGitRefs(ctx) {
+	isRefs, err := primaryBackendIsGitRefs(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !isRefs {
 		return false, nil
 	}
 	repo, err := OpenRepository(ctx)
@@ -79,9 +83,18 @@ var ErrOuterPushCarriesHeldCheckpoints = errors.New("refusing to push checkpoint
 // Without the hook's ref list there is nothing to check; pre-push warns then.
 func checkOuterPushUnderManualPolicy(ctx context.Context) error {
 	name, ok := outerPushCheckpointRefName(ctx)
-	if !ok || !primaryIsGitRefs(ctx) {
+	if !ok {
 		return nil
 	}
+	isRefs, err := primaryBackendIsGitRefs(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: this push includes %s, and the checkpoint backend could not be read (%w). %s",
+			ErrOuterPushCarriesHeldCheckpoints, name, err, outerPushHowTo)
+	}
+	if !isRefs {
+		return nil
+	}
+
 	repo, err := OpenRepository(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: this push includes %s, and the checkpoint push policy could not be read (open repository: %w). %s",
