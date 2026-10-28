@@ -1830,3 +1830,110 @@ func setupCheckpointFetchRepos(t *testing.T) (remoteDir, localDir string) {
 	testutil.GitCommit(t, localDir, "init")
 	return remoteDir, localDir
 }
+
+// An empty-orphan heal is best-effort: running out of budget while another
+// fetch holds the lock must leave `entire enable` working on the local orphan.
+//
+// Not parallel: uses t.Chdir() and t.Setenv()
+func TestEnsurePrimaryRef_HealLockWaitFailureKeepsOrphan(t *testing.T) {
+	t.Setenv(foregroundFetchBudgetEnvVar, "300ms")
+	localDir, _ := setupEmptyOrphanHeal(t)
+	orphanTip := checkpointRemoteRevParse(t, localDir, paths.MetadataBranchName)
+
+	root, err := gitdir.Open(context.Background())
+	require.NoError(t, err)
+	release, err := flock.AcquireIn(root, checkpointRemoteFetchLockName)
+	require.NoError(t, err)
+	defer release()
+
+	repo, err := OpenRepository(context.Background())
+	require.NoError(t, err)
+	defer repo.Close()
+
+	require.NoError(t, EnsurePrimaryRef(WithCheckpointRemoteBootstrap(context.Background()), repo))
+	assert.Equal(t, orphanTip, checkpointRemoteRevParse(t, localDir, paths.MetadataBranchName))
+}
+
+// A checkpoint written to the local orphan while the heal waits for the fetch
+// lock must survive: the heal force-sets the ref, so it has to re-check for
+// data once it holds the lock.
+//
+// Not parallel: uses t.Chdir()
+func TestEnsurePrimaryRef_HealKeepsCheckpointWrittenWhileWaitingForLock(t *testing.T) {
+	localDir, remoteTip := setupEmptyOrphanHeal(t)
+
+	root, err := gitdir.Open(context.Background())
+	require.NoError(t, err)
+	release, err := flock.AcquireIn(root, checkpointRemoteFetchLockName)
+	require.NoError(t, err)
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+
+	repo, err := OpenRepository(context.Background())
+	require.NoError(t, err)
+	defer repo.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- EnsurePrimaryRef(WithCheckpointRemoteBootstrap(context.Background()), repo) }()
+
+	// Write the checkpoint through a second worktree so the main worktree, which
+	// the waiting heal resolved, stays untouched.
+	metadataWorktree := filepath.Join(t.TempDir(), "metadata")
+	testutil.RunGit(t, localDir, "worktree", "add", metadataWorktree, paths.MetadataBranchName)
+	commitCheckpointRemoteMetadata(t, metadataWorktree, "bbbbbbbbbbbb", "device-b")
+	localCheckpoint := checkpointRemoteRevParse(t, localDir, paths.MetadataBranchName)
+
+	release()
+	released = true
+	require.NoError(t, <-done)
+
+	localTip := checkpointRemoteRevParse(t, localDir, paths.MetadataBranchName)
+	assert.NotEqual(t, remoteTip, localTip, "the heal must not replace a branch that gained data")
+	assert.Equal(t, localCheckpoint, localTip)
+}
+
+// setupEmptyOrphanHeal returns a local repository, now the working directory,
+// whose metadata branch is an empty orphan and whose checkpoint_remote holds a
+// real checkpoint at remoteTip.
+func setupEmptyOrphanHeal(t *testing.T) (localDir, remoteTip string) {
+	t.Helper()
+	remoteDir := t.TempDir()
+	testutil.InitRepo(t, remoteDir)
+	testutil.WriteFile(t, remoteDir, "f.txt", "init")
+	testutil.GitAdd(t, remoteDir, "f.txt")
+	testutil.GitCommit(t, remoteDir, "init")
+	remoteDefaultBranch := checkpointRemoteCurrentBranch(t, remoteDir)
+	runCheckpointRemoteGit(t, remoteDir, "checkout", "--orphan", paths.MetadataBranchName)
+	runCheckpointRemoteGit(t, remoteDir, "rm", "-rf", ".")
+	commitCheckpointRemoteMetadata(t, remoteDir, "aaaaaaaaaaaa", "device-a")
+	runCheckpointRemoteGit(t, remoteDir, "checkout", remoteDefaultBranch)
+	remoteTip = checkpointRemoteRevParse(t, remoteDir, paths.MetadataBranchName)
+
+	localDir = t.TempDir()
+	testutil.InitRepo(t, localDir)
+	testutil.WriteFile(t, localDir, "f.txt", "init")
+	testutil.GitAdd(t, localDir, "f.txt")
+	testutil.GitCommit(t, localDir, "init")
+	runCheckpointRemoteGit(t, localDir, "remote", "add", "origin", "git@github.com:org/main-repo.git")
+	runCheckpointRemoteGit(t, localDir, "checkout", "--orphan", paths.MetadataBranchName)
+	runCheckpointRemoteGit(t, localDir, "rm", "-rf", ".")
+	runCheckpointRemoteGit(t, localDir, "commit", "--allow-empty", "-m", "Initialize metadata ref")
+	runCheckpointRemoteGit(t, localDir, "checkout", remoteDefaultBranch)
+
+	entireDir := filepath.Join(localDir, ".entire")
+	require.NoError(t, os.MkdirAll(entireDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(entireDir, "settings.json"),
+		[]byte(`{"enabled": true, "strategy_options": {"checkpoint_remote": {"provider": "github", "repo": "org/checkpoints"}}}`),
+		0o644,
+	))
+	redirectGitURL(t, localDir, "git@github.com:org/checkpoints.git", "file://"+remoteDir)
+
+	t.Chdir(localDir)
+	paths.ClearWorktreeRootCache()
+	return localDir, remoteTip
+}

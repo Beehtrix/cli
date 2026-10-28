@@ -1093,10 +1093,23 @@ func healEmptyOrphanFromCheckpointRemote(ctx context.Context, repo *git.Reposito
 	// Taken before the cleanup defer so the lock outlives the tmp ref.
 	fetchCtx, release, err := startForegroundFetch(ctx, worktreeRoot)
 	if err != nil {
-		return false, err
+		logging.Warn(ctx, "checkpoint-remote: empty-orphan heal could not start its fetch; keeping local orphan",
+			slog.String("error", err.Error()),
+		)
+		return false, nil
 	}
 	defer release()
 	defer func() { _ = repo.Storer.RemoveReference(tmpRefName) }() //nolint:errcheck // cleanup is best-effort
+
+	// The ref is force-set below, and the lock wait can be long enough for a
+	// checkpoint to land on the orphan meanwhile, so check for data again.
+	current, err := repo.Reference(primary, true)
+	if err != nil {
+		return false, nil
+	}
+	if hasData, err := metadataBranchHasData(repo, current); err != nil || hasData {
+		return false, nil
+	}
 
 	// Unfiltered, for the same reason as the bootstrap fetch above: this heal
 	// replaces a data-free orphan with the real branch, which readers then treat

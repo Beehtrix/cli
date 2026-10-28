@@ -186,8 +186,8 @@ type FetchOptions struct {
 	ExtraArgs []string // additional flags before remote (e.g., "--no-write-fetch-head")
 	// AbortStalled kills a fetch that goes stallAbortIdle without git printing
 	// anything, for callers whose transfer can legitimately take longer than a
-	// fixed per-fetch deadline. It requests --progress so git reports objects
-	// as they arrive.
+	// fixed per-fetch deadline. It requests --progress so git reports the
+	// transfer while it runs.
 	AbortStalled bool
 }
 
@@ -874,10 +874,11 @@ func disableTerminalPrompt(cmd *exec.Cmd) {
 }
 
 // stallAbortIdle is how long an AbortStalled fetch may print nothing before it
-// is killed. git redraws its receive progress only as each object completes,
-// so a single large object (a transcript chunk up to agent.MaxChunkSize, or an
-// extracted image) arrives in silence. The window must outlast that transfer
-// on a slow link; callers bound the total time separately.
+// is killed. A pack that goes through index-pack redraws its receive progress
+// about once a second, but a fetch of fewer than fetch.unpackLimit objects (100
+// by default) is unpacked without progress and prints nothing until it is done.
+// The window must outlast such a fetch on a slow link; callers bound the total
+// time separately.
 var stallAbortIdle = 10 * time.Minute
 
 var errFetchStalled = errors.New("fetch stalled")
