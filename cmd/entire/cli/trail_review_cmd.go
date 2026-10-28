@@ -19,7 +19,6 @@ import (
 	"text/tabwriter"
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
-	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/worktreedir"
 
@@ -1016,15 +1015,7 @@ func readWorktreeFileSafely(worktreeRoot, filePath string) ([]byte, bool) {
 	if filepath.IsAbs(filePath) {
 		return nil, false
 	}
-	name, err := worktreedir.Name(worktreeRoot, filePath)
-	if err != nil {
-		return nil, false
-	}
-	root, err := worktreedir.OpenAt(worktreeRoot)
-	if err != nil {
-		return nil, false
-	}
-	data, err := osroot.ReadFileNoFollow(root, name)
+	data, err := worktreedir.ReadFileNoFollow(worktreeRoot, filePath)
 	if err != nil {
 		return nil, false
 	}

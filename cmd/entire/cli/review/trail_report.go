@@ -44,10 +44,8 @@ type TrailLocation struct {
 type TrailReport struct {
 	Comments []TrailComment
 	Prose    string
-	// ChangedFiles holds the repo-relative paths the reviewed change adds or
-	// modifies. Posting quotes worktree lines only from these files; nil
-	// means none.
-	ChangedFiles map[string]struct{}
+	// Scope is what the findings may anchor to; see TrailScope.
+	Scope TrailScope
 }
 
 // trailReportFor decides what a trail-mode run posts. It returns post=false

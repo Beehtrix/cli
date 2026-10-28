@@ -3,10 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -54,8 +57,8 @@ func TestReviewTrailFindingInputsSplitsTopLevelBullets(t *testing.T) {
 - **[Low] Third issue:** remove the note from daytona-command-native-plan.md:1`
 
 	inputs := reviewTrailFindingInputs("general", cliReview.TrailReport{
-		Prose:        verdict,
-		ChangedFiles: changedFileSet("sandbox-runs-queue.ts", "daytona.ts", "daytona-command-native-plan.md"),
+		Prose: verdict,
+		Scope: trailScopeWith(t, []string{"sandbox-runs-queue.ts", "daytona.ts", "daytona-command-native-plan.md"}),
 	})
 	if len(inputs) != 3 {
 		t.Fatalf("inputs = %d, want 3", len(inputs))
@@ -100,8 +103,8 @@ func TestReviewTrailFindingInputsSplitsTopLevelMarkedFindings(t *testing.T) {
 		"**[MEDIUM] PATCH thread route missing requestBody** — `api/src/routes/trails.ts:2802`. Generated clients cannot send updates.\n"
 
 	inputs := reviewTrailFindingInputs("general", cliReview.TrailReport{
-		Prose:        verdict,
-		ChangedFiles: changedFileSet("api/src/lib/planetscale/trails.ts", "api/src/routes/trails.ts"),
+		Prose: verdict,
+		Scope: trailScopeWith(t, []string{"api/src/lib/planetscale/trails.ts", "api/src/routes/trails.ts"}),
 	})
 	if len(inputs) != 2 {
 		t.Fatalf("inputs = %d, want 2", len(inputs))
@@ -130,7 +133,7 @@ func TestReviewTrailFindingInputsMapsStructuredComments(t *testing.T) {
 	report := cliReview.TrailReport{Comments: []cliReview.TrailComment{
 		{Severity: "high", Confidence: &confidence, Body: "`daytona.ts` rejects public repos without a token; allow public clones or mint a token.", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "daytona.ts", StartLine: 901}},
 		{Severity: "P2", Confidence: &lowConfidence, Body: "Delete failures are swallowed, orphaning provider snapshots.", Location: cliReview.TrailLocation{Granularity: "range", FilePath: "daytona.ts", StartLine: 966, EndLine: 970}},
-	}, ChangedFiles: changedFileSet("daytona.ts")}
+	}, Scope: trailScopeWith(t, []string{"daytona.ts"})}
 
 	inputs := reviewTrailFindingInputs("general", report)
 	if len(inputs) != 2 {
@@ -647,7 +650,7 @@ func TestPostReviewToTrailCapsSelectedText(t *testing.T) {
 		{Severity: "low", Body: "short line", Location: cliReview.TrailLocation{Granularity: reviewTrailGranularityLine, FilePath: "app.go", StartLine: 3}},
 	}
 	var out bytes.Buffer
-	if err := postReviewToTrail(t.Context(), &out, "default", cliReview.TrailReport{Comments: comments, ChangedFiles: changedFileSet("app.go")}); err != nil {
+	if err := postReviewToTrail(t.Context(), &out, "default", cliReview.TrailReport{Comments: comments, Scope: trailScopeOver(t, ".", []string{"app.go"})}); err != nil {
 		t.Fatalf("postReviewToTrail: %v\noutput:\n%s", err, out.String())
 	}
 
@@ -671,12 +674,33 @@ func TestPostReviewToTrailCapsSelectedText(t *testing.T) {
 	}
 }
 
-func changedFileSet(paths ...string) map[string]struct{} {
-	set := make(map[string]struct{}, len(paths))
-	for _, p := range paths {
-		set[p] = struct{}{}
+// trailScopeOver returns a scope over root in which quotable files may be
+// quoted with their current contents and tracked files are only in the index.
+func trailScopeOver(t *testing.T, root string, quotable []string, tracked ...string) cliReview.TrailScope {
+	t.Helper()
+	scope := cliReview.TrailScope{Root: root, Quotable: make(map[string][sha256.Size]byte), Tracked: make(map[string]struct{})}
+	for _, p := range quotable {
+		data, err := os.ReadFile(filepath.Join(root, p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		scope.Quotable[p] = sha256.Sum256(data)
 	}
-	return set
+	for _, p := range tracked {
+		scope.Tracked[p] = struct{}{}
+	}
+	return scope
+}
+
+// trailScopeWith writes each quotable file into a fresh worktree, then
+// returns trailScopeOver it.
+func trailScopeWith(t *testing.T, quotable []string, tracked ...string) cliReview.TrailScope {
+	t.Helper()
+	root := t.TempDir()
+	for _, p := range quotable {
+		testutil.WriteFile(t, root, p, "package app\n")
+	}
+	return trailScopeOver(t, root, quotable, tracked...)
 }
 
 // A reviewer's location decides which worktree lines are uploaded as the
@@ -684,7 +708,7 @@ func changedFileSet(paths ...string) map[string]struct{} {
 // line anchor, and only for a bounded span.
 func TestReviewTrailFindingInputsRestrictsLineAnchorsToChangedFiles(t *testing.T) {
 	t.Parallel()
-	changed := changedFileSet("src/app.go")
+	scope := trailScopeWith(t, []string{"src/app.go"}, "src/app.go", "src/other.go")
 	tests := []struct {
 		name            string
 		report          cliReview.TrailReport
@@ -724,10 +748,16 @@ func TestReviewTrailFindingInputsRestrictsLineAnchorsToChangedFiles(t *testing.T
 			wantFile:        "src/app.go",
 		},
 		{
-			name:            "uncleaned path to a changed file",
+			name:            "uncleaned path to a changed file posts the cleaned file",
 			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "ok", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "./src/app.go", StartLine: 3}}}},
 			wantGranularity: reviewTrailGranularityLine,
-			wantFile:        "./src/app.go",
+			wantFile:        "src/app.go",
+		},
+		{
+			name:            "line in a tracked file outside the change",
+			report:          cliReview.TrailReport{Comments: []cliReview.TrailComment{{Body: "caller breaks", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "./src/other.go", StartLine: 120}}}},
+			wantGranularity: reviewTrailGranularityFile,
+			wantFile:        "src/other.go",
 		},
 		{
 			name:            "uncleaned path over the line cap posts the cleaned file",
@@ -745,7 +775,7 @@ func TestReviewTrailFindingInputsRestrictsLineAnchorsToChangedFiles(t *testing.T
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			report := tt.report
-			report.ChangedFiles = changed
+			report.Scope = scope
 			inputs := reviewTrailFindingInputs("", report)
 			if len(inputs) != 1 {
 				t.Fatalf("inputs = %d, want 1", len(inputs))
@@ -768,7 +798,7 @@ func TestReviewTrailFindingInputsRestrictsLineAnchorsToChangedFiles(t *testing.T
 	}
 }
 
-func TestReviewTrailFindingInputsWithoutChangedFilesDropsLineAnchors(t *testing.T) {
+func TestReviewTrailFindingInputsWithoutAScopeDropsLineAnchors(t *testing.T) {
 	t.Parallel()
 	inputs := reviewTrailFindingInputs("", cliReview.TrailReport{Comments: []cliReview.TrailComment{
 		{Body: "b", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "src/app.go", StartLine: 3}},
@@ -777,6 +807,24 @@ func TestReviewTrailFindingInputsWithoutChangedFilesDropsLineAnchors(t *testing.
 		t.Fatalf("inputs = %d, want 1", len(inputs))
 	}
 	if loc := inputs[0].Location; loc.Granularity != reviewTrailGranularityWholeChange || loc.FilePath != nil {
-		t.Fatalf("location = %+v, want whole_change when the changed set is unknown", loc)
+		t.Fatalf("location = %+v, want whole_change when the scope is unknown", loc)
+	}
+}
+
+// A file rewritten after the scope was fixed, such as by a reviewer appending
+// another file's text to it, posts against the file without a quote.
+func TestReviewTrailFindingInputsDropsQuotesFromRewrittenFiles(t *testing.T) {
+	t.Parallel()
+	scope := trailScopeWith(t, []string{"src/app.go"})
+	testutil.WriteFile(t, scope.Root, "src/app.go", "API_KEY=copied\n")
+
+	inputs := reviewTrailFindingInputs("", cliReview.TrailReport{Scope: scope, Comments: []cliReview.TrailComment{
+		{Body: "b", Location: cliReview.TrailLocation{Granularity: "line", FilePath: "src/app.go", StartLine: 1}},
+	}})
+	if len(inputs) != 1 {
+		t.Fatalf("inputs = %d, want 1", len(inputs))
+	}
+	if loc := inputs[0].Location; loc.Granularity != reviewTrailGranularityFile || loc.FilePath == nil || *loc.FilePath != "src/app.go" || loc.StartLine != nil {
+		t.Fatalf("location = %+v, want file granularity on src/app.go", loc)
 	}
 }
