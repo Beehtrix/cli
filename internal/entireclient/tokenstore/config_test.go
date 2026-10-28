@@ -13,7 +13,6 @@ func setupConfig(t *testing.T, env, config string) string {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("ENTIRE_CONFIG_DIR", dir)
-	t.Setenv(PathEnvVar, "")
 	t.Setenv(BackendEnvVar, env)
 	if env == "unset" {
 		if err := os.Unsetenv(BackendEnvVar); err != nil {
@@ -63,18 +62,27 @@ func TestChooseBackend_ConfigFile(t *testing.T) {
 	}
 }
 
+// A missing config dir means unset.
+func TestChooseBackend_MissingConfigDir(t *testing.T) {
+	setupConfig(t, "unset", "")
+	t.Setenv("ENTIRE_CONFIG_DIR", filepath.Join(t.TempDir(), "missing"))
+	if c := chooseBackend(); c.file || c.err != nil {
+		t.Fatalf("chooseBackend() = %+v, want keyring, no error", c)
+	}
+}
+
 // A bad config fails every store call.
-func TestResolveBackend_BadConfigFailsLoudly(t *testing.T) {
+func TestStore_BadConfigFailsLoudly(t *testing.T) {
 	dir := setupConfig(t, "unset", `{"token_store": "file",}`)
-	s := resolveBackendLocked()
-	_, err := s.Get("svc", "user")
+	resetBackendForTesting(t)
+	_, err := Get("svc", "user")
 	if !errors.Is(err, ErrBadConfig) {
 		t.Fatalf("Get() err = %v, want ErrBadConfig", err)
 	}
 	if !strings.Contains(err.Error(), filepath.Join(dir, configFileName)) {
 		t.Errorf("Get() err = %q, want it to name config.json", err)
 	}
-	if err := s.Set("svc", "user", "tok"); !errors.Is(err, ErrBadConfig) {
+	if err := Set("svc", "user", "tok"); !errors.Is(err, ErrBadConfig) {
 		t.Errorf("Set() err = %v, want ErrBadConfig", err)
 	}
 	if !strings.Contains(BackendDescription(), "fix or remove it") {

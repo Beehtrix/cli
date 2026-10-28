@@ -126,7 +126,7 @@ var geteuid = os.Geteuid
 // would make root read its config and credentials from, and write
 // root-owned files into, a directory that user controls. The passwd entry
 // is root-owned, so it can't be redirected that way. Without $HOME at all
-// (cron, systemd units) passwd is the only sound answer too.
+// (systemd system units, bare containers) passwd is the only sound answer too.
 //
 // Everyone else keeps $HOME, so HOME-based isolation still works.
 // ENTIRE_CONFIG_DIR and the other explicit overrides beat this. Windows uses
@@ -137,7 +137,7 @@ func Home() (string, error) {
 			return u.HomeDir, nil
 		}
 	}
-	return os.UserHomeDir() //nolint:wrapcheck // callers fall back on any error
+	return os.UserHomeDir() //nolint:wrapcheck // callers wrap or fall back
 }
 
 // configDir is Config with the override check, for the callers that can report.
@@ -181,7 +181,7 @@ func cacheDir() (string, error) {
 }
 
 // ownFallbackDir builds the home-relative default for a machine where
-// os.UserHomeDir fails, resolved to an absolute path.
+// Home fails, resolved to an absolute path.
 //
 // The absolutization is the point, and it belongs HERE rather than at each
 // consumer, because this is the only place that still knows the difference

@@ -25,6 +25,10 @@ func ConfigFilePath() string {
 
 // configTokenStore reads token_store; missing means unset.
 func configTokenStore() (string, error) {
+	// Bad override: its consumers report it.
+	if _, err := userdirs.ConfigDirChecked(); err != nil {
+		return "", nil //nolint:nilerr // see above
+	}
 	root, err := userdirs.ConfigRootForRead()
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", nil
@@ -46,7 +50,7 @@ func configTokenStore() (string, error) {
 		return "", badConfig(err)
 	}
 	switch cfg.TokenStore {
-	case "", "file", "keyring":
+	case "", fileBackend, "keyring":
 		return cfg.TokenStore, nil
 	}
 	return "", badConfig(fmt.Errorf(`token_store is %q, want "file" or "keyring"`, cfg.TokenStore))

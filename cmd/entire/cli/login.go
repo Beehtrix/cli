@@ -523,9 +523,9 @@ func loginCompleteLine(token, dialled string) string {
 // store write failure. The default backend is the OS keyring, which locked
 // or keyring-less machines (CI, containers, minimal server VMs) can't use —
 // the raw store error gives those users no way forward (#1036). The hint is
-// skipped when ENTIRE_TOKEN_STORE=file is already set (suggesting it again
-// would be nonsense) and for failures the file store wouldn't help with.
-// A broken config.json is its own error.
+// skipped when the file store is already selected, by env or config.json
+// (suggesting it again would be nonsense), on a bad config.json, and for
+// failures the file store wouldn't help with.
 func withHeadlessStoreHint(err error) error {
 	if !errors.Is(err, auth.ErrCredentialStoreWrite) || errors.Is(err, tokenstore.ErrBadConfig) || tokenstore.FileBackendSelected() {
 		return err

@@ -398,7 +398,7 @@ func resolveStatusTarget(ctx context.Context, listContexts contextsProvider, res
 		if c.Name != current || c.CoreURL == "" {
 			continue
 		}
-		// An unreadable keyring is surfaced rather than becoming a zero-token
+		// An unreadable store is surfaced rather than becoming a zero-token
 		// target: the login exists, and "not logged in" would send the user
 		// to `entire login`, which cannot help.
 		tok, terr := resolveLogin(ctx, c)

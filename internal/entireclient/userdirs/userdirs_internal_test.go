@@ -59,7 +59,7 @@ func TestRelativeUserOverridesAreStillRefused(t *testing.T) {
 }
 
 // Root and unset HOME resolve via passwd.
-func TestHomeDir_PasswdForRootOrUnsetHome(t *testing.T) {
+func TestHome_PasswdForRootOrUnsetHome(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("windows keeps os.UserHomeDir")
 	}

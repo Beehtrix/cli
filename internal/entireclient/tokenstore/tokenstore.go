@@ -106,9 +106,7 @@ const (
 	PathEnvVar    = "ENTIRE_TOKEN_STORE_PATH"
 )
 
-// FileBackendSelected reports whether the environment or config.json
-// selects the file backend — the single predicate shared by backend resolution, provenance
-// wording, and login's headless hint, so they can never disagree.
+// FileBackendSelected reports chooseBackend's file choice.
 func FileBackendSelected() bool {
 	return chooseBackend().file
 }
@@ -119,23 +117,27 @@ type backendChoice struct {
 	err  error
 }
 
-// chooseBackend: bad config fails; then variable wins.
+// fileBackend selects the file store.
+const fileBackend = "file"
+
+// chooseBackend is the one backend rule:
+// bad config fails, then the variable wins.
 func chooseBackend() backendChoice {
 	ts, err := configTokenStore()
 	if err != nil {
 		return backendChoice{err: err}
 	}
 	if v, ok := os.LookupEnv(BackendEnvVar); ok {
-		return backendChoice{file: v == "file"}
+		return backendChoice{file: v == fileBackend}
 	}
-	return backendChoice{file: ts == "file"}
+	return backendChoice{file: ts == fileBackend}
 }
 
 // BackendDescription names the credential backend the current environment
 // resolves to, for user-facing provenance lines (e.g. `entire auth status`).
-// It mirrors resolveBackendLocked's env semantics — the production resolution
-// — rather than introspecting the live backend, so test-only overrides don't
-// leak into user-facing wording.
+// It uses chooseBackend, like resolveBackendLocked, rather than introspecting
+// the live backend, so test-only overrides don't leak into user-facing
+// wording. A bad config.json returns its error.
 func BackendDescription() string {
 	c := chooseBackend()
 	switch {

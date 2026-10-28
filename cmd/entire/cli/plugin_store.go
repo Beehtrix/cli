@@ -60,7 +60,7 @@ const (
 // MSYS/Cygwin) — Windows users expect Windows conventions, and routing
 // through XDG would produce a surprising location.
 //
-// os.UserHomeDir is called only when no env-var branch resolves, so a
+// userdirs.Home is called only when no env-var branch resolves, so a
 // degenerate environment with $LOCALAPPDATA or $XDG_DATA_HOME but no home
 // still returns a usable path.
 func pluginParentDir() (string, error) {
