@@ -217,7 +217,7 @@ func NewRootCmd() *cobra.Command {
 	experimental.Register(cmd, newWhyCmd())   // 'why' (experimental)
 	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newLoginCmd(), groupAccount)))
 	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newLogoutCmd(), groupAccount)))
-	cmd.AddCommand(exemptFromEntireDirCheck(newVersionCmd()))
+	cmd.AddCommand(exemptFromConfigCheck(exemptFromEntireDirCheck(newVersionCmd())))
 	cmd.AddCommand(inGroup(newDispatchCmd(), groupSessions))
 	cmd.AddCommand(inGroup(newActivityCmd(), groupSessions))
 	cmd.AddCommand(inGroup(newRecapCmd(), groupSessions))
@@ -242,7 +242,7 @@ func NewRootCmd() *cobra.Command {
 	cmd.SetVersionTemplate(versionString())
 
 	// Replace default help command with custom one that supports -t flag
-	cmd.SetHelpCommand(NewHelpCmd(cmd))
+	cmd.SetHelpCommand(exemptFromConfigCheck(NewHelpCmd(cmd)))
 
 	// Materialize cobra's `completion` command now, so it can be exempted from
 	// the `.entire` check. It prints a shell script and reads nothing from the

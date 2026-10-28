@@ -7,9 +7,10 @@ import (
 )
 
 // skipConfigCheckAnnotation exempts a command from the config.json check.
-// Checked is the default. Only commands that promise never to fail, the
-// agent and git hooks, are exempt: a typo in config.json must not block a
-// commit. Set it on a group root to cover the whole group.
+// Checked is the default. Exempt are the hooks, which promise never to
+// fail (a typo in config.json must not block a commit), and help and
+// version, which never touch the token store. Set it on a group root to
+// cover the whole group.
 const (
 	skipConfigCheckAnnotation = "entire_skip_config_check"
 	skipConfigCheckEnabled    = "true"

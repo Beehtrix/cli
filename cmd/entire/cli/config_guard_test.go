@@ -33,7 +33,7 @@ func TestRoot_BadConfigFailsEarly(t *testing.T) {
 	writeBadConfig(t)
 	t.Chdir(t.TempDir())
 
-	for _, args := range [][]string{{"auth", "status"}, {"login", "--device"}, {"version"}} {
+	for _, args := range [][]string{{"auth", "status"}, {"login", "--device"}, {"status"}} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			root := NewRootCmd()
@@ -56,26 +56,29 @@ func TestRoot_BadConfigFailsEarly(t *testing.T) {
 func TestRoot_EnvTokenSkipsConfigCheck(t *testing.T) {
 	writeBadConfig(t)
 	t.Setenv(auth.EnvTokenVar, "x")
-	t.Chdir(t.TempDir())
 
-	root := NewRootCmd()
-	root.SetOut(&bytes.Buffer{})
-	root.SetErr(&bytes.Buffer{})
-	root.SetArgs([]string{"version"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("version with ENTIRE_TOKEN: %v", err)
+	cmd, _, err := NewRootCmd().Find([]string{"auth", "status"})
+	if err != nil {
+		t.Fatalf("find auth status: %v", err)
+	}
+	if err := checkConfigBeforeRun(cmd); err != nil {
+		t.Fatalf("auth status with ENTIRE_TOKEN: %v", err)
 	}
 }
 
-// Hooks never fail on config.json.
-func TestCheckConfigBeforeRun_HooksExempt(t *testing.T) {
+// Hooks, help and version skip the check.
+func TestCheckConfigBeforeRun_Exemptions(t *testing.T) {
 	writeBadConfig(t)
 
 	root := NewRootCmd()
-	for _, args := range [][]string{{"hooks", "git", "pre-push"}, {"hooks", "claude-code", "stop"}} {
+	root.InitDefaultHelpCmd()
+	for _, args := range [][]string{{"hooks", "git", "pre-push"}, {"hooks", "claude-code", "stop"}, {"help"}, {"version"}} {
 		cmd, _, err := root.Find(args)
 		if err != nil {
 			t.Fatalf("find %v: %v", args, err)
+		}
+		if cmd == root {
+			t.Fatalf("find %v: got root", args)
 		}
 		if err := checkConfigBeforeRun(cmd); err != nil {
 			t.Errorf("%q: err = %v, want nil", cmd.CommandPath(), err)
