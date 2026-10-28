@@ -113,14 +113,17 @@ func NewRootCmd() *cobra.Command {
 		// stop the command. Everything below that check reads or writes through
 		// `.entire` — IsSetUpAny stats .entire/settings.json and ensureLogger
 		// opens .entire/logs/entire.log — so it has to precede them. Only
-		// validateContextFlag is allowed above it, because it touches nothing
-		// under `.entire`: it reads the flag and the saved logins in the user's
-		// config dir.
+		// checkConfigBeforeRun and validateContextFlag are allowed above it,
+		// because they touch nothing under `.entire`: they read config.json,
+		// the flag, and the saved logins in the user's config dir.
 		// cobra.EnableTraverseRunHooks (set in init) runs parent hooks before
 		// child ones, so this fires ahead of the group pre-runs and every RunE.
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			if isShellCompletion(cmd) {
 				return nil
+			}
+			if err := checkConfigBeforeRun(cmd); err != nil {
+				return err
 			}
 			if err := validateContextFlag(cmd); err != nil {
 				return err
@@ -227,7 +230,7 @@ func NewRootCmd() *cobra.Command {
 
 	// Hidden infrastructure.
 	cmd.AddCommand(newMCPCmd(cmd)) // MCP stdio server for MCP-host agents
-	cmd.AddCommand(newHooksCmd())
+	cmd.AddCommand(exemptFromConfigCheck(newHooksCmd()))
 	cmd.AddCommand(newSendAnalyticsCmd())
 	cmd.AddCommand(newCurlBashPostInstallCmd())
 	cmd.AddCommand(newRefreshTrailEnablementCmd())

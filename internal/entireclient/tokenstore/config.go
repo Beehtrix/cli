@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"path/filepath"
+	"slices"
 
 	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/internal/entireclient/userdirs"
@@ -16,6 +18,15 @@ const configFileName = "config.json"
 
 // ErrBadConfig marks an unusable config.json.
 var ErrBadConfig = errors.New("invalid Entire config")
+
+// tokenStoreKey is config.json's only key.
+const tokenStoreKey = "token_store"
+
+// CheckConfig reports an unusable config.json.
+func CheckConfig() error {
+	_, err := configTokenStore()
+	return err
+}
 
 // ConfigFilePath is config.json's full path.
 func ConfigFilePath() string {
@@ -42,6 +53,16 @@ func configTokenStore() (string, error) {
 	}
 	if err != nil {
 		return "", badConfig(err)
+	}
+	// Unknown keys fail; json matching ignores case.
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return "", badConfig(err)
+	}
+	for _, key := range slices.Sorted(maps.Keys(keys)) {
+		if key != tokenStoreKey {
+			return "", badConfig(fmt.Errorf("unknown key %q", key))
+		}
 	}
 	var cfg struct {
 		TokenStore string `json:"token_store"`
