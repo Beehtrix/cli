@@ -174,6 +174,14 @@ func TestCodexItemRecordsSpawns(t *testing.T) {
 		`{"op":"message","id":"s3","sourceId":"s3","role":"assistant","ts":`+codexItemDoneTS+`,"content":[{"type":"tool_use","id":"s3","name":"spawn_agent","input":{"agent_path":"/root/b"}}]}`,
 		`{"op":"result","id":"s3","sourceId":"s3","ts":`+codexItemDoneTS+`,"toolUseId":"s3","result":{"output":"","status":"success"}}`)
 
+	// Coordination with a running sub-agent shows as the call it was.
+	assertCodexRecords(t, doneCodexItem(codexitem.Item{ID: "s4", Kind: codexitem.KindSubAgent, ActivityKind: "interacted", AgentThreadID: "th3", AgentPath: "/root/explorer"}),
+		`{"op":"message","id":"s4","sourceId":"s4","role":"assistant","ts":`+codexItemDoneTS+`,"content":[{"type":"tool_use","id":"s4","name":"interact_agent","input":{"agent_path":"/root/explorer"}}]}`,
+		`{"op":"result","id":"s4","sourceId":"s4","ts":`+codexItemDoneTS+`,"toolUseId":"s4","result":{"output":"","status":"success","agent":{"id":"th3"}}}`)
+	assertCodexRecords(t, doneCodexItem(codexitem.Item{ID: "s5", Kind: codexitem.KindSubAgent, ActivityKind: "interrupted", AgentThreadID: "th3", AgentPath: "/root/explorer"}),
+		`{"op":"message","id":"s5","sourceId":"s5","role":"assistant","ts":`+codexItemDoneTS+`,"content":[{"type":"tool_use","id":"s5","name":"interrupt_agent","input":{"agent_path":"/root/explorer"}}]}`,
+		`{"op":"result","id":"s5","sourceId":"s5","ts":`+codexItemDoneTS+`,"toolUseId":"s5","result":{"output":"","status":"success","agent":{"id":"th3"}}}`)
+
 	assertCodexRecords(t, doneCodexItem(codexitem.Item{ID: "s2", Kind: codexitem.KindSubAgent, ActivityKind: "completed", AgentThreadID: "th3"}))
 }
 
@@ -363,6 +371,18 @@ var codexKindCases = []codexKindCase{
 		rollout: `{"type":"SubAgentActivity","id":"s1","kind":"started","agent_thread_id":"th2","agent_path":"/root/explorer"}`,
 		daemon:  `{"type":"subAgentActivity","id":"s1","kind":"started","agentThreadId":"th2","agentPath":"/root/explorer"}`,
 		want:    codexitem.Item{ID: "s1", Kind: codexitem.KindSubAgent, Status: codexitem.StatusCompleted, AgentThreadID: "th2", AgentPath: "/root/explorer", ActivityKind: "started"},
+	},
+	{
+		name:    "subAgentActivity interacted",
+		rollout: `{"type":"SubAgentActivity","id":"s4","kind":"interacted","agent_thread_id":"th2","agent_path":"/root/explorer"}`,
+		daemon:  `{"type":"subAgentActivity","id":"s4","kind":"interacted","agentThreadId":"th2","agentPath":"/root/explorer"}`,
+		want:    codexitem.Item{ID: "s4", Kind: codexitem.KindSubAgent, Status: codexitem.StatusCompleted, AgentThreadID: "th2", AgentPath: "/root/explorer", ActivityKind: "interacted"},
+	},
+	{
+		name:    "subAgentActivity interrupted",
+		rollout: `{"type":"SubAgentActivity","id":"s5","kind":"interrupted","agent_thread_id":"th2","agent_path":"/root/explorer"}`,
+		daemon:  `{"type":"subAgentActivity","id":"s5","kind":"interrupted","agentThreadId":"th2","agentPath":"/root/explorer"}`,
+		want:    codexitem.Item{ID: "s5", Kind: codexitem.KindSubAgent, Status: codexitem.StatusCompleted, AgentThreadID: "th2", AgentPath: "/root/explorer", ActivityKind: "interrupted"},
 	},
 	{
 		name:    "reasoning",

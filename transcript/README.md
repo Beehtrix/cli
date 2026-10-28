@@ -82,7 +82,10 @@ Commands are `Bash` tool uses whose input is the script inside `<shell> -lc`
 or `<shell> -c` (other commands are shown whole), with the command's output;
 file changes are `FileChange` with each file's diff; MCP calls are named
 `server.tool`; web searches are `WebSearch` and image views
-`ImageView`; a sub-agent spawn is `spawn_agent` with `agent.id`. Code-mode
+`ImageView`; a sub-agent spawn is `spawn_agent`, an interrupt
+`interrupt_agent` and any other interaction (a message or a follow-up task,
+which the item doesn't tell apart) `interact_agent`, each with the
+sub-agent's `agent.id`. Code-mode
 wrapper calls no longer appear. Lines carry their item's time (RFC 3339 UTC
 with milliseconds), and usage is per model call (see Per-call usage).
 Items it can't read (such as one without an ID) or doesn't map (reasoning,

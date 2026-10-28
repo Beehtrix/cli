@@ -52,6 +52,18 @@ type codexAgentPathInput struct {
 	AgentPath string `json:"agent_path"`
 }
 
+// codexSubAgentTools names the tool use a sub-agent activity shows as: the
+// call that caused it. A spawn and an interrupt are spawn_agent and
+// interrupt_agent, as the response_item path names those calls; an
+// interaction is either send_message or followup_task, which the activity
+// doesn't tell apart, so it gets a name of its own. A completed sub-agent
+// shows nothing: its result reaches the parent as a later tool output.
+var codexSubAgentTools = map[string]string{
+	"started":     "spawn_agent",
+	"interacted":  "interact_agent",
+	"interrupted": "interrupt_agent",
+}
+
 // codexSpawnAgentTool is the collab tool that starts a sub-agent.
 const codexSpawnAgentTool = "spawnAgent"
 
@@ -120,10 +132,11 @@ func codexItemRecords(it codexitem.Item) []Record {
 			result.Agent = &ToolResultAgent{ID: it.ReceiverThreadIDs[0]}
 		}
 	case codexitem.KindSubAgent:
-		if it.ActivityKind != "started" {
+		name = codexSubAgentTools[it.ActivityKind]
+		if name == "" {
 			return nil
 		}
-		name, input = "spawn_agent", codexAgentPathInput{AgentPath: it.AgentPath}
+		input = codexAgentPathInput{AgentPath: it.AgentPath}
 		result = &ToolResult{Status: ToolStatusSuccess}
 		if it.AgentThreadID != "" {
 			result.Agent = &ToolResultAgent{ID: it.AgentThreadID}
