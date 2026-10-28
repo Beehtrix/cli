@@ -89,7 +89,6 @@ func pluginParentDir() (string, error) {
 		}
 		return filepath.Join(v, pluginManagedTopDir, pluginManagedSubDir), nil
 	}
-	// Entire's own files; see userdirs.Home.
 	home, err := userdirs.Home()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
