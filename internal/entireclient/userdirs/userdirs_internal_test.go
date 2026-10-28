@@ -72,25 +72,25 @@ func TestHomeDir_PasswdForRootOrUnsetHome(t *testing.T) {
 	t.Run("user keeps HOME", func(t *testing.T) {
 		setEuid(t, 1000)
 		t.Setenv("HOME", elsewhere)
-		got, err := homeDir()
+		got, err := Home()
 		if err != nil || got != elsewhere {
-			t.Errorf("homeDir() = %q, %v; want %q", got, err, elsewhere)
+			t.Errorf("Home() = %q, %v; want %q", got, err, elsewhere)
 		}
 	})
 	t.Run("unset HOME uses passwd", func(t *testing.T) {
 		setEuid(t, 1000)
 		t.Setenv("HOME", "")
-		got, err := homeDir()
+		got, err := Home()
 		if err != nil || got != u.HomeDir {
-			t.Errorf("homeDir() = %q, %v; want %q", got, err, u.HomeDir)
+			t.Errorf("Home() = %q, %v; want %q", got, err, u.HomeDir)
 		}
 	})
 	t.Run("root ignores HOME", func(t *testing.T) {
 		setEuid(t, 0)
 		t.Setenv("HOME", elsewhere)
-		got, err := homeDir()
+		got, err := Home()
 		if err != nil || got != u.HomeDir {
-			t.Errorf("homeDir() = %q, %v; want %q", got, err, u.HomeDir)
+			t.Errorf("Home() = %q, %v; want %q", got, err, u.HomeDir)
 		}
 	})
 }

@@ -112,8 +112,26 @@ func CacheDirChecked() (string, error) {
 // geteuid is swapped out by tests.
 var geteuid = os.Geteuid
 
-// homeDir uses passwd for root, unset HOME.
-func homeDir() (string, error) {
+// Home returns the home directory for Entire's own files: config, cache,
+// and managed plugins.
+//
+// Entire's own files follow Entire's home: passwd for root, like ssh. Files
+// written by other programs (agent transcripts, agent hooks, shell rc files)
+// follow that program's home, because that's where they are. Those programs
+// read $HOME, so their lookups use os.UserHomeDir, not this; see
+// agent.ResolveHome.
+//
+// Why root ignores $HOME: under `sudo -E`, or anything else that keeps the
+// caller's environment, $HOME is chosen by a non-root user. Following it
+// would make root read its config and credentials from, and write
+// root-owned files into, a directory that user controls. The passwd entry
+// is root-owned, so it can't be redirected that way. Without $HOME at all
+// (cron, systemd units) passwd is the only sound answer too.
+//
+// Everyone else keeps $HOME, so HOME-based isolation still works.
+// ENTIRE_CONFIG_DIR and the other explicit overrides beat this. Windows uses
+// os.UserHomeDir unchanged.
+func Home() (string, error) {
 	if runtime.GOOS != "windows" && (geteuid() == 0 || os.Getenv("HOME") == "") {
 		if u, err := user.Current(); err == nil && u.HomeDir != "" {
 			return u.HomeDir, nil
@@ -130,7 +148,7 @@ func configDir() (string, error) {
 	if dir, ok := testdirs.Dir("config"); ok {
 		return dir, nil
 	}
-	home, err := homeDir()
+	home, err := Home()
 	if err != nil {
 		// nil error deliberately: a machine with no resolvable home is not a
 		// user error to report, and ownFallbackDir returns something usable.
@@ -154,7 +172,7 @@ func cacheDir() (string, error) {
 	if dir, ok := testdirs.Dir("cache"); ok {
 		return filepath.Join(dir, "entire"), nil
 	}
-	home, err := homeDir()
+	home, err := Home()
 	if err != nil {
 		// See configDir: the fallback is usable, so there is nothing to report.
 		return ownFallbackDir(".cache", "entire"), nil //nolint:nilerr // see ownFallbackDir
