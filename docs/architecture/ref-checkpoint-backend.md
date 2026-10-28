@@ -150,6 +150,8 @@ Without a terminal, `entire checkpoint push` accepts only `<id>@<commit>`; `--al
 
 With OPF enabled, `entire checkpoint push <id>` still runs the OPF gate over the whole queue, not only the named refs. A large checkpoint that was not named can then trip an OPF cap and keep the named one from uploading. This affects only OPF users (deprecated) on `manual`.
 
+While the policy is unset, a user's `git push` from a terminal (`interactive.CanPromptInteractively()`) with checkpoints waiting asks once: automatic, manual, or not now. It is asked before the policy is read for that push, so choosing manual already holds it. "Not now" saves nothing and asks again on the next push; no answer within the prompt timeout counts as "not now" and stops the question for 7 days on this clone (`checkpoint_push_question_backoff_until`). A malformed back-off brings the question back. OPF users are not asked, since OPF already asks on every push; they get a one-time deprecation line instead (`opf_deprecation_notice_shown`). Commit linking asks during `git commit`, so a push never shows two Entire questions. `entire enable` on git-refs names `--checkpoint-push-policy manual` while the policy reads as automatic.
+
 ### Non-force, fast-forward-only
 
 All checkpoint-ref pushes are **fast-forward-only — never a force push.** There is no server-side ref protection, so a force push risks silently clobbering a checkpoint written elsewhere. Per-checkpoint refs normally advance by fast-forward (append-only per-checkpoint history), so this is the common case.
@@ -297,6 +299,7 @@ When checkpoints *are* actively migrated from the branch into refs (a path that 
 | `settings/checkpoints.go` | `checkpoints` block parsing + env override |
 | `strategy/manual_commit_push.go` | Pre-push: drain queue, batch push, per-ref recovery |
 | `strategy/checkpoint_push_policy.go` | Checkpoint push policy gate, `PushCheckpoints` for `entire checkpoint push` |
+| `strategy/checkpoint_push_question.go` | First-push policy question, its back-off, and the OPF deprecation line |
 | `strategy/push_common.go` | `batchPushCheckpointRefs`, `pushCheckpointRefWithRecovery`, fetch+replay |
 | `strategy/checkpoint_delete*.go` | `entire checkpoint delete`: read-only plan, leased per-remote deletes |
 | `checkpoint/deleted_list.go` | Local deleted-checkpoints list in the git common dir |

@@ -307,6 +307,16 @@ type ClonePreferences struct {
 	// recognize instead of treating them as automatic.
 	CheckpointPushPolicy CheckpointPushPolicy `json:"checkpoint_push_policy,omitempty"`
 
+	// CheckpointPushQuestionBackoffUntil postpones the first-push policy
+	// question after it went unanswered, as an RFC 3339 time. A string rather
+	// than a time so a malformed value only brings the question back: a decode
+	// error would make the policy unreadable and hold every automatic upload.
+	CheckpointPushQuestionBackoffUntil string `json:"checkpoint_push_question_backoff_until,omitempty"`
+
+	// OPFDeprecationNoticeShown records that pre-push told this clone OPF is
+	// deprecated, in place of the policy question.
+	OPFDeprecationNoticeShown bool `json:"opf_deprecation_notice_shown,omitempty"`
+
 	// unknown holds keys this binary does not model, written back unchanged so
 	// a rewrite by one version does not delete another version's preferences.
 	unknown map[string]json.RawMessage
