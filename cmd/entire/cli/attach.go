@@ -277,6 +277,7 @@ func runAttach(ctx context.Context, w, errW io.Writer, sessionID string, agentNa
 	if err != nil {
 		return err
 	}
+	plan.heldForManualPush, plan.policyErr = strategy.CheckpointsHeldForManualPush(ctx)
 	target := plan.target
 
 	// Resolve agent and transcript path.
@@ -323,8 +324,9 @@ func runAttach(ctx context.Context, w, errW io.Writer, sessionID string, agentNa
 		if plan.remote == "" || checkpointOnRemote(ctx, plan.remote, cp.id) {
 			return nil
 		}
-		// Under manual nothing is sent, so there is nothing to confirm.
-		if held, heldErr := strategy.CheckpointsHeldForManualPush(ctx); heldErr == nil && held {
+		// Under manual nothing is sent, so there is nothing to confirm; an
+		// unreadable policy sends nothing either, and delivery reports why.
+		if plan.heldForManualPush || plan.policyErr != nil {
 			return redeliverAttachedCheckpoint(ctx, w, errW, plan, cp.id)
 		}
 		warning := []string{
@@ -586,11 +588,12 @@ func attachWarning(ctx context.Context, plan attachLinkPlan, sessionID string, c
 		lines = append(lines, fmt.Sprintf("Session %s goes into a new checkpoint linked by that trailer.", sessionID))
 	}
 	// An unreadable policy uploads nothing either, so it must not promise to.
-	if held, heldErr := strategy.CheckpointsHeldForManualPush(ctx); held || heldErr != nil {
+	switch {
+	case plan.heldForManualPush || plan.policyErr != nil:
 		lines = append(lines, "The checkpoint, including the session transcript, stays on this machine until you upload it with 'entire checkpoint push'.")
-	} else if plan.remote != "" {
+	case plan.remote != "":
 		lines = append(lines, "Pending checkpoints, including this one with the session transcript, are pushed to "+plan.remote+" now.")
-	} else {
+	default:
 		lines = append(lines, "The checkpoint, including the session transcript, is pushed with your next git push.")
 	}
 	if window.start > 0 {
@@ -635,7 +638,7 @@ func redeliverAttachedCheckpoint(ctx context.Context, w, errW io.Writer, plan at
 	if plan.remote == "" {
 		return nil
 	}
-	err := pushAttachedCheckpoint(ctx, w, plan.remote, checkpointID)
+	err := pushAttachedCheckpoint(ctx, w, plan, checkpointID)
 	if err != nil && plan.mode != attachRecordLink {
 		fmt.Fprintf(errW, "warning: %v\n", err)
 		return nil
@@ -677,6 +680,11 @@ type attachLinkPlan struct {
 	rewrite []*object.Commit
 	// checkedRemotes are the remotes asked whether they hold target.
 	checkedRemotes []string
+	// heldForManualPush and policyErr are the checkpoint push policy read
+	// once, so delivery does what the confirmation said even if another
+	// worktree changes the policy in between.
+	heldForManualPush bool
+	policyErr         error
 }
 
 // planAttachLink resolves the target (HEAD unless --commit names another) and
@@ -1006,7 +1014,7 @@ func reportLinkedCommit(ctx context.Context, w, errW io.Writer, plan attachLinkP
 		fmt.Fprintf(errW, "Note: commit %s was authored by %s. A link recorded in the checkpoint counts only when the commit's author attaches it.\n",
 			plan.target.Hash.String()[:12], plan.target.Author.Email)
 	}
-	return pushAttachedCheckpoint(ctx, w, plan.remote, checkpointID)
+	return pushAttachedCheckpoint(ctx, w, plan, checkpointID)
 }
 
 // attachLinkRepo names the code repository for a link as
@@ -1030,18 +1038,17 @@ func attachLinkRepo(ctx context.Context, remote string) string {
 // push_sessions, checkpoint_remote and the privacy filter; that path is
 // fail-soft, so delivery is checked against the remote afterwards. Under the
 // manual checkpoint push policy the checkpoint waits like any other.
-func pushAttachedCheckpoint(ctx context.Context, w io.Writer, remote string, checkpointID id.CheckpointID) error {
+func pushAttachedCheckpoint(ctx context.Context, w io.Writer, plan attachLinkPlan, checkpointID id.CheckpointID) error {
+	remote := plan.remote
 	target, disabled := strategy.CheckpointPushTarget(ctx, remote)
 	if disabled {
 		return fmt.Errorf("checkpoint %s was written locally but not pushed: push_sessions is turned off in settings, so the link stays invisible to others until the checkpoint is pushed", checkpointID)
 	}
-	held, err := strategy.CheckpointsHeldForManualPush(ctx)
-	if err != nil {
-		return fmt.Errorf("checkpoint %s was written locally but not pushed: %w", checkpointID, err)
+	if plan.policyErr != nil {
+		return fmt.Errorf("checkpoint %s was written locally but not pushed: %w", checkpointID, plan.policyErr)
 	}
-	if held {
-		fmt.Fprintf(w, "  Checkpoint %s is waiting; upload it with: entire checkpoint push %s\n", checkpointID, checkpointID)
-		return nil
+	if plan.heldForManualPush {
+		return reportHeldAttachedCheckpoint(ctx, w, checkpointID)
 	}
 	if err := strategy.NewManualCommitStrategy().PrePush(ctx, remote); err != nil {
 		return fmt.Errorf("checkpoint %s was written locally but could not be pushed to %s: %w", checkpointID, remote, err)
@@ -1050,6 +1057,23 @@ func pushAttachedCheckpoint(ctx context.Context, w io.Writer, remote string, che
 		return fmt.Errorf("checkpoint %s was written locally but did not reach %s: %w", checkpointID, remote, err)
 	}
 	fmt.Fprintf(w, "  Pushed checkpoint metadata to %s\n", remote)
+	return nil
+}
+
+// reportHeldAttachedCheckpoint tells the user how to upload a checkpoint that
+// manual held back. A checkpoint from before the switch to git-refs that was
+// never migrated lives on the v1 branch: attach adds the session there, and
+// 'entire checkpoint push' only uploads checkpoint refs.
+func reportHeldAttachedCheckpoint(ctx context.Context, w io.Writer, checkpointID id.CheckpointID) error {
+	waiting, err := strategy.CheckpointWaiting(ctx, checkpointID)
+	if err != nil {
+		return fmt.Errorf("checkpoint %s was written locally but not pushed: %w", checkpointID, err)
+	}
+	if !waiting && checkpointID.Kind() != id.KindULID {
+		fmt.Fprintf(w, "  Checkpoint %s is on the old checkpoint branch, which 'entire checkpoint push' can't upload; run 'entire doctor migrate-checkpoints' to move it to checkpoint refs, then upload it with: entire checkpoint push %s\n", checkpointID, checkpointID)
+		return nil
+	}
+	fmt.Fprintf(w, "  Checkpoint %s is waiting; upload it with: entire checkpoint push %s\n", checkpointID, checkpointID)
 	return nil
 }
 

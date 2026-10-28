@@ -128,6 +128,14 @@ func warnPrePushRefsUnknown(ctx context.Context, w io.Writer) {
 		"`entire enable` to update the hook.")
 }
 
+// checkpointRefName is whichever side of the line names a checkpoint ref.
+func (r PrePushRef) checkpointRefName() string {
+	if isCheckpointRefName(r.LocalRef) {
+		return r.LocalRef
+	}
+	return r.RemoteRef
+}
+
 // outerPushCheckpointRef returns the first line of the user's own push that
 // sends checkpoint content (see PrePushRef.sends), if the hook passed the list.
 func outerPushCheckpointRef(ctx context.Context) (PrePushRef, bool) {

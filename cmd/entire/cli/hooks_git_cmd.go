@@ -228,6 +228,28 @@ func newHooksGitPostRewriteCmd() *cobra.Command {
 	}
 }
 
+// refuseOuterCheckpointPushWithUnloadableSettings is the one pre-push check
+// that runs with Entire's hooks off: a repository set up for Entire whose
+// settings cannot be loaded may hold checkpoints back, and the user's own
+// push must not send them. An explicitly disabled repository loads fine.
+func refuseOuterCheckpointPushWithUnloadableSettings(cmd *cobra.Command) error {
+	ctx := cmd.Context()
+	if !settings.IsSetUpAny(ctx) {
+		return nil
+	}
+	_, loadErr := settings.Load(ctx)
+	if loadErr == nil {
+		return nil
+	}
+	if os.Getenv(strategy.PrePushStdinRefsEnv) == "1" {
+		ctx = strategy.WithPrePushRefsFrom(ctx, cmd.InOrStdin())
+	}
+	if err := strategy.CheckOuterPushWithUnloadableSettings(ctx, loadErr); err != nil {
+		return fmt.Errorf("pre-push: %w", err)
+	}
+	return nil
+}
+
 func newHooksGitPrePushCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "pre-push <remote>",
@@ -242,7 +264,7 @@ func newHooksGitPrePushCmd() *cobra.Command {
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if gitHooksDisabled {
-				return nil
+				return refuseOuterCheckpointPushWithUnloadableSettings(cmd)
 			}
 
 			remote := args[0]

@@ -321,6 +321,84 @@ func TestAttachCommit_UnreadablePolicyIsAnError(t *testing.T) {
 	}
 }
 
+// A retry that finds the policy unreadable reports the file to fix, not the
+// confirmation it cannot use: nothing would upload anyway.
+// Not parallel: sets ENTIRE_CHECKPOINTS_PRIMARY.
+func TestAttachCommit_RetryWithUnreadablePolicyNamesTheFile(t *testing.T) {
+	t.Setenv("ENTIRE_CHECKPOINTS_PRIMARY", "git-refs")
+	setupAttachTestRepo(t)
+	commitAt(t, "work.txt")
+	pushToOrigin(t)
+	setAttachCheckpointPushPolicy(t, "manual")
+	const sessionID = "attach-retry-unreadable-policy"
+	if out, err := attachHeadless(t, sessionID, attachOptions{}); err != nil {
+		t.Fatalf("first attach: %v\n%s", err, out)
+	}
+	setAttachCheckpointPushPolicy(t, "approved")
+
+	var out bytes.Buffer
+	err := runAttach(context.Background(), &out, &out, sessionID, agent.AgentNameClaudeCode, attachOptions{})
+	if err == nil || !strings.Contains(err.Error(), "preferences.json") {
+		t.Fatalf("expected an error naming preferences.json, got %v\n%s", err, out.String())
+	}
+}
+
+// Delivery follows the policy attach warned about, not a later reread: a
+// policy changed by another worktree mid-confirmation must not upload a
+// session the user was told stays local.
+// Not parallel: sets ENTIRE_CHECKPOINTS_PRIMARY.
+func TestAttachCommit_DeliveryUsesThePolicyAttachWarnedAbout(t *testing.T) {
+	t.Setenv("ENTIRE_CHECKPOINTS_PRIMARY", "git-refs")
+	setupAttachTestRepo(t)
+	commitAt(t, "work.txt")
+	remote := pushToOrigin(t)
+	setAttachCheckpointPushPolicy(t, "manual")
+	const sessionID = "attach-policy-changes-mid-attach"
+	if out, err := attachHeadless(t, sessionID, attachOptions{}); err != nil {
+		t.Fatalf("attach: %v\n%s", err, out)
+	}
+	state, err := loadAttachState(t, sessionID)
+	if err != nil || state == nil {
+		t.Fatalf("load state: %v, %v", state, err)
+	}
+	setAttachCheckpointPushPolicy(t, "automatic")
+
+	plan := attachLinkPlan{target: headCommitOf(t), mode: attachRecordLink, remote: "origin", holder: "origin", heldForManualPush: true}
+	var out bytes.Buffer
+	if err := pushAttachedCheckpoint(context.Background(), &out, plan, state.LastCheckpointID); err != nil {
+		t.Fatalf("pushAttachedCheckpoint: %v\n%s", err, out.String())
+	}
+	if refs := remoteCheckpointRefs(t, remote); refs != "" {
+		t.Fatalf("uploaded after warning that the checkpoint stays local:\n%s", refs)
+	}
+}
+
+// A checkpoint made before the switch to git-refs lives on the v1 branch,
+// which 'entire checkpoint push' cannot upload; attach must not point there.
+// Not parallel: sets ENTIRE_CHECKPOINTS_PRIMARY.
+func TestAttachCommit_LegacyCheckpointUnderManualPointsToMigration(t *testing.T) {
+	setupAttachTestRepo(t)
+	if out, err := attachHeadless(t, "attach-legacy-first", attachOptions{}); err != nil {
+		t.Fatalf("first attach: %v\n%s", err, out)
+	}
+	target := headCommitOf(t)
+	cpID, ok := trailers.ParseCheckpoint(target.Message)
+	if !ok || cpID.Kind() == checkpointid.KindULID {
+		t.Fatalf("expected a legacy checkpoint trailer, got %q", target.Message)
+	}
+	pushToOrigin(t)
+	t.Setenv("ENTIRE_CHECKPOINTS_PRIMARY", "git-refs")
+	setAttachCheckpointPushPolicy(t, "manual")
+
+	out, err := attachHeadless(t, "attach-legacy-second", attachOptions{Commit: target.Hash.String()})
+	if err != nil {
+		t.Fatalf("second attach: %v\n%s", err, out)
+	}
+	if strings.Contains(out, cpID.String()+" is waiting") || !strings.Contains(out, "entire doctor migrate-checkpoints") {
+		t.Fatalf("expected migration guidance instead of a waiting checkpoint, got:\n%s", out)
+	}
+}
+
 // An older pushed commit is linked in the checkpoint, never rewritten.
 func TestAttachCommit_PushedOlderCommitIsLinkedInTheCheckpoint(t *testing.T) {
 	setupAttachTestRepo(t)

@@ -79,6 +79,7 @@ func (s *ManualCommitStrategy) prePush(ctx context.Context, remote string, prote
 	if err := checkOuterPushUnderManualPolicy(ctx); err != nil {
 		return err
 	}
+	warnOuterPushUncheckable(ctx)
 
 	// Load settings once for remote resolution and push_sessions check.
 	// Spanned because checkpoint-remote resolution can perform a one-time

@@ -638,6 +638,39 @@ func TestCheckpointPushPolicy_UnreadablePolicyRefusesExplicitCheckpointPush(t *t
 	require.Empty(t, remoteCheckpointIDs(t, bareDir))
 }
 
+// Settings Entire cannot load turn its git hooks off, but a push that sends
+// checkpoint refs itself must still be refused: neither the backend nor the
+// policy is known, so it may be publishing what manual holds back.
+func TestCheckpointPushPolicy_UnloadableSettingsRefuseExplicitCheckpointPush(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		preferences string
+	}{
+		{name: "malformed", preferences: `{not json`},
+		{name: "wrong type", preferences: `{"checkpoint_push_policy":5}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			env := newOutgoingEnv(t)
+			bareDir := env.SetupBareRemote()
+			setCheckpointPushPolicy(t, env, "manual")
+			createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+			writeClonePreferences(t, env, tt.preferences)
+
+			output, err := gitPushArgs(t, env, "--mirror", "origin")
+
+			require.Error(t, err, "unloadable settings must not let checkpoint refs through: %s", output)
+			require.Contains(t, output, "--no-verify")
+			require.Empty(t, remoteCheckpointIDs(t, bareDir))
+
+			output, err = gitPushArgs(t, env, "origin", "HEAD")
+			require.NoError(t, err, "a push without checkpoint refs is not refused: %s", output)
+		})
+	}
+}
+
 // Deleting a remote checkpoint ref sends no checkpoint content.
 func TestCheckpointPushPolicy_ManualAllowsDeletingARemoteCheckpoint(t *testing.T) {
 	t.Parallel()
@@ -665,12 +698,47 @@ func TestCheckpointPushPolicy_OldHookWarnsOnlyWhileCheckpointsWait(t *testing.T)
 	env.SetupBareRemote()
 	setCheckpointPushPolicy(t, env, "manual")
 	work := createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	push := installOldPrePushHook(t, env)
 
+	output := push()
+	require.Equal(t, 1, strings.Count(output, oldHookWarning), "warn once while checkpoints wait:\n%s", output)
+
+	_, err := runCheckpointPushJSON(t, env, false, work+"@"+outgoingCommit(t, env, work))
+	require.NoError(t, err)
+	env.WriteFile("more.go", "package more")
+	env.GitAdd("more.go")
+	env.GitCommit("More")
+	require.NotContains(t, push(), oldHookWarning, "nothing waiting, nothing to warn about")
+}
+
+// The warning is about what the user's own push can send, so the gates on
+// what Entire sends must not hide it.
+func TestCheckpointPushPolicy_OldHookWarnsWhenEntireSendsNothing(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	env.PatchSettings(map[string]any{
+		"strategy_options": map[string]any{"push_sessions": false},
+	})
+	push := installOldPrePushHook(t, env)
+
+	output := push()
+	require.Equal(t, 1, strings.Count(output, oldHookWarning), "push_sessions=false must not hide the warning:\n%s", output)
+}
+
+const oldHookWarning = "does not pass the refs being pushed"
+
+// installOldPrePushHook writes a pre-push line from before the hook passed
+// git's ref list, and returns a push of HEAD through it.
+func installOldPrePushHook(t *testing.T, env *TestEnv) func() string {
+	t.Helper()
 	hookPath := filepath.Join(env.RepoDir, ".git", "hooks", "pre-push")
 	require.NoError(t, os.MkdirAll(filepath.Dir(hookPath), 0o755))
 	oldHook := "#!/bin/sh\nexec \"" + getTestBinary() + "\" hooks git pre-push \"$1\"\n"
 	require.NoError(t, os.WriteFile(hookPath, []byte(oldHook), 0o755))
-	push := func() string {
+	return func() string {
 		t.Helper()
 		cmd := execx.NonInteractive(t.Context(), "git", "push", "origin", "HEAD")
 		cmd.Dir = env.RepoDir
@@ -679,17 +747,6 @@ func TestCheckpointPushPolicy_OldHookWarnsOnlyWhileCheckpointsWait(t *testing.T)
 		require.NoError(t, err, "%s", output)
 		return string(output)
 	}
-	const warning = "does not pass the refs being pushed"
-
-	output := push()
-	require.Equal(t, 1, strings.Count(output, warning), "warn once while checkpoints wait:\n%s", output)
-
-	_, err := runCheckpointPushJSON(t, env, false, work+"@"+outgoingCommit(t, env, work))
-	require.NoError(t, err)
-	env.WriteFile("more.go", "package more")
-	env.GitAdd("more.go")
-	env.GitCommit("More")
-	require.NotContains(t, push(), warning, "nothing waiting, nothing to warn about")
 }
 
 func TestConfigure_SetsCheckpointPushPolicy(t *testing.T) {

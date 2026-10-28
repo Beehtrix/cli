@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/go-git/go-git/v6"
@@ -81,29 +82,81 @@ func checkOuterPushUnderManualPolicy(ctx context.Context) error {
 	if !ok || !primaryIsGitRefs(ctx) {
 		return nil
 	}
-	name := outer.LocalRef
-	if !isCheckpointRefName(name) {
-		name = outer.RemoteRef
-	}
-	const howTo = "Leave checkpoint refs out of this push (avoid --mirror) and upload checkpoints with 'entire checkpoint push'. " +
-		"To push them anyway, run git push with --no-verify"
+	name := outer.checkpointRefName()
 
 	repo, err := OpenRepository(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: this push includes %s, and the checkpoint push policy could not be read (open repository: %w). %s",
-			ErrOuterPushCarriesHeldCheckpoints, name, err, howTo)
+			ErrOuterPushCarriesHeldCheckpoints, name, err, outerPushHowTo)
 	}
 	defer repo.Close()
 	automatic, err := automaticCheckpointDelivery(repo)
 	if err != nil {
 		return fmt.Errorf("%w: this push includes %s, and the checkpoint push policy could not be read (%w). %s",
-			ErrOuterPushCarriesHeldCheckpoints, name, err, howTo)
+			ErrOuterPushCarriesHeldCheckpoints, name, err, outerPushHowTo)
 	}
 	if automatic {
 		return nil
 	}
 	return fmt.Errorf("%w: this push includes %s, and this clone's checkpoint push policy is manual. %s",
-		ErrOuterPushCarriesHeldCheckpoints, name, howTo)
+		ErrOuterPushCarriesHeldCheckpoints, name, outerPushHowTo)
+}
+
+const outerPushHowTo = "Leave checkpoint refs out of this push (avoid --mirror) and upload checkpoints with 'entire checkpoint push'. " +
+	"To push them anyway, run git push with --no-verify"
+
+// CheckOuterPushWithUnloadableSettings refuses the user's push when it sends
+// checkpoint content and Entire's settings could not be loaded, which turns
+// its git hooks off. Neither the backend nor the policy is known then, so the
+// push may be publishing checkpoints that manual holds back.
+func CheckOuterPushWithUnloadableSettings(ctx context.Context, loadErr error) error {
+	outer, ok := outerPushCheckpointRef(ctx)
+	if !ok {
+		return nil
+	}
+	return fmt.Errorf("%w: this push includes %s, and Entire's settings could not be read (%w). %s",
+		ErrOuterPushCarriesHeldCheckpoints, outer.checkpointRefName(), loadErr, outerPushHowTo)
+}
+
+// warnOuterPushUncheckable warns, under manual with checkpoints waiting, that
+// an old hook line cannot show what the user's own push sends. It runs before
+// the push_sessions and sync-remote gates: those decide what Entire sends, but
+// the user's push can carry checkpoint refs to any remote.
+func warnOuterPushUncheckable(ctx context.Context) {
+	if prePushRefsKnown(ctx) || !primaryIsGitRefs(ctx) {
+		return
+	}
+	repo, err := OpenRepository(ctx)
+	if err != nil {
+		return
+	}
+	defer repo.Close()
+	if automatic, err := automaticCheckpointDelivery(repo); err != nil || automatic {
+		return
+	}
+	if waitingCheckpointCount(ctx, repo) > 0 {
+		warnPrePushRefsUnknown(ctx, stderrWriter)
+	}
+}
+
+// CheckpointWaiting reports whether checkpointID has a queued ref present
+// locally, the set 'entire checkpoint push' can upload.
+func CheckpointWaiting(ctx context.Context, checkpointID id.CheckpointID) (bool, error) {
+	ref, err := checkpoint.RefName(checkpointID)
+	if err != nil {
+		return false, fmt.Errorf("checkpoint ref for %s: %w", checkpointID, err)
+	}
+	repo, err := OpenRepository(ctx)
+	if err != nil {
+		return false, fmt.Errorf("open repository: %w", err)
+	}
+	defer repo.Close()
+	waiting, err := waitingCheckpointRefs(ctx, repo)
+	if err != nil {
+		return false, err
+	}
+	_, ok := waiting[ref]
+	return ok, nil
 }
 
 // announceCheckpointPushPolicy is the pre-push hook's view of the policy. It
@@ -122,7 +175,6 @@ func announceCheckpointPushPolicy(ctx context.Context, repo *git.Repository) boo
 	}
 	if waiting := waitingCheckpointCount(ctx, repo); waiting > 0 {
 		fmt.Fprintf(stderrWriter, "[entire] %s waiting, upload with: entire checkpoint push\n", pluralCheckpoints(waiting))
-		warnPrePushRefsUnknown(ctx, stderrWriter)
 	}
 	return false
 }
