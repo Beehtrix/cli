@@ -108,6 +108,11 @@ func TestTrailerAuthority_RealGitCommits(t *testing.T) {
 		{name: "merge --squash of a commit whose body names a checkpoint", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
 			return []string{squashOf(env, git, bodyMention...)}, []string{advForeignCheckpoint}
 		}, editor: keep},
+		{name: "merge --squash of a commit whose body names a commit", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
+			namedID := commitLinked(env, git, "named.txt")
+			sideID := squashOf(env, git, "-m", "Side work", "-m", "commit "+env.GetHeadHash())
+			return []string{sideID}, []string{namedID}
+		}, editor: keep},
 		{name: "redo after reset --soft then editor", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
 			return []string{redoOf(env, git)}, nil
 		}, editor: typeSubject},

@@ -729,15 +729,17 @@ func (s *ManualCommitStrategy) inheritSquashedCheckpointTrailers(ctx context.Con
 }
 
 // squashedCommits returns the commits Git recorded in SQUASH_MSG, in its
-// order, leaving out any this repository cannot read.
+// order, leaving out any this repository cannot read. Git writes each one's
+// `commit <sha>` header unindented and indents its message, so a message line
+// naming another commit is not a header.
 func squashedCommits(repo *git.Repository, squashMsg []byte) []*object.Commit {
 	var commits []*object.Commit
 	for _, line := range strings.Split(string(squashMsg), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 || fields[0] != "commit" || !plumbing.IsHash(fields[1]) {
+		hash, ok := strings.CutPrefix(line, "commit ")
+		if !ok || !plumbing.IsHash(hash) {
 			continue
 		}
-		if commit, err := repo.CommitObject(plumbing.NewHash(fields[1])); err == nil {
+		if commit, err := repo.CommitObject(plumbing.NewHash(hash)); err == nil {
 			commits = append(commits, commit)
 		}
 	}
