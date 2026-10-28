@@ -3060,9 +3060,10 @@ func addInheritedCheckpointTrailer(message string, checkpointID id.CheckpointID,
 // addCheckpointTrailerWithComment adds the Entire-Checkpoint trailer with an explanatory comment.
 // The trailer is placed above the git comment block but below the user's message area,
 // with a comment explaining that the user can remove it if they don't want to link the commit
-// to the agent session. If prompt is non-empty, it's shown as context.
+// to the agent session. If prompt is non-empty, it's shown as context. A trailer block that
+// ends the user's lines, such as a squash's inherited trailers, gets the trailer joined to it:
+// a paragraph of its own would leave that block out of the last paragraph, which alone links.
 func addCheckpointTrailerWithComment(message string, checkpointID id.CheckpointID, agentName, prompt string) string {
-	trailer := trailers.CheckpointTrailerKey + ": " + checkpointID.String()
 	commentLines := []string{
 		"# Remove the Entire-Checkpoint trailer above if you don't want to link this commit to " + agentName + " session context.",
 	}
@@ -3085,7 +3086,7 @@ func addCheckpointTrailerWithComment(message string, checkpointID id.CheckpointI
 
 	if commentStart == -1 {
 		// No git comments, append trailer at the end
-		return strings.TrimRight(message, "\n") + "\n\n" + trailer + "\n" + comment + "\n"
+		return addCheckpointTrailer(message, checkpointID) + comment + "\n"
 	}
 
 	// Split into user content and git comments
@@ -3097,9 +3098,9 @@ func addCheckpointTrailerWithComment(message string, checkpointID id.CheckpointI
 	if userContent == "" {
 		// No user content yet - leave space for them to type, then trailer
 		// Two newlines: first for user's message line, second for blank separator
-		return "\n\n" + trailer + "\n" + comment + "\n\n" + gitComments
+		return "\n\n" + trailers.CheckpointTrailerKey + ": " + checkpointID.String() + "\n" + comment + "\n\n" + gitComments
 	}
-	return userContent + "\n\n" + trailer + "\n" + comment + "\n\n" + gitComments
+	return addCheckpointTrailer(userContent, checkpointID) + comment + "\n\n" + gitComments
 }
 
 // resolveSessionAgentType picks the most reliable identifier for which agent

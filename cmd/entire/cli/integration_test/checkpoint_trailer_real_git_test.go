@@ -34,22 +34,57 @@ func TestTrailerAuthority_RealGitCommits(t *testing.T) {
 	foreignTrailer := filepath.Join(files, "foreign-trailer")
 	require.NoError(t, os.WriteFile(foreignTrailer, []byte("Fix login\n\nEntire-Checkpoint: "+advForeignCheckpoint+"\n"), 0o600))
 
-	// commitLinked commits path with -m as an agent's work.
-	commitLinked := func(env *TestEnv, git func([]string, ...string) (string, error), path string) {
+	// commitLinked commits path with messageArgs (-m "My change" when none)
+	// as an agent's work, and returns the checkpoint the commit links.
+	commitLinked := func(env *TestEnv, git func([]string, ...string) (string, error), path string, messageArgs ...string) string {
 		env.T.Helper()
 		authorityAgentTurn(env, path, "work on "+path+"\n")
 		_, err := git(nil, "add", path)
 		require.NoError(env.T, err)
-		out, err := git(nil, "commit", "--no-gpg-sign", "-m", "My change")
+		if len(messageArgs) == 0 {
+			messageArgs = []string{"-m", "My change"}
+		}
+		out, err := git(nil, append([]string{"commit", "--no-gpg-sign"}, messageArgs...)...)
 		require.NoError(env.T, err, out)
-		require.NotEmpty(env.T, trailers.ParseLastParagraphCheckpoints(env.GetCommitMessage(env.GetHeadHash()), trailers.DefaultCommentPrefix), "precondition: the commit is linked")
+		linked := trailers.ParseLastParagraphCheckpoints(env.GetCommitMessage(env.GetHeadHash()), trailers.DefaultCommentPrefix)
+		require.Len(env.T, linked, 1, "precondition: the commit is linked")
+		return linked[0].String()
+	}
+	runGit := func(env *TestEnv, git func([]string, ...string) (string, error), args ...string) {
+		env.T.Helper()
+		out, err := git(nil, args...)
+		require.NoError(env.T, err, out)
+	}
+	// squashOf commits side.txt on a side branch with messageArgs, then
+	// squash-merges it back, and returns the side commit's checkpoint.
+	squashOf := func(env *TestEnv, git func([]string, ...string) (string, error), messageArgs ...string) string {
+		env.T.Helper()
+		runGit(env, git, "checkout", "-q", "-b", "side")
+		sideID := commitLinked(env, git, "side.txt", messageArgs...)
+		runGit(env, git, "checkout", "-q", "-")
+		runGit(env, git, "merge", "--squash", "side")
+		return sideID
+	}
+	// redoOf commits first.txt with messageArgs and resets it away softly, so
+	// the commit under test redoes it, and returns its checkpoint.
+	redoOf := func(env *TestEnv, git func([]string, ...string) (string, error), messageArgs ...string) string {
+		env.T.Helper()
+		firstID := commitLinked(env, git, "first.txt", messageArgs...)
+		runGit(env, git, "reset", "-q", "--soft", "HEAD~1")
+		return firstID
+	}
+	amendLinked := func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
+		commitLinked(env, git, "first.txt")
+		return nil, nil
 	}
 
 	tests := []struct {
 		name   string
 		config map[string]string
-		// setup makes the commit the one under test amends.
-		setup  func(env *TestEnv, git func([]string, ...string) (string, error))
+		// setup prepares what the commit under test amends, squashes or
+		// redoes, and returns the checkpoints the commit must also link and
+		// the ones it must not.
+		setup  func(env *TestEnv, git func([]string, ...string) (string, error)) (inherits, unlinked []string)
 		commit []string
 		// editor is the GIT_EDITOR for the commit, when git opens one.
 		editor string
@@ -61,8 +96,17 @@ func TestTrailerAuthority_RealGitCommits(t *testing.T) {
 		{name: "-m", commit: []string{"-m", "Fix login"}},
 		{name: "-F", commit: []string{"-F", message}},
 		{name: "editor", editor: typeSubject},
-		{name: "--amend", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) { commitLinked(env, git, "first.txt") }, commit: []string{"--amend"}, editor: keep},
-		{name: "--amend --no-edit", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) { commitLinked(env, git, "first.txt") }, commit: []string{"--amend", "--no-edit"}},
+		{name: "--amend", setup: amendLinked, commit: []string{"--amend"}, editor: keep},
+		{name: "--amend --no-edit", setup: amendLinked, commit: []string{"--amend", "--no-edit"}},
+		{name: "merge --squash then editor", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
+			return []string{squashOf(env, git)}, nil
+		}, editor: keep},
+		{name: "merge --squash then -m", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
+			return []string{squashOf(env, git)}, nil
+		}, commit: []string{"-m", "Squash side"}},
+		{name: "redo after reset --soft then editor", setup: func(env *TestEnv, git func([]string, ...string) (string, error)) ([]string, []string) {
+			return []string{redoOf(env, git)}, nil
+		}, editor: typeSubject},
 		{name: "editor with ; comments", config: map[string]string{"core.commentChar": ";"}, editor: typeSubject, prefix: ";"},
 		{name: "editor with whitespace cleanup", config: map[string]string{"commit.cleanup": "whitespace"}, editor: typeSubject, wholeMessage: true},
 		{name: "editor with verbatim cleanup", config: map[string]string{"commit.cleanup": "verbatim"}, editor: typeSubject, wholeMessage: true},
@@ -78,8 +122,9 @@ func TestTrailerAuthority_RealGitCommits(t *testing.T) {
 			for key, value := range tt.config {
 				setRepoGitConfig(env, key, value)
 			}
+			var inherits, unlinked []string
 			if tt.setup != nil {
-				tt.setup(env, git)
+				inherits, unlinked = tt.setup(env, git)
 			}
 			authorityAgentTurn(env, "mine.txt", "my agent work\n")
 			_, err := git(nil, "add", "mine.txt")
@@ -104,6 +149,12 @@ func TestTrailerAuthority_RealGitCommits(t *testing.T) {
 				linked = trailers.ParseLastParagraphCheckpoints(recorded, prefix)
 			}
 			require.NotEmpty(t, linked, "the commit stays linked: %q", recorded)
+			for _, cpID := range inherits {
+				require.Contains(t, linked, id.MustCheckpointID(cpID), "the commit links the checkpoint it inherits: %q", recorded)
+			}
+			for _, cpID := range unlinked {
+				require.NotContains(t, linked, id.MustCheckpointID(cpID), "the commit does not link a checkpoint a squashed or redone message only names: %q", recorded)
+			}
 			require.True(t, advCheckpointStored(env, linked[len(linked)-1].String()), "post-commit condenses into the checkpoint the commit links: %q", recorded)
 			require.False(t, advCheckpointStored(env, advForeignCheckpoint), "no checkpoint the message only names is created: %q", recorded)
 		})
