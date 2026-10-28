@@ -525,13 +525,14 @@ func loginCompleteLine(token, dialled string) string {
 // the raw store error gives those users no way forward (#1036). The hint is
 // skipped when ENTIRE_TOKEN_STORE=file is already set (suggesting it again
 // would be nonsense) and for failures the file store wouldn't help with.
+// A broken config.json is its own error.
 func withHeadlessStoreHint(err error) error {
-	if !errors.Is(err, auth.ErrCredentialStoreWrite) || tokenstore.FileBackendSelected() {
+	if !errors.Is(err, auth.ErrCredentialStoreWrite) || errors.Is(err, tokenstore.ErrBadConfig) || tokenstore.FileBackendSelected() {
 		return err
 	}
 
-	return fmt.Errorf("%w\n\nIf this machine has no usable OS keyring (headless server, container, CI), store tokens in a file instead:\n\n  %s=file entire login\n\nTokens are then written with 0600 permissions to %s (override the location with %s)",
-		err, tokenstore.BackendEnvVar, tokenstore.FileBackendPath(), tokenstore.PathEnvVar)
+	return fmt.Errorf("%w\n\nIf this machine has no usable OS keyring (headless server, container, CI), store tokens in a file instead:\n\n  %s=file entire login\n\nor, to make it stick, put {\"token_store\": \"file\"} in %s.\n\nTokens are then written with 0600 permissions to %s (override the location with %s)",
+		err, tokenstore.BackendEnvVar, tokenstore.ConfigFilePath(), tokenstore.FileBackendPath(), tokenstore.PathEnvVar)
 }
 
 // validateReceivedToken runs minimum-trust checks on the access token

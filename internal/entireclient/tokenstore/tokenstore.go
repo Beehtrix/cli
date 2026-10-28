@@ -5,7 +5,9 @@
 // Service, etc.). Set ENTIRE_TOKEN_STORE=file to use a JSON file instead,
 // which is useful in CI environments that lack a keyring daemon. Without
 // the variable, "token_store": "file" in the per-user config.json does the
-// same, e.g. once in /root/.config/entire for root's unattended jobs.
+// same, e.g. once in /root/.config/entire for root's unattended jobs. A set
+// ENTIRE_TOKEN_STORE, even an empty one, overrides config.json. An unusable
+// config.json is always an error, whatever the environment says.
 //
 // When using the file backend the tokens are stored in
 // $ENTIRE_TOKEN_STORE_PATH (default: tokens.json in the per-user config
@@ -104,16 +106,30 @@ const (
 	PathEnvVar    = "ENTIRE_TOKEN_STORE_PATH"
 )
 
-// FileBackendSelected reports whether the environment selects the file
-// backend — the single predicate shared by backend resolution, provenance
+// FileBackendSelected reports whether the environment or config.json
+// selects the file backend — the single predicate shared by backend resolution, provenance
 // wording, and login's headless hint, so they can never disagree.
-//
-// A set ENTIRE_TOKEN_STORE wins over config.json.
 func FileBackendSelected() bool {
-	if v, ok := os.LookupEnv(BackendEnvVar); ok {
-		return v == "file"
+	return chooseBackend().file
+}
+
+// backendChoice is the backend and its source.
+type backendChoice struct {
+	file       bool
+	fromConfig bool
+	err        error
+}
+
+// chooseBackend: bad config fails; then variable wins.
+func chooseBackend() backendChoice {
+	ts, err := configTokenStore()
+	if err != nil {
+		return backendChoice{err: err}
 	}
-	return configTokenStore() == "file"
+	if v, ok := os.LookupEnv(BackendEnvVar); ok {
+		return backendChoice{file: v == "file"}
+	}
+	return backendChoice{file: ts == "file", fromConfig: ts == "file"}
 }
 
 // BackendDescription names the credential backend the current environment
@@ -122,7 +138,13 @@ func FileBackendSelected() bool {
 // — rather than introspecting the live backend, so test-only overrides don't
 // leak into user-facing wording.
 func BackendDescription() string {
-	if FileBackendSelected() {
+	c := chooseBackend()
+	switch {
+	case c.err != nil:
+		return c.err.Error()
+	case c.fromConfig:
+		return "file " + FileBackendPath() + " (token_store in " + ConfigFilePath() + ")"
+	case c.file:
 		return "file " + FileBackendPath()
 	}
 	return keyringProviderName()
@@ -167,7 +189,11 @@ func fileBackendPathChecked() (string, error) {
 }
 
 func resolveBackendLocked() store {
-	if FileBackendSelected() {
+	c := chooseBackend()
+	if c.err != nil {
+		return errStore{c.err}
+	}
+	if c.file {
 		// Entire owns the directory only when it also picked it: an
 		// explicit PathEnvVar names a location the user chose, and its
 		// mode is theirs to set.
@@ -206,6 +232,13 @@ func Delete(service, user string) error {
 	//nolint:wrapcheck // thin wrapper, callers handle errors
 	return currentBackend().Delete(service, user)
 }
+
+// errStore fails every call with err.
+type errStore struct{ err error }
+
+func (e errStore) Get(string, string) (string, error) { return "", e.err }
+func (e errStore) Set(string, string, string) error   { return e.err }
+func (e errStore) Delete(string, string) error        { return e.err }
 
 // keyringStore delegates to the OS keyring. Every call is bounded by
 // callKeyringWithTimeout: the underlying provider (Secret Service,
