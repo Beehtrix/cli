@@ -81,8 +81,8 @@ func requireSecureDataOverride() error {
 // repository and returns its repo_id for repo-addressed trail reads. It is a
 // package seam so tests can substitute a client pointed at a stub server.
 var newTrailAPIClient = func(ctx context.Context, insecureHTTP bool, forge, owner, repo string) (*api.Client, string, error) {
-	return openTrailRepoClient(ctx, forge, owner, repo, func() (*auth.CellClientFactory, error) {
-		return auth.NewEntireAPICellClientFactory(ctx, insecureHTTP)
+	return openTrailRepoClient(ctx, forge, owner, repo, func() (cellClientBuilder, error) {
+		return newCellClientBuilder(ctx, insecureHTTP)
 	})
 }
 
@@ -97,18 +97,18 @@ type trailRepoClientOpener func(ctx context.Context, forge, owner, repo string) 
 var newTrailRepoClientOpener = func(insecureHTTP bool) trailRepoClientOpener {
 	var (
 		once    sync.Once
-		factory *auth.CellClientFactory
+		factory cellClientBuilder
 		err     error
 	)
 	return func(ctx context.Context, forge, owner, repo string) (*api.Client, string, error) {
-		return openTrailRepoClient(ctx, forge, owner, repo, func() (*auth.CellClientFactory, error) {
-			once.Do(func() { factory, err = auth.NewEntireAPICellClientFactory(ctx, insecureHTTP) })
-			return factory, err //nolint:wrapcheck // openTrailRepoClient maps and wraps auth errors
+		return openTrailRepoClient(ctx, forge, owner, repo, func() (cellClientBuilder, error) {
+			once.Do(func() { factory, err = newCellClientBuilder(ctx, insecureHTTP) })
+			return factory, err
 		})
 	}
 }
 
-func openTrailRepoClient(ctx context.Context, forge, owner, repo string, newFactory func() (*auth.CellClientFactory, error)) (*api.Client, string, error) {
+func openTrailRepoClient(ctx context.Context, forge, owner, repo string, newFactory func() (cellClientBuilder, error)) (*api.Client, string, error) {
 	placement, err := resolveForgeRepoCellPlacement(ctx, forge, owner, repo)
 	if err != nil {
 		return nil, "", err
