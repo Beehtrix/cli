@@ -12,11 +12,10 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/opencode"
-	"github.com/entireio/cli/cmd/entire/cli/api"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 )
 
-func TestConfigureOpenCodeSummaryAndAgentTuning(t *testing.T) {
+func TestConfigureOpenCodeSummaryProvider(t *testing.T) {
 	// Changes CWD and the provider registry; must remain non-parallel.
 	catPath, err := exec.LookPath("cat")
 	if err != nil {
@@ -61,8 +60,9 @@ func TestConfigureOpenCodeSummaryAndAgentTuning(t *testing.T) {
 			t.Fatalf("incorrect provider: %+v", provider)
 		}
 	}
-	agents := []api.ProjectAgent{{ID: "agent-risk", ProjectAgentDefinition: api.ProjectAgentDefinition{Name: "Risk", Instructions: "Evaluate {{branch}}."}}}
-	response := `{"agent-risk":"Evaluate {{branch}} and return a risk assessment."}`
+	// The configured provider generates text end to end: the saved model is
+	// forwarded to OpenCode and its text event comes back as the result.
+	response := "A generated summary."
 	event, err := json.Marshal(map[string]any{"type": "text", "part": map[string]string{"text": response}})
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +78,7 @@ func TestConfigureOpenCodeSummaryAndAgentTuning(t *testing.T) {
 			}
 			i := slices.Index(args, "--model")
 			if i < 0 || args[i+1] != "openai/test" {
-				t.Fatalf("tuning model not forwarded: %v", args)
+				t.Fatalf("summary model not forwarded: %v", args)
 			}
 			return exec.CommandContext(ctx, catPath, path)
 		}}
@@ -88,14 +88,11 @@ func TestConfigureOpenCodeSummaryAndAgentTuning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	changes, skipped, err := runTuning(t.Context(), io.Discard, provider, agents, "synthetic tuning prompt", "")
+	out, err := provider.TextGenerator.GenerateText(t.Context(), "synthetic prompt", provider.Model)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if skipped != 0 || len(changes) != 1 {
-		t.Fatalf("changes = %+v, skipped = %d", changes, skipped)
-	}
-	if changes[0].instructions != "Evaluate {{branch}} and return a risk assessment." {
-		t.Fatalf("instructions = %q", changes[0].instructions)
+	if out != response {
+		t.Fatalf("generated text = %q, want %q", out, response)
 	}
 }

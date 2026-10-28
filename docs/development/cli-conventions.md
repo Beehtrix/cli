@@ -240,17 +240,13 @@ always runnable in every build.
   plus `grant` (`add`/`list`/`remove`): org membership for a `provider:handle`
   grantee, roles owner/admin/member (default member)
 - `project`: control-plane project management — `create`, `list`, `get`, `delete`,
-  plus `agent` (`list`/`add`/`tune`): the project's review agents, configured in
+  plus `agent` (`list`/`add`): the project's review agents, configured in
   entire-api rather than repository files (they replaced the trail runners).
   `add` creates a preset agent for the current repository, or extends the
   project's existing agent of that preset to it (one agent per preset per
-  project). `tune` rewrites agents' instructions for the current repository
-  and asks before a save would reach further: `--presets` for preset agents
-  (a tuned preset agent is custom, so it needs billing enrollment to run) and
-  `--shared` for agents that also review other repositories, which it names.
-  Copies always select only the current repository. Creates send a fresh
-  `Idempotency-Key` and replaces the agent's `If-Match` etag, as entire-api
-  requires. Also
+  project), refusing `--disabled`/`--environment` an existing agent cannot
+  honor. Creates send a fresh `Idempotency-Key` and replaces the agent's
+  `If-Match` etag, as entire-api requires. Also
   `grant` (`add`/`list`/`remove`): project access for a `provider:handle`
   grantee, roles reader/writer/admin; both `add` and `remove` take the grantee
   optionally (see the grant-subtree notes below). `create <name> --owner <ref>`

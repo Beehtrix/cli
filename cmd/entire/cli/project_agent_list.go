@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
+	"github.com/entireio/cli/cmd/entire/cli/tuiutil"
 )
 
 func newProjectAgentListCmd() *cobra.Command {
@@ -53,8 +54,7 @@ func printProjectAgents(cmd *cobra.Command, t *projectAgentTarget, agents []api.
 		if agents == nil {
 			agents = []api.ProjectAgent{}
 		}
-		fmt.Fprintln(w, jsonEncode(agents, true))
-		return nil
+		return printJSON(w, agents)
 	}
 	if len(agents) == 0 {
 		fmt.Fprintf(w, "No agents in %s. List the presets with `entire project agent list --presets` and add one with `entire project agent add <preset>`.\n", t.label())
@@ -81,15 +81,14 @@ func printProjectAgentPresets(cmd *cobra.Command, catalog []api.ProjectAgentPres
 	}
 	w := cmd.OutOrStdout()
 	if jsonRequested(cmd) {
-		fmt.Fprintln(w, jsonEncode(rows, true))
-		return nil
+		return printJSON(w, rows)
 	}
 	if len(rows) == 0 {
 		fmt.Fprintln(w, "No agent presets are available.")
 		return nil
 	}
 	return printTable(w, []string{"PRESET", colHeaderName, "HARNESS", "MODEL", "ADDED", "DESCRIPTION"}, rows, func(p projectAgentPresetJSON) []string {
-		return []string{p.ID, p.Name, p.Agent.Harness, derefOr(p.Agent.Model, "default"), strconv.FormatBool(p.Added), oneLine(p.Description)}
+		return []string{p.ID, p.Name, p.Agent.Harness, derefOr(p.Agent.Model, "default"), strconv.FormatBool(p.Added), tuiutil.SanitizeDisplayText(p.Description)}
 	})
 }
 

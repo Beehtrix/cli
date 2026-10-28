@@ -25,7 +25,7 @@ const projectAgentPresetsPath = "/api/v1/agents/presets"
 func newProjectAgentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "agent",
-		Short: "List, add and tune the project's review agents",
+		Short: "List and add the project's review agents",
 		Long: `Manage the review agents an Entire project runs on pushes.
 
 Agents are configured per project in Entire, not in repository files. Each
@@ -33,9 +33,8 @@ reviews the Changes of the repositories it selects and reports findings and a
 signal (risk, confidence, …) on the trail.
 
 Preset agents are maintained by Entire and run on free credit, so they work
-before billing is set up. A custom agent — including a preset agent whose
-instructions were tuned — runs only once the project's payer is enrolled in
-billing.
+before billing is set up. A custom agent runs only once the project's payer is
+enrolled in billing.
 
 The project is the current repository's (gh/<owner> or et/<project>) unless
 --project names another.`,
@@ -47,7 +46,6 @@ The project is the current repository's (gh/<owner> or et/<project>) unless
 	cmd.PersistentFlags().String("project", "", "Project to manage: gh/<owner> or et/<project> (default: the current repository's)")
 	cmd.AddCommand(newProjectAgentListCmd())
 	cmd.AddCommand(newProjectAgentAddCmd())
-	cmd.AddCommand(newProjectAgentTuneCmd())
 	return cmd
 }
 
@@ -123,7 +121,7 @@ func projectAgentProjectFlag(cmd *cobra.Command) string {
 
 // currentRepoID is the id of the repository the command runs in, which must
 // belong to the target project. Commands that act on "this repo" (add's
-// default selection, tune's scope) use it.
+// default selection) use it.
 func (t *projectAgentTarget) currentRepoID(cmd *cobra.Command) (id, label string, err error) {
 	forge, owner, repo := t.repoForge, t.repoOwner, t.repoName
 	if repo == "" {

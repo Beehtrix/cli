@@ -13,6 +13,7 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
 	"github.com/entireio/cli/cmd/entire/cli/interactive"
+	"github.com/entireio/cli/cmd/entire/cli/tuiutil"
 )
 
 // projectAgentDefaultEnvironment is the environment add creates for a project
@@ -51,10 +52,7 @@ when they ask for different ones.
 
 Agents run in a project environment. With one environment, add uses it; with
 none, it creates one named "Default"; with several, name one with
---environment.
-
-Tune a preset agent's instructions to this repository with
-` + "`entire project agent tune`" + `.`,
+--environment.`,
 		Example: "  entire project agent add security-review\n" +
 			"  entire project agent add --project gh/acme security-review risk",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -139,14 +137,12 @@ func runProjectAgentAdd(cmd *cobra.Command, opts projectAgentAddOptions) error {
 	}
 
 	if jsonRequested(cmd) {
-		fmt.Fprintln(w, jsonEncode(saved, true))
-		return nil
+		return printJSON(w, saved)
 	}
 	if len(saved) == 0 {
 		return nil
 	}
-	fmt.Fprintf(errW, "\n%d agent(s) now review %s in %s. Tune them to this repository with `entire project agent tune`.\n",
-		len(saved), repoLabel, t.label())
+	fmt.Fprintf(errW, "\n%d agent(s) now review %s in %s.\n", len(saved), repoLabel, t.label())
 	return nil
 }
 
@@ -298,7 +294,7 @@ func selectProjectAgentPresets(ctx context.Context, errW io.Writer, names []stri
 func pickProjectAgentPresets(ctx context.Context, errW io.Writer, available []api.ProjectAgentPreset) ([]api.ProjectAgentPreset, error) {
 	options := make([]huh.Option[string], 0, len(available))
 	for _, p := range available {
-		options = append(options, huh.NewOption(p.Name+" — "+oneLine(p.Description), p.ID))
+		options = append(options, huh.NewOption(p.Name+" — "+tuiutil.SanitizeDisplayText(p.Description), p.ID))
 	}
 	var chosen []string
 	// The note is in the title: accessible mode renders no description.
