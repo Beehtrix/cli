@@ -77,15 +77,13 @@ type trailRepoAccess struct {
 }
 
 // lookupTrailChangeReviews reads each change's approvals through its
-// repository's trail route, keyed by change ID. Failures leave a change out:
-// callers list it without state rather than failing the list.
+// repository's trail route, keyed by change ID, sharing one login across the
+// repositories it opens. Failures leave a change out: callers list it without
+// state rather than failing the list.
 func lookupTrailChangeReviews(ctx context.Context, insecure bool, target *projectTrailTarget, local trailRepoAccess, changes []api.ChangeSummary) map[string]trailChangeReviews {
 	ctx, cancel := context.WithTimeout(ctx, trailChangeReviewTimeout)
 	defer cancel()
-	open := func(ctx context.Context, forge, owner, repo string) (*api.Client, string, error) {
-		return newTrailAPIClient(ctx, insecure, forge, owner, repo)
-	}
-	out, _ := lookupTrailChangeData(ctx, open, target, local, changes, readTrailChangeReviews)
+	out, _ := lookupTrailChangeData(ctx, newTrailRepoClientOpener(insecure), target, local, changes, readTrailChangeReviews)
 	return out
 }
 
