@@ -1957,8 +1957,8 @@ func assertAttachIgnoresBodyCheckpoint(t *testing.T, commitMessage string) {
 	}
 
 	headMessage := headCommitOf(t).Message
-	if linked := trailers.ParseLastParagraphCheckpoints(headMessage, trailers.DefaultCommentPrefix); len(linked) == 0 || linked[0] != state.LastCheckpointID {
-		t.Errorf("HEAD's last paragraph should name the attached checkpoint %s, got %v:\n%s",
+	if linked := trailers.ParseAllCheckpointsFromFinalTrailerBlock(headMessage, trailers.DefaultCommentPrefix); len(linked) == 0 || linked[0] != state.LastCheckpointID {
+		t.Errorf("HEAD's final trailer block should name the attached checkpoint %s, got %v:\n%s",
 			state.LastCheckpointID, linked, headMessage)
 	}
 

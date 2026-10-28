@@ -2,7 +2,7 @@
 
 package integration
 
-// Only a commit's last paragraph links it to a checkpoint, and post-commit
+// Only a commit's final trailer block links it to a checkpoint, and post-commit
 // creates only a checkpoint prepare-commit-msg stamped. A checkpoint ID
 // anywhere else in the message (pasted, quoted, or left over from another
 // commit) names a checkpoint the commit did not stamp, so the hooks must stamp
@@ -90,8 +90,8 @@ func TestTrailerAuthority_AgentCommitWithBodyLine(t *testing.T) {
 		"a body line must not claim a checkpoint ID this clone does not have")
 }
 
-// `git commit -C <sha>` reuses another commit's message, its last paragraph
-// included. A teammate's checkpoint this clone has not fetched is not one
+// `git commit -C <sha>` reuses another commit's message, its final trailer
+// block included. A teammate's checkpoint this clone has not fetched is not one
 // prepare-commit-msg stamped, so post-commit must not create it with this
 // session's work.
 func TestTrailerAuthority_ReusedMessageNamingUnfetchedCheckpoint(t *testing.T) {
@@ -140,7 +140,7 @@ func TestTrailerAuthority_TrailerReplacedInTheEditorNamingUnfetchedCheckpoint(t 
 }
 
 // A paragraph added below the trailer prepare-commit-msg stamped (an editor, a
-// commit-msg hook, a chained tool) moves it out of the last paragraph. The
+// commit-msg hook, a chained tool) moves it out of the final trailer block. The
 // stamp record still proves the ID is this commit's, so post-commit must
 // create its checkpoint rather than leave the commit naming a missing one.
 func TestTrailerAuthority_ParagraphAddedBelowTheStampedTrailer(t *testing.T) {
@@ -160,7 +160,7 @@ func TestTrailerAuthority_ParagraphAddedBelowTheStampedTrailer(t *testing.T) {
 	require.NoError(t, err, out)
 
 	recorded := env.GetCommitMessage(env.GetHeadHash())
-	require.Empty(t, trailers.ParseLastParagraphCheckpoints(recorded, ""), "precondition: the stamped trailer is no longer in the last paragraph: %q", recorded)
+	require.Empty(t, trailers.ParseAllCheckpointsFromFinalTrailerBlock(recorded, ""), "precondition: the stamped trailer is no longer in the final trailer block: %q", recorded)
 	ids := trailers.ParseAllCheckpoints(recorded)
 	require.Len(t, ids, 1, "precondition: the commit keeps the stamped trailer: %q", recorded)
 	require.True(t, advCheckpointStored(env, ids[0].String()),
@@ -188,7 +188,7 @@ func TestTrailerAuthority_StampedTrailerBelowAParagraphStaysLinked(t *testing.T)
 
 	head := env.GetHeadHash()
 	recorded := env.GetCommitMessage(head)
-	require.Empty(t, trailers.ParseLastParagraphCheckpoints(recorded, ""), "precondition: the stamped trailer is no longer in the last paragraph: %q", recorded)
+	require.Empty(t, trailers.ParseAllCheckpointsFromFinalTrailerBlock(recorded, ""), "precondition: the stamped trailer is no longer in the final trailer block: %q", recorded)
 	ids := trailers.ParseAllCheckpoints(recorded)
 	require.Len(t, ids, 1, "precondition: the commit keeps the stamped trailer: %q", recorded)
 	stamped := ids[0].String()
@@ -249,7 +249,7 @@ func TestTrailerAuthority_CancelledAmendRestoreThenCommitNamingIt(t *testing.T) 
 	require.NoError(t, err, out)
 
 	final := env.GetCommitMessage(env.GetHeadHash())
-	ids := trailers.ParseLastParagraphCheckpoints(final, "")
+	ids := trailers.ParseAllCheckpointsFromFinalTrailerBlock(final, "")
 	require.Len(t, ids, 2, "prepare stamps its own trailer after the restored one: %q", final)
 	require.True(t, advCheckpointStored(env, ids[1].String()), "the follow-up's work is recorded in its own checkpoint")
 	after, ok := checkpointBlob(env, restored, paths.MetadataFileName)
@@ -257,10 +257,10 @@ func TestTrailerAuthority_CancelledAmendRestoreThenCommitNamingIt(t *testing.T) 
 	require.Equal(t, before, after, "the first commit's checkpoint must not change")
 }
 
-// The last paragraph names a checkpoint this clone does not have, then
+// The final trailer block names a checkpoint this clone does not have, then
 // one it has. Neither is one prepare-commit-msg stamped, so prepare must stamp
 // a fresh trailer, and post-commit must condense there, not into the first.
-func TestTrailerAuthority_LastParagraphNamingUnknownThenExistingCheckpoint(t *testing.T) {
+func TestTrailerAuthority_FinalBlockNamingUnknownThenExistingCheckpoint(t *testing.T) {
 	t.Parallel()
 	env := NewFeatureBranchEnv(t)
 	authorityAgentTurn(env, "first.txt", "first change\n")
@@ -276,11 +276,11 @@ func TestTrailerAuthority_LastParagraphNamingUnknownThenExistingCheckpoint(t *te
 		"message", keepAll, "second.txt")
 
 	require.False(t, advCheckpointStored(env, advForeignCheckpoint),
-		"an unknown checkpoint in the last paragraph is not this commit's stamp: %q", final)
+		"an unknown checkpoint in the final trailer block is not this commit's stamp: %q", final)
 	after, ok := checkpointBlob(env, existing, paths.MetadataFileName)
 	require.True(t, ok)
 	require.Equal(t, before, after, "the existing checkpoint must not change")
-	ids := trailers.ParseLastParagraphCheckpoints(final, "")
+	ids := trailers.ParseAllCheckpointsFromFinalTrailerBlock(final, "")
 	require.Len(t, ids, 3, "prepare stamps its own trailer after the two it did not stamp: %q", final)
 	require.True(t, advCheckpointStored(env, ids[2].String()), "the session's work goes into the trailer prepare stamped")
 }
@@ -306,12 +306,12 @@ func authorityAgentTurn(env *TestEnv, path, content string) {
 	require.NoError(env.T, env.SimulateStop(sess.ID, sess.TranscriptPath))
 }
 
-// requireFreshFinalTrailer returns the checkpoint the commit's last paragraph
+// requireFreshFinalTrailer returns the checkpoint the commit's final trailer block
 // names, requiring it to differ from the one its body mentions.
 func requireFreshFinalTrailer(t *testing.T, message, mentioned string) string {
 	t.Helper()
-	stamped := trailers.ParseLastParagraphCheckpoints(message, "")
-	require.Len(t, stamped, 1, "prepare-commit-msg must stamp a trailer in the last paragraph: %q", message)
+	stamped := trailers.ParseAllCheckpointsFromFinalTrailerBlock(message, "")
+	require.Len(t, stamped, 1, "prepare-commit-msg must stamp a trailer in the final trailer block: %q", message)
 	require.NotEqual(t, mentioned, stamped[0].String(), "the stamped trailer must not reuse the body's ID: %q", message)
 	return stamped[0].String()
 }

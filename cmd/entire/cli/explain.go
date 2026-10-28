@@ -1686,7 +1686,7 @@ func getAssociatedCommits(ctx context.Context, repo *git.Repository, checkpointI
 	commits := []associatedCommit{} // Initialize as empty slice, not nil (nil means "not searched")
 
 	// Any checkpoint the commit links, as explain <commit> reads it: a squash
-	// commit's last paragraph names its squashed commits' checkpoints before
+	// commit's final trailer block names its squashed commits' checkpoints before
 	// the one it stamped.
 	collectCommit := func(c *object.Commit) {
 		if slices.Contains(strategy.CommitCheckpoints(c.Message), checkpointID) {

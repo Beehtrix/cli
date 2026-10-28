@@ -21,18 +21,33 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/trailers"
 )
 
-// stampedTrailer returns the last checkpoint ID in message that
-// prepare-commit-msg stamped itself (recordStampedTrailer). Any other ID
-// (pasted, quoted, reused with `commit -C`, inherited from squashed commits)
-// names a checkpoint this commit did not stamp, and would otherwise suppress
-// the fresh trailer new work needs. A checkpoint deleted from this clone never
-// counts either.
-func stampedTrailer(ctx context.Context, message string, inherited []id.CheckpointID) (id.CheckpointID, bool) {
-	ids := withoutInherited(withoutDeletedCheckpoints(ctx, trailers.ParseAllCheckpoints(message)), checkpointSet(inherited))
+// stampedTrailer returns the checkpoint trailer in message's final trailer
+// block that prepare-commit-msg stamped itself (recordStampedTrailer), the last
+// one, as post-commit picks it. Any other ID there (pasted, reused with
+// `commit -C`, inherited from squashed commits) names a checkpoint this commit
+// did not stamp, and would otherwise suppress the fresh trailer new work
+// needs; so does an ID anywhere else in the message. A checkpoint deleted from
+// this clone never counts either. rules is messageCommentRules' answer for
+// message.
+func stampedTrailer(ctx context.Context, message string, rules commentRules, inherited []id.CheckpointID) (id.CheckpointID, bool) {
+	ids := withoutInherited(withoutDeletedCheckpoints(ctx, preparedFinalTrailers(message, rules)), checkpointSet(inherited))
 	if len(ids) == 0 {
 		return id.EmptyCheckpointID, false
 	}
 	return lastStamped(ids, readStampedTrailers(ctx))
+}
+
+// preparedFinalTrailers returns the checkpoint IDs in the final trailer block
+// of a message prepare-commit-msg was handed, as post-commit will read the
+// recorded commit: cleaned as git will clean it (an edited message still
+// carries git's comment block and, with `commit -v`, a scissors line and diff
+// below the message), then read by git's trailer grammar.
+func preparedFinalTrailers(message string, rules commentRules) []id.CheckpointID {
+	message = trailers.CutAtScissors(message, rules.prefix)
+	if rules.stripped {
+		message = trailers.StripEditorComments(message, rules.prefix)
+	}
+	return trailers.ParseAllCheckpointsFromFinalTrailerBlock(message, rules.trailerPrefix)
 }
 
 // lastStamped returns the last of ids that stamped holds.
@@ -188,12 +203,12 @@ func commitParentCandidates(ctx context.Context) []string {
 // linkedTrailersOf returns the checkpoint trailers commit links
 // (LinkedCheckpoints), plus any trailer prepare-commit-msg stamped that a
 // paragraph added below it (an editor, a commit-msg hook) moved out of the
-// last paragraph, leaving out the ones prepare recorded as inherited and any
+// final trailer block, leaving out the ones prepare recorded as inherited and any
 // checkpoint deleted from this clone: post-commit must never condense new work
 // into a deleted ID, which would re-create it. It also returns, consuming the
 // record, the IDs prepare stamped (see pickCondensationTarget), the committed
 // paths a redo's inherited checkpoints hold, and the stamped trailers found
-// outside the last paragraph.
+// outside the final trailer block.
 func linkedTrailersOf(ctx context.Context, commit *object.Commit) (ids []id.CheckpointID, stamped map[id.CheckpointID]bool, redone map[string]bool, moved []id.CheckpointID) {
 	var parent string
 	if len(commit.ParentHashes) > 0 {
@@ -203,16 +218,16 @@ func linkedTrailersOf(ctx context.Context, commit *object.Commit) (ids []id.Chec
 	inherited, redone = takeInheritedMarker(ctx, parent)
 	stamped = takeStampedTrailers(ctx)
 	linked := LinkedCheckpoints(ctx, commit.Message)
-	moved = stampedOutsideLastParagraph(linked, commit.Message, stamped)
+	moved = stampedOutsideFinalBlock(linked, commit.Message, stamped)
 	ids = withoutInherited(append(slices.Clone(moved), linked...), inherited)
 	return withoutDeletedCheckpoints(ctx, ids), stamped, redone, moved
 }
 
-// stampedOutsideLastParagraph returns the stamped trailers message names
-// outside its last paragraph (linked). The stamp record, not the trailer's
+// stampedOutsideFinalBlock returns the stamped trailers message names outside
+// its final trailer block (linked). The stamp record, not the trailer's
 // position, proves the ID is this commit's. Callers put them before linked, so
-// a stamped trailer in the last paragraph stays the condensation target.
-func stampedOutsideLastParagraph(linked []id.CheckpointID, message string, stamped map[id.CheckpointID]bool) []id.CheckpointID {
+// a stamped trailer in the final trailer block stays the condensation target.
+func stampedOutsideFinalBlock(linked []id.CheckpointID, message string, stamped map[id.CheckpointID]bool) []id.CheckpointID {
 	var moved []id.CheckpointID
 	for _, cpID := range trailers.ParseAllCheckpoints(message) {
 		if stamped[cpID] && !slices.Contains(linked, cpID) {
@@ -225,8 +240,8 @@ func stampedOutsideLastParagraph(linked []id.CheckpointID, message string, stamp
 type recordedCommitLinkKey struct{}
 
 // withRecordedCommitLink marks a post-commit whose condensation target is a
-// stamped trailer outside the commit's last paragraph. Commands that write
-// into a commit's checkpoint read only that paragraph, so the checkpoint
+// stamped trailer outside the commit's final trailer block. Commands that
+// write into a commit's checkpoint read only that block, so the checkpoint
 // records the commit (LinkedCommits) for them to find it by, as attach does
 // for a pushed commit it links without a trailer.
 func withRecordedCommitLink(ctx context.Context, commitSHA string) context.Context {

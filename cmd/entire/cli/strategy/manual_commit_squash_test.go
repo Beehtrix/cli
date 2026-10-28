@@ -59,9 +59,8 @@ func TestPrepareCommitMsg_SquashWithCustomMessageInheritsBranchTrailers(t *testi
 }
 
 // Editor flow: the seeded message lists the squashed commit's trailer indented
-// in its body, where git reads no trailer; the last paragraph must name it,
-// once.
-func TestPrepareCommitMsg_SquashDefaultMessageLinksInheritedTrailerInTheLastParagraph(t *testing.T) {
+// in its body, where git reads no trailer; the final block must name it, once.
+func TestPrepareCommitMsg_SquashDefaultMessageLinksInheritedTrailerInTheFinalBlock(t *testing.T) {
 	dir, branchCheckpoint := squashFixture(t)
 	squashMsg, err := os.ReadFile(filepath.Join(dir, ".git", "SQUASH_MSG"))
 	require.NoError(t, err)
@@ -75,14 +74,14 @@ func TestPrepareCommitMsg_SquashDefaultMessageLinksInheritedTrailerInTheLastPara
 
 	got, err := os.ReadFile(msgFile)
 	require.NoError(t, err)
-	require.Equal(t, []string{branchCheckpoint}, lastParagraphIDs(string(got)), "%q", got)
+	recorded := trailers.StripEditorComments(string(got), trailers.DefaultCommentPrefix)
+	require.Equal(t, []string{branchCheckpoint}, finalBlockIDs(recorded), "%q", got)
 }
 
-// lastParagraphIDs returns the checkpoint IDs in message's last paragraph,
-// skipping "#" comment lines as git's default cleanup drops them.
-func lastParagraphIDs(message string) []string {
+// finalBlockIDs returns the checkpoint IDs in message's final trailer block.
+func finalBlockIDs(message string) []string {
 	var out []string
-	for _, cpID := range trailers.ParseLastParagraphCheckpoints(message, trailers.DefaultCommentPrefix) {
+	for _, cpID := range trailers.ParseAllCheckpointsFromFinalTrailerBlock(message, trailers.DefaultCommentPrefix) {
 		out = append(out, cpID.String())
 	}
 	return out

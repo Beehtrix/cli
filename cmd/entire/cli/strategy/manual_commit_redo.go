@@ -23,7 +23,6 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/osroot"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
-	"github.com/entireio/cli/cmd/entire/cli/trailers"
 )
 
 // maxReplacedCommits bounds how many dropped commits a redo considers.
@@ -37,7 +36,7 @@ const maxReplacedCommits = 200
 // is recommitted, not rewritten, and one coincidentally identical file among
 // rewritten ones is not a redo. Returns what was inherited; the zero redo when
 // nothing applies.
-func (s *ManualCommitStrategy) inheritReplacedCommitsTrailers(ctx context.Context, repo *git.Repository, commitMsgFile, source string) redo {
+func (s *ManualCommitStrategy) inheritReplacedCommitsTrailers(ctx context.Context, repo *git.Repository, commitMsgFile string) redo {
 	logCtx := logging.WithComponent(ctx, "checkpoint")
 	logging.Debug(logCtx, "prepare-commit-msg: checking for redone commits")
 	tip, replaced, why := replacedCommits(ctx, repo)
@@ -129,14 +128,16 @@ func (s *ManualCommitStrategy) inheritReplacedCommitsTrailers(ctx context.Contex
 		return redo{}
 	}
 	message := string(content)
+	rules := messageCommentRules(ctx, message)
+	// Only the final block links; a trailer quoted in the body does not.
 	present := make(map[id.CheckpointID]bool)
-	for _, cpID := range trailers.ParseUnindentedCheckpoints(message) { // a quoted, indented copy is not present
+	for _, cpID := range preparedFinalTrailers(message, rules) {
 		present[cpID] = true
 	}
 	added := 0
 	for _, cpID := range inherited {
 		if !present[cpID] {
-			message = addInheritedCheckpointTrailer(message, cpID, source)
+			message = addCheckpointTrailerAboveComments(message, cpID, rules)
 			added++
 		}
 	}
@@ -261,7 +262,7 @@ func (s *ManualCommitStrategy) reconcileRedoneFiles(ctx context.Context, repo *g
 // withRedoneTrailers adds the trailers of the commits this one redoes to the
 // message and to inherited, and records the combined set for post-commit.
 func (s *ManualCommitStrategy) withRedoneTrailers(ctx context.Context, repo *git.Repository, commitMsgFile, source string, inherited []id.CheckpointID) ([]id.CheckpointID, redo) {
-	redone := s.inheritReplacedCommitsTrailers(ctx, repo, commitMsgFile, source)
+	redone := s.inheritReplacedCommitsTrailers(ctx, repo, commitMsgFile)
 	if len(redone.ids) == 0 {
 		return inherited, redone
 	}
@@ -288,7 +289,7 @@ func (s *ManualCommitStrategy) prepareAmendCommitMsg(ctx context.Context, commit
 		return nil // the amend itself is prepared; folding is best-effort
 	}
 	defer repo.Close()
-	recordInheritedTrailers(ctx, s.inheritReplacedCommitsTrailers(ctx, repo, commitMsgFile, "commit").ids)
+	recordInheritedTrailers(ctx, s.inheritReplacedCommitsTrailers(ctx, repo, commitMsgFile).ids)
 	return nil
 }
 

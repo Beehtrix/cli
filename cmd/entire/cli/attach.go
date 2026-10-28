@@ -641,7 +641,7 @@ func redeliverAttachedCheckpoint(ctx context.Context, w, errW io.Writer, plan at
 type attachLinkMode int
 
 const (
-	// attachJoinExisting: the commit's last paragraph already carries an
+	// attachJoinExisting: the commit's final trailer block already carries an
 	// Entire-Checkpoint trailer, or post-commit recorded an unpushed commit in
 	// its checkpoint; the session joins that checkpoint and history is
 	// unchanged.
@@ -707,7 +707,7 @@ func planAttachLink(ctx context.Context, repo *git.Repository, headCommit *objec
 		return attachLinkPlan{target: target, mode: attachRecordLink, remote: pushTo, holder: holder, checkedRemotes: remotes}, nil
 	}
 	// A paragraph added below the trailer prepare stamped leaves no trailer in
-	// the last one; post-commit recorded the commit in that checkpoint
+	// the final block; post-commit recorded the commit in that checkpoint
 	// instead. Join it rather than rewrite the commit under a second one.
 	if store, openErr := openAttachStore(ctx, repo, opts.committedRefs(ctx)); openErr == nil {
 		if recorded, ok := checkpointLinkedTo(ctx, store, target); ok {
