@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -13,10 +12,11 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/opencode"
+	"github.com/entireio/cli/cmd/entire/cli/api"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 )
 
-func TestConfigureOpenCodeSummaryAndRunner(t *testing.T) {
+func TestConfigureOpenCodeSummaryAndAgentTuning(t *testing.T) {
 	// Changes CWD and the provider registry; must remain non-parallel.
 	catPath, err := exec.LookPath("cat")
 	if err != nil {
@@ -61,13 +61,8 @@ func TestConfigureOpenCodeSummaryAndRunner(t *testing.T) {
 			t.Fatalf("incorrect provider: %+v", provider)
 		}
 	}
-	root := setupRunnersDir(t)
-	writeRunner(t, filepath.Join(root, ".entire", "runners"), "trail-risk", "Evaluate {{ diff }}.")
-	runners, err := loadTuneRunners(root, "risk")
-	if err != nil {
-		t.Fatal(err)
-	}
-	response := `{"trail-risk":"Evaluate {{ diff }} and return a risk assessment."}`
+	agents := []api.ProjectAgent{{ID: "agent-risk", ProjectAgentDefinition: api.ProjectAgentDefinition{Name: "Risk", Instructions: "Evaluate {{branch}}."}}}
+	response := `{"agent-risk":"Evaluate {{branch}} and return a risk assessment."}`
 	event, err := json.Marshal(map[string]any{"type": "text", "part": map[string]string{"text": response}})
 	if err != nil {
 		t.Fatal(err)
@@ -83,29 +78,24 @@ func TestConfigureOpenCodeSummaryAndRunner(t *testing.T) {
 			}
 			i := slices.Index(args, "--model")
 			if i < 0 || args[i+1] != "openai/test" {
-				t.Fatalf("runner model not forwarded: %v", args)
+				t.Fatalf("tuning model not forwarded: %v", args)
 			}
 			return exec.CommandContext(ctx, catPath, path)
 		}}
 	})
 	t.Cleanup(func() { agent.Register(agent.AgentNameOpenCode, opencode.NewOpenCodeAgent) })
-	var output bytes.Buffer
 	provider, err := resolveCheckpointSummaryProvider(t.Context(), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	changes, skipped, err := runTuning(t.Context(), io.Discard, provider, runners, "synthetic tuning prompt", "")
+	changes, skipped, err := runTuning(t.Context(), io.Discard, provider, agents, "synthetic tuning prompt", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := applyTunedRunners(&output, io.Discard, root, changes, skipped, nil); err != nil {
-		t.Fatal(err)
+	if skipped != 0 || len(changes) != 1 {
+		t.Fatalf("changes = %+v, skipped = %d", changes, skipped)
 	}
-	updated, err := loadTuneRunners(root, "risk")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if updated[0].Template != "Evaluate {{ diff }} and return a risk assessment." {
-		t.Fatalf("template = %q", updated[0].Template)
+	if changes[0].instructions != "Evaluate {{branch}} and return a risk assessment." {
+		t.Fatalf("instructions = %q", changes[0].instructions)
 	}
 }

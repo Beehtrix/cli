@@ -73,7 +73,7 @@ Checks performed:
   6. Summary provider: warn when summary_generation.provider names a registered
      agent that cannot generate text (e.g. factoryai-droid), which makes
      'entire checkpoint explain --generate', 'entire dispatch' and
-     'entire runner setup' fail. Reports the file to change; does not rewrite it.
+     'entire project agent tune' fail. Reports the file to change; does not rewrite it.
 
   7. Legacy shadow branches: report entire/<commit>-<worktree> branches older
      versions wrote at every turn. They hold full snapshots of the working
@@ -1500,7 +1500,7 @@ func checkRetiredGeminiHooks(cmd *cobra.Command) {
 // Worth a check of its own because nothing else says a word about it: the
 // settings loader validates only model-without-provider, `entire status` never
 // mentions summary generation, and the resolver's error surfaces at
-// `checkpoint explain --generate` / `dispatch` / `runner setup` — commands a
+// `checkpoint explain --generate` / `dispatch` / `project agent tune` — commands a
 // user may not run for weeks after the edit, by which time the cause is not in
 // view. Read-only; the remedy is the user's choice of provider, and the value
 // may live in a committed settings.json where a rewrite changes everyone's.
@@ -1543,7 +1543,7 @@ func checkSummaryProvider(cmd *cobra.Command) {
 		fmt.Fprintf(w, "  summary_generation.provider is %q in %s, which cannot generate text.\n", name, sourceFile)
 	}
 	fmt.Fprintln(w, "  `entire checkpoint explain --generate`, `entire dispatch`, and")
-	fmt.Fprintln(w, "  `entire runner setup` all fail while it is set.")
+	fmt.Fprintln(w, "  `entire project agent tune` all fail while it is set.")
 	// The command names an INSTALLED provider, not merely a capable one.
 	// summaryCapableProviderNames is deliberately unfiltered by $PATH — it
 	// answers "what does this field accept" — but a command built from its

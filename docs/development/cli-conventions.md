@@ -240,7 +240,18 @@ always runnable in every build.
   plus `grant` (`add`/`list`/`remove`): org membership for a `provider:handle`
   grantee, roles owner/admin/member (default member)
 - `project`: control-plane project management — `create`, `list`, `get`, `delete`,
-  plus `grant` (`add`/`list`/`remove`): project access for a `provider:handle`
+  plus `agent` (`list`/`add`/`tune`): the project's review agents, configured in
+  entire-api rather than repository files (they replaced the trail runners).
+  `add` creates a preset agent for the current repository, or extends the
+  project's existing agent of that preset to it (one agent per preset per
+  project). `tune` rewrites agents' instructions for the current repository
+  and asks before a save would reach further: `--presets` for preset agents
+  (a tuned preset agent is custom, so it needs billing enrollment to run) and
+  `--shared` for agents that also review other repositories, which it names.
+  Copies always select only the current repository. Creates send a fresh
+  `Idempotency-Key` and replaces the agent's `If-Match` etag, as entire-api
+  requires. Also
+  `grant` (`add`/`list`/`remove`): project access for a `provider:handle`
   grantee, roles reader/writer/admin; both `add` and `remove` take the grantee
   optionally (see the grant-subtree notes below). `create <name> --owner <ref>`
   creates without prompting even in a terminal, leaving an omitted `--region`
@@ -816,7 +827,7 @@ and inferred from the origin remote — and the inferred one is the common path.
 Experimental commands (gated by the build version as described above — visible
 and grouped under "Experimental commands:" in developer/nightly builds, hidden
 in stable releases, always runnable): `tokens`, `import`, `review`,
-`blame`, `why`, `experts`, and `runner`.
+`blame`, `why`, and `experts`.
 `tokens` is also advertised through `entire labs`.
 
 Top-level lifecycle and standalone commands: `enable`, `disable`, `status`,

@@ -161,7 +161,6 @@ var agentHelpClassification = map[string]agentHelpFacts{
 	"dispatch": {agentHelpAudienceTaskDriven, false},
 	"doctor":   {agentHelpAudienceTaskDriven, false},
 	"import":   {agentHelpAudienceTaskDriven, false},
-	"runner":   {agentHelpAudienceTaskDriven, false},
 
 	// The user's to start. review is not destructive but spawns a paid
 	// multi-agent run, so an uninvited one spends the user's money.

@@ -33,6 +33,10 @@ func TestControlPlaneJSONFlag_OnlyOnHonoringCommands(t *testing.T) {
 		"project list":   true,
 		"project get":    true,
 		"project delete": false,
+		// list and add render the agents; tune prints a diff, not an object.
+		"project agent list": true,
+		"project agent add":  true,
+		"project agent tune": false,
 		// repo
 		"repo create":        true,
 		"repo list":          true,

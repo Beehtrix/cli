@@ -57,7 +57,7 @@ func TestGatherTrailsUsesNativeRepoBaseForFindings(t *testing.T) {
 }
 
 // TestReadCapped_TruncatesOnARuneBoundary pins that the byte budget does not cut
-// a multi-byte rune in half. The output is embedded in the prompt the runner
+// a multi-byte rune in half. The output is embedded in the prompt tune
 // sends to a model, so an invalid UTF-8 sequence there is a defect the caller
 // cannot see; the callers' constants are labelled "max chars" while the cap is
 // applied in bytes, which is what made this easy to miss.
