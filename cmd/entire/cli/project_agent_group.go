@@ -3,10 +3,12 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"slices"
 	"strings"
 
+	"charm.land/huh/v2"
 	"github.com/spf13/cobra"
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
@@ -242,6 +244,25 @@ func repoNames(names map[string]string, ids []string) string {
 	}
 	slices.Sort(out)
 	return strings.Join(out, ", ")
+}
+
+// runProjectAgentPrompt runs form where the user can see it — stderr when it
+// is a terminal, else the controlling terminal (runPromptFormThen) — so a
+// question never lands in --json output or a captured diff. An abort prints
+// "<action> cancelled." there and reports cancelled, which the caller must
+// treat as "change nothing", not as an answer.
+func runProjectAgentPrompt(ctx context.Context, errW io.Writer, action string, form *huh.Form) (cancelled bool, err error) {
+	_, err = runPromptFormThen(ctx, errW, form, nil, func(render io.Writer, formErr error) error {
+		if formErr == nil {
+			return nil
+		}
+		if cerr := handleFormCancellation(render, action, formErr); cerr != nil {
+			return cerr
+		}
+		cancelled = true
+		return nil
+	})
+	return cancelled, err
 }
 
 // projectAgentCustomLabel names an agent that runs no preset.

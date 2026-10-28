@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -687,6 +688,70 @@ func TestProjectAgentAdd_RefusesFlagsAnExistingAgentCannotHonor(t *testing.T) {
 	}
 }
 
+// Not parallel: replaces the package-level API resolvers.
+func TestProjectAgentAdd_RefusesFlagsForAPresetThatAlreadyCoversTheRepo(t *testing.T) {
+	// risk already reviews widget, so add has nothing to do — but the flags
+	// still ask for something the agent is not, and are refused, not ignored.
+	fake := &fakeAgentsAPI{
+		agents:  []api.ProjectAgent{sampleAgent("01JA", "Risk", "risk")},
+		presets: []api.ProjectAgentPreset{samplePreset("risk")},
+		envs:    []api.ProjectEnvironment{{ID: "01JENV0000000000000000000", Name: "Default"}, {ID: "01JENV0000000000000000009", Name: "GPU"}},
+	}
+	stubProjectAgentAPI(t, fake)
+
+	for _, args := range [][]string{
+		{"add", "risk", "--disabled"},
+		{"add", "risk", "--disabled", "--json"},
+		{"add", "risk", "--environment", "GPU"},
+	} {
+		if _, _, err := executeProjectAgent(t, args...); err == nil {
+			t.Errorf("%v: want a refusal", args)
+		}
+	}
+	if n := len(fake.writesTo(http.MethodPut)) + len(fake.writesTo(http.MethodPost)); n != 0 {
+		t.Errorf("refused requests made %d write(s)", n)
+	}
+}
+
+// Not parallel: replaces the package-level API resolvers.
+func TestProjectAgentAdd_DisabledSendsAnExplicitFalse(t *testing.T) {
+	fake := &fakeAgentsAPI{presets: []api.ProjectAgentPreset{samplePreset("risk")}, envs: []api.ProjectEnvironment{{ID: "01JENV0000000000000000000", Name: "Default"}}}
+	stubProjectAgentAPI(t, fake)
+
+	if _, _, err := executeProjectAgent(t, "add", "risk", "--disabled"); err != nil {
+		t.Fatal(err)
+	}
+	posts := fake.writesTo(http.MethodPost)
+	if len(posts) != 1 {
+		t.Fatalf("POSTs = %+v", posts)
+	}
+	if v, ok := posts[0].Body["is_enabled"]; !ok || v != false {
+		t.Errorf("is_enabled = %v (sent: %v), want an explicit false", v, ok)
+	}
+}
+
+func TestPlanTunedSaves_AbortingTheFinalConfirmSavesNothing(t *testing.T) {
+	old := confirmTuneSolo
+	t.Cleanup(func() { confirmTuneSolo = old })
+	confirmTuneSolo = func(context.Context, io.Writer, int) (bool, bool, error) { return false, true, nil }
+
+	scope := tuneScope{repoID: agentTestRepoID, repoName: "widget"}
+	changes := []tunedAgent{
+		{agent: sampleAgent("01JC", "Docs", ""), instructions: "x"},     // solo custom: confirmed
+		{agent: sampleAgent("01JP", "Risk", "risk"), instructions: "y"}, // preset: copied per --presets
+	}
+	plan, err := planTunedSaves(t.Context(), io.Discard, true, scope, changes, presetTuneCopy, "")
+	if err != nil || plan != nil {
+		t.Fatalf("plan = %v, err = %v; an abort must cancel every save, the preset copy included", plan, err)
+	}
+
+	confirmTuneSolo = func(context.Context, io.Writer, int) (bool, bool, error) { return false, false, nil }
+	plan, err = planTunedSaves(t.Context(), io.Discard, true, scope, changes, presetTuneCopy, "")
+	if err != nil || len(plan) != 2 || plan[0] != tuneSaveSkip || plan[1] != tuneSaveCopy {
+		t.Fatalf("plan = %v, err = %v; answering No skips only the confirmed agents", plan, err)
+	}
+}
+
 func TestCopyFollowUp(t *testing.T) {
 	t.Parallel()
 	scope := tuneScope{repoID: agentTestRepoID, repoName: "widget", names: map[string]string{agentTestOtherRepoID: "frontend"}}
@@ -913,8 +978,16 @@ func TestUniqueAgentName(t *testing.T) {
 	if len(got) > projectAgentMaxName || !utf8.ValidString(got) || !strings.HasSuffix(got, " (widget) 2") {
 		t.Errorf("got %q (%d bytes), want a valid name within %d bytes ending in the numbered suffix", got, len(got), projectAgentMaxName)
 	}
-	if got := uniqueAgentName("Risk", " ("+strings.Repeat("r", 200)+")", nil); len(got) > projectAgentMaxName {
-		t.Errorf("an oversized suffix gave %d bytes", len(got))
+	oversized := " (" + strings.Repeat("r", 200) + ")"
+	first := uniqueAgentName("Risk", oversized, nil)
+	if len(first) > projectAgentMaxName {
+		t.Errorf("an oversized suffix gave %d bytes", len(first))
+	}
+	// With that name taken, the number must survive the shortening; cutting
+	// it off made every attempt the same name and the loop never ended.
+	second := uniqueAgentName("Risk", oversized, []string{first})
+	if len(second) > projectAgentMaxName || !strings.HasSuffix(second, " 2") {
+		t.Errorf("got %q (%d bytes), want a numbered name within the limit", second, len(second))
 	}
 }
 

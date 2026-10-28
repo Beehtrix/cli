@@ -101,10 +101,12 @@ type ProjectEnvironmentInput struct {
 // and no Preset. A replace of a preset agent without Preset customizes it
 // under the same id.
 type ProjectAgentWrite struct {
-	Preset          string                `json:"preset,omitempty"`
-	Name            string                `json:"name,omitempty"`
-	Description     string                `json:"description,omitempty"`
-	IsEnabled       bool                  `json:"is_enabled,omitempty"`
+	Preset      string `json:"preset,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	// IsEnabled is always sent: the API defaults a missing value to false,
+	// but a write should say what it means.
+	IsEnabled       bool                  `json:"is_enabled"`
 	Harness         string                `json:"harness,omitempty"`
 	Model           *string               `json:"model,omitempty"`
 	ReasoningEffort *string               `json:"reasoning_effort,omitempty"`

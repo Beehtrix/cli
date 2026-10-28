@@ -96,21 +96,22 @@ func runProjectAgentAdd(cmd *cobra.Command, opts projectAgentAddOptions) error {
 		return err
 	}
 
-	// Extending an existing agent keeps its enabled state and environment: it
-	// is shared with other repositories. A flag asking for different ones
-	// cannot be honored, so it is refused before anything is written.
-	var extend []api.ProjectAgent
+	// An existing agent keeps its enabled state and environment: it is
+	// shared with other repositories. A flag asking for different ones cannot
+	// be honored, so it is refused before anything is written — for every
+	// named preset the project runs, including one selection skipped because
+	// it already reviews this repository, so no flag is silently ignored.
 	needEnv := opts.environment != ""
 	for _, p := range selected {
-		a, ok := byPreset[strings.ToLower(p.ID)]
-		if !ok {
+		if _, ok := byPreset[strings.ToLower(p.ID)]; !ok {
 			needEnv = true
-			continue
 		}
+	}
+	touched := existingPresetAgents(byPreset, opts.presets, selected)
+	for _, a := range touched {
 		if opts.disabled && a.IsEnabled {
-			return fmt.Errorf("--disabled cannot apply to %s: the project already runs it, enabled, and adding %s extends that agent; drop --disabled, or disable the agent itself", a.Name, repoLabel)
+			return fmt.Errorf("--disabled cannot apply to %s: the project already runs it, enabled, and it is shared with the repositories it reviews; drop --disabled, or disable the agent itself", a.Name)
 		}
-		extend = append(extend, a)
 	}
 	var envID string
 	if needEnv {
@@ -121,9 +122,9 @@ func runProjectAgentAdd(cmd *cobra.Command, opts projectAgentAddOptions) error {
 		}
 	}
 	if opts.environment != "" {
-		for _, a := range extend {
+		for _, a := range touched {
 			if a.EnvironmentID != envID {
-				return fmt.Errorf("--environment %s cannot apply to %s: the project already runs it in environment %s, and adding %s extends that agent; drop --environment", opts.environment, a.Name, a.EnvironmentID, repoLabel)
+				return fmt.Errorf("--environment %s cannot apply to %s: the project already runs it in environment %s; drop --environment", opts.environment, a.Name, a.EnvironmentID)
 			}
 		}
 	}
@@ -209,6 +210,28 @@ func addOrExtendPresetAgent(cmd *cobra.Command, t *projectAgentTarget, p api.Pro
 	return updated, nil
 }
 
+// existingPresetAgents are the project's agents for the named presets and the
+// selected ones, once each: every existing agent the request touches or
+// names, whether it is extended or already reviews this repository.
+func existingPresetAgents(byPreset map[string]api.ProjectAgent, names []string, selected []api.ProjectAgentPreset) []api.ProjectAgent {
+	ids := make([]string, 0, len(names)+len(selected))
+	for _, n := range names {
+		ids = append(ids, strings.ToLower(strings.TrimSpace(n)))
+	}
+	for _, p := range selected {
+		ids = append(ids, strings.ToLower(p.ID))
+	}
+	var out []api.ProjectAgent
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if a, ok := byPreset[id]; ok && !seen[a.ID] {
+			seen[a.ID] = true
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 // presetAgents maps each preset the project runs to its agent. A project runs
 // each preset at most once among its active agents.
 func presetAgents(agents []api.ProjectAgent) map[string]api.ProjectAgent {
@@ -278,15 +301,15 @@ func pickProjectAgentPresets(ctx context.Context, errW io.Writer, available []ap
 		options = append(options, huh.NewOption(p.Name+" — "+oneLine(p.Description), p.ID))
 	}
 	var chosen []string
+	// The note is in the title: accessible mode renders no description.
 	form := NewAccessibleForm(huh.NewGroup(
 		huh.NewMultiSelect[string]().
-			Title("Which preset agents should review this repository?").
-			Description("Preset agents run on Entire's free credit.").
+			Title("Which preset agents should review this repository? Preset agents run on Entire's free credit.").
 			Options(options...).
 			Value(&chosen),
 	))
-	if err := form.RunWithContext(ctx); err != nil {
-		return nil, handleFormCancellation(errW, "Adding agents", err)
+	if cancelled, err := runProjectAgentPrompt(ctx, errW, "Adding agents", form); err != nil || cancelled {
+		return nil, err
 	}
 	var out []api.ProjectAgentPreset
 	for _, p := range available {
@@ -343,8 +366,8 @@ func resolveProjectAgentEnvironment(ctx context.Context, errW io.Writer, t *proj
 	form := NewAccessibleForm(huh.NewGroup(
 		huh.NewSelect[string]().Title("Which environment should the agents run in?").Options(options...).Value(&id),
 	))
-	if err := form.RunWithContext(ctx); err != nil {
-		return "", handleFormCancellation(errW, "Adding agents", err)
+	if cancelled, err := runProjectAgentPrompt(ctx, errW, "Adding agents", form); err != nil || cancelled {
+		return "", err
 	}
 	return id, nil
 }

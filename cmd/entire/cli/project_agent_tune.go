@@ -363,8 +363,10 @@ func planTunedSaves(ctx context.Context, errW io.Writer, ask bool, scope tuneSco
 		}
 	}
 	if ask && n > 0 {
-		ok, err := confirmTuneCustom(ctx, errW, n)
-		if err != nil {
+		// Answering No skips these agents and keeps the other answers; an
+		// abort cancels the whole save, including what was already chosen.
+		ok, cancelled, err := confirmTuneSolo(ctx, errW, n)
+		if err != nil || cancelled {
 			return nil, err
 		}
 		for i, c := range changes {
@@ -534,17 +536,21 @@ func previewTunedAgents(w io.Writer, scope tuneScope, changes []tunedAgent) {
 	}
 }
 
-func confirmTuneCustom(ctx context.Context, errW io.Writer, n int) (bool, error) {
-	ok := true
+// confirmTuneSolo is the final confirmation; a test replaces it to answer or
+// abort without a terminal.
+var confirmTuneSolo = confirmTuneCustom
+
+func confirmTuneCustom(ctx context.Context, errW io.Writer, n int) (ok, cancelled bool, err error) {
+	ok = true
 	form := NewAccessibleForm(huh.NewGroup(
 		huh.NewConfirm().
 			Title(fmt.Sprintf("Save the tuning of %d custom agent(s) that review only this repository?", n)).
 			Value(&ok),
 	))
-	if err := form.RunWithContext(ctx); err != nil {
-		return false, handleFormCancellation(errW, "Tuning", err)
+	if cancelled, err = runProjectAgentPrompt(ctx, errW, "Tuning", form); err != nil || cancelled {
+		return false, cancelled, err
 	}
-	return ok, nil
+	return ok, false, nil
 }
 
 // choosePresetTuneAction asks, after the diff, what to do with tuned preset
@@ -554,8 +560,9 @@ func choosePresetTuneAction(ctx context.Context, errW io.Writer) (presetTuneActi
 	action := presetTuneCopy
 	form := NewAccessibleForm(huh.NewGroup(
 		huh.NewSelect[presetTuneAction]().
-			Title("Preset agents were tuned. How should their tuning be saved?").
-			Description("A tuned preset agent is a custom agent: it runs only once the project's payer is enrolled in billing. Preset agents run on free credit.").
+			// The billing warning is in the title: accessible mode renders no
+			// description, and this is what the answer consents to.
+			Title("Preset agents were tuned. A tuned preset agent is a custom agent, which runs only once the project's payer is enrolled in billing; preset agents run on free credit. How should their tuning be saved?").
 			Options(
 				huh.NewOption("Add a new custom agent for this repository only, disabled, and keep the preset running", presetTuneCopy),
 				huh.NewOption("Replace each preset agent with its tuned custom version", presetTuneConvert),
@@ -563,8 +570,8 @@ func choosePresetTuneAction(ctx context.Context, errW io.Writer) (presetTuneActi
 			).
 			Value(&action),
 	))
-	if err := form.RunWithContext(ctx); err != nil {
-		return "", handleFormCancellation(errW, "Tuning", err)
+	if cancelled, err := runProjectAgentPrompt(ctx, errW, "Tuning", form); err != nil || cancelled {
+		return "", err
 	}
 	return action, nil
 }
@@ -584,8 +591,8 @@ func chooseSharedTuneAction(ctx context.Context, errW io.Writer, scope tuneScope
 			).
 			Value(&action),
 	))
-	if err := form.RunWithContext(ctx); err != nil {
-		return "", handleFormCancellation(errW, "Tuning", err)
+	if cancelled, err := runProjectAgentPrompt(ctx, errW, "Tuning", form); err != nil || cancelled {
+		return "", err
 	}
 	return action, nil
 }
@@ -698,31 +705,34 @@ const projectAgentMaxName = 128
 // uniqueAgentName is base+suffix, numbered if needed, unique among taken
 // ignoring case — the API's rule for active agents — and within the API's
 // name limit: base is shortened (on a rune boundary) rather than the save
-// failing after the provider call it follows.
+// failing after the provider call it follows. The number is reserved first
+// and the suffix shortened around it, so an oversized suffix cannot cut the
+// number off and make every attempt the same name.
 func uniqueAgentName(base, suffix string, taken []string) string {
 	isTaken := func(n string) bool {
 		return slices.ContainsFunc(taken, func(t string) bool { return strings.EqualFold(t, n) })
 	}
-	fit := func(tail string) string {
-		for len(tail) > projectAgentMaxName {
-			_, size := utf8.DecodeLastRuneInString(tail)
-			tail = tail[:len(tail)-size]
-		}
-		b := base
-		for len(b)+len(tail) > projectAgentMaxName && b != "" {
-			_, size := utf8.DecodeLastRuneInString(b)
-			b = b[:len(b)-size]
-		}
-		return strings.TrimRight(b, " ") + tail
+	fit := func(num string) string {
+		tail := trimToBytes(suffix, projectAgentMaxName-len(num)) + num
+		return strings.TrimRight(trimToBytes(base, projectAgentMaxName-len(tail)), " ") + tail
 	}
-	if n := fit(suffix); !isTaken(n) {
+	if n := fit(""); !isTaken(n) {
 		return n
 	}
 	for i := 2; ; i++ {
-		if n := fit(fmt.Sprintf("%s %d", suffix, i)); !isTaken(n) {
+		if n := fit(fmt.Sprintf(" %d", i)); !isTaken(n) {
 			return n
 		}
 	}
+}
+
+// trimToBytes shortens s to at most n bytes on a rune boundary.
+func trimToBytes(s string, n int) string {
+	for len(s) > n && s != "" {
+		_, size := utf8.DecodeLastRuneInString(s)
+		s = s[:len(s)-size]
+	}
+	return s
 }
 
 // writeTuneDebug best-effort writes content to <dir>/<name> for debugging,
