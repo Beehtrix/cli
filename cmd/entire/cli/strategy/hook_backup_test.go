@@ -1403,6 +1403,10 @@ const unguardedRelativeWrapper = "#!/bin/sh\nexec \"$0.pre-entire-brain\" \"$@\"
 // when it does not.
 const andGuardedRelativeWrapper = "#!/bin/sh\n[ -f \"$0.pre-entire-brain\" ] && exec \"$0.pre-entire-brain\" \"$@\"\n"
 
+// codeAfterGuardWrapper is brainWrapper followed by a command that fails,
+// which runs only when the guarded exec does not.
+const codeAfterGuardWrapper = brainWrapper + "echo 'no chained hook' >&2\nexit 1\n"
+
 // brainInstall does what entire-brain's connect does to pre-push: move the
 // hook it finds to pre-push.pre-entire-brain and put its wrapper in front.
 // wrapper is brainWrapper unless given.
@@ -1478,6 +1482,12 @@ func TestRemoveHooks_AfterBrainWrapperLeavesNoEntireHook(t *testing.T) {
 			setup:       func(f *hooksFixture) { f.install(spec); f.brainInstall(andGuardedRelativeWrapper) },
 			placeholder: true, want: "",
 		},
+		// Code after the guarded exec runs only once the copy is gone.
+		"wrapper with code after its guarded exec, no user hook": {
+			wrapper:     codeAfterGuardWrapper,
+			setup:       func(f *hooksFixture) { f.install(spec); f.brainInstall(codeAfterGuardWrapper) },
+			placeholder: true, want: "",
+		},
 		"brain wrapped the user's hook before Entire": {
 			userHook:   true,
 			setup:      func(f *hooksFixture) { f.brainInstall(); f.install(spec) },
@@ -1551,15 +1561,17 @@ func TestGuardsRelative(t *testing.T) {
 		content string
 		want    bool
 	}{
-		"brain wrapper":                 {brainWrapper, true},
-		"if around the copy itself":     {"#!/bin/sh\nif [ -f \"$0.pre-entire-brain\" ]; then exec \"$0.pre-entire-brain\" \"$@\"; fi\n", true},
-		"braced variable":               {"#!/bin/sh\nb=\"${0}.pre-entire-brain\"\nif [ -e \"${b}\" ]; then exec \"${b}\" \"$@\"; fi\n", true},
-		"check that fails without it":   {andGuardedRelativeWrapper, false},
-		"unguarded":                     {unguardedRelativeWrapper, false},
-		"another use of the copy":       {brainWrapper + "cat \"$backup\" >/dev/null\n", false},
-		"guard only in a comment":       {"#!/bin/sh\n# if [ -x \"$0.pre-entire-brain\" ]; then exec \"$0.pre-entire-brain\" \"$@\"; fi\nexec \"$0.pre-entire-brain\" \"$@\"\n", false},
-		"checks another variable":       {"#!/bin/sh\nb=\"$0.pre-entire-brain\"\nif [ -x \"$bb\" ]; then exec \"$bb\" \"$@\"; fi\nexec \"$b\" \"$@\"\n", false},
-		"variable that is not the copy": {"#!/bin/sh\nb=\"$0.other\"\nif [ -x \"$b\" ]; then exec \"$b\" \"$@\"; fi\nexec \"$0.pre-entire-brain\" \"$@\"\n", false},
+		"brain wrapper":                  {brainWrapper, true},
+		"if around the copy itself":      {"#!/bin/sh\nif [ -f \"$0.pre-entire-brain\" ]; then exec \"$0.pre-entire-brain\" \"$@\"; fi\n", true},
+		"braced variable":                {"#!/bin/sh\nb=\"${0}.pre-entire-brain\"\nif [ -e \"${b}\" ]; then exec \"${b}\" \"$@\"; fi\n", true},
+		"check that fails without it":    {andGuardedRelativeWrapper, false},
+		"unguarded":                      {unguardedRelativeWrapper, false},
+		"code after the guarded exec":    {codeAfterGuardWrapper, false},
+		"comment after the guarded exec": {brainWrapper + "\n# end of chain\n", true},
+		"another use of the copy":        {brainWrapper + "cat \"$backup\" >/dev/null\n", false},
+		"guard only in a comment":        {"#!/bin/sh\n# if [ -x \"$0.pre-entire-brain\" ]; then exec \"$0.pre-entire-brain\" \"$@\"; fi\nexec \"$0.pre-entire-brain\" \"$@\"\n", false},
+		"checks another variable":        {"#!/bin/sh\nb=\"$0.pre-entire-brain\"\nif [ -x \"$bb\" ]; then exec \"$bb\" \"$@\"; fi\nexec \"$b\" \"$@\"\n", false},
+		"variable that is not the copy":  {"#!/bin/sh\nb=\"$0.other\"\nif [ -x \"$b\" ]; then exec \"$b\" \"$@\"; fi\nexec \"$0.pre-entire-brain\" \"$@\"\n", false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
