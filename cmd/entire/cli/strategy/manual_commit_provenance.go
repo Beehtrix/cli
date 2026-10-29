@@ -220,11 +220,12 @@ func withStampedOutsideLastParagraph(linked []id.CheckpointID, message string, s
 }
 
 // stampedTrailersFile lists the trailers prepare-commit-msg stamped since the
-// last post-commit: IDs it generated or took from a session's reservation, and
-// ones an amend restored. Post-commit may create the checkpoint of only these
-// (pickCondensationTarget). Per worktree, like inheritedTrailersFile. An entry
-// a commit that never happened left stays until the next post-commit; it
-// names a checkpoint only this clone minted, so no commit can steal it.
+// last post-commit: IDs it generated or took from a session's reservation. An
+// amend's restored trailer names an existing checkpoint and is not listed.
+// Post-commit may create the checkpoint of only these (pickCondensationTarget).
+// Per worktree, like inheritedTrailersFile. An entry a commit that never
+// happened left stays until the next post-commit; it names a checkpoint only
+// this clone minted and nothing holds, so no commit can steal it.
 const stampedTrailersFile = "entire-stamped-trailers.json"
 
 // recordStampedTrailer adds cpID to the trailers prepare-commit-msg stamped,

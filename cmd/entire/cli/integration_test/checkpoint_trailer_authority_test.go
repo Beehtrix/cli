@@ -167,6 +167,51 @@ func TestTrailerAuthority_ParagraphAddedBelowTheStampedTrailer(t *testing.T) {
 		"the session's work belongs in the checkpoint prepare stamped, wherever the message moved it")
 }
 
+// An amend that restores the session's last trailer and is then cancelled
+// must not leave that existing ID looking like a later commit's own stamp. A
+// follow-up commit naming it gets a trailer of its own, and its work is
+// recorded there, as it would be had the amend never run.
+func TestTrailerAuthority_CancelledAmendRestoreThenCommitNamingIt(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	git := gitWithEntireCommitHooksEnv(t, env)
+	editors := t.TempDir()
+	writeScripts(t, editors, map[string]string{
+		// Leaves only the trailer, so commit-msg strips it and git aborts.
+		"cancel": "#!/bin/sh\ngrep -E '^(Entire-Checkpoint|#)' \"$1\" > \"$1.new\"; mv \"$1.new\" \"$1\"\n",
+	})
+	authorityAgentTurn(env, "first.txt", "first\n")
+	_, err := git(nil, "add", "first.txt")
+	require.NoError(t, err)
+	out, err := git(nil, "commit", "--no-gpg-sign", "-m", "First")
+	require.NoError(t, err, out)
+	restored := env.GetCheckpointIDFromCommitMessage(env.GetHeadHash())
+	require.NotEmpty(t, restored, "precondition: the first commit is linked")
+	before, ok := checkpointBlob(env, restored, paths.MetadataFileName)
+	require.True(t, ok, "precondition: the first checkpoint is stored")
+
+	// Reword without the trailer, so a plain --amend restores it.
+	out, err = git(nil, "commit", "--no-gpg-sign", "--amend", "-m", "First, reworded")
+	require.NoError(t, err, out)
+	editor := "GIT_EDITOR=" + shellQuote(filepath.ToSlash(filepath.Join(editors, "cancel")))
+	out, err = git([]string{editor}, "commit", "--no-gpg-sign", "--amend")
+	require.Error(t, err, "precondition: the amend is cancelled: %s", out)
+
+	authorityAgentTurn(env, "second.txt", "second\n")
+	_, err = git(nil, "add", "second.txt")
+	require.NoError(t, err)
+	out, err = git(nil, "commit", "--no-gpg-sign", "-m", "Follow-up\n\nEntire-Checkpoint: "+restored)
+	require.NoError(t, err, out)
+
+	final := env.GetCommitMessage(env.GetHeadHash())
+	ids := trailers.ParseLastParagraphCheckpoints(final, "")
+	require.Len(t, ids, 2, "prepare stamps its own trailer after the restored one: %q", final)
+	require.True(t, advCheckpointStored(env, ids[1].String()), "the follow-up's work is recorded in its own checkpoint")
+	after, ok := checkpointBlob(env, restored, paths.MetadataFileName)
+	require.True(t, ok)
+	require.Equal(t, before, after, "the first commit's checkpoint must not change")
+}
+
 // The last paragraph names a checkpoint this clone does not have, then
 // one it has. Neither is one prepare-commit-msg stamped, so prepare must stamp
 // a fresh trailer, and post-commit must condense there, not into the first.

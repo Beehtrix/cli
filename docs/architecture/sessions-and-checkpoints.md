@@ -300,9 +300,12 @@ quoted, indented, or mentioned in prose) is not the commit's link.
   `LinkedCheckpoints`.
 - **Stamp.** Prepare-commit-msg still reads the whole draft, but an ID there
   counts as already stamped (`stampedTrailer`) only when prepare recorded
-  stamping it: each ID it stamps (one it generates, a session's reserved one,
-  or the one an amend restores) goes into `entire-stamped-trailers.json` in
-  the per-worktree git dir until the next post-commit, which consumes it.
+  stamping it: each ID it stamps (one it generates, or a session's reserved
+  one) goes into `entire-stamped-trailers.json` in the per-worktree git dir
+  until the next post-commit, which consumes it. The trailer an amend
+  restores names an existing checkpoint and is not recorded: post-commit
+  condenses into it for its owner without a stamp, and a record a cancelled
+  amend left would let a later commit naming it skip its own trailer.
   Prepare writes a trailer only once its stamp is recorded
   (`recordStampedTrailer`). A draft that already names another ID (pasted
   into `-m`, `-F` or a template) gets prepare's own trailer after it.
@@ -310,8 +313,8 @@ quoted, indented, or mentioned in prose) is not the commit's link.
   commit links (`pickCondensationTarget`). A stamped ID that a paragraph added
   below it (an editor, a `commit-msg` hook) moved out of the last paragraph
   still counts: the stamp record, not its position, makes it the commit's.
-  Without one (an amend that kept its
-  trailer, a sequence operation) it condenses only into the last linked ID
+  Without one (an amend that kept or restored its trailer, a sequence
+  operation) it condenses only into the last linked ID
   whose checkpoint exists, and only for the session that owns it
   (`stampedByAnotherCommit`). It never creates a checkpoint prepare did not
   stamp, so a teammate's checkpoint this clone has not fetched is never

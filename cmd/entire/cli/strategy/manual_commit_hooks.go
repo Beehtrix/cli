@@ -873,11 +873,11 @@ func (s *ManualCommitStrategy) handleAmendCommitMsg(ctx context.Context, commitM
 		cpID := state.LastCheckpointID
 		source := "LastCheckpointID"
 
-		// Restore the trailer
+		// Restore the trailer. It is not recorded as stamped: post-commit
+		// condenses into an existing checkpoint for the session that owns it
+		// without a stamp, and a record left by a cancelled amend would let a
+		// later commit naming this ID skip its own trailer.
 		message = addCheckpointTrailer(message, cpID)
-		if !recordStampedTrailer(ctx, cpID) {
-			return nil
-		}
 		if writeErr := os.WriteFile(commitMsgFile, []byte(message), 0o600); writeErr != nil { //nolint:gosec // path from git hook arg
 			return nil
 		}
