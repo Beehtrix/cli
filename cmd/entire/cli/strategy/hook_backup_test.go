@@ -1599,6 +1599,8 @@ func TestRunsRelative(t *testing.T) {
 		"copy with a longer name":  {"#!/bin/sh\nexec \"$0.old.1\" \"$@\"\n", "pre-push", "pre-push.old", false},
 		"other hook's copy":        {brainWrapper, "pre-commit", "pre-push.pre-entire-brain", false},
 		"names the copy literally": {toolWrapper("pre-push.pre-entire-brain", "/dev/null"), "pre-push", "pre-push.pre-entire-brain", false},
+		"trailing comment":         {"#!/bin/sh\nexit 0 # ran \"$0.pre-entire-brain\"\n", "pre-push", "pre-push.pre-entire-brain", false},
+		"name continues with +":    {"#!/bin/sh\nexec \"$0.pre-entire-brain+v2\" \"$@\"\n", "pre-push", "pre-push.pre-entire-brain", false},
 		"only a comment":           {"#!/bin/sh\n# chains to \"$0.pre-entire-brain\" in older versions\nexit 0\n", "pre-push", "pre-push.pre-entire-brain", false},
 		"Entire's own hook":        {specFor(t, prePushHook).content + "# $0.pre-entire-brain\n", "pre-push", "pre-push.pre-entire-brain", false},
 	} {
@@ -1652,4 +1654,62 @@ func TestRemoveHooks_RelativeReferenceOnlyWhereItRuns(t *testing.T) {
 			t.Errorf("pre-push%s left behind", backupSuffix)
 		}
 	})
+}
+
+// Kilo review: a trailing comment is not a chain, a reference to a longer
+// file name is not one to the copy, and a relative wrapper that is also in
+// .pre-entire (its manager installed again over Entire) is not the user's hook
+// to move behind it.
+func TestRemoveHooks_RelativeWrapperLookalikes(t *testing.T) {
+	t.Parallel()
+	spec := specFor(t, prePushHook)
+	const brainCopy = "pre-push.pre-entire-brain"
+	for name, hook := range map[string]string{
+		"trailing comment": "#!/bin/sh\nexit 0 # formerly ran \"$0.pre-entire-brain\"\n",
+		"longer name":      "#!/bin/sh\nif [ -x \"$0.pre-entire-brain+v2\" ]; then exec \"$0.pre-entire-brain+v2\" \"$@\"; fi\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newHooksFixture(t)
+			f.write("pre-push", hook)
+			f.write("pre-push"+backupSuffix, userHookV1)
+			f.write(brainCopy, spec.content)
+
+			if _, err := removeHooks(context.Background(), f.lockRoot, f.root, f.dir, restoreMovedHooks); err != nil {
+				t.Fatalf("removeHooks: %v", err)
+			}
+
+			assertHooks(t, f, map[string]string{"pre-push": hook, "pre-push" + backupSuffix: userHookV1})
+		})
+	}
+	for name, tc := range map[string]struct {
+		wrapper     string
+		placeholder bool
+	}{
+		"guarded wrapper installed again":   {brainWrapper, false},
+		"unguarded wrapper installed again": {unguardedRelativeWrapper, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newHooksFixture(t)
+			f.write("pre-push", tc.wrapper)
+			f.write("pre-push"+backupSuffix, tc.wrapper)
+			f.write(brainCopy, spec.content)
+
+			if _, err := removeHooks(context.Background(), f.lockRoot, f.root, f.dir, restoreMovedHooks); err != nil {
+				t.Fatalf("removeHooks: %v", err)
+			}
+
+			assertHooks(t, f, map[string]string{"pre-push": tc.wrapper})
+			switch {
+			case tc.placeholder:
+				assertHooks(t, f, map[string]string{brainCopy: noopMovedHook})
+			case f.exists(brainCopy):
+				t.Errorf("%s left behind: %q", brainCopy, f.read(brainCopy))
+			}
+			if f.exists("pre-push" + backupSuffix) {
+				t.Errorf("pre-push%s left behind", backupSuffix)
+			}
+		})
+	}
 }

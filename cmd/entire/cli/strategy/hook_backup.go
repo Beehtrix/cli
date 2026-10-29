@@ -539,8 +539,8 @@ func runsRelative(root *os.Root, name, at, moved string) bool {
 }
 
 // foreignShellCode reads name, a regular file that is not Entire's, without
-// its whole-line comments, so a path a comment mentions is not taken for one
-// the script runs.
+// its comments, so a path a comment mentions is not taken for one the script
+// runs.
 func foreignShellCode(root *os.Root, name string) ([]byte, bool) {
 	data, err := osroot.ReadFileNoFollow(root, name)
 	if err != nil || bytes.Contains(data, []byte(entireHookMarker)) {
@@ -548,11 +548,23 @@ func foreignShellCode(root *os.Root, name string) ([]byte, bool) {
 	}
 	var code []byte
 	for line := range bytes.Lines(data) {
-		if !bytes.HasPrefix(bytes.TrimSpace(line), []byte("#")) {
-			code = append(code, line...)
-		}
+		code = append(code, stripShellComment(line)...)
+		code = append(code, '\n')
 	}
 	return code, true
+}
+
+// stripShellComment cuts line at a # that starts a word, ignoring quotes: a
+// # inside a quoted string then cuts too much, which only makes a reference
+// harder to find.
+func stripShellComment(line []byte) []byte {
+	line = bytes.TrimRight(line, "\r\n")
+	for i, b := range line {
+		if b == '#' && (i == 0 || line[i-1] == ' ' || line[i-1] == '\t') {
+			return line[:i]
+		}
+	}
+	return line
 }
 
 // relativeRefs returns how code, run from at, refers to moved: "$0<suffix>"
@@ -565,7 +577,7 @@ func relativeRefs(code []byte, at, moved string) []string {
 	}
 	var direct []string
 	for _, ref := range []string{"$0" + suffix, "${0}" + suffix} {
-		if endsFileName(code, ref) {
+		if endsShellWord(code, ref) {
 			direct = append(direct, ref)
 		}
 	}
@@ -620,7 +632,7 @@ func guardsRelative(root *os.Root, name, at, moved string) bool {
 			// Runs only once moved is gone, so it could fail the hook.
 			return false
 		}
-		if !slices.ContainsFunc(refs, func(ref string) bool { return endsFileName([]byte(l), ref) }) {
+		if !slices.ContainsFunc(refs, func(ref string) bool { return endsShellWord([]byte(l), ref) }) {
 			continue
 		}
 		switch {
@@ -654,16 +666,17 @@ func isRelativeAssignment(line string, refs []string) bool {
 		(strings.HasPrefix(value, "$0") || strings.HasPrefix(value, "${0}")) && slices.Contains(refs, value)
 }
 
-// endsFileName finds ref in data followed by a byte that cannot continue a
-// file name, so "$0.pre-entire-brain" does not match "$0.pre-entire-brain.old".
-func endsFileName(data []byte, ref string) bool {
+// endsShellWord finds ref in data where the shell word it starts ends: at
+// the end, a quote, a blank or an operator. A file name may hold almost any
+// other byte, so "$0.old+v2" does not refer to <hook>.old.
+func endsShellWord(data []byte, ref string) bool {
 	for i := 0; ; {
 		j := bytes.Index(data[i:], []byte(ref))
 		if j < 0 {
 			return false
 		}
 		end := i + j + len(ref)
-		if end == len(data) || !isFileNameByte(data[end]) {
+		if end == len(data) || strings.IndexByte("\"' \t\r\n;|&()<>`", data[end]) >= 0 {
 			return true
 		}
 		i = end
@@ -868,7 +881,11 @@ func restoreWrapped(root *os.Root, hook string) error {
 			// The manager installed over Entire before any reclaim: the user's
 			// hook is still in .pre-entire, which the wrapper does not run.
 			switch {
-			case hookFileExists(root, backup) && !carriesEntireMarker(root, backup) && !runsByName(root, backup, m):
+			case hookFileExists(root, backup) && !carriesEntireMarker(root, backup) && !runsByName(root, backup, m) &&
+				(!runsRelative(root, hook, hook, m) || !runsRelative(root, backup, hook, m)):
+				// Not when both are relative wrappers: the manager installed
+				// again over Entire, and its copy moved into m would look for
+				// m+suffix rather than run anything the user had.
 				err = root.Rename(backup, m)
 			case runsRelative(root, hook, hook, m):
 				err = clearRelativeCopy(root, hook, hook, m)
