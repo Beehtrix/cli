@@ -150,21 +150,12 @@ func outerPushHeldError(name, why string) error {
 	return fmt.Errorf("%w: this push includes %s, and %s. %s", ErrOuterPushCarriesHeldCheckpoints, name, why, outerPushHowTo)
 }
 
-// checkOuterPushOfHeldCommits refuses the push when a line whose source is a
-// commit or an expression sends the current version of a waiting checkpoint,
-// such as `git push origin <commit>:refs/heads/copy`. When the repository or
-// the queue cannot be read there is nothing to compare against, and the push
-// is not blocked over it.
+// checkOuterPushOfHeldCommits refuses the push when any line sends the
+// current version of a waiting checkpoint under another name: a commit or an
+// expression (`git push origin <commit>:refs/heads/copy`), or a branch or tag
+// created at that commit. When the repository or the queue cannot be read
+// there is nothing to compare against, and the push is not blocked over it.
 func checkOuterPushOfHeldCommits(ctx context.Context, lines []PrePushRef, why string) error {
-	var commitLines []PrePushRef
-	for _, line := range lines {
-		if namesCommitNotRef(line.LocalRef) {
-			commitLines = append(commitLines, line)
-		}
-	}
-	if len(commitLines) == 0 {
-		return nil
-	}
 	repo, err := OpenRepository(ctx)
 	if err != nil {
 		logging.Warn(ctx, "pre-push: cannot open repository to check pushed commits", slog.String("error", err.Error()))
@@ -182,7 +173,7 @@ func checkOuterPushOfHeldCommits(ctx context.Context, lines []PrePushRef, why st
 			tips[r.Hash()] = ref
 		}
 	}
-	for _, line := range commitLines {
+	for _, line := range lines {
 		if ref, held := tips[plumbing.NewHash(line.LocalSHA)]; held {
 			return fmt.Errorf("%w: this push sends %s, the current version of %s, and %s. %s",
 				ErrOuterPushCarriesHeldCheckpoints, line.LocalRef, ref, why, outerPushHowTo)

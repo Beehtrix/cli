@@ -434,6 +434,25 @@ func TestCheckpointPush_AlreadyUploadedSucceeds(t *testing.T) {
 	require.Equal(t, "not_waiting", result.status(t, work))
 }
 
+// A bare push only lists, which is a text view. With --json it is refused,
+// as JSON, and points at the listing that has a JSON form.
+func TestCheckpointPush_BareJSONIsRefusedAsJSON(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+
+	stdout, _, err := runCheckpointPush(t, env, false, "--json")
+
+	require.Error(t, err)
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(stdout), &parsed), "stdout must be JSON: %q", stdout)
+	require.Contains(t, parsed.Error, "entire checkpoint list --outgoing --json")
+}
+
 // Callers that pass --json read stdout as JSON, failures included.
 func TestCheckpointPush_JSONRefusalIsJSON(t *testing.T) {
 	t.Parallel()
@@ -657,6 +676,16 @@ func TestCheckpointPushPolicy_ManualRefusesExplicitCheckpointPush(t *testing.T) 
 		{name: "by expression", args: func(t *testing.T, env *TestEnv) []string {
 			t.Helper()
 			return []string{"origin", "HEAD", onlyOutgoingRef(t, env) + "~0:refs/heads/held-copy"}
+		}},
+		{name: "branch at the checkpoint's commit", args: func(t *testing.T, env *TestEnv) []string {
+			t.Helper()
+			testutil.RunGit(t, env.RepoDir, "branch", "held-copy", onlyOutgoingRef(t, env))
+			return []string{"origin", "HEAD", "held-copy"}
+		}},
+		{name: "tag at the checkpoint's commit", args: func(t *testing.T, env *TestEnv) []string {
+			t.Helper()
+			testutil.RunGit(t, env.RepoDir, "tag", "held-tag", onlyOutgoingRef(t, env))
+			return []string{"origin", "HEAD", "refs/tags/held-tag"}
 		}},
 		{name: "v1 branch", args: func(t *testing.T, env *TestEnv) []string {
 			t.Helper()
