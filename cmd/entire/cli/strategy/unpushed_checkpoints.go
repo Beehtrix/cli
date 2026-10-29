@@ -64,7 +64,11 @@ type OutgoingCheckpoints struct {
 // ref is sent whether or not its name parses. It reads local state only, and
 // returns ErrOutgoingNeedsGitRefs on the git-branch backend.
 func ListOutgoingCheckpoints(ctx context.Context) (OutgoingCheckpoints, error) {
-	if !primaryIsGitRefs(ctx) {
+	isRefs, err := primaryBackendIsGitRefs(ctx)
+	if err != nil {
+		return OutgoingCheckpoints{}, err
+	}
+	if !isRefs {
 		return OutgoingCheckpoints{}, ErrOutgoingNeedsGitRefs
 	}
 	repo, err := OpenRepository(ctx)

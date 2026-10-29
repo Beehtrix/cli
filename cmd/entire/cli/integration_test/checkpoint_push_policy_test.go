@@ -1004,3 +1004,40 @@ func TestConfigure_PolicyNotSavedWhenBackendSwitchFails(t *testing.T) {
 	require.Error(t, err, "the backend save must fail for this test to mean anything")
 	require.NoFileExists(t, gitCommonDirFile(t, env, settings.CheckpointPushPolicyFile), "manual must not be saved when the backend switch failed")
 }
+
+// The policy applies to git-refs only, so on git-branch status must not report
+// it, and a policy file it cannot read is not a warning there.
+func TestCheckpointPushPolicy_StatusIgnoresPolicyOnGitBranch(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "approved")
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+
+	var status struct {
+		Policy      string `json:"checkpoint_push_policy"`
+		PolicyError string `json:"checkpoint_push_policy_error"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(cliStdout(t, env, "status", "--json")), &status))
+	require.Empty(t, status.Policy)
+	require.Empty(t, status.PolicyError)
+	require.NotContains(t, cliStdout(t, env, "status"), "push policy")
+}
+
+// A checkpoints block that cannot be read is a config error to fix, not a
+// sign the repository uses git-branch.
+func TestCheckpointPush_UnreadableBackendNamesTheConfigError(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	env.SetupBareRemote()
+	env.CheckpointStore = ""
+	env.PatchSettings(map[string]any{
+		"checkpoints": map[string]any{"primary": map[string]any{"type": ""}},
+	})
+
+	_, stderr, err := runCheckpointPush(t, env, true, "--all")
+
+	require.Error(t, err)
+	require.NotContains(t, stderr, "git-branch")
+	require.Contains(t, stderr, "checkpoints.primary.type")
+}

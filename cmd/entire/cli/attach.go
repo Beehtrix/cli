@@ -1078,10 +1078,10 @@ func reportHeldAttachedCheckpoint(ctx context.Context, w io.Writer, checkpointID
 			return fmt.Errorf("checkpoint %s was written locally but not pushed: %w", checkpointID, err)
 		}
 		if onRef {
-			return fmt.Errorf("checkpoint %s was written locally but not queued for upload, so 'entire checkpoint push' can't send it yet; run 'entire attach' again to queue it", checkpointID)
+			return fmt.Errorf("checkpoint %s was written locally but not queued for upload, so 'entire checkpoint push' can't send it yet; run 'entire session attach' again to queue it", checkpointID)
 		}
 		if checkpointID.Kind() == id.KindULID {
-			return fmt.Errorf("checkpoint %s was not found after it was written; run 'entire attach' again", checkpointID)
+			return fmt.Errorf("checkpoint %s was not found after it was written; run 'entire session attach' again", checkpointID)
 		}
 		fmt.Fprintf(w, "  Checkpoint %s is on the old checkpoint branch, which 'entire checkpoint push' can't upload; run 'entire doctor migrate-checkpoints' to move it to checkpoint refs, then upload it with: entire checkpoint push %s\n", checkpointID, checkpointID)
 		return nil
