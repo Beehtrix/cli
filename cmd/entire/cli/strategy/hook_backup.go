@@ -526,174 +526,6 @@ func namesFile(data []byte, file string) bool {
 	}
 }
 
-// runsRelative: name is a regular file, not Entire's, that, placed at the
-// path at, runs moved through a path relative to its own: "$0<suffix>" or
-// "${0}<suffix>", where moved is at+suffix. entire-brain's pre-push wrapper
-// chains to "$0.pre-entire-brain" this way. Such a wrapper stops running moved
-// once it is itself moved, as Entire's install moves it to .pre-entire, so
-// only uninstall, which puts the wrapper back at the hook path, has to look
-// for it.
-func runsRelative(root *os.Root, name, at, moved string) bool {
-	code, ok := foreignShellCode(root, name)
-	return ok && len(relativeRefs(code, at, moved)) > 0
-}
-
-// foreignShellCode reads name, a regular file that is not Entire's, without
-// its comments, so a path a comment mentions is not taken for one the script
-// runs.
-func foreignShellCode(root *os.Root, name string) ([]byte, bool) {
-	data, err := osroot.ReadFileNoFollow(root, name)
-	if err != nil || bytes.Contains(data, []byte(entireHookMarker)) {
-		return nil, false
-	}
-	var code []byte
-	for line := range bytes.Lines(data) {
-		code = append(code, stripShellComment(line)...)
-		code = append(code, '\n')
-	}
-	return code, true
-}
-
-// stripShellComment cuts line at a # that starts a word, ignoring quotes: a
-// # inside a quoted string then cuts too much, which only makes a reference
-// harder to find.
-func stripShellComment(line []byte) []byte {
-	line = bytes.TrimRight(line, "\r\n")
-	for i, b := range line {
-		if b == '#' && (i == 0 || line[i-1] == ' ' || line[i-1] == '\t') {
-			return line[:i]
-		}
-	}
-	return line
-}
-
-// relativeRefs returns how code, run from at, refers to moved: "$0<suffix>"
-// or "${0}<suffix>" where moved is at+suffix, and "$v"/"${v}" for each
-// variable v assigned one of those.
-func relativeRefs(code []byte, at, moved string) []string {
-	suffix, ok := strings.CutPrefix(moved, at)
-	if !ok || len(suffix) < 2 || suffix[0] != '.' {
-		return nil
-	}
-	var direct []string
-	for _, ref := range []string{"$0" + suffix, "${0}" + suffix} {
-		if endsShellWord(code, ref) {
-			direct = append(direct, ref)
-		}
-	}
-	if len(direct) == 0 {
-		return nil
-	}
-	refs := slices.Clone(direct)
-	for line := range strings.Lines(string(code)) {
-		v, value, ok := strings.Cut(strings.TrimSpace(line), "=")
-		if ok && isShellVarName(v) && slices.Contains(direct, strings.Trim(value, `"`)) {
-			refs = append(refs, "$"+v, "${"+v+"}")
-		}
-	}
-	return refs
-}
-
-func isShellVarName(s string) bool {
-	if s == "" || s[0] >= '0' && s[0] <= '9' {
-		return false
-	}
-	for i := range len(s) {
-		if b := s[i]; b == '-' || !isHookNameByte(b) {
-			return false
-		}
-	}
-	return true
-}
-
-// guardsRelative: name, at the path at, still succeeds without moved. That
-// holds when the only line that runs moved is
-//
-//	if [ -x "<ref>" ]; then exec "<ref>" "$@"; fi
-//
-// (or -f, -e) and it is the wrapper's last command, as in entire-brain's
-// wrapper, and every other line that mentions moved only assigns its path to
-// a variable. An if whose test fails and has no else exits 0, and with the
-// exec last nothing runs after it that ran only because moved was there. Anything else, `[ -f "<ref>" ] && exec ...` for
-// one, may fail on a missing file, so the caller leaves a placeholder.
-func guardsRelative(root *os.Root, name, at, moved string) bool {
-	code, ok := foreignShellCode(root, name)
-	if !ok {
-		return false
-	}
-	refs := relativeRefs(code, at, moved)
-	guarded := false
-	for line := range strings.Lines(string(code)) {
-		l := strings.TrimSpace(line)
-		if l == "" {
-			continue
-		}
-		if guarded {
-			// Runs only once moved is gone, so it could fail the hook.
-			return false
-		}
-		if !slices.ContainsFunc(refs, func(ref string) bool { return endsShellWord([]byte(l), ref) }) {
-			continue
-		}
-		switch {
-		case isGuardedExec(l, refs):
-			guarded = true
-		case isRelativeAssignment(l, refs):
-		default:
-			return false
-		}
-	}
-	return guarded
-}
-
-func isGuardedExec(line string, refs []string) bool {
-	for _, ref := range refs {
-		for _, op := range []string{"-x", "-f", "-e"} {
-			if line == `if [ `+op+` "`+ref+`" ]; then exec "`+ref+`" "$@"; fi` {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// isRelativeAssignment: line assigns one of refs that starts at $0 to a
-// variable, as `backup="$0.pre-entire-brain"` does.
-func isRelativeAssignment(line string, refs []string) bool {
-	v, value, ok := strings.Cut(line, "=")
-	value = strings.Trim(value, `"`)
-	return ok && isShellVarName(v) &&
-		(strings.HasPrefix(value, "$0") || strings.HasPrefix(value, "${0}")) && slices.Contains(refs, value)
-}
-
-// endsShellWord finds ref in data where the shell word it starts ends: at
-// the end, a quote, a blank or an operator. A file name may hold almost any
-// other byte, so "$0.old+v2" does not refer to <hook>.old.
-func endsShellWord(data []byte, ref string) bool {
-	for i := 0; ; {
-		j := bytes.Index(data[i:], []byte(ref))
-		if j < 0 {
-			return false
-		}
-		end := i + j + len(ref)
-		if end == len(data) || strings.IndexByte("\"' \t\r\n;|&()<>`", data[end]) >= 0 {
-			return true
-		}
-		i = end
-	}
-}
-
-// clearRelativeCopy takes Entire's hook out of moved, which wrapper runs
-// relative to its own path once it is at hook: moved goes when the wrapper
-// checks it exists first, and otherwise becomes noopMovedHook.
-func clearRelativeCopy(root *os.Root, wrapper, hook, moved string) error {
-	if guardsRelative(root, wrapper, hook, moved) {
-		return root.Remove(moved) //nolint:wrapcheck // caller adds the file name
-	}
-	_, err := writeHookFile(root, moved, noopMovedHook)
-	return err
-}
-
 func isFileNameByte(b byte) bool {
 	return b == '.' || isHookNameByte(b)
 }
@@ -855,13 +687,93 @@ func restoreLegacy(root *os.Root, hook string) error {
 	return nil
 }
 
+// entire-brain's pre-push wrapper, as its v0.4.0 install writes it: it moves
+// the hook it finds to pre-push.pre-entire-brain and ends by running that file
+// relative to its own path. The chain never names the file, so runsByName does
+// not see it.
+const (
+	brainWrapperMarker = "# entire-brain push hook"
+	brainMovedSuffix   = ".pre-entire-brain"
+	brainChainAssign   = `backup="$0` + brainMovedSuffix + `"`
+	brainChainExec     = `if [ -x "$backup" ]; then exec "$backup" "$@"; fi`
+)
+
+// isBrainChain: name is a regular file holding exactly the wrapper
+// entire-brain v0.4.0 writes for hook (byte for byte, whatever plugin path it
+// baked in), which ends by running <name>.pre-entire-brain if it is
+// executable. That wrapper exits 0 when the file is gone, so uninstall can
+// remove a copy of Entire's hook there instead of leaving a placeholder. Any
+// other wrapper, including an edited one, is left as before.
+func isBrainChain(root *os.Root, name, hook string) bool {
+	if hook != prePushHook {
+		return false
+	}
+	data, err := osroot.ReadFileNoFollow(root, name)
+	if err != nil {
+		return false
+	}
+	text := string(data)
+	const head = "#!/bin/sh\n" + brainWrapperMarker + "\n" +
+		"# Tells the local entire-brain plugin that a push is transferring this\n" +
+		"# repo's commits, so it uploads its fact store (detached, best-effort).\n" +
+		"if [ -x "
+	rest, ok := strings.CutPrefix(text, head)
+	if !ok {
+		return false
+	}
+	self, _, ok := strings.Cut(rest, " ]; then\n")
+	if !ok || !isShellSingleQuoted(self) {
+		return false
+	}
+	return text == head+self+" ]; then\n"+
+		"  "+self+" memory notify --event push </dev/null >/dev/null 2>&1 &\n"+
+		"fi\n"+
+		"# Chain: run the pre-existing hook with the original stdin and arguments;\n"+
+		"# its exit code decides the push, exactly as before.\n"+
+		brainChainAssign+"\n"+
+		brainChainExec+"\n"
+}
+
+// isShellSingleQuoted: s is one word quoted the way entire-brain quotes its
+// plugin path: wrapped in single quotes, each quote inside written as '\”.
+func isShellSingleQuoted(s string) bool {
+	if len(s) < 2 || s[0] != '\'' || s[len(s)-1] != '\'' {
+		return false
+	}
+	return !strings.Contains(strings.ReplaceAll(s[1:len(s)-1], `'\''`, ""), "'")
+}
+
+// restoreBrainChain is restoreWrapped for entire-brain's wrapper. With the
+// wrapper at hook (Brain installed over Entire), the user's hook in
+// .pre-entire goes into the copy, where the wrapper runs it, as Brain's own
+// install would have left it; with none, the copy goes. With Entire's hook at
+// hook and the wrapper backed up (Entire re-wrapped Brain), the copy was
+// dormant, and the caller is about to put the wrapper back where it would run
+// it, so the copy goes. Reports whether it handled m.
+func restoreBrainChain(root *os.Root, hook, m string) (bool, error) {
+	if m != hook+brainMovedSuffix || !carriesEntireMarker(root, m) {
+		return false, nil
+	}
+	backup := hook + backupSuffix
+	switch {
+	case isBrainChain(root, hook, hook):
+		if hookFileExists(root, backup) && !carriesEntireMarker(root, backup) &&
+			!isBrainChain(root, backup, hook) && !runsByName(root, backup, m) {
+			return true, root.Rename(backup, m) //nolint:wrapcheck // caller adds the file name
+		}
+		return true, root.Remove(m) //nolint:wrapcheck // caller adds the file name
+	case carriesEntireMarker(root, hook) && isBrainChain(root, backup, hook):
+		return true, root.Remove(m) //nolint:wrapcheck // caller adds the file name
+	}
+	return false, nil
+}
+
 // restoreWrapped undoes reclaimFromWrappers on uninstall: each file a hook
 // manager's wrapper runs by name gets the user's hook back if the manager
 // moved Entire's onto it, and the keep copy goes. A moved copy of Entire's
 // hook that no install has reclaimed yet becomes noopMovedHook, so the wrapper
-// the caller restores does not go on running Entire's hook. A wrapper that
-// finds the copy relative to its own path (see runsRelative) and checks that
-// it exists before running it gets no file there instead.
+// the caller restores does not go on running Entire's hook. entire-brain's
+// wrapper, which never names its copy, is handled by restoreBrainChain.
 func restoreWrapped(root *os.Root, hook string) error {
 	moved, err := movedHookCopies(root, hook)
 	if err != nil {
@@ -873,23 +785,22 @@ func restoreWrapped(root *os.Root, hook string) error {
 		if err := removeEntireKeepCopy(root, keep); err != nil {
 			return err
 		}
+		if done, err := restoreBrainChain(root, hook, m); done || err != nil {
+			if err != nil {
+				return fmt.Errorf("restore %s: %w", m, err)
+			}
+			continue
+		}
 		keepExists := hookFileExists(root, keep)
 		switch {
 		case carriesEntireMarker(root, m) && keepExists:
 			err = root.Rename(keep, m)
-		case carriesEntireMarker(root, m) && (runsByName(root, hook, m) || runsRelative(root, hook, hook, m)):
+		case carriesEntireMarker(root, m) && runsByName(root, hook, m):
 			// The manager installed over Entire before any reclaim: the user's
 			// hook is still in .pre-entire, which the wrapper does not run.
-			switch {
-			case hookFileExists(root, backup) && !carriesEntireMarker(root, backup) && !runsByName(root, backup, m) &&
-				(!runsRelative(root, hook, hook, m) || !runsRelative(root, backup, hook, m)):
-				// Not when both are relative wrappers: the manager installed
-				// again over Entire, and its copy moved into m would look for
-				// m+suffix rather than run anything the user had.
+			if hookFileExists(root, backup) && !carriesEntireMarker(root, backup) && !runsByName(root, backup, m) {
 				err = root.Rename(backup, m)
-			case runsRelative(root, hook, hook, m):
-				err = clearRelativeCopy(root, hook, hook, m)
-			default:
+			} else {
 				_, err = writeHookFile(root, m, noopMovedHook)
 			}
 		case carriesEntireMarker(root, m) && carriesEntireMarker(root, hook) && runsByName(root, backup, m):
@@ -897,11 +808,6 @@ func restoreWrapped(root *os.Root, hook string) error {
 			// caller restores to the hook path. The user's hook it rotated away
 			// cannot be told from any other older copy.
 			_, err = writeHookFile(root, m, noopMovedHook)
-		case carriesEntireMarker(root, m) && carriesEntireMarker(root, hook) && runsRelative(root, backup, hook, m):
-			// Entire backed up a wrapper that runs m relative to its own path,
-			// so m was dormant; the caller restores the wrapper to the hook
-			// path, where it would run m again.
-			err = clearRelativeCopy(root, backup, hook, m)
 		case keepExists && sameHookFile(root, keep, m):
 			err = root.Remove(keep)
 		}
