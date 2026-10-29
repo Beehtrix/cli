@@ -43,7 +43,8 @@ const maxPrePushFieldLen = 4096
 
 // ParsePrePushRefs reads the "<local ref> <local sha> <remote ref> <remote sha>"
 // lines git passes to a pre-push hook and keeps the ones that touch checkpoint
-// refs, the only ones Entire needs. It reads to the end with no size cap: a
+// refs, plus the ones whose source is a commit or an expression rather than a
+// full ref name, which may still be checkpoint content. It reads to the end with no size cap: a
 // `--mirror` of a repository with many tags can be large, and a truncated list
 // could hide a checkpoint ref line. For the same reason an oversized ref name
 // is cut short, and its line marked Truncated, rather than failing the whole
@@ -74,7 +75,7 @@ func ParsePrePushRefs(r io.Reader) ([]PrePushRef, error) {
 		endField()
 		if nfields == len(fields) {
 			ref := PrePushRef{LocalRef: fields[0], LocalSHA: fields[1], RemoteRef: fields[2], RemoteSHA: fields[3], Truncated: truncated}
-			if isCheckpointRefName(ref.LocalRef) || isCheckpointRefName(ref.RemoteRef) {
+			if isCheckpointRefName(ref.LocalRef) || isCheckpointRefName(ref.RemoteRef) || namesCommitNotRef(ref.LocalRef) {
 				refs = append(refs, ref)
 			}
 		}
@@ -169,6 +170,28 @@ func WithPrePushRefs(ctx context.Context, refs []PrePushRef) context.Context {
 		refs = []PrePushRef{} // known to be empty, unlike absent
 	}
 	return context.WithValue(ctx, prePushRefsKey{}, refs)
+}
+
+// namesCommitNotRef reports whether a pre-push source field is something other
+// than a full ref name. Git writes a full ref name for a source that names a
+// ref, and the source as typed otherwise (a commit, HEAD, or an expression
+// such as name~0), so only these lines can hide checkpoint content under
+// another name.
+func namesCommitNotRef(local string) bool {
+	return local != "(delete)" && !strings.HasPrefix(local, "refs/")
+}
+
+// outerPushCommitLines returns the lines of the user's own push that send
+// content from a source that is not a full ref name.
+func outerPushCommitLines(ctx context.Context) []PrePushRef {
+	refs, _ := ctx.Value(prePushRefsKey{}).([]PrePushRef) //nolint:errcheck // absent means "not known"
+	var lines []PrePushRef
+	for _, r := range refs {
+		if r.sends() && namesCommitNotRef(r.LocalRef) {
+			lines = append(lines, r)
+		}
+	}
+	return lines
 }
 
 // isCheckpointRefName reports whether name holds checkpoint content: the v1

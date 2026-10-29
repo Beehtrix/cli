@@ -574,6 +574,15 @@ func TestCheckpointPushPolicy_ManualRefusesExplicitCheckpointPush(t *testing.T) 
 			t.Helper()
 			return []string{"--mirror", "origin"}
 		}},
+		{name: "by commit", args: func(t *testing.T, env *TestEnv) []string {
+			t.Helper()
+			tip := strings.TrimSpace(testutil.RunGit(t, env.RepoDir, "rev-parse", onlyOutgoingRef(t, env)))
+			return []string{"origin", "HEAD", tip + ":refs/heads/held-copy"}
+		}},
+		{name: "by expression", args: func(t *testing.T, env *TestEnv) []string {
+			t.Helper()
+			return []string{"origin", "HEAD", onlyOutgoingRef(t, env) + "~0:refs/heads/held-copy"}
+		}},
 		{name: "v1 branch", args: func(t *testing.T, env *TestEnv) []string {
 			t.Helper()
 			// -f: the fixture may already have a v1 branch.
@@ -622,6 +631,24 @@ func TestCheckpointPushPolicy_AutomaticAllowsExplicitCheckpointPush(t *testing.T
 
 	require.NoError(t, err, "under automatic an explicit checkpoint push is the user's call: %s", output)
 	require.Equal(t, []string{work}, remoteCheckpointIDs(t, bareDir))
+}
+
+// Under automatic, pushing a checkpoint's commit under another name is the
+// user's call, and an ordinary push is never held up by the commit check.
+func TestCheckpointPushPolicy_AutomaticAllowsPushByCommit(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	bareDir := env.SetupBareRemote()
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	env.PatchSettings(map[string]any{
+		"strategy_options": map[string]any{"push_sessions": false},
+	})
+	tip := strings.TrimSpace(testutil.RunGit(t, env.RepoDir, "rev-parse", onlyOutgoingRef(t, env)))
+
+	output, err := gitPushArgs(t, env, "origin", "HEAD", tip+":refs/heads/copy")
+
+	require.NoError(t, err, "under automatic a push by commit is the user's call: %s", output)
+	require.Contains(t, testutil.RunGit(t, bareDir, "for-each-ref", "refs/heads/copy"), tip)
 }
 
 func TestCheckpointPushPolicy_UnreadablePolicyRefusesExplicitCheckpointPush(t *testing.T) {
