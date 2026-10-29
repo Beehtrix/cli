@@ -594,24 +594,56 @@ func isShellVarName(s string) bool {
 	return true
 }
 
-// guardsRelative: name, at the path at, checks that moved exists before it
-// runs it, with [ -x ], [ -f ] or [ -e ] (or test) on one of the references
-// relativeRefs finds, as entire-brain's `if [ -x "$backup" ]` does. Removing
-// moved then leaves the wrapper working; without such a check, the wrapper
-// would fail on a missing file.
+// guardsRelative: name, at the path at, still succeeds without moved. That
+// holds when the only line that runs moved is
+//
+//	if [ -x "<ref>" ]; then exec "<ref>" "$@"; fi
+//
+// (or -f, -e), as in entire-brain's wrapper, and every other line that
+// mentions moved only assigns its path to a variable. An if whose test fails
+// and has no else exits 0. Anything else, `[ -f "<ref>" ] && exec ...` for
+// one, may fail on a missing file, so the caller leaves a placeholder.
 func guardsRelative(root *os.Root, name, at, moved string) bool {
 	code, ok := foreignShellCode(root, name)
 	if !ok {
 		return false
 	}
-	for _, ref := range relativeRefs(code, at, moved) {
-		for _, op := range []string{"-x ", "-f ", "-e "} {
-			if endsFileName(code, op+ref) || endsFileName(code, op+`"`+ref) {
+	refs := relativeRefs(code, at, moved)
+	guarded := false
+	for line := range strings.Lines(string(code)) {
+		l := strings.TrimSpace(line)
+		if !slices.ContainsFunc(refs, func(ref string) bool { return endsFileName([]byte(l), ref) }) {
+			continue
+		}
+		switch {
+		case isGuardedExec(l, refs):
+			guarded = true
+		case isRelativeAssignment(l, refs):
+		default:
+			return false
+		}
+	}
+	return guarded
+}
+
+func isGuardedExec(line string, refs []string) bool {
+	for _, ref := range refs {
+		for _, op := range []string{"-x", "-f", "-e"} {
+			if line == `if [ `+op+` "`+ref+`" ]; then exec "`+ref+`" "$@"; fi` {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// isRelativeAssignment: line assigns one of refs that starts at $0 to a
+// variable, as `backup="$0.pre-entire-brain"` does.
+func isRelativeAssignment(line string, refs []string) bool {
+	v, value, ok := strings.Cut(line, "=")
+	value = strings.Trim(value, `"`)
+	return ok && isShellVarName(v) &&
+		(strings.HasPrefix(value, "$0") || strings.HasPrefix(value, "${0}")) && slices.Contains(refs, value)
 }
 
 // endsFileName finds ref in data followed by a byte that cannot continue a
