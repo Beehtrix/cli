@@ -331,9 +331,13 @@ commit.
   (`addCheckpointTrailerAboveComments`). When that block would stay in the
   commit below the trailer where git's trailer grammar does not skip it
   (`auto` picked another prefix and the cleanup mode keeps comment lines), the
-  trailer goes below the block instead, and no explanation is written. A
-  message git does not open in the editor keeps its comment lines as written,
-  so the trailer is appended.
+  trailer goes below the block instead. A message git does not open in the
+  editor keeps its comment lines as written, so the trailer is appended.
+- **Explanation.** Below the stamped trailer prepare writes a comment saying
+  how to unlink the commit, only when git opens the editor and its cleanup
+  drops comment lines; otherwise git would record it. It never quotes the
+  session's prompt: the hooks cannot see `git commit --cleanup=<mode>`, so a
+  mode given there records the comment.
 - **Empty message.** Commit-msg removes Entire's trailer when the message
   holds nothing else git will record (`hasUserContent`), so git aborts the
   commit: comment lines count as git's cleanup treats them, everything from the

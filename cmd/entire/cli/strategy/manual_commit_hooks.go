@@ -557,7 +557,7 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 		return fmt.Errorf("failed to generate checkpoint ID: %w", err)
 	}
 
-	agentType, displayPrompt, commitLinking := s.trailerPromptContext(ctx, sessionsWithContent)
+	agentType, commitLinking := s.trailerPromptContext(ctx, sessionsWithContent)
 	resolveMetadataSpan.End()
 
 	// Add trailer differently based on commit source
@@ -577,7 +577,7 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 			// Human at terminal — prompt interactively
 			header := "Entire: Active " + string(agentType) + " session detected"
 			var details []string
-			if displayPrompt != "" {
+			if displayPrompt := s.displayLastPrompt(ctx, sessionsWithContent); displayPrompt != "" {
 				details = append(details, "Last prompt: "+displayPrompt)
 			}
 
@@ -604,13 +604,12 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 			message = addCheckpointTrailerAboveComments(message, checkpointID, rules)
 		}
 	default:
-		if rules.stripped || rules.prefix == rules.trailerPrefix {
+		if rules.edited && rules.stripped {
 			// Normal editor flow: add trailer with explanatory comment (will be stripped by git)
-			message = addCheckpointTrailerWithComment(message, checkpointID, string(agentType), displayPrompt, rules.prefix)
+			message = addCheckpointTrailerWithComment(message, checkpointID, string(agentType), rules.prefix)
 		} else {
-			// core.commentChar=auto picked a prefix git's trailer grammar does
-			// not skip, and the cleanup mode keeps comment lines: the
-			// explanation would end the trailer block and unlink the commit.
+			// --no-edit, or a cleanup mode that keeps comment lines: the
+			// explanation would be recorded with the commit
 			message = addCheckpointTrailerAboveComments(message, checkpointID, rules)
 		}
 	}
@@ -637,28 +636,28 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
 }
 
 // trailerPromptContext returns what the trailer prompt shows and whether to
-// ask: the first session's agent type and display-ready last prompt, and the
-// commit_linking setting.
-func (s *ManualCommitStrategy) trailerPromptContext(ctx context.Context, sessions []*SessionState) (types.AgentType, string, string) {
+// ask: the first session's agent type and the commit_linking setting.
+func (s *ManualCommitStrategy) trailerPromptContext(ctx context.Context, sessions []*SessionState) (types.AgentType, string) {
 	var agentType types.AgentType
-	var lastPrompt string
 	if len(sessions) > 0 {
-		firstSession := sessions[0]
-		if firstSession.AgentType != "" {
-			agentType = firstSession.AgentType
-		}
-		lastPrompt = s.getLastPrompt(ctx, firstSession)
+		agentType = sessions[0].AgentType
 	}
-
-	// Prepare prompt for display: collapse newlines/whitespace, then truncate (rune-safe)
-	displayPrompt := stringutil.TruncateRunes(stringutil.CollapseWhitespace(lastPrompt), 80, "...")
 
 	// Load commit_linking setting to decide whether to prompt
 	commitLinking := settings.CommitLinkingPrompt // safe default
 	if stngs, loadErr := settings.Load(ctx); loadErr == nil {
 		commitLinking = stngs.GetCommitLinking()
 	}
-	return agentType, displayPrompt, commitLinking
+	return agentType, commitLinking
+}
+
+// displayLastPrompt returns the first session's last prompt for the trailer
+// prompt: whitespace collapsed, truncated rune-safe.
+func (s *ManualCommitStrategy) displayLastPrompt(ctx context.Context, sessions []*SessionState) string {
+	if len(sessions) == 0 {
+		return ""
+	}
+	return stringutil.TruncateRunes(stringutil.CollapseWhitespace(s.getLastPrompt(ctx, sessions[0])), 80, "...")
 }
 
 // openRepositoryTimed opens the repository under an "open_repository" perf span.
@@ -3142,20 +3141,16 @@ const trailerExplanation = " Remove the Entire-Checkpoint trailer above if you d
 // addCheckpointTrailerWithComment adds the Entire-Checkpoint trailer with an explanatory comment.
 // The trailer is placed above git's comment block (trailers.EditorCommentBlockStart) but below
 // the user's message area, with a comment explaining that the user can remove it if they don't
-// want to link the commit to the agent session. If prompt is non-empty, it's shown as context.
-// The comment is written with commentPrefix, the prefix git strips (see messageCommentRules).
+// want to link the commit to the agent session. The comment is written with commentPrefix, the
+// prefix git strips (see messageCommentRules), and only into a message whose comment lines git's
+// cleanup drops. It never quotes the prompt: the hooks cannot see `git commit --cleanup=<mode>`,
+// so a mode given there can still record it.
 // A trailer block that ends the user's lines, such as a squash's inherited trailers, gets the
 // trailer joined to it: a paragraph of its own would leave that block out of the final trailer
 // block, which alone links.
-func addCheckpointTrailerWithComment(message string, checkpointID id.CheckpointID, agentName, prompt, commentPrefix string) string {
-	commentLines := []string{
-		commentPrefix + trailerExplanation + agentName + " session context.",
-	}
-	if prompt != "" {
-		commentLines = append(commentLines, commentPrefix+" Last Prompt: "+prompt)
-	}
-	commentLines = append(commentLines, commentPrefix+" The trailer will be added to your next commit based on this branch.")
-	comment := strings.Join(commentLines, "\n")
+func addCheckpointTrailerWithComment(message string, checkpointID id.CheckpointID, agentName, commentPrefix string) string {
+	comment := commentPrefix + trailerExplanation + agentName + " session context.\n" +
+		commentPrefix + " The trailer will be added to your next commit based on this branch."
 
 	lines := strings.Split(message, "\n")
 	commentStart := trailers.EditorCommentBlockStart(lines, commentPrefix)

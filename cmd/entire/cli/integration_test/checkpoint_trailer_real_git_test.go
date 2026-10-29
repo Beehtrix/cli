@@ -124,9 +124,10 @@ func TestTrailerAuthority_RealGitCommits(t *testing.T) {
 		// links are checkpoints the user's own message names: the commit
 		// mentions them, and post-commit must not condense into them.
 		links []string
-		// keepsComments marks a cleanup mode that keeps comment lines, so
-		// Entire's explanation is recorded with the commit.
-		keepsComments bool
+		// recordsExplanation marks a commit whose cleanup mode only git
+		// knows, so Entire's explanation can be recorded with it; the prompt
+		// never is.
+		recordsExplanation bool
 	}{
 		{name: "-m", commit: []string{"-m", "Fix login"}, starts: "Fix login\n"},
 		{name: "-m subject starting with #", commit: []string{"-m", "#42 fix login"}, starts: "#42 fix login\n"},
@@ -166,9 +167,12 @@ func TestTrailerAuthority_RealGitCommits(t *testing.T) {
 			editor: typeSubject,
 			starts: "Typed #42 Subject\n\nBody\n; see the notes\n",
 		},
-		{name: "editor with whitespace cleanup", config: map[string]string{"commit.cleanup": "whitespace"}, editor: typeSubject, starts: "Typed\n", keepsComments: true},
-		{name: "editor with scissors cleanup", config: map[string]string{"commit.cleanup": "scissors"}, editor: typeSubject, starts: "Typed\n", keepsComments: true},
-		{name: "editor with verbatim cleanup", config: map[string]string{"commit.cleanup": "verbatim"}, editor: typeSubject, starts: "Typed \n", keepsComments: true},
+		{name: "editor with whitespace cleanup", config: map[string]string{"commit.cleanup": "whitespace"}, editor: typeSubject, starts: "Typed\n"},
+		{name: "editor with scissors cleanup", config: map[string]string{"commit.cleanup": "scissors"}, editor: typeSubject, starts: "Typed\n"},
+		{name: "editor with verbatim cleanup", config: map[string]string{"commit.cleanup": "verbatim"}, editor: typeSubject, starts: "Typed \n"},
+		// The hooks cannot see --cleanup on the command line: prepare writes
+		// the explanation for git's default cleanup, and whitespace keeps it.
+		{name: "editor with --cleanup=whitespace", commit: []string{"--cleanup=whitespace"}, editor: typeSubject, starts: "Typed\n", recordsExplanation: true},
 		{name: "editor left untouched aborts", editor: keep, aborts: true},
 		{name: "amend in the editor", setup: amended(), commit: []string{"--amend"}, editor: keep, starts: "My change\n"},
 		{name: "--amend --no-edit", setup: amended(), commit: []string{"--amend", "--no-edit"}, starts: "My change\n"},
@@ -306,10 +310,10 @@ func TestTrailerAuthority_RealGitCommits(t *testing.T) {
 				require.False(t, advCheckpointStored(env, link), "post-commit does not condense into a checkpoint the user's message names: %q", recorded)
 			}
 			require.False(t, advCheckpointStored(env, advForeignCheckpoint), "no checkpoint the message only names is created: %q", recorded)
-			if !tt.keepsComments {
+			if !tt.recordsExplanation {
 				require.NotContains(t, recorded, "Remove the Entire-Checkpoint trailer", "Entire's explanation never reaches the commit: %q", recorded)
-				require.NotContains(t, recorded, "Last Prompt:", "the prompt never reaches the commit: %q", recorded)
 			}
+			require.NotContains(t, recorded, "change mine.txt", "the prompt never reaches the commit: %q", recorded)
 		})
 	}
 }
