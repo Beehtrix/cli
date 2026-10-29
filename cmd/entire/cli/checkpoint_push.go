@@ -111,6 +111,8 @@ func runCheckpointPush(cmd *cobra.Command, args []string, flags checkpointPushFl
 		for _, oc := range outgoing.Checkpoints {
 			requests = append(requests, strategy.CheckpointPushRequest{Ref: oc.Ref})
 		}
+	case len(args) == 0 && flags.json:
+		return errors.New("checkpoint push --json needs checkpoint IDs or --all; to see what is waiting, run entire checkpoint list --outgoing --json")
 	case len(args) == 0:
 		return printWaitingForCheckpointPush(cmd, errOut, canPrompt)
 	default:
