@@ -287,13 +287,17 @@ quoted, indented, or mentioned in prose) is not the commit's link.
   see `git commit --cleanup=<mode>`.
 - **Read-only views.** `explain <commit>`, `explain --commit`, the branch
   listing, the export and the review re-run guard read with `#` and no git
-  config (`CommitCheckpoint`): the last paragraph's last ID, the one attach
-  joins and `--generate` writes, or the first ID anywhere when the last
-  paragraph names none, since a squash commit can carry its squashed commits'
-  trailers in the body. `explain --checkpoint` lists a commit under every ID
-  that view reads from it (`CommitCheckpoints`). Other read-only lookups
-  (resume, status, attribution, other history listings) still scan the whole
-  message.
+  config (`CommitCheckpoint`): the last paragraph's last ID, or the first ID
+  anywhere when the last paragraph names none, since a squash commit can
+  carry its squashed commits' trailers in the body. `explain --checkpoint`
+  lists a commit under every ID that view reads from it (`CommitCheckpoints`).
+  Other read-only lookups (resume, status, attribution, review context,
+  dispatch, pending-checkpoint listings) still scan the whole message on
+  purpose: a squash merge made on a forge lists every squashed commit's
+  trailer in its body, and these lookups must find all of them. They never
+  write, so a body mention can make them show a checkpoint but cannot
+  redirect a commit's work into one; code that writes resolves through
+  `LinkedCheckpoints`.
 - **Stamp.** Prepare-commit-msg still reads the whole draft, but an ID there
   counts as already stamped (`stampedTrailer`) only when prepare recorded
   stamping it: each ID it stamps (one it generates, a session's reserved one,
@@ -303,7 +307,10 @@ quoted, indented, or mentioned in prose) is not the commit's link.
   (`recordStampedTrailer`). A draft that already names another ID (pasted
   into `-m`, `-F` or a template) gets prepare's own trailer after it.
 - **Condensation target.** Post-commit condenses into the last stamped ID the
-  commit links (`pickCondensationTarget`). Without one (an amend that kept its
+  commit links (`pickCondensationTarget`). A stamped ID that a paragraph added
+  below it (an editor, a `commit-msg` hook) moved out of the last paragraph
+  still counts: the stamp record, not its position, makes it the commit's.
+  Without one (an amend that kept its
   trailer, a sequence operation) it condenses only into the last linked ID
   whose checkpoint exists, and only for the session that owns it
   (`stampedByAnotherCommit`). It never creates a checkpoint prepare did not

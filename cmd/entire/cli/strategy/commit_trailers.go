@@ -74,7 +74,8 @@ func LinkedCheckpoints(ctx context.Context, message string) []id.CheckpointID {
 // commit, without reading git config: its last paragraph's IDs, skipping
 // git's default comment lines, or, when that names none, the first ID
 // anywhere in the message, since a squash commit can carry its squashed
-// commits' trailers in the body. Only read-only views may use that fallback.
+// commits' trailers in the body. Only read-only views may use that fallback:
+// a body mention can make them show a checkpoint, never write into one.
 func CommitCheckpoints(message string) []id.CheckpointID {
 	if ids := trailers.ParseLastParagraphCheckpoints(message, trailers.DefaultCommentPrefix); len(ids) > 0 {
 		return ids
@@ -86,9 +87,9 @@ func CommitCheckpoints(message string) []id.CheckpointID {
 }
 
 // CommitCheckpoint returns the checkpoint a read-only view shows for a saved
-// commit: the last of CommitCheckpoints, the one attach joins and
-// `explain --generate` writes, since a squash's inherited trailers come before
-// the one prepare-commit-msg stamped.
+// commit: the last of CommitCheckpoints, since a squash's inherited trailers
+// come before the one prepare-commit-msg stamped. Attach and
+// `explain --generate` resolve through LinkedCheckpoints instead.
 func CommitCheckpoint(message string) (id.CheckpointID, bool) {
 	ids := CommitCheckpoints(message)
 	if len(ids) == 0 {

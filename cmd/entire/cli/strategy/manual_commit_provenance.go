@@ -186,12 +186,13 @@ func commitParentCandidates(ctx context.Context) []string {
 }
 
 // linkedTrailersOf returns the checkpoint trailers commit links
-// (LinkedCheckpoints), leaving out the ones prepare-commit-msg recorded as
-// inherited and any checkpoint deleted from this clone: post-commit must never
-// condense new work into a deleted ID, which would re-create it. It also
-// returns, consuming the record, the IDs prepare stamped (see
-// pickCondensationTarget), and the committed paths a redo's inherited
-// checkpoints hold.
+// (LinkedCheckpoints), plus any trailer prepare-commit-msg stamped that a
+// paragraph added below it (an editor, a commit-msg hook) moved out of the
+// last paragraph, leaving out the ones prepare recorded as inherited and any
+// checkpoint deleted from this clone: post-commit must never condense new work
+// into a deleted ID, which would re-create it. It also returns, consuming the
+// record, the IDs prepare stamped (see pickCondensationTarget), and the
+// committed paths a redo's inherited checkpoints hold.
 func linkedTrailersOf(ctx context.Context, commit *object.Commit) ([]id.CheckpointID, map[id.CheckpointID]bool, map[string]bool) {
 	var parent string
 	if len(commit.ParentHashes) > 0 {
@@ -199,8 +200,23 @@ func linkedTrailersOf(ctx context.Context, commit *object.Commit) ([]id.Checkpoi
 	}
 	inherited, redone := takeInheritedMarker(ctx, parent)
 	stamped := takeStampedTrailers(ctx)
-	ids := withoutInherited(LinkedCheckpoints(ctx, commit.Message), inherited)
+	ids := withStampedOutsideLastParagraph(LinkedCheckpoints(ctx, commit.Message), commit.Message, stamped)
+	ids = withoutInherited(ids, inherited)
 	return withoutDeletedCheckpoints(ctx, ids), stamped, redone
+}
+
+// withStampedOutsideLastParagraph adds to linked the stamped trailers message
+// names outside its last paragraph. The stamp record, not the trailer's
+// position, proves the ID is this commit's. They go first, so a stamped
+// trailer in the last paragraph stays the condensation target.
+func withStampedOutsideLastParagraph(linked []id.CheckpointID, message string, stamped map[id.CheckpointID]bool) []id.CheckpointID {
+	var moved []id.CheckpointID
+	for _, cpID := range trailers.ParseAllCheckpoints(message) {
+		if stamped[cpID] && !slices.Contains(linked, cpID) {
+			moved = append(moved, cpID)
+		}
+	}
+	return append(moved, linked...)
 }
 
 // stampedTrailersFile lists the trailers prepare-commit-msg stamped since the

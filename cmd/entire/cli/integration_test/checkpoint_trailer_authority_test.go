@@ -139,6 +139,34 @@ func TestTrailerAuthority_TrailerReplacedInTheEditorNamingUnfetchedCheckpoint(t 
 		"a trailer prepare did not stamp must not claim a checkpoint ID this clone does not have")
 }
 
+// A paragraph added below the trailer prepare-commit-msg stamped (an editor, a
+// commit-msg hook, a chained tool) moves it out of the last paragraph. The
+// stamp record still proves the ID is this commit's, so post-commit must
+// create its checkpoint rather than leave the commit naming a missing one.
+func TestTrailerAuthority_ParagraphAddedBelowTheStampedTrailer(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	git := gitWithEntireCommitHooksEnv(t, env)
+	editors := t.TempDir()
+	writeScripts(t, editors, map[string]string{
+		"append": "#!/bin/sh\nprintf '\\nRefs: JIRA-123\\n' >> \"$1\"\n",
+	})
+	authorityAgentTurn(env, "mine.txt", "my agent work\n")
+	_, err := git(nil, "add", "mine.txt")
+	require.NoError(t, err)
+
+	editor := "GIT_EDITOR=" + shellQuote(filepath.ToSlash(filepath.Join(editors, "append")))
+	out, err := git([]string{editor}, "commit", "--no-gpg-sign", "-m", "My change", "-e")
+	require.NoError(t, err, out)
+
+	recorded := env.GetCommitMessage(env.GetHeadHash())
+	require.Empty(t, trailers.ParseLastParagraphCheckpoints(recorded, ""), "precondition: the stamped trailer is no longer in the last paragraph: %q", recorded)
+	ids := trailers.ParseAllCheckpoints(recorded)
+	require.Len(t, ids, 1, "precondition: the commit keeps the stamped trailer: %q", recorded)
+	require.True(t, advCheckpointStored(env, ids[0].String()),
+		"the session's work belongs in the checkpoint prepare stamped, wherever the message moved it")
+}
+
 // The last paragraph names a checkpoint this clone does not have, then
 // one it has. Neither is one prepare-commit-msg stamped, so prepare must stamp
 // a fresh trailer, and post-commit must condense there, not into the first.
