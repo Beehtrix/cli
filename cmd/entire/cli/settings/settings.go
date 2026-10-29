@@ -300,6 +300,17 @@ type ClonePreferences struct {
 	TrailsAgentHelpFailureAPIBase  string     `json:"trails_agent_help_failure_api_base,omitempty"`
 	TrailsAgentHelpFailureAuthKey  string     `json:"trails_agent_help_failure_auth_key,omitempty"`
 
+	// CheckpointPushQuestionBackoffUntil postpones the first-push policy
+	// question after it went unanswered, as an RFC 3339 time. A string rather
+	// than a time so a malformed value only brings the question back: a decode
+	// error would fail every clone-preferences read and turn Entire's git hooks
+	// off.
+	CheckpointPushQuestionBackoffUntil string `json:"checkpoint_push_question_backoff_until,omitempty"`
+
+	// OPFDeprecationNoticeShown records that pre-push told this clone OPF is
+	// deprecated, in place of the policy question.
+	OPFDeprecationNoticeShown bool `json:"opf_deprecation_notice_shown,omitempty"`
+
 	// unknown holds keys this binary does not model, written back unchanged so
 	// a rewrite by one version does not delete another version's preferences.
 	unknown map[string]json.RawMessage

@@ -87,26 +87,76 @@ func SaveCheckpointPushPolicy(ctx context.Context, policy CheckpointPushPolicy) 
 	return saveCheckpointPushPolicyAt(commonDir, policy)
 }
 
+// SaveCheckpointPushPolicyIfUnset stores the policy unless the clone already
+// has one, and reports whether it did. A choice made while the caller waited,
+// for example on a question, wins.
+func SaveCheckpointPushPolicyIfUnset(ctx context.Context, policy CheckpointPushPolicy) (bool, error) {
+	commonDir, err := session.GetGitCommonDir(ctx)
+	if err != nil {
+		return false, fmt.Errorf("save checkpoint push policy: resolve git common dir: %w", err)
+	}
+	return saveCheckpointPushPolicyIfUnsetAt(commonDir, policy)
+}
+
+// CheckpointPushPolicyStored reports whether the clone has chosen a policy,
+// which a stored automatic counts as and the default does not.
+func CheckpointPushPolicyStored(ctx context.Context) (bool, error) {
+	commonDir, err := session.GetGitCommonDir(ctx)
+	if err != nil {
+		return false, fmt.Errorf("read checkpoint push policy: resolve git common dir: %w", err)
+	}
+	return checkpointPushPolicyStoredAt(commonDir)
+}
+
+func checkpointPushPolicyStoredAt(commonDir string) (bool, error) {
+	root, name, _, err := checkpointPushPolicyRoot(commonDir)
+	if err != nil {
+		return false, fmt.Errorf("read checkpoint push policy: %w", err)
+	}
+	if _, err := root.Lstat(name); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read checkpoint push policy: %w", err)
+	}
+	return true, nil
+}
+
 func saveCheckpointPushPolicyAt(commonDir string, policy CheckpointPushPolicy) error {
+	_, err := writeCheckpointPushPolicy(commonDir, policy, false)
+	return err
+}
+
+func saveCheckpointPushPolicyIfUnsetAt(commonDir string, policy CheckpointPushPolicy) (bool, error) {
+	return writeCheckpointPushPolicy(commonDir, policy, true)
+}
+
+func writeCheckpointPushPolicy(commonDir string, policy CheckpointPushPolicy, onlyIfUnset bool) (bool, error) {
 	if _, err := ParseCheckpointPushPolicy(string(policy)); err != nil {
-		return err
+		return false, err
 	}
 	root, name, _, err := checkpointPushPolicyRoot(commonDir)
 	if err != nil {
-		return fmt.Errorf("save checkpoint push policy: %w", err)
+		return false, fmt.Errorf("save checkpoint push policy: %w", err)
 	}
 	if err := osroot.MkdirAllNoSymlink(root, path.Dir(name), 0o750); err != nil {
-		return fmt.Errorf("save checkpoint push policy: create directory: %w", err)
+		return false, fmt.Errorf("save checkpoint push policy: create directory: %w", err)
 	}
 	release, err := flock.AcquireIn(root, name+".lock")
 	if err != nil {
-		return fmt.Errorf("save checkpoint push policy: lock: %w", err)
+		return false, fmt.Errorf("save checkpoint push policy: lock: %w", err)
 	}
 	defer release()
-	if err := jsonutil.WriteFileAtomicIn(root, name, []byte(string(policy)+"\n"), 0o644); err != nil {
-		return fmt.Errorf("save checkpoint push policy: %w", err)
+	if onlyIfUnset {
+		stored, err := checkpointPushPolicyStoredAt(commonDir)
+		if err != nil || stored {
+			return false, err
+		}
 	}
-	return nil
+	if err := jsonutil.WriteFileAtomicIn(root, name, []byte(string(policy)+"\n"), 0o644); err != nil {
+		return false, fmt.Errorf("save checkpoint push policy: %w", err)
+	}
+	return true, nil
 }
 
 func checkpointPushPolicyRoot(commonDir string) (*os.Root, string, string, error) {

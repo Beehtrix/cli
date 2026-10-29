@@ -117,3 +117,33 @@ func TestParseCheckpointPushPolicy(t *testing.T) {
 		require.Error(t, err, "%q must be rejected", invalid)
 	}
 }
+
+func TestCheckpointPushPolicyStoredAt(t *testing.T) {
+	t.Parallel()
+	commonDir := checkpointPushPolicyTestCommonDir(t)
+
+	stored, err := checkpointPushPolicyStoredAt(commonDir)
+	require.NoError(t, err)
+	assert.False(t, stored, "the default is not a choice")
+
+	require.NoError(t, saveCheckpointPushPolicyAt(commonDir, CheckpointPushPolicyAutomatic))
+	stored, err = checkpointPushPolicyStoredAt(commonDir)
+	require.NoError(t, err)
+	assert.True(t, stored, "a chosen automatic is a choice")
+}
+
+func TestSaveCheckpointPushPolicyIfUnsetAt(t *testing.T) {
+	t.Parallel()
+	commonDir := checkpointPushPolicyTestCommonDir(t)
+
+	saved, err := saveCheckpointPushPolicyIfUnsetAt(commonDir, CheckpointPushPolicyManual)
+	require.NoError(t, err)
+	assert.True(t, saved)
+
+	saved, err = saveCheckpointPushPolicyIfUnsetAt(commonDir, CheckpointPushPolicyAutomatic)
+	require.NoError(t, err)
+	assert.False(t, saved, "an existing choice wins")
+	got, err := LoadCheckpointPushPolicyAt(commonDir)
+	require.NoError(t, err)
+	assert.Equal(t, CheckpointPushPolicyManual, got)
+}

@@ -109,6 +109,23 @@ func CheckOuterPushHeldCheckpoints(ctx context.Context) error {
 	if !held {
 		return nil
 	}
+	return checkOuterPushLines(ctx, lines, why)
+}
+
+// refuseOuterPushAfterManualAnswer re-checks the user's push once manual was
+// chosen for it at the first-push question. It takes the answer rather than
+// reading the policy, which may not have been saved.
+func refuseOuterPushAfterManualAnswer(ctx context.Context) error {
+	const why = "you just chose the manual checkpoint push policy"
+	if prePushRefsUnsaved(ctx) {
+		return refuseUncheckedPushWhileWaiting(ctx, why)
+	}
+	return checkOuterPushLines(ctx, outerPushSendingLines(ctx), why)
+}
+
+// checkOuterPushLines refuses lines that send held checkpoint content; why
+// says what holds it back.
+func checkOuterPushLines(ctx context.Context, lines []PrePushRef, why string) error {
 	for _, line := range lines {
 		name := line.checkpointRefName()
 		if strings.HasPrefix(name, checkpoint.CheckpointRefPrefix) {
@@ -212,6 +229,12 @@ func checkOuterPushUnchecked(ctx context.Context) error {
 	if !held {
 		return nil
 	}
+	return refuseUncheckedPushWhileWaiting(ctx, why)
+}
+
+// refuseUncheckedPushWhileWaiting refuses a push whose ref list the hook could
+// not save, if any checkpoint waits; why says what holds them back.
+func refuseUncheckedPushWhileWaiting(ctx context.Context, why string) error {
 	repo, err := OpenRepository(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: the hook could not save the list of refs this push sends, and %s. %s",
