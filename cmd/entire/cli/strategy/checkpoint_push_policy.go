@@ -331,23 +331,22 @@ func PushCheckpoints(ctx context.Context, targets []CheckpointPushRequest) (Chec
 	}
 	defer repo.Close()
 
-	selection := checkpointRefSelection{refs: make(map[plumbing.ReferenceName]plumbing.Hash, len(targets))}
-	for _, target := range targets {
-		if pinned, ok := selection.refs[target.Ref]; ok && pinned != target.Commit {
-			return CheckpointPushReport{}, fmt.Errorf("%s is named with two different commits; name each checkpoint once", target.Ref)
-		}
-		selection.refs[target.Ref] = target.Commit
-	}
 	waiting, err := waitingCheckpointRefs(ctx, repo)
+	if err != nil {
+		return CheckpointPushReport{}, err
+	}
+	selection, err := waitingTargetSelection(targets, waiting)
 	if err != nil {
 		return CheckpointPushReport{}, err
 	}
 
 	report := CheckpointPushReport{Remote: syncRemote.Name}
-	if anyTargetWaiting(targets, waiting) {
-		if opfErr := opfGateForCheckpointRefs(ctx, repo); opfErr != nil {
-			return report, fmt.Errorf("checkpoint refs stay queued: %w", opfErr)
-		}
+	if len(selection.refs) == 0 {
+		report.Outcomes = checkpointPushOutcomes(targets, waiting, checkpointFlushResult{}, nil)
+		return report, nil
+	}
+	if opfErr := opfGateForCheckpointRefs(ctx, repo); opfErr != nil {
+		return report, fmt.Errorf("checkpoint refs stay queued: %w", opfErr)
 	}
 	result, flushErr := flushCheckpointRefs(ctx, repo, ps, selection)
 	report.Outcomes = checkpointPushOutcomes(targets, waiting, result, flushErr)
@@ -372,13 +371,24 @@ func waitingCheckpointRefs(ctx context.Context, repo *git.Repository) (map[plumb
 	return set, nil
 }
 
-func anyTargetWaiting(targets []CheckpointPushRequest, waiting map[plumbing.ReferenceName]struct{}) bool {
+// waitingTargetSelection selects the named refs that were waiting when the
+// queue was read. The OPF gate runs only for those, so a named ref queued
+// after that read is left for the next upload rather than sent unscanned.
+func waitingTargetSelection(targets []CheckpointPushRequest, waiting map[plumbing.ReferenceName]struct{}) (checkpointRefSelection, error) {
+	named := make(map[plumbing.ReferenceName]plumbing.Hash, len(targets))
 	for _, target := range targets {
-		if _, ok := waiting[target.Ref]; ok {
-			return true
+		if pinned, ok := named[target.Ref]; ok && pinned != target.Commit {
+			return checkpointRefSelection{}, fmt.Errorf("%s is named with two different commits; name each checkpoint once", target.Ref)
+		}
+		named[target.Ref] = target.Commit
+	}
+	selection := checkpointRefSelection{refs: make(map[plumbing.ReferenceName]plumbing.Hash, len(named))}
+	for ref, commit := range named {
+		if _, ok := waiting[ref]; ok {
+			selection.refs[ref] = commit
 		}
 	}
-	return false
+	return selection, nil
 }
 
 // checkpointPushOutcomes maps the flush back onto each target. A flush-wide
