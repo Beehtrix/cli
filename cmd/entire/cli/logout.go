@@ -72,7 +72,7 @@ func newLogoutCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&everywhere, "everywhere", false, "Also end browser and web sessions")
 	addInsecureHTTPAuthFlag(cmd, &insecureHTTPAuth)
-	// Logout deletes from the store.
+	// In the constructor: root and auth both register it.
 	return alwaysCheckConfig(cmd)
 }
 

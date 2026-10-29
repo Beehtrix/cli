@@ -2,12 +2,9 @@ package cli
 
 import (
 	"bytes"
-	"context"
 	"errors"
-	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -18,63 +15,94 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// configCheckAnnotations pins every annotated command and why.
-// TestConfigCheckAnnotations fails on a missing or stale entry, so an
-// exemption cannot be added quietly to make a failing test pass.
-var configCheckAnnotations = map[string]struct{ mode, reason string }{
-	"entire hooks":                      {configCheckSkip, "agent and git hooks must never exit non-zero"},
-	"entire __send_analytics":           {configCheckSkip, "detached; nobody sees its failure"},
-	"entire __sweep_sessions":           {configCheckSkip, "detached from session-start; nobody sees its failure"},
-	"entire __refresh_trail_enablement": {configCheckSkip, "detached; fails before the logger starts"},
-	"entire curl-bash-post-install":     {configCheckSkip, "install.sh runs it under set -e; a re-install must not report failure"},
-	"entire completion":                 {configCheckSkip, "users eval it from a shell rc; never touches the token store"},
-	"entire help":                       {configCheckSkip, "prints help; never touches the token store"},
-	"entire version":                    {configCheckSkip, "prints build information; never touches the token store"},
-	"entire doctor":                     {configCheckSkip, "diagnostic; must run on a broken setup"},
-	"entire login":                      {configCheckAlways, "saves to the store even with ENTIRE_TOKEN set"},
-	"entire logout":                     {configCheckAlways, "deletes from the store even with ENTIRE_TOKEN set"},
-	"entire auth login":                 {configCheckAlways, "saves to the store even with ENTIRE_TOKEN set"},
-	"entire auth logout":                {configCheckAlways, "deletes from the store even with ENTIRE_TOKEN set"},
+// configCheckEntry is one ledger row.
+type configCheckEntry struct {
+	mode string
+	// subtree covers every descendant too.
+	subtree bool
+	reason  string
 }
 
-// collectAnnotated maps command paths to their own key value.
-func collectAnnotated(root *cobra.Command, key string) map[string]string {
-	found := map[string]string{}
-	var walk func(*cobra.Command)
-	walk = func(c *cobra.Command) {
-		if v := c.Annotations[key]; v != "" {
-			found[c.CommandPath()] = v
-		}
-		for _, child := range c.Commands() {
-			walk(child)
+// configCheckLedger pins every command whose effective config.json check
+// mode is not the default, and why. TestConfigCheckLedger fails on a
+// command missing from it, so a child added under an exempt group, or a new
+// exemption, needs an entry here.
+//
+// Deliberately absent: status, disable and the rest. A broken config.json
+// should reach the user as early as possible, and those are the commands
+// they run.
+var configCheckLedger = map[string]configCheckEntry{
+	"entire hooks":                      {configCheckSkip, true, "agent and git hooks must never exit non-zero"},
+	"entire __send_analytics":           {configCheckSkip, false, "detached; nobody sees its failure"},
+	"entire __sweep_sessions":           {configCheckSkip, false, "detached from session-start; nobody sees its failure"},
+	"entire __refresh_trail_enablement": {configCheckSkip, false, "detached; fails before the logger starts"},
+	"entire curl-bash-post-install":     {configCheckSkip, false, "install.sh runs it under set -e; a re-install must not report failure"},
+	"entire completion":                 {configCheckSkip, true, "users eval it from a shell rc; never touches the token store"},
+	"entire help":                       {configCheckSkip, false, "prints help; never touches the token store"},
+	"entire version":                    {configCheckSkip, false, "prints build information; never touches the token store"},
+	"entire mcp":                        {configCheckSkip, false, "agent hosts start it unattended and show only \"server failed\""},
+	"entire agent-help":                 {configCheckSkip, false, "agents read it unattended; never touches the token store"},
+	"entire doctor":                     {configCheckSkip, false, "diagnostic; reports config.json itself and exits non-zero"},
+	"entire doctor trace":               {configCheckSkip, false, "reads local hook traces only"},
+	"entire doctor logs":                {configCheckSkip, false, "reads .entire/logs only"},
+	"entire doctor bundle":              {configCheckSkip, false, "bundles local diagnostics only"},
+	"entire doctor migrate-checkpoints": {configCheckSkip, false, "rewrites local checkpoint refs; pushes go through the checked remote helper"},
+	"entire login":                      {configCheckAlways, false, "saves to the store even with ENTIRE_TOKEN set"},
+	"entire logout":                     {configCheckAlways, false, "deletes from the store even with ENTIRE_TOKEN set"},
+	"entire auth login":                 {configCheckAlways, false, "saves to the store even with ENTIRE_TOKEN set"},
+	"entire auth logout":                {configCheckAlways, false, "deletes from the store even with ENTIRE_TOKEN set"},
+}
+
+// ledgerEntryFor finds the row covering cmd.
+func ledgerEntryFor(cmd *cobra.Command) (configCheckEntry, bool) {
+	if e, ok := configCheckLedger[cmd.CommandPath()]; ok {
+		return e, true
+	}
+	for c := cmd.Parent(); c != nil; c = c.Parent() {
+		if e, ok := configCheckLedger[c.CommandPath()]; ok && e.subtree {
+			return e, true
 		}
 	}
-	walk(root)
-	return found
+	return configCheckEntry{}, false
 }
 
-func TestConfigCheckAnnotations(t *testing.T) {
+// allCommands lists root and every descendant.
+func allCommands(root *cobra.Command) []*cobra.Command {
+	all := []*cobra.Command{root}
+	for i := 0; i < len(all); i++ {
+		all = append(all, all[i].Commands()...)
+	}
+	return all
+}
+
+func TestConfigCheckLedger(t *testing.T) {
 	t.Parallel()
 
 	root := NewRootCmd()
 	root.InitDefaultHelpCmd()
-	got := collectAnnotated(root, configCheckAnnotation)
-
-	for _, path := range slices.Sorted(maps.Keys(got)) {
-		want, ok := configCheckAnnotations[path]
+	seen := map[string]bool{}
+	for _, cmd := range allCommands(root) {
+		path := cmd.CommandPath()
+		seen[path] = true
+		mode := configCheckMode(cmd)
+		entry, ok := ledgerEntryFor(cmd)
 		switch {
-		case !ok:
-			t.Errorf("%q has config check mode %q but is not in configCheckAnnotations.\n"+
-				"Add an entry saying why, or drop the annotation.", path, got[path])
-		case want.mode != got[path]:
-			t.Errorf("%q has config check mode %q, ledger says %q", path, got[path], want.mode)
+		case mode != "" && !ok:
+			t.Errorf("%q has config check mode %q but no configCheckLedger entry covers it.\n"+
+				"Add an entry saying why, or move it out of the exempt group.", path, mode)
+		case ok && entry.mode != mode:
+			t.Errorf("%q has config check mode %q, ledger says %q", path, mode, entry.mode)
+		}
+		// Detached internals must never fail.
+		if cmd.Parent() == root && strings.HasPrefix(cmd.Name(), "__") && mode != configCheckSkip {
+			t.Errorf("%q is a detached internal command; exempt it from the config check", path)
 		}
 	}
-	for path, want := range configCheckAnnotations {
-		if _, ok := got[path]; !ok {
-			t.Errorf("configCheckAnnotations lists %q, but no such command carries the annotation", path)
+	for path, entry := range configCheckLedger {
+		if !seen[path] {
+			t.Errorf("configCheckLedger lists %q, but no such command exists", path)
 		}
-		if strings.TrimSpace(want.reason) == "" {
+		if strings.TrimSpace(entry.reason) == "" {
 			t.Errorf("entry for %q has no reason", path)
 		}
 	}
@@ -88,10 +116,9 @@ func writeBadConfig(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"tokenstore": "file"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(auth.EnvTokenVar, "")
-	if err := os.Unsetenv(auth.EnvTokenVar); err != nil {
-		t.Fatal(err)
-	}
+	unsetEnv(t, auth.EnvTokenVar)
+	// Keep regressions off the shared store.
+	t.Cleanup(tokenstore.UseFileBackendForTesting(filepath.Join(t.TempDir(), "tokens.json")))
 }
 
 // executeRoot runs the real root command.
@@ -103,8 +130,48 @@ func executeRoot(t *testing.T, args ...string) (string, error) {
 	root.SetOut(&out)
 	root.SetErr(&out)
 	root.SetArgs(args)
-	err := root.ExecuteContext(context.Background())
+	err := root.ExecuteContext(t.Context())
 	return out.String(), err
+}
+
+// Every command's guard matches its mode.
+func TestCheckConfigBeforeRun_EveryCommand(t *testing.T) {
+	writeBadConfig(t)
+
+	root := NewRootCmd()
+	root.InitDefaultHelpCmd()
+	commands := allCommands(root)
+	check := func(envToken bool) {
+		for _, cmd := range commands {
+			mode := configCheckMode(cmd)
+			wantErr := mode == configCheckAlways || (mode == "" && !envToken)
+			err := checkConfigBeforeRun(cmd)
+			if gotErr := errors.Is(err, tokenstore.ErrBadConfig); gotErr != wantErr {
+				t.Errorf("%q (ENTIRE_TOKEN set: %v): err = %v, want ErrBadConfig %v", cmd.CommandPath(), envToken, err, wantErr)
+			}
+		}
+	}
+	check(false)
+	t.Setenv(auth.EnvTokenVar, "x")
+	check(true)
+}
+
+// Root's pre-run lets every skipped command through.
+func TestRoot_PreRunSkipsExemptCommands(t *testing.T) {
+	writeBadConfig(t)
+	t.Chdir(t.TempDir())
+
+	root := NewRootCmd()
+	root.InitDefaultHelpCmd()
+	for _, cmd := range allCommands(root) {
+		if configCheckMode(cmd) != configCheckSkip {
+			continue
+		}
+		cmd.SetContext(t.Context())
+		if err := root.PersistentPreRunE(cmd, nil); err != nil {
+			t.Errorf("%q: pre-run err = %v, want nil", cmd.CommandPath(), err)
+		}
+	}
 }
 
 // A bad config.json fails before RunE.
@@ -112,6 +179,7 @@ func TestRoot_BadConfigFailsEarly(t *testing.T) {
 	writeBadConfig(t)
 	t.Chdir(t.TempDir())
 
+	// status is deliberate: fail as early as possible.
 	for _, args := range [][]string{{"auth", "status"}, {"login", "--device"}, {"status"}} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			out, err := executeRoot(t, args...)
@@ -125,19 +193,11 @@ func TestRoot_BadConfigFailsEarly(t *testing.T) {
 	}
 }
 
-// ENTIRE_TOKEN skips the check, except for login/logout.
-func TestRoot_EnvTokenSkipsConfigCheck(t *testing.T) {
+// login/logout check despite ENTIRE_TOKEN.
+func TestRoot_EnvTokenStillChecksLogin(t *testing.T) {
 	writeBadConfig(t)
 	t.Setenv(auth.EnvTokenVar, "x")
 	t.Chdir(t.TempDir())
-
-	cmd, _, err := NewRootCmd().Find([]string{"auth", "status"})
-	if err != nil {
-		t.Fatalf("find auth status: %v", err)
-	}
-	if err := checkConfigBeforeRun(cmd); err != nil {
-		t.Fatalf("auth status with ENTIRE_TOKEN: %v", err)
-	}
 
 	for _, args := range [][]string{{"login", "--device"}, {"auth", "login", "--device"}, {"logout"}, {"auth", "logout"}} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
@@ -157,11 +217,29 @@ func TestRoot_ExemptCommandsRun(t *testing.T) {
 	writeBadConfig(t)
 	t.Chdir(t.TempDir())
 
-	for _, args := range [][]string{{"completion", "zsh"}, {"hooks", "git", "pre-push", "origin"}, {"help"}, {"version"}} {
+	for _, args := range [][]string{{"completion", "zsh"}, {"hooks", "git", "pre-push", "origin"}, {"help"}, {"version"}, {"agent-help"}} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			if _, err := executeRoot(t, args...); err != nil {
 				t.Fatalf("err = %v, want nil", err)
 			}
 		})
+	}
+}
+
+// Doctor reports a bad config.json.
+func TestDoctor_ReportsBadConfig(t *testing.T) {
+	writeBadConfig(t)
+
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	err := checkUserConfig(cmd)
+	if !errors.Is(err, tokenstore.ErrBadConfig) {
+		t.Fatalf("err = %v, want ErrBadConfig", err)
+	}
+	for _, want := range []string{"Per-user config: INVALID", `unknown key "tokenstore"`} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("doctor output missing %q:\n%s", want, out.String())
+		}
 	}
 }

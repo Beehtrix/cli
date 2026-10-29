@@ -19,8 +19,11 @@ const configFileName = "config.json"
 // ErrBadConfig marks an unusable config.json.
 var ErrBadConfig = errors.New("invalid Entire config")
 
-// tokenStoreKey is config.json's only key.
+// tokenStoreKey picks the credential backend.
 const tokenStoreKey = "token_store"
+
+// knownConfigKeys are config.json's allowed keys.
+var knownConfigKeys = []string{tokenStoreKey}
 
 // CheckConfig reports an unusable config.json.
 func CheckConfig() error {
@@ -54,27 +57,27 @@ func configTokenStore() (string, error) {
 	if err != nil {
 		return "", badConfig(err)
 	}
-	// Unknown keys fail; json matching ignores case.
+	// A map, so keys match exactly.
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(data, &keys); err != nil {
 		return "", badConfig(err)
 	}
 	for _, key := range slices.Sorted(maps.Keys(keys)) {
-		if key != tokenStoreKey {
+		if !slices.Contains(knownConfigKeys, key) {
 			return "", badConfig(fmt.Errorf("unknown key %q", key))
 		}
 	}
-	var cfg struct {
-		TokenStore string `json:"token_store"`
+	var tokenStore string
+	if raw, ok := keys[tokenStoreKey]; ok {
+		if err := json.Unmarshal(raw, &tokenStore); err != nil {
+			return "", badConfig(fmt.Errorf("%s: %w", tokenStoreKey, err))
+		}
 	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return "", badConfig(err)
-	}
-	switch cfg.TokenStore {
+	switch tokenStore {
 	case "", fileBackend, "keyring":
-		return cfg.TokenStore, nil
+		return tokenStore, nil
 	}
-	return "", badConfig(fmt.Errorf(`token_store is %q, want "file" or "keyring"`, cfg.TokenStore))
+	return "", badConfig(fmt.Errorf(`token_store is %q, want "file" or "keyring"`, tokenStore))
 }
 
 func badConfig(err error) error {
