@@ -599,9 +599,10 @@ func isShellVarName(s string) bool {
 //
 //	if [ -x "<ref>" ]; then exec "<ref>" "$@"; fi
 //
-// (or -f, -e), as in entire-brain's wrapper, and every other line that
-// mentions moved only assigns its path to a variable. An if whose test fails
-// and has no else exits 0. Anything else, `[ -f "<ref>" ] && exec ...` for
+// (or -f, -e) and it is the wrapper's last command, as in entire-brain's
+// wrapper, and every other line that mentions moved only assigns its path to
+// a variable. An if whose test fails and has no else exits 0, and with the
+// exec last nothing runs after it that ran only because moved was there. Anything else, `[ -f "<ref>" ] && exec ...` for
 // one, may fail on a missing file, so the caller leaves a placeholder.
 func guardsRelative(root *os.Root, name, at, moved string) bool {
 	code, ok := foreignShellCode(root, name)
@@ -612,6 +613,13 @@ func guardsRelative(root *os.Root, name, at, moved string) bool {
 	guarded := false
 	for line := range strings.Lines(string(code)) {
 		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		if guarded {
+			// Runs only once moved is gone, so it could fail the hook.
+			return false
+		}
 		if !slices.ContainsFunc(refs, func(ref string) bool { return endsFileName([]byte(l), ref) }) {
 			continue
 		}
