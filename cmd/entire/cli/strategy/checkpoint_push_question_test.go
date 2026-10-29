@@ -219,4 +219,3 @@ func TestFirstPushQuestion_LostRaceToManualStillRefusesHeldRefs(t *testing.T) {
 	require.ErrorIs(t, err, ErrOuterPushCarriesHeldCheckpoints)
 	assertRefsAbsentFromRemote(t, bareDir, refs, "the stored manual holds this push")
 }
-
