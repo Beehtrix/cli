@@ -296,9 +296,9 @@ func outgoingHeadline(info checkpointSyncInfo, n int, dest string) string {
 	case info.PushPolicyErr != "":
 		return fmt.Sprintf("'git push' sends none of these until the checkpoint push policy can be read. %s %s queued:", count, beVerb(n))
 	case info.PushPolicy == settings.CheckpointPushPolicyManual && dest != "":
-		return fmt.Sprintf("%s %s waiting for 'entire checkpoint push', which sends them to %s:", count, beVerb(n), dest)
+		return fmt.Sprintf("%s %s waiting for 'entire checkpoint push --all', which sends them to %s:", count, beVerb(n), dest)
 	case info.PushPolicy == settings.CheckpointPushPolicyManual:
-		return fmt.Sprintf("%s %s waiting for 'entire checkpoint push':", count, beVerb(n))
+		return fmt.Sprintf("%s %s waiting for 'entire checkpoint push --all':", count, beVerb(n))
 	case info.Err != "":
 		return fmt.Sprintf("'git push' sends none of these until that is fixed. %s %s queued:", count, beVerb(n))
 	case dest == "":

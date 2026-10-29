@@ -58,7 +58,7 @@ is still its current version: if it changed since you looked, it is not sent.
 
 --all and a bare <checkpoint-id> need a terminal. Without one, name each
 checkpoint as <checkpoint-id>@<commit>, using the commit --outgoing --json
-reports.
+reports. With no arguments, it lists what is waiting and uploads nothing.
 
 Examples:
   entire checkpoint push <id>
@@ -98,7 +98,7 @@ func runCheckpointPush(cmd *cobra.Command, args []string, flags checkpointPushFl
 			requests = append(requests, strategy.CheckpointPushRequest{Ref: oc.Ref})
 		}
 	case len(args) == 0:
-		return printWaitingForCheckpointPush(cmd, errOut)
+		return printWaitingForCheckpointPush(cmd, errOut, canPrompt)
 	default:
 		parsed, err := parseCheckpointPushArgs(args, canPrompt, errOut)
 		if err != nil {
@@ -174,24 +174,28 @@ func refuseCheckpointPushWithoutTerminal(errOut io.Writer, what string) error {
 }
 
 // printWaitingForCheckpointPush answers a bare `entire checkpoint push`: it
-// names what is waiting and how to send it, and exits non-zero because nothing
-// was uploaded.
-func printWaitingForCheckpointPush(cmd *cobra.Command, errOut io.Writer) error {
+// names what is waiting and how to send it. --all is offered only where it is
+// accepted.
+func printWaitingForCheckpointPush(cmd *cobra.Command, errOut io.Writer, canPrompt bool) error {
 	outgoing, err := strategy.ListOutgoingCheckpoints(cmd.Context())
 	if err != nil {
 		return reportOutgoingErr(errOut, err)
 	}
 	if len(outgoing.Checkpoints) == 0 {
 		fmt.Fprintln(errOut, "No checkpoints are waiting to upload.")
-		return NewSilentError(errors.New("no checkpoints named"))
+		return nil
 	}
 	fmt.Fprintf(errOut, "%d waiting to upload:\n", len(outgoing.Checkpoints))
 	for _, oc := range outgoing.Checkpoints {
 		fmt.Fprintf(errOut, "  %s\n", checkpointPushLabel(oc.CheckpointID, oc.Ref))
 	}
-	fmt.Fprintln(errOut, "Upload with 'entire checkpoint push <checkpoint-id>@<commit>' or 'entire checkpoint push --all'.")
-	fmt.Fprintln(errOut, "See each one with 'entire checkpoint list --outgoing'.")
-	return NewSilentError(errors.New("no checkpoints named"))
+	if canPrompt {
+		fmt.Fprintln(errOut, "Upload them all with 'entire checkpoint push --all', or name each one as <checkpoint-id>@<commit>.")
+	} else {
+		fmt.Fprintln(errOut, "Upload with 'entire checkpoint push <checkpoint-id>@<commit>'.")
+	}
+	fmt.Fprintln(errOut, "Each checkpoint's commit is in 'entire checkpoint list --outgoing --json'.")
+	return nil
 }
 
 func checkpointPushLabel(cid id.CheckpointID, ref plumbing.ReferenceName) string {

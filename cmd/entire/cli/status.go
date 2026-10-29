@@ -739,7 +739,7 @@ func formatUnpushedCheckpointsLine(info checkpointSyncInfo) string {
 		return fmt.Sprintf("%d %s not on %s", info.Unpushed, noun, info.Remote)
 	}
 	manual := info.PushPolicy == settings.CheckpointPushPolicyManual
-	const manualHint = "; upload with 'entire checkpoint push'"
+	const manualHint = "; upload with 'entire checkpoint push --all'"
 	if info.Source == checkpointSyncSourceDedicated {
 		line := fmt.Sprintf("%d %s not yet pushed", info.Unpushed, noun)
 		if manual {

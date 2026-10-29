@@ -61,7 +61,7 @@ func announceCheckpointPushPolicy(ctx context.Context, repo *git.Repository) boo
 		return true
 	}
 	if waiting := waitingCheckpointCount(ctx, repo); waiting > 0 {
-		fmt.Fprintf(stderrWriter, "[entire] %s waiting, upload with: entire checkpoint push\n", pluralCheckpoints(waiting))
+		fmt.Fprintf(stderrWriter, "[entire] %s waiting, upload with: entire checkpoint push --all\n", pluralCheckpoints(waiting))
 	}
 	return false
 }

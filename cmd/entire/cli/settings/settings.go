@@ -300,88 +300,9 @@ type ClonePreferences struct {
 	TrailsAgentHelpFailureAPIBase  string     `json:"trails_agent_help_failure_api_base,omitempty"`
 	TrailsAgentHelpFailureAuthKey  string     `json:"trails_agent_help_failure_auth_key,omitempty"`
 
-	// CheckpointPushPolicy decides whether checkpoints upload on git push or
-	// only through `entire checkpoint push`. Clone preferences rather than
-	// settings.local.json because the push queue is shared by every worktree,
-	// and a committed file must never be able to loosen it. Read it through
-	// EffectiveCheckpointPushPolicy, which rejects values this binary does not
-	// recognize instead of treating them as automatic.
-	CheckpointPushPolicy CheckpointPushPolicy `json:"checkpoint_push_policy,omitempty"`
-
 	// unknown holds keys this binary does not model, written back unchanged so
 	// a rewrite by one version does not delete another version's preferences.
 	unknown map[string]json.RawMessage
-}
-
-// CheckpointPushPolicy is the clone's choice of when checkpoints upload.
-type CheckpointPushPolicy string
-
-const (
-	// CheckpointPushPolicyAutomatic uploads queued checkpoints on git push.
-	CheckpointPushPolicyAutomatic CheckpointPushPolicy = "automatic"
-	// CheckpointPushPolicyManual uploads only what `entire checkpoint push` names.
-	CheckpointPushPolicyManual CheckpointPushPolicy = "manual"
-)
-
-// ParseCheckpointPushPolicy accepts exactly "automatic" or "manual".
-func ParseCheckpointPushPolicy(value string) (CheckpointPushPolicy, error) {
-	switch policy := CheckpointPushPolicy(value); policy {
-	case CheckpointPushPolicyAutomatic, CheckpointPushPolicyManual:
-		return policy, nil
-	default:
-		return "", fmt.Errorf("checkpoint push policy %q is not one of %q, %q",
-			value, CheckpointPushPolicyAutomatic, CheckpointPushPolicyManual)
-	}
-}
-
-// EffectiveCheckpointPushPolicy returns the stored policy, with an unset one
-// meaning automatic. An unrecognized value is an error so callers can fail
-// closed: it may be a stricter policy written by a newer binary.
-func (p *ClonePreferences) EffectiveCheckpointPushPolicy() (CheckpointPushPolicy, error) {
-	if p == nil || p.CheckpointPushPolicy == "" {
-		return CheckpointPushPolicyAutomatic, nil
-	}
-	return ParseCheckpointPushPolicy(string(p.CheckpointPushPolicy))
-}
-
-// LoadCheckpointPushPolicy reads the policy of the clone ctx resolves to.
-func LoadCheckpointPushPolicy(ctx context.Context) (CheckpointPushPolicy, error) {
-	path, err := ClonePreferencesPath(ctx)
-	if err != nil {
-		return "", fmt.Errorf("read checkpoint push policy: %w", err)
-	}
-	return loadCheckpointPushPolicyFromFile(path)
-}
-
-// LoadCheckpointPushPolicyAt reads the policy of the clone whose git common
-// dir is commonDir, for callers holding an opened repository rather than a
-// process directory to resolve from.
-func LoadCheckpointPushPolicyAt(commonDir string) (CheckpointPushPolicy, error) {
-	return loadCheckpointPushPolicyFromFile(filepath.Join(commonDir, ClonePreferencesFile))
-}
-
-const checkpointPushPolicyKey = "checkpoint_push_policy"
-
-// loadCheckpointPushPolicyFromFile reads only clone preferences, never through
-// Load: the push path treats a Load error as default settings, which would
-// turn a stored manual into automatic.
-func loadCheckpointPushPolicyFromFile(path string) (CheckpointPushPolicy, error) {
-	prefs, err := loadClonePreferencesFromFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read checkpoint push policy from %s: %w", path, err)
-	}
-	// A case variant of the key is kept as unknown, so reading past it would
-	// turn a stored manual into automatic.
-	for key := range prefs.unknown {
-		if strings.EqualFold(key, checkpointPushPolicyKey) {
-			return "", fmt.Errorf("read checkpoint push policy from %s: key %q must be spelled %q", path, key, checkpointPushPolicyKey)
-		}
-	}
-	policy, err := prefs.EffectiveCheckpointPushPolicy()
-	if err != nil {
-		return "", fmt.Errorf("read checkpoint push policy from %s: %w", path, err)
-	}
-	return policy, nil
 }
 
 // SummaryGenerationSettings configures provider selection for on-demand

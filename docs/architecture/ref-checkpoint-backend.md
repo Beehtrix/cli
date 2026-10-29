@@ -131,7 +131,7 @@ Two diagnostics make a wholesale failure readable. The batch error is logged bef
 
 ### Checkpoint push policy
 
-Each clone has a checkpoint push policy, `checkpoint_push_policy` in clone preferences (`entire/preferences.json` in the git common dir), set with `entire configure --checkpoint-push-policy`:
+Each clone has a checkpoint push policy, stored as one word in `entire/checkpoint-push-policy` in the git common dir and set with `entire configure --checkpoint-push-policy`:
 
 - `automatic` (also when unset): pre-push sends every queued ref, as above.
 - `manual`: pre-push sends nothing and prints how many checkpoints are waiting. `entire checkpoint push <id>[@<commit>]` or `--all` uploads the named refs through the same flush. With `@<commit>`, the ref is sent only while that commit is still its tip, so a version the user did not look at never uploads. The zero hash is not a pin, and one ref named with two different commits is refused. Each named ref reports `uploaded`, `changed`, `failed` (including a queued ref that could not be read, or a flush that failed before reaching it), or `not_waiting`.
@@ -140,9 +140,9 @@ Each clone has a checkpoint push policy, `checkpoint_push_policy` in clone prefe
 
 The policy is per clone because the push queue is: a per-worktree setting would let one worktree upload what another holds back. Automatic delivery (`flushCheckpointRefsQueue`, and `PushQueuedCheckpointRefs` for the migration push) reads it from the opened repository's common dir before OPF and again inside the flush, so a new automatic caller cannot upload under `manual` by skipping the check. Under `manual`, `PushQueuedCheckpointRefs` returns `ErrCheckpointPushHeldByPolicy` rather than reporting an empty queue, so the migration's push-now says the refs are held. `entire checkpoint push` does not read it: naming the refs is the decision.
 
-The read fails closed. A value this binary does not recognize, for example from a newer version, or the key spelled with different capitalization, uploads nothing on automatic paths, and pre-push names the file to fix. The policy is never read through `settings.Load`, whose callers on the push path fall back to defaults on a load error and would turn `manual` into `automatic`. A preferences file that does not parse disables Entire's git hooks entirely, because `settings.Load` reads clone preferences. Clone preference writes keep keys the running binary does not model, so a rewrite by another version does not drop the policy. Binaries released before that change still drop unknown keys, which matters only when two Entire versions run in one clone.
+A missing file means `automatic`. The read fails closed: an empty file, a symlink, or a value this binary does not recognize (for example from a newer version) uploads nothing on automatic paths, and pre-push names the file to fix. The policy is never read through `settings.Load`, whose callers on the push path fall back to defaults on a load error and would turn `manual` into `automatic`. It is its own file rather than a key in `entire/preferences.json` because released binaries rewrite that file without the keys they do not model, which would silently release a `manual` clone.
 
-Without a terminal, `entire checkpoint push` accepts only `<id>@<commit>`; `--all` and a bare ID need `interactive.CanPromptInteractively()`. This is a speed bump for agents, not a control: anything running as the user can edit the preferences file or push `refs/entire/*` itself.
+Without a terminal, `entire checkpoint push` accepts only `<id>@<commit>`; `--all` and a bare ID need `interactive.CanPromptInteractively()`. With no arguments it lists what is waiting and exits 0. This is a speed bump for agents, not a control: anything running as the user can edit the policy file or push `refs/entire/*` itself.
 
 ### Non-force, fast-forward-only
 
