@@ -127,7 +127,11 @@ type CheckpointPushReport struct {
 // and the policy only governs what uploads without being named. It returns
 // ErrOutgoingNeedsGitRefs on the git-branch backend.
 func PushCheckpoints(ctx context.Context, targets []CheckpointPushRequest) (CheckpointPushReport, error) {
-	if !primaryIsGitRefs(ctx) {
+	isRefs, err := primaryBackendIsGitRefs(ctx)
+	if err != nil {
+		return CheckpointPushReport{}, err
+	}
+	if !isRefs {
 		return CheckpointPushReport{}, ErrOutgoingNeedsGitRefs
 	}
 	syncRemote, err := ResolveCheckpointSyncRemote(ctx)

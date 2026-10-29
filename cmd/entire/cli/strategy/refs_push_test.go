@@ -599,6 +599,30 @@ func TestPushQueuedCheckpointRefs_ManualPolicyHoldsRefs(t *testing.T) {
 	assert.ElementsMatch(t, refs, remaining, "held refs stay queued")
 }
 
+// flushCheckpointRefsQueue checks the policy itself, so a new caller that
+// forgets to cannot upload under manual.
+func TestFlushCheckpointRefsQueue_ManualPolicySendsNothing(t *testing.T) {
+	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
+	t.Chdir(workDir)
+	paths.ClearWorktreeRootCache()
+	policyFile := filepath.Join(workDir, ".git", filepath.FromSlash(settings.CheckpointPushPolicyFile))
+	require.NoError(t, os.MkdirAll(filepath.Dir(policyFile), 0o755))
+	require.NoError(t, os.WriteFile(policyFile, []byte("manual\n"), 0o600))
+
+	repo, err := git.PlainOpen(workDir)
+	require.NoError(t, err)
+	queue := enqueueRefs(t, repo, refs)
+
+	pushed, err := flushCheckpointRefsQueue(context.Background(), repo, pushSettings{remote: bareDir})
+	require.NoError(t, err)
+	assert.Equal(t, 0, pushed)
+
+	assert.Empty(t, strings.TrimSpace(testutil.RunGit(t, bareDir, "for-each-ref", "refs/entire/")), "manual must not push")
+	remaining, err := queue.Drain()
+	require.NoError(t, err)
+	assert.ElementsMatch(t, refs, remaining, "held refs stay queued")
+}
+
 func TestPushQueuedCheckpointRefs_FailureLeavesRefsQueued(t *testing.T) {
 	workDir, _, refs := setupRepoWithCheckpointRefs(t)
 	t.Chdir(workDir)

@@ -486,10 +486,13 @@ func computeCheckpointSyncInfo(ctx context.Context, s *EntireSettings) checkpoin
 // checkpoints does not list them again.
 func computeCheckpointSyncInfoCounting(ctx context.Context, s *EntireSettings, countUnpushed func(ctx context.Context, remoteName string) int) checkpointSyncInfo {
 	info := checkpointSyncInfo{PushDisabled: s.IsPushSessionsDisabled()}
-	if policy, err := settings.LoadCheckpointPushPolicy(ctx); err != nil {
-		info.PushPolicyErr = err.Error()
-	} else {
-		info.PushPolicy = policy
+	// Only git-refs delivery reads the policy, so on git-branch it says nothing.
+	if refs, err := primaryBackendIsRefsAfter(ctx, ""); err == nil && refs {
+		if policy, err := settings.LoadCheckpointPushPolicy(ctx); err != nil {
+			info.PushPolicyErr = err.Error()
+		} else {
+			info.PushPolicy = policy
+		}
 	}
 
 	elected, err := strategy.ResolveCheckpointSyncRemote(ctx)
