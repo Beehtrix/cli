@@ -156,20 +156,13 @@ func readOutgoingCheckpoint(ctx context.Context, store checkpoint.PersistentStor
 	}
 	row.createdAt = first.CreatedAt
 	row.sessionIDs = append(row.sessionIDs, first.SessionID)
-	for i := 1; i < row.sessionCount; i++ {
-		meta, err := store.ReadSessionMetadata(ctx, oc.CheckpointID, i)
-		if err != nil {
-			row.err = fmt.Errorf("read session metadata: %w", err)
-			return row
-		}
-		row.sessionIDs = append(row.sessionIDs, meta.SessionID)
-	}
 	latest := first
-	if row.sessionCount > 1 {
-		if latest, err = store.ReadSessionMetadata(ctx, oc.CheckpointID, row.sessionCount-1); err != nil {
+	for i := 1; i < row.sessionCount; i++ {
+		if latest, err = store.ReadSessionMetadata(ctx, oc.CheckpointID, i); err != nil {
 			row.err = fmt.Errorf("read session metadata: %w", err)
 			return row
 		}
+		row.sessionIDs = append(row.sessionIDs, latest.SessionID)
 	}
 	row.agent = string(latest.Agent)
 	if latest.Summary != nil {

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/entiredir"
@@ -1298,9 +1299,9 @@ func loadClonePreferencesFromFile(filePath string) (*ClonePreferences, error) {
 	return prefs, nil
 }
 
-// clonePreferencesJSONKeys returns the JSON key of every ClonePreferences
+// clonePreferencesJSONKeys holds the JSON key of every ClonePreferences
 // field, so a new field is recognized without a second list to update.
-func clonePreferencesJSONKeys() map[string]struct{} {
+var clonePreferencesJSONKeys = sync.OnceValue(func() map[string]struct{} {
 	t := reflect.TypeFor[ClonePreferences]()
 	keys := make(map[string]struct{}, t.NumField())
 	for field := range t.Fields() {
@@ -1311,7 +1312,7 @@ func clonePreferencesJSONKeys() map[string]struct{} {
 		keys[name] = struct{}{}
 	}
 	return keys
-}
+})
 
 func saveClonePreferencesToFile(prefs *ClonePreferences, filePath string) error {
 	if prefs == nil {
@@ -1329,8 +1330,8 @@ func saveClonePreferencesToFile(prefs *ClonePreferences, filePath string) error 
 }
 
 // marshalClonePreferences writes the modeled fields and then the unknown keys
-// loaded with them. A modeled key always wins, so a field this binary cleared
-// is not brought back from the preserved keys.
+// loaded with them. Loading never keeps a modeled key as unknown, so the two
+// sets cannot collide.
 func marshalClonePreferences(prefs *ClonePreferences) ([]byte, error) {
 	if len(prefs.unknown) == 0 {
 		return jsonutil.MarshalIndentWithNewline(prefs, "", "  ") //nolint:wrapcheck // caller wraps
@@ -1343,11 +1344,7 @@ func marshalClonePreferences(prefs *ClonePreferences) ([]byte, error) {
 	if err := json.Unmarshal(modeled, &merged); err != nil {
 		return nil, err //nolint:wrapcheck // caller wraps
 	}
-	knownKeys := clonePreferencesJSONKeys()
 	for key, value := range prefs.unknown {
-		if _, ok := knownKeys[key]; ok {
-			continue
-		}
 		merged[key] = value
 	}
 	return jsonutil.MarshalIndentWithNewline(merged, "", "  ") //nolint:wrapcheck // caller wraps

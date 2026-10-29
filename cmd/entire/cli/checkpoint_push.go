@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -227,29 +226,26 @@ func checkpointPushResults(report strategy.CheckpointPushReport) []checkpointPus
 }
 
 func writeCheckpointPushJSON(w io.Writer, report strategy.CheckpointPushReport) error {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(checkpointPushJSON{Remote: report.Remote, Results: checkpointPushResults(report)}); err != nil {
-		return fmt.Errorf("write checkpoint push JSON: %w", err)
-	}
-	return nil
+	return printJSON(w, checkpointPushJSON{Remote: report.Remote, Results: checkpointPushResults(report)})
 }
 
 func writeCheckpointPushText(w io.Writer, report strategy.CheckpointPushReport) {
-	for _, result := range checkpointPushResults(report) {
-		label := result.CheckpointID
-		if label == "" {
-			label = result.Ref
-		}
-		switch strategy.CheckpointPushStatus(result.Status) {
+	for _, outcome := range report.Outcomes {
+		cid, _ := checkpoint.ParseRef(outcome.Target.Ref)
+		label := checkpointPushLabel(cid, outcome.Target.Ref)
+		switch outcome.Status {
 		case strategy.CheckpointPushUploaded:
 			fmt.Fprintf(w, "%s  uploaded to %s\n", label, report.Remote)
 		case strategy.CheckpointPushChanged:
-			fmt.Fprintf(w, "%s  not sent: it changed since you looked; it is now %s. Check it with 'entire checkpoint list --outgoing'.\n", label, result.Commit)
+			commit := ""
+			if !outcome.Commit.IsZero() {
+				commit = outcome.Commit.String()
+			}
+			fmt.Fprintf(w, "%s  not sent: it changed since you looked; it is now %s. Check it with 'entire checkpoint list --outgoing'.\n", label, commit)
 		case strategy.CheckpointPushNotWaiting:
 			fmt.Fprintf(w, "%s  not sent: it is not waiting to upload\n", label)
 		case strategy.CheckpointPushFailed:
-			fmt.Fprintf(w, "%s  failed: %s; it stays queued\n", label, result.Error)
+			fmt.Fprintf(w, "%s  failed: %v; it stays queued\n", label, outcome.Err)
 		}
 	}
 }

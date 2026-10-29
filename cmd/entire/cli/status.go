@@ -738,17 +738,20 @@ func formatUnpushedCheckpointsLine(info checkpointSyncInfo) string {
 		}
 		return fmt.Sprintf("%d %s not on %s", info.Unpushed, noun, info.Remote)
 	}
-	if info.PushPolicy == settings.CheckpointPushPolicyManual {
-		if info.Source == checkpointSyncSourceDedicated {
-			return fmt.Sprintf("%d %s not yet pushed; upload with 'entire checkpoint push'", info.Unpushed, noun)
-		}
-		return fmt.Sprintf("%d %s not yet on %s; upload with 'entire checkpoint push'", info.Unpushed, noun, info.Remote)
-	}
+	manual := info.PushPolicy == settings.CheckpointPushPolicyManual
+	const manualHint = "; upload with 'entire checkpoint push'"
 	if info.Source == checkpointSyncSourceDedicated {
-		return fmt.Sprintf("%d %s not yet pushed", info.Unpushed, noun)
+		line := fmt.Sprintf("%d %s not yet pushed", info.Unpushed, noun)
+		if manual {
+			line += manualHint
+		}
+		return line
 	}
-	return fmt.Sprintf("%d %s not yet on %s — %s with your next 'git push %s'",
-		info.Unpushed, noun, info.Remote, pronoun, info.Remote)
+	line := fmt.Sprintf("%d %s not yet on %s", info.Unpushed, noun, info.Remote)
+	if manual {
+		return line + manualHint
+	}
+	return fmt.Sprintf("%s — %s with your next 'git push %s'", line, pronoun, info.Remote)
 }
 
 // timeAgo formats a time as a human-readable relative duration.

@@ -70,12 +70,11 @@ func announceCheckpointPushPolicy(ctx context.Context, repo *git.Repository) boo
 // `entire checkpoint list --outgoing` lists. A queue that cannot be read
 // counts as zero: the line it feeds is a reminder, not a report.
 func waitingCheckpointCount(ctx context.Context, repo *git.Repository) int {
-	queued, err := peekCheckpointQueue(ctx, repo)
+	waiting, err := waitingCheckpointRefs(ctx, repo)
 	if err != nil {
 		return 0
 	}
-	existing, _ := partitionLocalRefs(repo, queued)
-	return len(existing)
+	return len(waiting)
 }
 
 func pluralCheckpoints(n int) string {
