@@ -142,7 +142,7 @@ The policy is per clone because the push queue is: a per-worktree setting would 
 
 A missing file means `automatic`. The read fails closed: an empty file, a symlink, or a value this binary does not recognize (for example from a newer version) uploads nothing on automatic paths, and pre-push names the file to fix. The policy is never read through `settings.Load`, whose callers on the push path fall back to defaults on a load error and would turn `manual` into `automatic`. It is its own file rather than a key in `entire/preferences.json` because released binaries rewrite that file without the keys they do not model, which would silently release a `manual` clone.
 
-Without a terminal, `entire checkpoint push` accepts only `<id>@<commit>`; `--all` and a bare ID need `interactive.CanPromptInteractively()`. With no arguments it lists what is waiting and exits 0. This is a speed bump for agents, not a control: anything running as the user can edit the policy file or push `refs/entire/*` itself.
+Without a terminal, `entire checkpoint push` accepts only `<id>@<commit>`; `--all` and a bare ID need `interactive.CanPromptInteractively()`. With no arguments it lists what is waiting and exits 0. This is a speed bump for agents, not a control: anything running as the user can edit the policy file, push `refs/entire/*` itself, or set `ENTIRE_TEST_TTY=1`, the test override `interactive.CanPromptInteractively()` honors in every build. A check that must hold against the user's own agent cannot live in the CLI.
 
 ### Non-force, fast-forward-only
 
