@@ -148,7 +148,7 @@ Under `manual`, or when the policy cannot be read, pre-push also refuses a user'
 
 Without a terminal, `entire checkpoint push` accepts only `<id>@<commit>`; `--all` and a bare ID need `interactive.CanPromptInteractively()`. With no arguments it lists what is waiting and exits 0; with `--json` and no arguments it refuses and points at `entire checkpoint list --outgoing --json`. It exits 0 when every named checkpoint was uploaded or had already been uploaded (`not_waiting`), and non-zero for `changed`, `failed` or `not_found` (no checkpoint with that ID here). With `--json`, a failure before any result is reported as `{"error": ...}` on stdout. This is a speed bump for agents, not a control: anything running as the user can edit the policy file, push `refs/entire/*` with `--no-verify`, or set `ENTIRE_TEST_TTY=1`, the test override `interactive.CanPromptInteractively()` honors in every build. A check that must hold against the user's own agent cannot live in the CLI.
 
-With OPF enabled, `entire checkpoint push <id>` still runs the OPF gate over the whole queue, not only the named refs. A large checkpoint that was not named can then trip an OPF cap and keep the named one from uploading. This affects only OPF users (deprecated) on `manual`.
+With OPF enabled, `entire checkpoint push <id>` still runs the OPF gate over the whole queue, not only the named refs. A large checkpoint that was not named can then trip an OPF cap and keep the named one from uploading. The rewrite also moves each waiting ref to a new tip, so a pinned `<id>@<commit>` taken before it reports `changed` and sends nothing on the first try. This affects only OPF users (deprecated) on `manual`.
 
 ### Non-force, fast-forward-only
 
