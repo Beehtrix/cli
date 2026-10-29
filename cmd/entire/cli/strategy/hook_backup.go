@@ -754,7 +754,7 @@ func singleQuotedPrefix(s string) string {
 }
 
 // mentionsOwnPath: name refers to $0, so renaming it could change what it
-// runs. Any mention counts; such a hook is left where it is.
+// runs. Any mention counts.
 func mentionsOwnPath(root *os.Root, name string) bool {
 	data, err := osroot.ReadFileNoFollow(root, name)
 	return err != nil || bytes.Contains(data, []byte("$0")) || bytes.Contains(data, []byte("${0"))
@@ -763,8 +763,8 @@ func mentionsOwnPath(root *os.Root, name string) bool {
 // restoreBrainChain is restoreWrapped for entire-brain's wrapper. With the
 // wrapper at hook (Brain installed over Entire), the user's hook in
 // .pre-entire goes into the copy, where the wrapper runs it, as Brain's own
-// install would have left it; with none, or with one that refers to $0 and
-// so could change if moved (it stays in .pre-entire), the copy goes. With
+// install would have left it; with none, the copy goes. A hook there that
+// refers to $0 could change if moved, so that layout is left as on main. With
 // Entire's hook at hook and the wrapper backed up (Entire re-wrapped Brain),
 // the copy was dormant, and the caller is about to put the wrapper back
 // where it would run it, so the copy goes. A keep copy beside m is left to
@@ -775,9 +775,14 @@ func restoreBrainChain(root *os.Root, hook, m string) (bool, error) {
 	}
 	backup := hook + backupSuffix
 	switch {
+	case isBrainChain(root, hook, hook) && hookFileExists(root, backup) && mentionsOwnPath(root, backup) &&
+		!carriesEntireMarker(root, backup) && !isBrainChain(root, backup, hook):
+		// Moving it could change what it runs, and removing the copy would
+		// stop Entire's copy running it from .pre-entire: leave all as is.
+		return false, nil
 	case isBrainChain(root, hook, hook):
 		if hookFileExists(root, backup) && !carriesEntireMarker(root, backup) &&
-			!isBrainChain(root, backup, hook) && !runsByName(root, backup, m) && !mentionsOwnPath(root, backup) {
+			!isBrainChain(root, backup, hook) && !runsByName(root, backup, m) {
 			return true, root.Rename(backup, m) //nolint:wrapcheck // caller adds the file name
 		}
 		return true, root.Remove(m) //nolint:wrapcheck // caller adds the file name

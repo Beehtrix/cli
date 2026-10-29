@@ -1553,12 +1553,15 @@ func TestRemoveHooks_NearBrainLayouts(t *testing.T) {
 			gone:  []string{brainCopy + backupSuffix},
 		},
 		// A backed-up hook that runs files relative to its own path would
-		// run something else if renamed, so it stays; Entire's copy goes.
+		// run something else if renamed, and Entire's copy is what runs it
+		// from .pre-entire, so the layout stays as on main.
 		"backed-up hook relative to its own path": {
 			hook:   brainWrapper,
 			backup: "#!/bin/sh\nexec \"$0.other\" \"$@\"\n",
-			want:   map[string]string{"pre-push" + backupSuffix: "#!/bin/sh\nexec \"$0.other\" \"$@\"\n"},
-			gone:   []string{brainCopy},
+			want: map[string]string{
+				"pre-push" + backupSuffix: "#!/bin/sh\nexec \"$0.other\" \"$@\"\n",
+				brainCopy:                 spec.content,
+			},
 		},
 		"brain wrapper at the hook path and backed up": {
 			hook:   brainWrapper,
