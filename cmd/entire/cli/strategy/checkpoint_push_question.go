@@ -25,6 +25,12 @@ const CheckpointPushQuestionLogMsg = "pre-push: asking for the checkpoint push p
 // so a terminal nobody watches does not cost every push the prompt timeout.
 const checkpointPushQuestionBackoff = 7 * 24 * time.Hour
 
+// checkpointPushQuestionTimeout bounds how long the question waits. It is
+// longer than confirmPromptTimeout because this is a three-way policy choice,
+// not a yes/no, and running out of time uploads the push being decided about.
+// Nothing outside pre-push bounds the hook, so the wait is not cut short.
+const checkpointPushQuestionTimeout = 60 * time.Second
+
 const opfDeprecationNotice = "OPF is deprecated and will be removed. To upload only the checkpoints you choose, run `entire configure --checkpoint-push-policy manual`."
 
 // checkpointPushQuestionFormat takes the prompt timeout.
@@ -36,7 +42,7 @@ Entire saves your AI sessions as checkpoints and uploads them when you push.
   [m] Manual: checkpoints stay on this machine until you run
       ` + "`entire checkpoint push`" + `. A push that sends refs/entire/* itself
       with --no-verify isn't covered.
-  [n] Not now
+  [n] Not now (this push uploads as usual)
 
 Choice [a/m/n] (%s, default n): `
 
@@ -191,11 +197,11 @@ func askCheckpointPushQuestionTTY() checkpointPushQuestionAnswer {
 	}
 	defer tty.Close()
 
-	fmt.Fprintf(tty, checkpointPushQuestionFormat, confirmPromptTimeout)
-	answer := readCheckpointPushQuestionAnswer(tty, confirmPromptTimeout)
+	fmt.Fprintf(tty, checkpointPushQuestionFormat, checkpointPushQuestionTimeout)
+	answer := readCheckpointPushQuestionAnswer(tty, checkpointPushQuestionTimeout)
 	if answer == checkpointPushAnswerTimedOut {
-		fmt.Fprintf(tty, "\nNo answer within %s. Entire will ask again in %d days.\n",
-			confirmPromptTimeout, int(checkpointPushQuestionBackoff.Hours()/24))
+		fmt.Fprintf(tty, "\nNo answer within %s, so this push uploads as usual. Entire will ask again in %d days.\n",
+			checkpointPushQuestionTimeout, int(checkpointPushQuestionBackoff.Hours()/24))
 	}
 	return answer
 }
