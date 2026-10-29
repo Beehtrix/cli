@@ -116,7 +116,7 @@ func TestCheckpointPushQuestion_BackoffOverAsksAgain(t *testing.T) {
 	require.Equal(t, 1, checkpointPushQuestionsAsked(t, env))
 }
 
-// OPF users already answer a question on every push, so they get a one-time
+// OPF can ask its own question on a push, so OPF users get a one-time
 // deprecation line instead of the policy question.
 func TestCheckpointPushQuestion_OPFUsersGetDeprecationLineOnce(t *testing.T) {
 	t.Parallel()

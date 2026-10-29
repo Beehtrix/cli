@@ -98,8 +98,10 @@ const (
 )
 
 // firstPushPromptFor decides what a terminal push shows a clone whose
-// preferences are prefs, where policyStored says whether it chose a policy. OPF users already answer an OPF question on every
-// push, so they get a one-time deprecation line instead of a second question.
+// preferences are prefs, where policyStored says whether it chose a policy.
+// OPF can ask its own question on a push (unless its prompt_default answers
+// for it), so OPF users get a one-time deprecation line instead of a possible
+// second question.
 // Commit linking asks in prepare-commit-msg, never during a push, so this is
 // the only other question a push can show.
 func firstPushPromptFor(policyStored bool, prefs *settings.ClonePreferences, now time.Time, opfEnabled bool) firstPushPrompt {
