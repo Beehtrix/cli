@@ -127,3 +127,47 @@ func TestFirstPushQuestion_ManualRefusesPushSendingHeldCommit(t *testing.T) {
 	require.ErrorIs(t, err, ErrOuterPushCarriesHeldCheckpoints)
 	assertRefsAbsentFromRemote(t, bareDir, refs, "Entire's own flush sends nothing either")
 }
+
+// When automatic was stored while the question waited, an answer of manual
+// loses: the push is neither refused nor held, and the stored policy decides.
+func TestFirstPushQuestion_LostRaceLetsStoredPolicyDecide(t *testing.T) {
+	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
+	prepareGitRefsPrePush(t, workDir, bareDir)
+	t.Setenv(interactive.EnvTestTTY, "1")
+	previous := askCheckpointPushQuestion
+	askCheckpointPushQuestion = func() checkpointPushQuestionAnswer {
+		require.NoError(t, settings.SaveCheckpointPushPolicy(t.Context(), settings.CheckpointPushPolicyAutomatic))
+		return checkpointPushAnswerManual
+	}
+	t.Cleanup(func() { askCheckpointPushQuestion = previous })
+	repo, err := gitrepo.OpenPath(workDir)
+	require.NoError(t, err)
+	defer repo.Close()
+	enqueueRefs(t, repo, refs)
+
+	outer := refs[0].String()
+	tip := strings.TrimSpace(testutil.RunGit(t, workDir, "rev-parse", outer))
+	ctx := WithPrePushRefs(t.Context(), []PrePushRef{{
+		LocalRef: outer, LocalSHA: tip, RemoteRef: outer, RemoteSHA: plumbing.ZeroHash.String(),
+	}})
+	captureStderrWriter(t)
+	require.NoError(t, NewManualCommitStrategy().PrePushFromGitHook(ctx, "origin"), "automatic was stored, so the push is not refused")
+	assert.NotEmpty(t, strings.TrimSpace(testutil.RunGit(t, bareDir, "for-each-ref", "refs/entire/")), "and Entire uploads as automatic does")
+}
+
+// After a saved manual answer, the waiting line that follows already names
+// the upload command; the answer line must not repeat it.
+func TestFirstPushQuestion_ManualAnswerNamesTheUploadCommandOnce(t *testing.T) {
+	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
+	prepareGitRefsPrePush(t, workDir, bareDir)
+	answerFirstPushQuestionWith(t, checkpointPushAnswerManual)
+	repo, err := gitrepo.OpenPath(workDir)
+	require.NoError(t, err)
+	defer repo.Close()
+	enqueueRefs(t, repo, refs)
+
+	stderr := captureStderrWriter(t)
+	require.NoError(t, NewManualCommitStrategy().PrePushFromGitHook(WithPrePushRefs(t.Context(), nil), "origin"))
+
+	assert.Equal(t, 1, strings.Count(stderr.String(), "entire checkpoint push --all"), "stderr:\n%s", stderr.String())
+}

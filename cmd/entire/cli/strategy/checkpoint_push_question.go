@@ -114,7 +114,10 @@ func firstPushPromptFor(policyStored bool, prefs *settings.ClonePreferences, now
 		}
 		return firstPushPromptOPFNotice
 	}
-	if until, err := time.Parse(time.RFC3339, prefs.CheckpointPushQuestionBackoffUntil); err == nil && now.Before(until) {
+	// A back-off further out than one period came from a clock that was ahead,
+	// or a hand edit, and is treated like a malformed one.
+	if until, err := time.Parse(time.RFC3339, prefs.CheckpointPushQuestionBackoffUntil); err == nil &&
+		now.Before(until) && !until.After(now.Add(checkpointPushQuestionBackoff)) {
 		return firstPushPromptNone
 	}
 	return firstPushPromptQuestion
@@ -174,8 +177,9 @@ func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repositor
 			return answer, false
 		}
 		if !saved {
+			// The stored choice wins, so this push follows it, not the answer.
 			fmt.Fprintln(stderrWriter, "[entire] A checkpoint push policy was chosen while this question waited; keeping that one.")
-			return answer, false
+			return checkpointPushAnswerNotNow, false
 		}
 	}
 	if err := settings.ModifyClonePreferences(ctx, func(p *settings.ClonePreferences) error {
@@ -189,7 +193,8 @@ func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repositor
 	}
 	switch answer {
 	case checkpointPushAnswerManual:
-		fmt.Fprintln(stderrWriter, "[entire] Checkpoint push policy: manual. Upload checkpoints with: entire checkpoint push --all")
+		// The waiting line that follows names the upload command.
+		fmt.Fprintln(stderrWriter, "[entire] Checkpoint push policy: manual.")
 	case checkpointPushAnswerAutomatic:
 		fmt.Fprintln(stderrWriter, "[entire] Checkpoint push policy: automatic. Change it with: entire configure --checkpoint-push-policy manual")
 	case checkpointPushAnswerNotNow, checkpointPushAnswerTimedOut:

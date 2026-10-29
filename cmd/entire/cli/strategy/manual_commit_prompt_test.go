@@ -3,8 +3,12 @@ package strategy
 import (
 	"errors"
 	"io"
+	"os"
+	"runtime"
 	"testing"
 	"time"
+
+	"github.com/creack/pty"
 
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 )
@@ -126,6 +130,9 @@ func TestFirstPushPromptFor(t *testing.T) {
 		{name: "back-off over", prefs: settings.ClonePreferences{CheckpointPushQuestionBackoffUntil: now.Add(-time.Second).Format(time.RFC3339)}, want: firstPushPromptQuestion},
 		// A bad value may only bring the question back, never hide it for good.
 		{name: "malformed back-off", prefs: settings.ClonePreferences{CheckpointPushQuestionBackoffUntil: "next tuesday"}, want: firstPushPromptQuestion},
+		// A back-off further out than one back-off period was written by a
+		// clock that was ahead, or by hand, and must not hide the question.
+		{name: "back-off beyond one period", prefs: settings.ClonePreferences{CheckpointPushQuestionBackoffUntil: now.Add(5 * 365 * 24 * time.Hour).Format(time.RFC3339)}, want: firstPushPromptQuestion},
 		{name: "OPF user", opf: true, want: firstPushPromptOPFNotice},
 		{name: "OPF user while backing off", opf: true, prefs: settings.ClonePreferences{CheckpointPushQuestionBackoffUntil: now.Add(time.Hour).Format(time.RFC3339)}, want: firstPushPromptOPFNotice},
 		{name: "OPF notice already shown", opf: true, prefs: settings.ClonePreferences{OPFDeprecationNoticeShown: true}, want: firstPushPromptNone},
@@ -153,5 +160,38 @@ func TestCheckpointPushQuestionBackoffAfterTimeout(t *testing.T) {
 	}
 	if got := firstPushPromptFor(false, prefs, answeredAt.Add(7*24*time.Hour+time.Minute), false); got != firstPushPromptQuestion {
 		t.Fatalf("after 7 days: %v, want the question", got)
+	}
+}
+
+// After a timeout the prompt must not leave a read behind on the terminal: pre-push
+// goes on to the upload, and a leftover read would take the next line typed,
+// such as an answer to a git credential prompt.
+func TestReadPromptAnswer_TimeoutLeavesTheNextLineForTheNextReader(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a pty")
+	}
+	ptmx, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	t.Cleanup(func() { _ = ptmx.Close() })
+	name := tty.Name()
+	_ = tty.Close()
+	f, err := os.OpenFile(name, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	if _, err := readPromptAnswer(f, 50*time.Millisecond); !errors.Is(err, errPromptTimedOut) {
+		t.Fatalf("err = %v, want errPromptTimedOut", err)
+	}
+	if _, err := ptmx.Write([]byte("hunter2\n")); err != nil {
+		t.Fatal(err)
+	}
+	line, err := readPromptAnswer(f, 2*time.Second)
+	if err != nil || line != "hunter2\n" {
+		t.Fatalf("the next reader got %q, %v; a read left behind by the timeout took it", line, err)
 	}
 }
