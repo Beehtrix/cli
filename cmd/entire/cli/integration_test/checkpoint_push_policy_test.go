@@ -411,8 +411,43 @@ func TestCheckpointPush_UnknownCheckpointIsReported(t *testing.T) {
 
 	missing := "a1b2c3d4e5f6"
 	result, err := runCheckpointPushJSON(t, env, false, missing+"@1111111111111111111111111111111111111111")
+	require.Error(t, err, "an ID with no checkpoint here is an error, so a typo fails")
+	require.Equal(t, "not_found", result.status(t, missing))
+}
+
+// Naming a checkpoint that was already uploaded asks for nothing that has not
+// happened, so a rerun succeeds.
+func TestCheckpointPush_AlreadyUploadedSucceeds(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	work := createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	pinned := work + "@" + outgoingCommit(t, env, work)
+	_, err := runCheckpointPushJSON(t, env, false, pinned)
+	require.NoError(t, err)
+
+	result, err := runCheckpointPushJSON(t, env, false, pinned)
+	require.NoError(t, err, "a rerun after the upload is not a failure")
+	require.Equal(t, "not_waiting", result.status(t, work))
+}
+
+// Callers that pass --json read stdout as JSON, failures included.
+func TestCheckpointPush_JSONRefusalIsJSON(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+
+	stdout, _, err := runCheckpointPush(t, env, false, "--all", "--json")
+
 	require.Error(t, err)
-	require.Equal(t, "not_waiting", result.status(t, missing))
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(stdout), &parsed), "stdout must be JSON: %q", stdout)
+	require.NotEmpty(t, parsed.Error)
 }
 
 // The zero hash is how the strategy spells "not pinned", so accepting it as a

@@ -103,6 +103,9 @@ const (
 	CheckpointPushChanged    CheckpointPushStatus = "changed"
 	CheckpointPushFailed     CheckpointPushStatus = "failed"
 	CheckpointPushNotWaiting CheckpointPushStatus = "not_waiting"
+	// CheckpointPushNotFound is a named checkpoint with no ref here at all,
+	// such as a mistyped ID.
+	CheckpointPushNotFound CheckpointPushStatus = "not_found"
 )
 
 // CheckpointPushOutcome reports one target. Commit is the version sent, or
@@ -165,16 +168,17 @@ func PushCheckpoints(ctx context.Context, targets []CheckpointPushRequest) (Chec
 		return CheckpointPushReport{}, err
 	}
 
+	missing := missingCheckpointRefs(repo, targets, waiting)
 	report := CheckpointPushReport{Remote: syncRemote.Name}
 	if len(selection.refs) == 0 {
-		report.Outcomes = checkpointPushOutcomes(targets, waiting, checkpointFlushResult{}, nil)
+		report.Outcomes = checkpointPushOutcomes(targets, waiting, missing, checkpointFlushResult{}, nil)
 		return report, nil
 	}
 	if opfErr := opfGateForCheckpointRefs(ctx, repo); opfErr != nil {
 		return report, fmt.Errorf("checkpoint refs stay queued: %w", opfErr)
 	}
 	result, flushErr := flushCheckpointRefs(ctx, repo, ps, selection)
-	report.Outcomes = checkpointPushOutcomes(targets, waiting, result, flushErr)
+	report.Outcomes = checkpointPushOutcomes(targets, waiting, missing, result, flushErr)
 	if flushErr != nil {
 		logging.Warn(ctx, "checkpoint push: delivery failed",
 			slog.String("error", flushErr.Error()))
@@ -219,9 +223,25 @@ func waitingTargetSelection(targets []CheckpointPushRequest, waiting map[plumbin
 // checkpointPushOutcomes maps the flush back onto each target. A flush-wide
 // error (one with no per-ref report, such as a failed queue drain) fails every
 // waiting target the flush did not report on, rather than reading as absence.
+// missingCheckpointRefs is the named refs that are not waiting and do not
+// exist here, as opposed to ones already uploaded.
+func missingCheckpointRefs(repo *git.Repository, targets []CheckpointPushRequest, waiting map[plumbing.ReferenceName]struct{}) map[plumbing.ReferenceName]struct{} {
+	missing := make(map[plumbing.ReferenceName]struct{})
+	for _, target := range targets {
+		if _, ok := waiting[target.Ref]; ok {
+			continue
+		}
+		if _, err := repo.Reference(target.Ref, true); errors.Is(err, plumbing.ErrReferenceNotFound) {
+			missing[target.Ref] = struct{}{}
+		}
+	}
+	return missing
+}
+
 func checkpointPushOutcomes(
 	targets []CheckpointPushRequest,
 	waiting map[plumbing.ReferenceName]struct{},
+	missing map[plumbing.ReferenceName]struct{},
 	result checkpointFlushResult,
 	flushErr error,
 ) []CheckpointPushOutcome {
@@ -248,6 +268,8 @@ func checkpointPushOutcomes(
 			}
 		} else if _, queued := waiting[target.Ref]; queued && flushErr != nil {
 			outcome.Status, outcome.Err = CheckpointPushFailed, flushErr
+		} else if _, absent := missing[target.Ref]; absent {
+			outcome.Status = CheckpointPushNotFound
 		} else {
 			// Not queued, or it left the queue while this command ran.
 			outcome.Status = CheckpointPushNotWaiting

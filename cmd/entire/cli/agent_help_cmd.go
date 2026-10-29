@@ -252,7 +252,9 @@ var agentHelpGuidance = map[string]string{
 	"checkpoint push": "Uploads checkpoints the user may be keeping on this machine on purpose.\n" +
 		"Never run this unless the user explicitly asks to upload those checkpoints.\n" +
 		"Without a terminal it accepts only <checkpoint-id>@<commit>; get the commit\n" +
-		"from `entire checkpoint list --outgoing --json`.",
+		"from `checkpoints[].commit` in `entire checkpoint list --outgoing --json`.\n" +
+		"A result with status `changed` means the checkpoint moved since that read:\n" +
+		"read the listing again and ask the user before uploading the new version.",
 }
 
 // agentHelpProjectTrailGuidance replaces agentHelpGuidance for commands in the
