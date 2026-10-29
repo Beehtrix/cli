@@ -150,18 +150,6 @@ func (r PrePushRef) checkpointRefName() string {
 	return r.RemoteRef
 }
 
-// outerPushCheckpointRef returns the first line of the user's own push that
-// sends checkpoint content (see PrePushRef.sends), if the hook passed the list.
-func outerPushCheckpointRef(ctx context.Context) (PrePushRef, bool) {
-	refs, _ := ctx.Value(prePushRefsKey{}).([]PrePushRef) //nolint:errcheck // absent means "not known"
-	for _, r := range refs {
-		if r.sends() && (isCheckpointRefName(r.LocalRef) || isCheckpointRefName(r.RemoteRef)) {
-			return r, true
-		}
-	}
-	return PrePushRef{}, false
-}
-
 // WithPrePushRefsFrom parses git's pre-push ref list from r and records it. A
 // list that cannot be read leaves the refs unknown, as with an old hook, and
 // the user's push is not blocked over it.
