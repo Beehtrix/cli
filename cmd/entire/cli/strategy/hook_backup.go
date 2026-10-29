@@ -529,20 +529,89 @@ func namesFile(data []byte, file string) bool {
 // runsRelative: name is a regular file, not Entire's, that, placed at the
 // path at, runs moved through a path relative to its own: "$0<suffix>" or
 // "${0}<suffix>", where moved is at+suffix. entire-brain's pre-push wrapper
-// chains to "$0.pre-entire-brain" this way, behind an [ -x ] check. Such a
-// wrapper stops running moved once it is itself moved, as Entire's install
-// moves it to .pre-entire, so only uninstall, which puts the wrapper back at
-// the hook path, has to look for it.
+// chains to "$0.pre-entire-brain" this way. Such a wrapper stops running moved
+// once it is itself moved, as Entire's install moves it to .pre-entire, so
+// only uninstall, which puts the wrapper back at the hook path, has to look
+// for it.
 func runsRelative(root *os.Root, name, at, moved string) bool {
-	suffix, ok := strings.CutPrefix(moved, at)
-	if !ok || len(suffix) < 2 || suffix[0] != '.' {
-		return false
-	}
+	code, ok := foreignShellCode(root, name)
+	return ok && len(relativeRefs(code, at, moved)) > 0
+}
+
+// foreignShellCode reads name, a regular file that is not Entire's, without
+// its whole-line comments, so a path a comment mentions is not taken for one
+// the script runs.
+func foreignShellCode(root *os.Root, name string) ([]byte, bool) {
 	data, err := osroot.ReadFileNoFollow(root, name)
 	if err != nil || bytes.Contains(data, []byte(entireHookMarker)) {
+		return nil, false
+	}
+	var code []byte
+	for line := range bytes.Lines(data) {
+		if !bytes.HasPrefix(bytes.TrimSpace(line), []byte("#")) {
+			code = append(code, line...)
+		}
+	}
+	return code, true
+}
+
+// relativeRefs returns how code, run from at, refers to moved: "$0<suffix>"
+// or "${0}<suffix>" where moved is at+suffix, and "$v"/"${v}" for each
+// variable v assigned one of those.
+func relativeRefs(code []byte, at, moved string) []string {
+	suffix, ok := strings.CutPrefix(moved, at)
+	if !ok || len(suffix) < 2 || suffix[0] != '.' {
+		return nil
+	}
+	var direct []string
+	for _, ref := range []string{"$0" + suffix, "${0}" + suffix} {
+		if endsFileName(code, ref) {
+			direct = append(direct, ref)
+		}
+	}
+	if len(direct) == 0 {
+		return nil
+	}
+	refs := slices.Clone(direct)
+	for line := range strings.Lines(string(code)) {
+		v, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok && isShellVarName(v) && slices.Contains(direct, strings.Trim(value, `"`)) {
+			refs = append(refs, "$"+v, "${"+v+"}")
+		}
+	}
+	return refs
+}
+
+func isShellVarName(s string) bool {
+	if s == "" || s[0] >= '0' && s[0] <= '9' {
 		return false
 	}
-	return endsFileName(data, "$0"+suffix) || endsFileName(data, "${0}"+suffix)
+	for i := range len(s) {
+		if b := s[i]; b == '-' || !isHookNameByte(b) {
+			return false
+		}
+	}
+	return true
+}
+
+// guardsRelative: name, at the path at, checks that moved exists before it
+// runs it, with [ -x ], [ -f ] or [ -e ] (or test) on one of the references
+// relativeRefs finds, as entire-brain's `if [ -x "$backup" ]` does. Removing
+// moved then leaves the wrapper working; without such a check, the wrapper
+// would fail on a missing file.
+func guardsRelative(root *os.Root, name, at, moved string) bool {
+	code, ok := foreignShellCode(root, name)
+	if !ok {
+		return false
+	}
+	for _, ref := range relativeRefs(code, at, moved) {
+		for _, op := range []string{"-x ", "-f ", "-e "} {
+			if endsFileName(code, op+ref) || endsFileName(code, op+`"`+ref) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // endsFileName finds ref in data followed by a byte that cannot continue a
@@ -559,6 +628,17 @@ func endsFileName(data []byte, ref string) bool {
 		}
 		i = end
 	}
+}
+
+// clearRelativeCopy takes Entire's hook out of moved, which wrapper runs
+// relative to its own path once it is at hook: moved goes when the wrapper
+// checks it exists first, and otherwise becomes noopMovedHook.
+func clearRelativeCopy(root *os.Root, wrapper, hook, moved string) error {
+	if guardsRelative(root, wrapper, hook, moved) {
+		return root.Remove(moved) //nolint:wrapcheck // caller adds the file name
+	}
+	_, err := writeHookFile(root, moved, noopMovedHook)
+	return err
 }
 
 func isFileNameByte(b byte) bool {
@@ -727,8 +807,8 @@ func restoreLegacy(root *os.Root, hook string) error {
 // moved Entire's onto it, and the keep copy goes. A moved copy of Entire's
 // hook that no install has reclaimed yet becomes noopMovedHook, so the wrapper
 // the caller restores does not go on running Entire's hook. A wrapper that
-// finds the copy relative to its own path (see runsRelative) is written to
-// work without it, so there the copy is removed instead.
+// finds the copy relative to its own path (see runsRelative) and checks that
+// it exists before running it gets no file there instead.
 func restoreWrapped(root *os.Root, hook string) error {
 	moved, err := movedHookCopies(root, hook)
 	if err != nil {
@@ -748,11 +828,10 @@ func restoreWrapped(root *os.Root, hook string) error {
 			// The manager installed over Entire before any reclaim: the user's
 			// hook is still in .pre-entire, which the wrapper does not run.
 			switch {
-			case hookFileExists(root, backup) && !carriesEntireMarker(root, backup) &&
-				!runsByName(root, backup, m) && !runsRelative(root, backup, hook, m):
+			case hookFileExists(root, backup) && !carriesEntireMarker(root, backup) && !runsByName(root, backup, m):
 				err = root.Rename(backup, m)
 			case runsRelative(root, hook, hook, m):
-				err = root.Remove(m)
+				err = clearRelativeCopy(root, hook, hook, m)
 			default:
 				_, err = writeHookFile(root, m, noopMovedHook)
 			}
@@ -765,7 +844,7 @@ func restoreWrapped(root *os.Root, hook string) error {
 			// Entire backed up a wrapper that runs m relative to its own path,
 			// so m was dormant; the caller restores the wrapper to the hook
 			// path, where it would run m again.
-			err = root.Remove(m)
+			err = clearRelativeCopy(root, backup, hook, m)
 		case keepExists && sameHookFile(root, keep, m):
 			err = root.Remove(keep)
 		}
