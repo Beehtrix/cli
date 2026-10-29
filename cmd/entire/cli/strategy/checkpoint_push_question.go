@@ -53,6 +53,9 @@ const (
 	checkpointPushAnswerAutomatic
 	checkpointPushAnswerManual
 	checkpointPushAnswerTimedOut
+	// checkpointPushAnswerSuperseded is an answer that lost to a policy stored
+	// while the question waited; the stored policy decides the push.
+	checkpointPushAnswerSuperseded
 )
 
 // readCheckpointPushQuestionAnswer reads one answer from r. Anything but an
@@ -85,7 +88,7 @@ func recordCheckpointPushQuestionAnswer(prefs *settings.ClonePreferences, answer
 		prefs.CheckpointPushQuestionBackoffUntil = ""
 	case checkpointPushAnswerTimedOut:
 		prefs.CheckpointPushQuestionBackoffUntil = now.Add(checkpointPushQuestionBackoff).UTC().Format(time.RFC3339)
-	case checkpointPushAnswerNotNow:
+	case checkpointPushAnswerNotNow, checkpointPushAnswerSuperseded:
 	}
 }
 
@@ -179,7 +182,7 @@ func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repositor
 		if !saved {
 			// The stored choice wins, so this push follows it, not the answer.
 			fmt.Fprintln(stderrWriter, "[entire] A checkpoint push policy was chosen while this question waited; keeping that one.")
-			return checkpointPushAnswerNotNow, false
+			return checkpointPushAnswerSuperseded, false
 		}
 	}
 	if err := settings.ModifyClonePreferences(ctx, func(p *settings.ClonePreferences) error {
@@ -197,7 +200,7 @@ func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repositor
 		fmt.Fprintln(stderrWriter, "[entire] Checkpoint push policy: manual.")
 	case checkpointPushAnswerAutomatic:
 		fmt.Fprintln(stderrWriter, "[entire] Checkpoint push policy: automatic. Change it with: entire configure --checkpoint-push-policy manual")
-	case checkpointPushAnswerNotNow, checkpointPushAnswerTimedOut:
+	case checkpointPushAnswerNotNow, checkpointPushAnswerTimedOut, checkpointPushAnswerSuperseded:
 	}
 	return answer, true
 }
@@ -210,7 +213,7 @@ func checkpointPushQuestionPolicy(answer checkpointPushQuestionAnswer) (settings
 		return settings.CheckpointPushPolicyAutomatic, true
 	case checkpointPushAnswerManual:
 		return settings.CheckpointPushPolicyManual, true
-	case checkpointPushAnswerNotNow, checkpointPushAnswerTimedOut:
+	case checkpointPushAnswerNotNow, checkpointPushAnswerTimedOut, checkpointPushAnswerSuperseded:
 	}
 	return "", false
 }

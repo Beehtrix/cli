@@ -189,3 +189,34 @@ func TestFirstPushQuestion_ManualAnswerNamesTheUploadCommandOnce(t *testing.T) {
 
 	assert.Equal(t, 1, strings.Count(stderr.String(), "entire checkpoint push --all"), "stderr:\n%s", stderr.String())
 }
+
+// When manual was stored while the question waited, the stored policy wins,
+// and the user's push is checked against it: the check before the question ran
+// while the policy was unset.
+func TestFirstPushQuestion_LostRaceToManualStillRefusesHeldRefs(t *testing.T) {
+	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
+	prepareGitRefsPrePush(t, workDir, bareDir)
+	t.Setenv(interactive.EnvTestTTY, "1")
+	previous := askCheckpointPushQuestion
+	askCheckpointPushQuestion = func() checkpointPushQuestionAnswer {
+		require.NoError(t, settings.SaveCheckpointPushPolicy(t.Context(), settings.CheckpointPushPolicyManual))
+		return checkpointPushAnswerAutomatic
+	}
+	t.Cleanup(func() { askCheckpointPushQuestion = previous })
+	repo, err := gitrepo.OpenPath(workDir)
+	require.NoError(t, err)
+	defer repo.Close()
+	enqueueRefs(t, repo, refs)
+
+	outer := refs[0].String()
+	tip := strings.TrimSpace(testutil.RunGit(t, workDir, "rev-parse", outer))
+	ctx := WithPrePushRefs(t.Context(), []PrePushRef{{
+		LocalRef: outer, LocalSHA: tip, RemoteRef: outer, RemoteSHA: plumbing.ZeroHash.String(),
+	}})
+	captureStderrWriter(t)
+	err = NewManualCommitStrategy().PrePushFromGitHook(ctx, "origin")
+
+	require.ErrorIs(t, err, ErrOuterPushCarriesHeldCheckpoints)
+	assertRefsAbsentFromRemote(t, bareDir, refs, "the stored manual holds this push")
+}
+
