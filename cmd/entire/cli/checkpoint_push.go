@@ -237,11 +237,11 @@ func writeCheckpointPushText(w io.Writer, report strategy.CheckpointPushReport) 
 		case strategy.CheckpointPushUploaded:
 			fmt.Fprintf(w, "%s  uploaded to %s\n", label, report.Remote)
 		case strategy.CheckpointPushChanged:
-			commit := ""
-			if !outcome.Commit.IsZero() {
-				commit = outcome.Commit.String()
+			if outcome.Commit.IsZero() {
+				fmt.Fprintf(w, "%s  not sent: it changed since you looked. Check it with 'entire checkpoint list --outgoing'.\n", label)
+				break
 			}
-			fmt.Fprintf(w, "%s  not sent: it changed since you looked; it is now %s. Check it with 'entire checkpoint list --outgoing'.\n", label, commit)
+			fmt.Fprintf(w, "%s  not sent: it changed since you looked; it is now %s. Check it with 'entire checkpoint list --outgoing'.\n", label, outcome.Commit)
 		case strategy.CheckpointPushNotWaiting:
 			fmt.Fprintf(w, "%s  not sent: it is not waiting to upload\n", label)
 		case strategy.CheckpointPushFailed:
