@@ -105,3 +105,26 @@ func TestFirstPushQuestion_LateAnswerKeepsNewerChoice(t *testing.T) {
 	assert.Equal(t, settings.CheckpointPushPolicyManual, policy)
 	assertRefsAbsentFromRemote(t, bareDir, refs, "the newer manual holds this push")
 }
+
+// Answering manual re-checks the push for held content, including a waiting
+// checkpoint sent by commit under another name.
+func TestFirstPushQuestion_ManualRefusesPushSendingHeldCommit(t *testing.T) {
+	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
+	prepareGitRefsPrePush(t, workDir, bareDir)
+	answerFirstPushQuestionWith(t, checkpointPushAnswerManual)
+	repo, err := gitrepo.OpenPath(workDir)
+	require.NoError(t, err)
+	defer repo.Close()
+	enqueueRefs(t, repo, refs)
+
+	tip := strings.TrimSpace(testutil.RunGit(t, workDir, "rev-parse", refs[0].String()))
+	ctx := WithPrePushRefs(t.Context(), []PrePushRef{{
+		LocalRef: tip, LocalSHA: tip, RemoteRef: "refs/heads/copy", RemoteSHA: plumbing.ZeroHash.String(),
+	}})
+	captureStderrWriter(t)
+	err = NewManualCommitStrategy().PrePushFromGitHook(ctx, "origin")
+
+	require.ErrorIs(t, err, ErrOuterPushCarriesHeldCheckpoints)
+	assertRefsAbsentFromRemote(t, bareDir, refs, "Entire's own flush sends nothing either")
+}
+
