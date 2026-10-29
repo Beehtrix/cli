@@ -91,9 +91,15 @@ var ErrOuterPushUncheckable = errors.New("refusing a push that could not be chec
 // checked-out branch's settings, and pre-push runs it whether or not Entire's
 // hooks are on for this branch. Checks run cheapest first: a push that sends
 // nothing, or a clone whose policy is automatic, costs no repository I/O.
+// An old hook line passes no ref list, so there is nothing to refuse, and it
+// warns instead.
 func CheckOuterPushHeldCheckpoints(ctx context.Context) error {
 	if prePushRefsUnsaved(ctx) {
 		return checkOuterPushUnchecked(ctx)
+	}
+	if !prePushRefsKnown(ctx) {
+		warnOuterPushUncheckable(ctx)
+		return nil
 	}
 	lines := outerPushSendingLines(ctx)
 	if len(lines) == 0 {
@@ -174,8 +180,18 @@ func checkOuterPushOfHeldCommits(ctx context.Context, lines []PrePushRef, why st
 			tips[r.Hash()] = ref
 		}
 	}
+	if len(tips) == 0 {
+		return nil
+	}
 	for _, line := range lines {
-		if ref, held := tips[peelToCommit(repo, plumbing.NewHash(line.LocalSHA))]; held {
+		hash := plumbing.NewHash(line.LocalSHA)
+		ref, held := tips[hash]
+		// Only a tag can name a tag object, and peeling reads an object, which
+		// adds up on a first `git push --tags`.
+		if !held && line.sendsTag() {
+			ref, held = tips[peelToCommit(repo, hash)]
+		}
+		if held {
 			return fmt.Errorf("%w: this push sends %s, the current version of %s, and %s. %s",
 				ErrOuterPushCarriesHeldCheckpoints, line.LocalRef, ref, why, outerPushHowTo)
 		}
@@ -229,12 +245,10 @@ const outerPushUncheckedHowTo = "Check that TMPDIR exists and is writable, then 
 
 // warnOuterPushUncheckable warns, while checkpoints are held and waiting, that
 // an old hook line cannot show what the user's own push sends. It runs before
-// the push_sessions and sync-remote gates: those decide what Entire sends, but
-// the user's push can carry checkpoint refs to any remote.
+// the push_sessions and sync-remote gates, and with Entire's hooks off: those
+// decide what Entire sends, but the user's push can carry checkpoint refs to
+// any remote.
 func warnOuterPushUncheckable(ctx context.Context) {
-	if prePushRefsKnown(ctx) || prePushRefsUnsaved(ctx) {
-		return
-	}
 	if _, held := checkpointsHeldBecause(ctx); !held {
 		return
 	}

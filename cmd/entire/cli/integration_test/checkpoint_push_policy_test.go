@@ -1002,6 +1002,21 @@ func TestCheckpointPushPolicy_OldHookWarnsWhenEntireSendsNothing(t *testing.T) {
 	require.Equal(t, 1, strings.Count(output, oldHookWarning), "push_sessions=false must not hide the warning:\n%s", output)
 }
 
+// With Entire's hooks off for the branch, the clone's policy still holds
+// checkpoints back, so an old hook line must still say the push is unchecked.
+func TestCheckpointPushPolicy_OldHookWarnsWhenEntireIsDisabled(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	env.PatchSettings(map[string]any{"enabled": false})
+	push := installOldPrePushHook(t, env)
+
+	output := push()
+	require.Equal(t, 1, strings.Count(output, oldHookWarning), "a disabled repository must not hide the warning:\n%s", output)
+}
+
 const oldHookWarning = "does not pass the refs being pushed"
 
 // installOldPrePushHook writes a pre-push line from before the hook passed
