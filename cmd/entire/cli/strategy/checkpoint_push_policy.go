@@ -164,6 +164,13 @@ func checkOuterPushOfHeldCommits(ctx context.Context) error {
 const outerPushHowTo = "Leave checkpoint refs out of this push (avoid --mirror) and upload checkpoints with 'entire checkpoint push --all'. " +
 	"To push them anyway, run git push with --no-verify"
 
+// CheckOuterPushWhileDisabled applies checkOuterPushUnderManualPolicy to a
+// repository with Entire disabled: its hooks are off, but the clone's policy
+// still holds checkpoints back from the user's own push.
+func CheckOuterPushWhileDisabled(ctx context.Context) error {
+	return checkOuterPushUnderManualPolicy(ctx)
+}
+
 // CheckOuterPushWithUnloadableSettings refuses the user's push when it sends
 // checkpoint content and Entire's settings could not be loaded, which turns
 // its git hooks off. Neither the backend nor the policy is known then, so the

@@ -736,6 +736,27 @@ func TestCheckpointPushPolicy_UnloadableSettingsRefuseExplicitCheckpointPush(t *
 	}
 }
 
+// Disabling Entire turns its hooks off, and `"enabled": false` can come from
+// the committed settings file. Neither may let a user's push send what this
+// clone's manual policy holds back.
+func TestCheckpointPushPolicy_DisabledRepositoryStillRefusesExplicitCheckpointPush(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	bareDir := env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	env.PatchSettings(map[string]any{"enabled": false})
+
+	output, err := gitPushArgs(t, env, "--mirror", "origin")
+
+	require.Error(t, err, "a disabled repository must not let held checkpoints through: %s", output)
+	require.Contains(t, output, "--no-verify")
+	require.Empty(t, remoteCheckpointIDs(t, bareDir))
+
+	output, err = gitPushArgs(t, env, "origin", "HEAD")
+	require.NoError(t, err, "a push without checkpoint refs is not refused: %s", output)
+}
+
 // A checkpoints block that settings.Load accepts but the backend loader
 // rejects leaves the backend unknown. That must not read as "not git-refs",
 // which would let the push send checkpoint refs manual holds back.

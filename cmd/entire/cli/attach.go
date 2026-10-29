@@ -108,7 +108,8 @@ already have a checkpoint, and is it pushed — the same for HEAD and --commit:
   - It already has a checkpoint: the session is added to it. Git history is
     not changed.
   - It is already pushed: the commit is left unchanged and the link is
-    recorded in a new checkpoint, which is pushed right away. The link counts
+    recorded in a new checkpoint, which is pushed right away (under the manual
+    checkpoint push policy it waits for 'entire checkpoint push'). The link counts
     once the commit's author attaches it, and names that exact commit: after
     a rebase or amend, attach the session to the new commit.
   - It isn't pushed: the Entire-Checkpoint trailer is added to it, which
