@@ -152,8 +152,9 @@ func outerPushHeldError(name, why string) error {
 
 // checkOuterPushOfHeldCommits refuses the push when any line sends the
 // current version of a waiting checkpoint under another name: a commit or an
-// expression (`git push origin <commit>:refs/heads/copy`), or a branch or tag
-// created at that commit. When the repository or the queue cannot be read
+// expression (`git push origin <commit>:refs/heads/copy`), or a branch or tag,
+// annotated or not, created at that commit. A commit built on top of it is not
+// caught: that would need an ancestry check per pushed line. When the repository or the queue cannot be read
 // there is nothing to compare against, and the push is not blocked over it.
 func checkOuterPushOfHeldCommits(ctx context.Context, lines []PrePushRef, why string) error {
 	repo, err := OpenRepository(ctx)
@@ -174,12 +175,30 @@ func checkOuterPushOfHeldCommits(ctx context.Context, lines []PrePushRef, why st
 		}
 	}
 	for _, line := range lines {
-		if ref, held := tips[plumbing.NewHash(line.LocalSHA)]; held {
+		if ref, held := tips[peelToCommit(repo, plumbing.NewHash(line.LocalSHA))]; held {
 			return fmt.Errorf("%w: this push sends %s, the current version of %s, and %s. %s",
 				ErrOuterPushCarriesHeldCheckpoints, line.LocalRef, ref, why, outerPushHowTo)
 		}
 	}
 	return nil
+}
+
+// maxTagPeel bounds how many tag objects peelToCommit follows, so a cycle in a
+// corrupt repository cannot hold the push.
+const maxTagPeel = 16
+
+// peelToCommit follows annotated tags to the object they name, so a tag made
+// at a waiting checkpoint's commit compares as that commit. Anything that is
+// not a readable tag is returned unchanged.
+func peelToCommit(repo *git.Repository, hash plumbing.Hash) plumbing.Hash {
+	for range maxTagPeel {
+		tag, err := repo.TagObject(hash)
+		if err != nil {
+			return hash
+		}
+		hash = tag.Target
+	}
+	return hash
 }
 
 // checkOuterPushUnchecked refuses a push whose ref list the hook could not
