@@ -109,6 +109,19 @@ func ParsePrePushRefs(r io.Reader) ([]PrePushRef, error) {
 
 type prePushRefsKey struct{}
 
+type prePushRefsUnsavedKey struct{}
+
+// WithPrePushRefsUnsaved records that the hook line could not save git's ref
+// list for this push, so what it sends cannot be checked.
+func WithPrePushRefsUnsaved(ctx context.Context) context.Context {
+	return context.WithValue(ctx, prePushRefsUnsavedKey{}, true)
+}
+
+func prePushRefsUnsaved(ctx context.Context) bool {
+	unsaved, _ := ctx.Value(prePushRefsUnsavedKey{}).(bool) //nolint:errcheck // absent means saved or an old hook
+	return unsaved
+}
+
 // prePushRefsKnown reports whether the hook passed the ref list, which an old
 // hook script or an old hook-manager line does not.
 func prePushRefsKnown(ctx context.Context) bool {
@@ -120,7 +133,7 @@ func prePushRefsKnown(ctx context.Context) bool {
 // that a push sending checkpoint refs itself cannot be checked. Callers warn
 // only when checkpoints are being held back, the one moment it matters.
 func warnPrePushRefsUnknown(ctx context.Context, w io.Writer) {
-	if prePushRefsKnown(ctx) {
+	if prePushRefsKnown(ctx) || prePushRefsUnsaved(ctx) {
 		return
 	}
 	fmt.Fprintln(w, "[entire] Warning: this pre-push hook does not pass the refs being pushed, so a push that "+
@@ -181,13 +194,13 @@ func namesCommitNotRef(local string) bool {
 	return local != "(delete)" && !strings.HasPrefix(local, "refs/")
 }
 
-// outerPushCommitLines returns the lines of the user's own push that send
-// content from a source that is not a full ref name.
-func outerPushCommitLines(ctx context.Context) []PrePushRef {
+// outerPushSendingLines returns the lines of the user's own push that send
+// content, as far as the hook passed them.
+func outerPushSendingLines(ctx context.Context) []PrePushRef {
 	refs, _ := ctx.Value(prePushRefsKey{}).([]PrePushRef) //nolint:errcheck // absent means "not known"
 	var lines []PrePushRef
 	for _, r := range refs {
-		if r.sends() && namesCommitNotRef(r.LocalRef) {
+		if r.sends() {
 			lines = append(lines, r)
 		}
 	}

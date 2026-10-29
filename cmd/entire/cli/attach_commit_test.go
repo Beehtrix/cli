@@ -284,6 +284,32 @@ func TestAttachCommit_PushedHeadWaitsUnderManualPolicy(t *testing.T) {
 	}
 }
 
+// When queueing the new checkpoint fails, 'entire checkpoint push' would not
+// send it, so attach must not say it is waiting.
+// Not parallel: sets ENTIRE_CHECKPOINTS_PRIMARY.
+func TestAttachCommit_FailedEnqueueIsNotReportedAsWaiting(t *testing.T) {
+	t.Setenv("ENTIRE_CHECKPOINTS_PRIMARY", "git-refs")
+	if os.Geteuid() == 0 {
+		t.Skip("root writes read-only files")
+	}
+	setupAttachTestRepo(t)
+	commitAt(t, "work.txt")
+	pushToOrigin(t)
+	setAttachCheckpointPushPolicy(t, "manual")
+	queueFile := filepath.Join(mustGetwd(t), ".git", "entire-checkpoint-push-queue.jsonl")
+	if err := os.WriteFile(queueFile, nil, 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := attachHeadless(t, "attach-failed-enqueue", attachOptions{})
+	if err == nil || !strings.Contains(err.Error(), "not queued") {
+		t.Fatalf("expected an error saying the checkpoint is not queued, got %v\n%s", err, out)
+	}
+	if strings.Contains(out, "is waiting") {
+		t.Fatalf("a checkpoint that is not queued was reported as waiting:\n%s", out)
+	}
+}
+
 // The confirmation must not promise an upload that manual will not make.
 // Not parallel: sets ENTIRE_CHECKPOINTS_PRIMARY.
 func TestAttachCommit_ManualConfirmationSaysTheCheckpointWaits(t *testing.T) {

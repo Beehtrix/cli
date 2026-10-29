@@ -1062,15 +1062,27 @@ func pushAttachedCheckpoint(ctx context.Context, w io.Writer, plan attachLinkPla
 }
 
 // reportHeldAttachedCheckpoint tells the user how to upload a checkpoint that
-// manual held back. A checkpoint from before the switch to git-refs that was
-// never migrated lives on the v1 branch: attach adds the session there, and
-// 'entire checkpoint push' only uploads checkpoint refs.
+// manual held back. A checkpoint on its own ref that is not queued (its
+// enqueue failed) would not be sent, so that is an error. A checkpoint from
+// before the switch to git-refs that was never migrated lives on the v1
+// branch: attach adds the session there, and 'entire checkpoint push' only
+// uploads checkpoint refs.
 func reportHeldAttachedCheckpoint(ctx context.Context, w io.Writer, checkpointID id.CheckpointID) error {
 	waiting, err := strategy.CheckpointWaiting(ctx, checkpointID)
 	if err != nil {
 		return fmt.Errorf("checkpoint %s was written locally but not pushed: %w", checkpointID, err)
 	}
-	if !waiting && checkpointID.Kind() != id.KindULID {
+	if !waiting {
+		onRef, err := strategy.CheckpointRefExists(ctx, checkpointID)
+		if err != nil {
+			return fmt.Errorf("checkpoint %s was written locally but not pushed: %w", checkpointID, err)
+		}
+		if onRef {
+			return fmt.Errorf("checkpoint %s was written locally but not queued for upload, so 'entire checkpoint push' can't send it yet; run 'entire attach' again to queue it", checkpointID)
+		}
+		if checkpointID.Kind() == id.KindULID {
+			return fmt.Errorf("checkpoint %s was not found after it was written; run 'entire attach' again", checkpointID)
+		}
 		fmt.Fprintf(w, "  Checkpoint %s is on the old checkpoint branch, which 'entire checkpoint push' can't upload; run 'entire doctor migrate-checkpoints' to move it to checkpoint refs, then upload it with: entire checkpoint push %s\n", checkpointID, checkpointID)
 		return nil
 	}
