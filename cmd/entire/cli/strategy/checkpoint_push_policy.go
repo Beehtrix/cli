@@ -91,9 +91,15 @@ var ErrOuterPushUncheckable = errors.New("refusing a push that could not be chec
 // checked-out branch's settings, and pre-push runs it whether or not Entire's
 // hooks are on for this branch. Checks run cheapest first: a push that sends
 // nothing, or a clone whose policy is automatic, costs no repository I/O.
+// An old hook line passes no ref list, so there is nothing to refuse, and it
+// warns instead.
 func CheckOuterPushHeldCheckpoints(ctx context.Context) error {
 	if prePushRefsUnsaved(ctx) {
 		return checkOuterPushUnchecked(ctx)
+	}
+	if !prePushRefsKnown(ctx) {
+		warnOuterPushUncheckable(ctx)
+		return nil
 	}
 	lines := outerPushSendingLines(ctx)
 	if len(lines) == 0 {
@@ -216,12 +222,10 @@ const outerPushUncheckedHowTo = "Check that TMPDIR exists and is writable, then 
 
 // warnOuterPushUncheckable warns, while checkpoints are held and waiting, that
 // an old hook line cannot show what the user's own push sends. It runs before
-// the push_sessions and sync-remote gates: those decide what Entire sends, but
-// the user's push can carry checkpoint refs to any remote.
+// the push_sessions and sync-remote gates, and with Entire's hooks off: those
+// decide what Entire sends, but the user's push can carry checkpoint refs to
+// any remote.
 func warnOuterPushUncheckable(ctx context.Context) {
-	if prePushRefsKnown(ctx) || prePushRefsUnsaved(ctx) {
-		return
-	}
 	if _, held := checkpointsHeldBecause(ctx); !held {
 		return
 	}
