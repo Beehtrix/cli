@@ -26,12 +26,17 @@ func TestParsePrePushRefs(t *testing.T) {
 			"malformed line\n" +
 			"\n" +
 			v1 + " " + testSHA1 + " " + v1 + " " + zeroSHA + "\n" +
-			"(delete) " + zeroSHA + " refs/entire/checkpoints/ab/cdef " + testSHA2 + "\n"))
+			"(delete) " + zeroSHA + " refs/entire/checkpoints/ab/cdef " + testSHA2 + "\n" +
+			testSHA1 + " " + testSHA1 + " refs/heads/copy " + zeroSHA + "\n" +
+			"HEAD " + testSHA2 + " refs/heads/main " + testSHA1 + "\n"))
 	require.NoError(t, err)
 	require.Equal(t, []PrePushRef{
 		{LocalRef: v1, LocalSHA: testSHA1, RemoteRef: v1, RemoteSHA: zeroSHA},
 		{LocalRef: "(delete)", LocalSHA: zeroSHA, RemoteRef: "refs/entire/checkpoints/ab/cdef", RemoteSHA: testSHA2},
-	}, refs, "only lines that touch checkpoint refs are kept")
+		{LocalRef: testSHA1, LocalSHA: testSHA1, RemoteRef: "refs/heads/copy", RemoteSHA: zeroSHA},
+		{LocalRef: "HEAD", LocalSHA: testSHA2, RemoteRef: "refs/heads/main", RemoteSHA: testSHA1},
+	}, refs, "lines that touch checkpoint refs are kept, and so are lines whose source is not a full ref name, "+
+		"since a commit or expression can name checkpoint content")
 }
 
 // A `--mirror` of a repository with many tags sends a long ref list; the v1

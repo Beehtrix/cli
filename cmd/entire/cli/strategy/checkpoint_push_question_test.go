@@ -79,3 +79,29 @@ func TestFirstPushQuestion_ManualWithoutOuterCheckpointRefsHoldsQuietly(t *testi
 	assert.Contains(t, stderr.String(), "2 checkpoints waiting")
 	assertRefsAbsentFromRemote(t, bareDir, refs, "an answer of manual holds this push")
 }
+
+// The question can wait a long time. A policy chosen meanwhile, with
+// `entire configure` or by a push from another worktree, wins over the answer.
+func TestFirstPushQuestion_LateAnswerKeepsNewerChoice(t *testing.T) {
+	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
+	prepareGitRefsPrePush(t, workDir, bareDir)
+	t.Setenv(interactive.EnvTestTTY, "1")
+	previous := askCheckpointPushQuestion
+	askCheckpointPushQuestion = func() checkpointPushQuestionAnswer {
+		require.NoError(t, settings.SaveCheckpointPushPolicy(t.Context(), settings.CheckpointPushPolicyManual))
+		return checkpointPushAnswerAutomatic
+	}
+	t.Cleanup(func() { askCheckpointPushQuestion = previous })
+	repo, err := gitrepo.OpenPath(workDir)
+	require.NoError(t, err)
+	defer repo.Close()
+	enqueueRefs(t, repo, refs)
+
+	captureStderrWriter(t)
+	require.NoError(t, NewManualCommitStrategy().PrePushFromGitHook(WithPrePushRefs(t.Context(), nil), "origin"))
+
+	policy, err := settings.LoadCheckpointPushPolicy(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, settings.CheckpointPushPolicyManual, policy)
+	assertRefsAbsentFromRemote(t, bareDir, refs, "the newer manual holds this push")
+}

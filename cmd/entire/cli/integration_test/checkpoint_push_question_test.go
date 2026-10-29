@@ -11,6 +11,7 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
+	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/stretchr/testify/require"
 )
@@ -52,7 +53,8 @@ func TestCheckpointPushQuestion_AskedOnTerminalPushWithCheckpointsWaiting(t *tes
 
 	require.Equal(t, 1, checkpointPushQuestionsAsked(t, env))
 	// "Not now" saves nothing and behaves as today.
-	require.NoFileExists(t, clonePreferencesFile(t, env))
+	require.NoFileExists(t, gitCommonDirFile(t, env, settings.CheckpointPushPolicyFile))
+	require.NoFileExists(t, gitCommonDirFile(t, env, settings.ClonePreferencesFile))
 	require.Equal(t, []string{work}, remoteCheckpointIDs(t, bareDir))
 }
 
@@ -62,15 +64,17 @@ func TestCheckpointPushQuestion_NotAsked(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		tty  string
+		// policy is the stored checkpoint push policy, if any.
+		policy string
 		// prefs is the clone preferences file content, if any.
 		prefs string
 		// noCheckpoint pushes a plain commit, leaving nothing waiting.
 		noCheckpoint bool
 	}{
 		{name: "no terminal", tty: "0"},
-		{name: "automatic chosen", tty: "1", prefs: `{"checkpoint_push_policy":"automatic"}`},
-		{name: "manual chosen", tty: "1", prefs: `{"checkpoint_push_policy":"manual"}`},
-		{name: "unreadable policy", tty: "1", prefs: `{"checkpoint_push_policy":"stricter"}`},
+		{name: "automatic chosen", tty: "1", policy: "automatic"},
+		{name: "manual chosen", tty: "1", policy: "manual"},
+		{name: "unreadable policy", tty: "1", policy: "stricter"},
 		{name: "backing off", tty: "1", prefs: `{"checkpoint_push_question_backoff_until":"` + inFuture + `"}`},
 		{name: "nothing waiting", tty: "1", noCheckpoint: true},
 	} {
@@ -78,8 +82,11 @@ func TestCheckpointPushQuestion_NotAsked(t *testing.T) {
 			t.Parallel()
 			env := newOutgoingEnv(t)
 			env.SetupBareRemote()
+			if tc.policy != "" {
+				setCheckpointPushPolicy(t, env, tc.policy)
+			}
 			if tc.prefs != "" {
-				writeClonePreferences(t, env, tc.prefs)
+				writeGitCommonDirFile(t, env, settings.ClonePreferencesFile, tc.prefs)
 			}
 			if tc.noCheckpoint {
 				env.WriteFile("plain.go", "package plain")
@@ -101,7 +108,7 @@ func TestCheckpointPushQuestion_BackoffOverAsksAgain(t *testing.T) {
 	env := newOutgoingEnv(t)
 	env.SetupBareRemote()
 	inPast := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
-	writeClonePreferences(t, env, `{"checkpoint_push_question_backoff_until":"`+inPast+`"}`)
+	writeGitCommonDirFile(t, env, settings.ClonePreferencesFile, `{"checkpoint_push_question_backoff_until":"`+inPast+`"}`)
 	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
 
 	gitPushAsTerminal(t, env, "1")

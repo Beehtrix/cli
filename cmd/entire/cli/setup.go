@@ -3414,15 +3414,12 @@ func checkCheckpointPushPolicy(ctx context.Context, value, backend string) (sett
 // clone preference, so --local and --project do not apply: every worktree
 // shares one push queue.
 func saveCheckpointPushPolicy(ctx context.Context, w io.Writer, policy settings.CheckpointPushPolicy) error {
-	if err := settings.ModifyClonePreferences(ctx, func(prefs *settings.ClonePreferences) error {
-		prefs.CheckpointPushPolicy = policy
-		return nil
-	}); err != nil {
-		return fmt.Errorf("save checkpoint push policy: %w", err)
+	if err := settings.SaveCheckpointPushPolicy(ctx, policy); err != nil {
+		return err //nolint:wrapcheck // already names what failed
 	}
 	switch policy {
 	case settings.CheckpointPushPolicyManual:
-		fmt.Fprintln(w, "✓ Checkpoint push policy: manual. git push no longer uploads checkpoints from this clone; upload them with 'entire checkpoint push'.")
+		fmt.Fprintln(w, "✓ Checkpoint push policy: manual. git push no longer uploads checkpoints from this clone; upload them with 'entire checkpoint push --all'.")
 	case settings.CheckpointPushPolicyAutomatic:
 		fmt.Fprintln(w, "✓ Checkpoint push policy: automatic. Checkpoints upload when you git push.")
 	}

@@ -95,19 +95,15 @@ func TestRecordCheckpointPushQuestionAnswer(t *testing.T) {
 
 	for _, tc := range []struct {
 		answer      checkpointPushQuestionAnswer
-		wantPolicy  settings.CheckpointPushPolicy
 		wantBackoff string
 	}{
-		{checkpointPushAnswerAutomatic, settings.CheckpointPushPolicyAutomatic, ""},
-		{checkpointPushAnswerManual, settings.CheckpointPushPolicyManual, ""},
-		{checkpointPushAnswerNotNow, "", staleBackoff},
-		{checkpointPushAnswerTimedOut, "", now.Add(7 * 24 * time.Hour).Format(time.RFC3339)},
+		{checkpointPushAnswerAutomatic, ""},
+		{checkpointPushAnswerManual, ""},
+		{checkpointPushAnswerNotNow, staleBackoff},
+		{checkpointPushAnswerTimedOut, now.Add(7 * 24 * time.Hour).Format(time.RFC3339)},
 	} {
 		prefs := &settings.ClonePreferences{CheckpointPushQuestionBackoffUntil: staleBackoff}
 		recordCheckpointPushQuestionAnswer(prefs, tc.answer, now)
-		if prefs.CheckpointPushPolicy != tc.wantPolicy {
-			t.Errorf("%v: policy = %q, want %q", tc.answer, prefs.CheckpointPushPolicy, tc.wantPolicy)
-		}
 		if prefs.CheckpointPushQuestionBackoffUntil != tc.wantBackoff {
 			t.Errorf("%v: back-off = %q, want %q", tc.answer, prefs.CheckpointPushQuestionBackoffUntil, tc.wantBackoff)
 		}
@@ -118,15 +114,14 @@ func TestFirstPushPromptFor(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
-		name  string
-		prefs settings.ClonePreferences
-		opf   bool
-		want  firstPushPrompt
+		name   string
+		stored bool
+		prefs  settings.ClonePreferences
+		opf    bool
+		want   firstPushPrompt
 	}{
 		{name: "policy unset", want: firstPushPromptQuestion},
-		{name: "automatic chosen", prefs: settings.ClonePreferences{CheckpointPushPolicy: settings.CheckpointPushPolicyAutomatic}, want: firstPushPromptNone},
-		{name: "manual chosen", prefs: settings.ClonePreferences{CheckpointPushPolicy: settings.CheckpointPushPolicyManual}, want: firstPushPromptNone},
-		{name: "unrecognized policy", prefs: settings.ClonePreferences{CheckpointPushPolicy: "stricter"}, want: firstPushPromptNone},
+		{name: "policy chosen", stored: true, want: firstPushPromptNone},
 		{name: "backing off", prefs: settings.ClonePreferences{CheckpointPushQuestionBackoffUntil: now.Add(time.Hour).Format(time.RFC3339)}, want: firstPushPromptNone},
 		{name: "back-off over", prefs: settings.ClonePreferences{CheckpointPushQuestionBackoffUntil: now.Add(-time.Second).Format(time.RFC3339)}, want: firstPushPromptQuestion},
 		// A bad value may only bring the question back, never hide it for good.
@@ -134,11 +129,11 @@ func TestFirstPushPromptFor(t *testing.T) {
 		{name: "OPF user", opf: true, want: firstPushPromptOPFNotice},
 		{name: "OPF user while backing off", opf: true, prefs: settings.ClonePreferences{CheckpointPushQuestionBackoffUntil: now.Add(time.Hour).Format(time.RFC3339)}, want: firstPushPromptOPFNotice},
 		{name: "OPF notice already shown", opf: true, prefs: settings.ClonePreferences{OPFDeprecationNoticeShown: true}, want: firstPushPromptNone},
-		{name: "OPF user with a policy", opf: true, prefs: settings.ClonePreferences{CheckpointPushPolicy: settings.CheckpointPushPolicyManual}, want: firstPushPromptNone},
+		{name: "OPF user with a policy", opf: true, stored: true, want: firstPushPromptNone},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := firstPushPromptFor(&tc.prefs, now, tc.opf); got != tc.want {
+			if got := firstPushPromptFor(tc.stored, &tc.prefs, now, tc.opf); got != tc.want {
 				t.Fatalf("firstPushPromptFor = %v, want %v", got, tc.want)
 			}
 		})
@@ -153,10 +148,10 @@ func TestCheckpointPushQuestionBackoffAfterTimeout(t *testing.T) {
 	prefs := &settings.ClonePreferences{}
 	recordCheckpointPushQuestionAnswer(prefs, checkpointPushAnswerTimedOut, answeredAt)
 
-	if got := firstPushPromptFor(prefs, answeredAt.Add(7*24*time.Hour-time.Minute), false); got != firstPushPromptNone {
+	if got := firstPushPromptFor(false, prefs, answeredAt.Add(7*24*time.Hour-time.Minute), false); got != firstPushPromptNone {
 		t.Fatalf("within 7 days: %v, want no question", got)
 	}
-	if got := firstPushPromptFor(prefs, answeredAt.Add(7*24*time.Hour+time.Minute), false); got != firstPushPromptQuestion {
+	if got := firstPushPromptFor(false, prefs, answeredAt.Add(7*24*time.Hour+time.Minute), false); got != firstPushPromptQuestion {
 		t.Fatalf("after 7 days: %v, want the question", got)
 	}
 }

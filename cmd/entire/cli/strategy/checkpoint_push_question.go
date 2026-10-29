@@ -76,15 +76,12 @@ func readCheckpointPushQuestionAnswer(r io.Reader, timeout time.Duration) checkp
 	}
 }
 
-// recordCheckpointPushQuestionAnswer applies answer to prefs. "Not now" leaves
-// them unchanged, so the question returns on the next push.
+// recordCheckpointPushQuestionAnswer applies answer's back-off to prefs; the
+// policy itself is saved in its own file. "Not now" leaves them unchanged, so
+// the question returns on the next push.
 func recordCheckpointPushQuestionAnswer(prefs *settings.ClonePreferences, answer checkpointPushQuestionAnswer, now time.Time) {
 	switch answer {
-	case checkpointPushAnswerAutomatic:
-		prefs.CheckpointPushPolicy = settings.CheckpointPushPolicyAutomatic
-		prefs.CheckpointPushQuestionBackoffUntil = ""
-	case checkpointPushAnswerManual:
-		prefs.CheckpointPushPolicy = settings.CheckpointPushPolicyManual
+	case checkpointPushAnswerAutomatic, checkpointPushAnswerManual:
 		prefs.CheckpointPushQuestionBackoffUntil = ""
 	case checkpointPushAnswerTimedOut:
 		prefs.CheckpointPushQuestionBackoffUntil = now.Add(checkpointPushQuestionBackoff).UTC().Format(time.RFC3339)
@@ -101,12 +98,12 @@ const (
 )
 
 // firstPushPromptFor decides what a terminal push shows a clone whose
-// preferences are prefs. OPF users already answer an OPF question on every
+// preferences are prefs, where policyStored says whether it chose a policy. OPF users already answer an OPF question on every
 // push, so they get a one-time deprecation line instead of a second question.
 // Commit linking asks in prepare-commit-msg, never during a push, so this is
 // the only other question a push can show.
-func firstPushPromptFor(prefs *settings.ClonePreferences, now time.Time, opfEnabled bool) firstPushPrompt {
-	if prefs.CheckpointPushPolicy != "" {
+func firstPushPromptFor(policyStored bool, prefs *settings.ClonePreferences, now time.Time, opfEnabled bool) firstPushPrompt {
+	if policyStored {
 		return firstPushPromptNone
 	}
 	if opfEnabled {
@@ -130,9 +127,13 @@ func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repositor
 	if !interactive.CanPromptInteractively() {
 		return checkpointPushAnswerNotNow, false
 	}
-	// The policy read refuses files a plain preferences load accepts, such as
-	// a case-variant key; announceCheckpointPushPolicy reports those.
+	// An unreadable policy is not asked about; announceCheckpointPushPolicy
+	// reports it.
 	if _, err := settings.LoadCheckpointPushPolicy(ctx); err != nil {
+		return checkpointPushAnswerNotNow, false
+	}
+	stored, err := settings.CheckpointPushPolicyStored(ctx)
+	if err != nil {
 		return checkpointPushAnswerNotNow, false
 	}
 	prefs, err := settings.LoadClonePreferences(ctx)
@@ -140,7 +141,7 @@ func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repositor
 		return checkpointPushAnswerNotNow, false
 	}
 	now := time.Now()
-	prompt := firstPushPromptFor(prefs, now, redact.OPFEnabled())
+	prompt := firstPushPromptFor(stored, prefs, now, redact.OPFEnabled())
 	if prompt == firstPushPromptNone || waitingCheckpointCount(ctx, repo) == 0 {
 		return checkpointPushAnswerNotNow, false
 	}
@@ -161,24 +162,50 @@ func askCheckpointPushPolicyOnFirstPush(ctx context.Context, repo *git.Repositor
 	if answer == checkpointPushAnswerNotNow {
 		return answer, false
 	}
+	if policy, chosen := checkpointPushQuestionPolicy(answer); chosen {
+		saved, err := settings.SaveCheckpointPushPolicyIfUnset(ctx, policy)
+		if err != nil {
+			logging.Warn(ctx, "pre-push: could not save the checkpoint push policy answer", slog.String("error", err.Error()))
+			if answer == checkpointPushAnswerManual {
+				fmt.Fprintf(stderrWriter, "[entire] No checkpoints were pushed: could not save the checkpoint push policy: %v\n", err)
+			}
+			return answer, false
+		}
+		if !saved {
+			fmt.Fprintln(stderrWriter, "[entire] A checkpoint push policy was chosen while this question waited; keeping that one.")
+			return answer, false
+		}
+	}
 	if err := settings.ModifyClonePreferences(ctx, func(p *settings.ClonePreferences) error {
 		recordCheckpointPushQuestionAnswer(p, answer, now)
 		return nil
 	}); err != nil {
-		logging.Warn(ctx, "pre-push: could not save the checkpoint push policy answer", slog.String("error", err.Error()))
-		if answer == checkpointPushAnswerManual {
-			fmt.Fprintf(stderrWriter, "[entire] No checkpoints were pushed: could not save the checkpoint push policy: %v\n", err)
+		logging.Warn(ctx, "pre-push: could not save the checkpoint push question back-off", slog.String("error", err.Error()))
+		if answer == checkpointPushAnswerTimedOut {
+			return answer, false
 		}
-		return answer, false
 	}
 	switch answer {
 	case checkpointPushAnswerManual:
-		fmt.Fprintln(stderrWriter, "[entire] Checkpoint push policy: manual. Upload checkpoints with: entire checkpoint push")
+		fmt.Fprintln(stderrWriter, "[entire] Checkpoint push policy: manual. Upload checkpoints with: entire checkpoint push --all")
 	case checkpointPushAnswerAutomatic:
 		fmt.Fprintln(stderrWriter, "[entire] Checkpoint push policy: automatic. Change it with: entire configure --checkpoint-push-policy manual")
 	case checkpointPushAnswerNotNow, checkpointPushAnswerTimedOut:
 	}
 	return answer, true
+}
+
+// checkpointPushQuestionPolicy is the policy an answer chooses, if it chooses
+// one.
+func checkpointPushQuestionPolicy(answer checkpointPushQuestionAnswer) (settings.CheckpointPushPolicy, bool) {
+	switch answer {
+	case checkpointPushAnswerAutomatic:
+		return settings.CheckpointPushPolicyAutomatic, true
+	case checkpointPushAnswerManual:
+		return settings.CheckpointPushPolicyManual, true
+	case checkpointPushAnswerNotNow, checkpointPushAnswerTimedOut:
+	}
+	return "", false
 }
 
 // askCheckpointPushQuestion shows the question and returns the answer; tests

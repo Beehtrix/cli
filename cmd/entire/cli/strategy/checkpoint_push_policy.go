@@ -84,7 +84,7 @@ var ErrOuterPushCarriesHeldCheckpoints = errors.New("refusing to push checkpoint
 func checkOuterPushUnderManualPolicy(ctx context.Context) error {
 	name, ok := outerPushCheckpointRefName(ctx)
 	if !ok {
-		return nil
+		return checkOuterPushOfHeldCommits(ctx)
 	}
 	isRefs, err := primaryBackendIsGitRefs(ctx)
 	if err != nil {
@@ -112,7 +112,54 @@ func checkOuterPushUnderManualPolicy(ctx context.Context) error {
 	return outerPushUnderManualError(name)
 }
 
-const outerPushHowTo = "Leave checkpoint refs out of this push (avoid --mirror) and upload checkpoints with 'entire checkpoint push'. " +
+// checkOuterPushOfHeldCommits refuses the user's push when a line whose source
+// is a commit or an expression sends the current version of a waiting
+// checkpoint, such as `git push origin <commit>:refs/heads/copy`. Only a
+// git-refs clone whose policy is not automatic compares commits, so an ordinary
+// push costs one policy read. When the repository or the queue cannot be read
+// there is nothing to compare against, and the push is not blocked over it.
+func checkOuterPushOfHeldCommits(ctx context.Context) error {
+	lines := outerPushCommitLines(ctx)
+	if len(lines) == 0 {
+		return nil
+	}
+	repo, err := OpenRepository(ctx)
+	if err != nil {
+		logging.Warn(ctx, "pre-push: cannot open repository to check pushed commits", slog.String("error", err.Error()))
+		return nil
+	}
+	defer repo.Close()
+	automatic, policyErr := automaticCheckpointDelivery(repo)
+	if automatic || !primaryIsGitRefs(ctx) {
+		return nil
+	}
+	waiting, err := waitingCheckpointRefs(ctx, repo)
+	if err != nil {
+		logging.Warn(ctx, "pre-push: cannot read the checkpoint queue to check pushed commits", slog.String("error", err.Error()))
+		return nil
+	}
+	tips := make(map[plumbing.Hash]plumbing.ReferenceName, len(waiting))
+	for ref := range waiting {
+		if r, err := repo.Reference(ref, true); err == nil {
+			tips[r.Hash()] = ref
+		}
+	}
+	for _, line := range lines {
+		ref, held := tips[plumbing.NewHash(line.LocalSHA)]
+		if !held {
+			continue
+		}
+		if policyErr != nil {
+			return fmt.Errorf("%w: this push sends %s, the current version of %s, and the checkpoint push policy could not be read (%w). %s",
+				ErrOuterPushCarriesHeldCheckpoints, line.LocalRef, ref, policyErr, outerPushHowTo)
+		}
+		return fmt.Errorf("%w: this push sends %s, the current version of %s, and this clone's checkpoint push policy is manual. %s",
+			ErrOuterPushCarriesHeldCheckpoints, line.LocalRef, ref, outerPushHowTo)
+	}
+	return nil
+}
+
+const outerPushHowTo = "Leave checkpoint refs out of this push (avoid --mirror) and upload checkpoints with 'entire checkpoint push --all'. " +
 	"To push them anyway, run git push with --no-verify"
 
 // refuseOuterPushAfterManualAnswer refuses the user's push when it sends
@@ -208,7 +255,7 @@ func announceCheckpointPushPolicy(ctx context.Context, repo *git.Repository) boo
 		return true
 	}
 	if waiting := waitingCheckpointCount(ctx, repo); waiting > 0 {
-		fmt.Fprintf(stderrWriter, "[entire] %s waiting, upload with: entire checkpoint push\n", pluralCheckpoints(waiting))
+		fmt.Fprintf(stderrWriter, "[entire] %s waiting, upload with: entire checkpoint push --all\n", pluralCheckpoints(waiting))
 	}
 	return false
 }
@@ -217,12 +264,11 @@ func announceCheckpointPushPolicy(ctx context.Context, repo *git.Repository) boo
 // `entire checkpoint list --outgoing` lists. A queue that cannot be read
 // counts as zero: the line it feeds is a reminder, not a report.
 func waitingCheckpointCount(ctx context.Context, repo *git.Repository) int {
-	queued, err := peekCheckpointQueue(ctx, repo)
+	waiting, err := waitingCheckpointRefs(ctx, repo)
 	if err != nil {
 		return 0
 	}
-	existing, _ := partitionLocalRefs(repo, queued)
-	return len(existing)
+	return len(waiting)
 }
 
 func pluralCheckpoints(n int) string {

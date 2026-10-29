@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/entireio/cli/cmd/entire/cli/execx"
+	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -73,22 +74,22 @@ func outgoingCommit(t *testing.T, env *TestEnv, checkpointID string) string {
 	return ""
 }
 
-func clonePreferencesFile(t *testing.T, env *TestEnv) string {
+func gitCommonDirFile(t *testing.T, env *TestEnv, name string) string {
 	t.Helper()
 	commonDir := strings.TrimSpace(testutil.RunGit(t, env.RepoDir, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-	return filepath.Join(commonDir, "entire", "preferences.json")
+	return filepath.Join(commonDir, filepath.FromSlash(name))
 }
 
-func writeClonePreferences(t *testing.T, env *TestEnv, content string) {
+func writeGitCommonDirFile(t *testing.T, env *TestEnv, name, content string) {
 	t.Helper()
-	path := clonePreferencesFile(t, env)
+	path := gitCommonDirFile(t, env, name)
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 }
 
 func setCheckpointPushPolicy(t *testing.T, env *TestEnv, policy string) {
 	t.Helper()
-	writeClonePreferences(t, env, `{"checkpoint_push_policy":"`+policy+`"}`)
+	writeGitCommonDirFile(t, env, settings.CheckpointPushPolicyFile, policy+"\n")
 }
 
 // gitPushWithHooksIn pushes HEAD from dir through the real pre-push hook and
@@ -152,7 +153,7 @@ func TestCheckpointPushPolicy_ManualGitPushSendsNoCheckpoints(t *testing.T) {
 	remoteBranchMatchesHead(t, env, bareDir)
 	require.Empty(t, remoteCheckpointIDs(t, bareDir), "under manual, git push sends no checkpoints")
 	require.Contains(t, output, "2 checkpoints waiting")
-	require.Contains(t, output, "entire checkpoint push")
+	require.Contains(t, output, "entire checkpoint push --all", "the suggested command must upload when run as printed")
 
 	listing := listPolicyOutgoing(t, env)
 	require.Equal(t, "manual", listing.Policy)
@@ -202,11 +203,8 @@ func TestCheckpointPushPolicy_AppliesToEveryWorktree(t *testing.T) {
 	require.Equal(t, []string{work}, remoteCheckpointIDs(t, bareDir))
 }
 
-// A preferences file that does not load at all (malformed, symlinked) already
-// disables every Entire git hook, because settings.Load reads clone
-// preferences; those cases guard that nothing starts uploading through it. A
-// file that loads but holds a policy this binary does not recognize reaches
-// the gate, which must name the file.
+// A policy file this binary cannot read must not read as automatic, and the
+// warning names the file to fix.
 func TestCheckpointPushPolicy_UnreadablePolicyUploadsNothing(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -214,9 +212,9 @@ func TestCheckpointPushPolicy_UnreadablePolicyUploadsNothing(t *testing.T) {
 		plant     func(t *testing.T, env *TestEnv)
 		namesFile bool
 	}{
-		{name: "malformed", plant: func(t *testing.T, env *TestEnv) {
+		{name: "empty", namesFile: true, plant: func(t *testing.T, env *TestEnv) {
 			t.Helper()
-			writeClonePreferences(t, env, `{not json`)
+			writeGitCommonDirFile(t, env, settings.CheckpointPushPolicyFile, "")
 		}},
 		{name: "unknown value", namesFile: true, plant: func(t *testing.T, env *TestEnv) {
 			t.Helper()
@@ -224,11 +222,11 @@ func TestCheckpointPushPolicy_UnreadablePolicyUploadsNothing(t *testing.T) {
 		}},
 		{name: "symlink", plant: func(t *testing.T, env *TestEnv) {
 			t.Helper()
-			path := clonePreferencesFile(t, env)
+			path := gitCommonDirFile(t, env, settings.CheckpointPushPolicyFile)
 			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
-			planted := filepath.Join(filepath.Dir(path), "planted.json")
-			require.NoError(t, os.WriteFile(planted, []byte(`{"checkpoint_push_policy":"automatic"}`), 0o600))
-			if err := os.Symlink("planted.json", path); err != nil {
+			planted := filepath.Join(filepath.Dir(path), "planted")
+			require.NoError(t, os.WriteFile(planted, []byte("automatic\n"), 0o600))
+			if err := os.Symlink("planted", path); err != nil {
 				t.Skipf("cannot create symlink: %v", err)
 			}
 		}},
@@ -246,7 +244,7 @@ func TestCheckpointPushPolicy_UnreadablePolicyUploadsNothing(t *testing.T) {
 			remoteBranchMatchesHead(t, env, bareDir)
 			require.Empty(t, remoteCheckpointIDs(t, bareDir), "an unreadable policy must not read as automatic")
 			if tt.namesFile {
-				require.Contains(t, output, "preferences.json", "the warning names the file to fix")
+				require.Contains(t, output, "checkpoint-push-policy", "the warning names the file to fix")
 			}
 		})
 	}
@@ -255,7 +253,7 @@ func TestCheckpointPushPolicy_UnreadablePolicyUploadsNothing(t *testing.T) {
 // A committed settings.json this binary cannot load (here, a key from a newer
 // version) must not loosen manual. The push path's settings fall back to
 // defaults on a load error (resolvePushSettings), so the policy is read from
-// clone preferences alone.
+// its own file alone.
 func TestCheckpointPushPolicy_BrokenProjectSettingsKeepManual(t *testing.T) {
 	t.Parallel()
 	env := newOutgoingEnv(t)
@@ -268,6 +266,23 @@ func TestCheckpointPushPolicy_BrokenProjectSettingsKeepManual(t *testing.T) {
 
 	remoteBranchMatchesHead(t, env, bareDir)
 	require.Empty(t, remoteCheckpointIDs(t, bareDir))
+}
+
+// Released binaries rewrite clone preferences without the keys they do not
+// model, for example when the trails cache refreshes. That must not turn a
+// manual clone back into automatic.
+func TestCheckpointPushPolicy_ManualSurvivesPreferencesRewrite(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	bareDir := env.SetupBareRemote()
+	env.RunCLI("configure", "--checkpoint-push-policy", "manual")
+	writeGitCommonDirFile(t, env, settings.ClonePreferencesFile, `{"trails_enabled":true}`)
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+
+	gitPushWithHooksIn(t, env, env.RepoDir)
+
+	remoteBranchMatchesHead(t, env, bareDir)
+	require.Empty(t, remoteCheckpointIDs(t, bareDir), "an older binary's preferences rewrite must not release checkpoints")
 }
 
 func TestCheckpointPush_SendsOnlyTheNamedCheckpoint(t *testing.T) {
@@ -360,7 +375,7 @@ func TestCheckpointPush_WithoutTerminalNeedsExactVersions(t *testing.T) {
 	setCheckpointPushPolicy(t, env, "manual")
 	work := createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
 
-	for _, args := range [][]string{{"--all"}, {work}, {}} {
+	for _, args := range [][]string{{"--all"}, {work}} {
 		_, stderr, err := runCheckpointPush(t, env, false, args...)
 		require.Error(t, err, "checkpoint push %v without a terminal must be refused", args)
 		require.Contains(t, stderr, "@", "the refusal shows the <id>@<commit> form: %s", stderr)
@@ -509,14 +524,37 @@ func TestCheckpointPushPolicy_ReadSurfaces(t *testing.T) {
 	require.Equal(t, strings.TrimSpace(testutil.RunGit(t, env.RepoDir, "rev-parse", row.Ref)), row.Commit)
 	require.NotEmpty(t, row.SessionIDs)
 
-	require.Contains(t, listOutgoingText(t, env), "entire checkpoint push")
+	require.Contains(t, listOutgoingText(t, env), "entire checkpoint push --all")
 
 	var status struct {
 		Policy string `json:"checkpoint_push_policy"`
 	}
 	require.NoError(t, json.Unmarshal([]byte(cliStdout(t, env, "status", "--json")), &status))
 	require.Equal(t, "manual", status.Policy)
-	require.Contains(t, cliStdout(t, env, "status"), "entire checkpoint push")
+	require.Contains(t, cliStdout(t, env, "status"), "entire checkpoint push --all")
+}
+
+// A bare `entire checkpoint push` only lists. Listing is not a failure, and
+// it must say where to find the commit an <id>@<commit> argument needs.
+func TestCheckpointPush_BareListsWaitingAndSucceeds(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	bareDir := env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	work := createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+
+	for _, tty := range []bool{true, false} {
+		_, stderr, err := runCheckpointPush(t, env, tty)
+		require.NoError(t, err, "listing is not a failure: %s", stderr)
+		require.Contains(t, stderr, work)
+		require.Contains(t, stderr, "entire checkpoint list --outgoing --json")
+		if tty {
+			require.Contains(t, stderr, "--all")
+		} else {
+			require.NotContains(t, stderr, "--all", "--all needs a terminal, so it is not offered without one")
+		}
+	}
+	require.Empty(t, remoteCheckpointIDs(t, bareDir), "a bare push uploads nothing")
 }
 
 func TestCheckpointPushPolicy_ReadSurfacesReportUnreadablePolicy(t *testing.T) {
@@ -574,6 +612,15 @@ func TestCheckpointPushPolicy_ManualRefusesExplicitCheckpointPush(t *testing.T) 
 			t.Helper()
 			return []string{"--mirror", "origin"}
 		}},
+		{name: "by commit", args: func(t *testing.T, env *TestEnv) []string {
+			t.Helper()
+			tip := strings.TrimSpace(testutil.RunGit(t, env.RepoDir, "rev-parse", onlyOutgoingRef(t, env)))
+			return []string{"origin", "HEAD", tip + ":refs/heads/held-copy"}
+		}},
+		{name: "by expression", args: func(t *testing.T, env *TestEnv) []string {
+			t.Helper()
+			return []string{"origin", "HEAD", onlyOutgoingRef(t, env) + "~0:refs/heads/held-copy"}
+		}},
 		{name: "v1 branch", args: func(t *testing.T, env *TestEnv) []string {
 			t.Helper()
 			// -f: the fixture may already have a v1 branch.
@@ -624,6 +671,24 @@ func TestCheckpointPushPolicy_AutomaticAllowsExplicitCheckpointPush(t *testing.T
 	require.Equal(t, []string{work}, remoteCheckpointIDs(t, bareDir))
 }
 
+// Under automatic, pushing a checkpoint's commit under another name is the
+// user's call, and an ordinary push is never held up by the commit check.
+func TestCheckpointPushPolicy_AutomaticAllowsPushByCommit(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	bareDir := env.SetupBareRemote()
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	env.PatchSettings(map[string]any{
+		"strategy_options": map[string]any{"push_sessions": false},
+	})
+	tip := strings.TrimSpace(testutil.RunGit(t, env.RepoDir, "rev-parse", onlyOutgoingRef(t, env)))
+
+	output, err := gitPushArgs(t, env, "origin", "HEAD", tip+":refs/heads/copy")
+
+	require.NoError(t, err, "under automatic a push by commit is the user's call: %s", output)
+	require.Contains(t, testutil.RunGit(t, bareDir, "for-each-ref", "refs/heads/copy"), tip)
+}
+
 func TestCheckpointPushPolicy_UnreadablePolicyRefusesExplicitCheckpointPush(t *testing.T) {
 	t.Parallel()
 	env := newOutgoingEnv(t)
@@ -634,7 +699,7 @@ func TestCheckpointPushPolicy_UnreadablePolicyRefusesExplicitCheckpointPush(t *t
 	output, err := gitPushArgs(t, env, "--mirror", "origin")
 
 	require.Error(t, err, "an unreadable policy must not read as automatic: %s", output)
-	require.Contains(t, output, "preferences.json", "the refusal names the file to fix")
+	require.Contains(t, output, "checkpoint-push-policy", "the refusal names the file to fix")
 	require.Empty(t, remoteCheckpointIDs(t, bareDir))
 }
 
@@ -648,7 +713,7 @@ func TestCheckpointPushPolicy_UnloadableSettingsRefuseExplicitCheckpointPush(t *
 		preferences string
 	}{
 		{name: "malformed", preferences: `{not json`},
-		{name: "wrong type", preferences: `{"checkpoint_push_policy":5}`},
+		{name: "wrong type", preferences: `{"trails_enabled":5}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -657,7 +722,7 @@ func TestCheckpointPushPolicy_UnloadableSettingsRefuseExplicitCheckpointPush(t *
 			bareDir := env.SetupBareRemote()
 			setCheckpointPushPolicy(t, env, "manual")
 			createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
-			writeClonePreferences(t, env, tt.preferences)
+			writeGitCommonDirFile(t, env, settings.ClonePreferencesFile, tt.preferences)
 
 			output, err := gitPushArgs(t, env, "--mirror", "origin")
 
@@ -795,7 +860,7 @@ func TestConfigure_ManualPolicyNeedsGitRefs(t *testing.T) {
 
 	_, err := env.RunCLIWithError("configure", "--checkpoint-push-policy", "manual")
 	require.Error(t, err)
-	require.NoFileExists(t, clonePreferencesFile(t, env), "a refused policy saves nothing")
+	require.NoFileExists(t, gitCommonDirFile(t, env, settings.CheckpointPushPolicyFile), "a refused policy saves nothing")
 
 	env.RunCLI("configure", "--checkpoint-push-policy", "automatic")
 
@@ -818,5 +883,5 @@ func TestConfigure_PolicyNotSavedWhenBackendSwitchFails(t *testing.T) {
 
 	_, err := env.RunCLIWithError("configure", "--checkpoint-backend", "git-refs", "--checkpoint-push-policy", "manual")
 	require.Error(t, err, "the backend save must fail for this test to mean anything")
-	require.NoFileExists(t, clonePreferencesFile(t, env), "manual must not be saved when the backend switch failed")
+	require.NoFileExists(t, gitCommonDirFile(t, env, settings.CheckpointPushPolicyFile), "manual must not be saved when the backend switch failed")
 }

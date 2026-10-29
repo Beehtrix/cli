@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/entireio/cli/redact"
@@ -148,10 +149,9 @@ func TestPushMigratedRefs_ManualPolicyReportsHeldRefs(t *testing.T) {
 	repo, bareDir := setupMigratePushRepo(t, `{"enabled": true}`)
 	workDir, err := os.Getwd()
 	require.NoError(t, err)
-	require.NoError(t, os.MkdirAll(filepath.Join(workDir, ".git", "entire"), 0o755))
-	require.NoError(t, os.WriteFile(
-		filepath.Join(workDir, ".git", "entire", "preferences.json"),
-		[]byte(`{"checkpoint_push_policy":"manual"}`), 0o600))
+	policyFile := filepath.Join(workDir, ".git", filepath.FromSlash(settings.CheckpointPushPolicyFile))
+	require.NoError(t, os.MkdirAll(filepath.Dir(policyFile), 0o755))
+	require.NoError(t, os.WriteFile(policyFile, []byte("manual\n"), 0o600))
 
 	var out bytes.Buffer
 	require.NoError(t, pushMigratedRefs(context.Background(), &out, repo, bareDir))

@@ -37,8 +37,8 @@ func TestEnable_PrivacyNotice(t *testing.T) {
 		noRemote bool
 		fork     bool
 		branch   bool
-		// prefs seeds the clone preferences file.
-		prefs  string
+		// policy seeds the stored checkpoint push policy.
+		policy string
 		before []string
 		args   []string
 		// after is setup output the notice must follow.
@@ -53,8 +53,8 @@ func TestEnable_PrivacyNotice(t *testing.T) {
 		{name: "push disabled", args: append(enableAgent, "--skip-push-sessions"), after: "Ready.", notice: "Checkpoint uploads are off (push_sessions: false). Checkpoints stay in this clone.\n" + redaction},
 		{name: "no remote", noRemote: true, args: enableAgent, after: "Ready.", notice: "No Git remotes configured. Once you add one, checkpoints will be uploaded when you push to it.\n" + privacy},
 		{name: "git-branch", branch: true, args: enableAgent, after: "Ready.", notice: "Checkpoints will be uploaded when you push to origin.\n" + privacyNoPolicy},
-		{name: "manual", prefs: `{"checkpoint_push_policy":"manual"}`, args: enableAgent, after: "Ready.", notice: "Checkpoints will be uploaded to origin when you run `entire checkpoint push`.\n" + privacyNoPolicy},
-		{name: "manual no remote", noRemote: true, prefs: `{"checkpoint_push_policy":"manual"}`, args: enableAgent, after: "Ready.", notice: "No Git remotes configured. Once you add one, `entire checkpoint push` will upload checkpoints to it.\n" + privacyNoPolicy},
+		{name: "manual", policy: "manual", args: enableAgent, after: "Ready.", notice: "Checkpoints will be uploaded to origin when you run `entire checkpoint push`.\n" + privacyNoPolicy},
+		{name: "manual no remote", noRemote: true, policy: "manual", args: enableAgent, after: "Ready.", notice: "No Git remotes configured. Once you add one, `entire checkpoint push` will upload checkpoints to it.\n" + privacyNoPolicy},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -62,8 +62,8 @@ func TestEnable_PrivacyNotice(t *testing.T) {
 			if tc.branch {
 				env.CheckpointStore = StoreGitBranch
 			}
-			if tc.prefs != "" {
-				writeClonePreferences(t, env, tc.prefs)
+			if tc.policy != "" {
+				setCheckpointPushPolicy(t, env, tc.policy)
 			}
 			if !tc.noRemote {
 				env.SetupBareRemote()

@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,7 +58,7 @@ is still its current version: if it changed since you looked, it is not sent.
 
 --all and a bare <checkpoint-id> need a terminal. Without one, name each
 checkpoint as <checkpoint-id>@<commit>, using the commit --outgoing --json
-reports.
+reports. With no arguments, it lists what is waiting and uploads nothing.
 
 Examples:
   entire checkpoint push <id>
@@ -99,7 +98,7 @@ func runCheckpointPush(cmd *cobra.Command, args []string, flags checkpointPushFl
 			requests = append(requests, strategy.CheckpointPushRequest{Ref: oc.Ref})
 		}
 	case len(args) == 0:
-		return printWaitingForCheckpointPush(cmd, errOut)
+		return printWaitingForCheckpointPush(cmd, errOut, canPrompt)
 	default:
 		parsed, err := parseCheckpointPushArgs(args, canPrompt, errOut)
 		if err != nil {
@@ -175,24 +174,28 @@ func refuseCheckpointPushWithoutTerminal(errOut io.Writer, what string) error {
 }
 
 // printWaitingForCheckpointPush answers a bare `entire checkpoint push`: it
-// names what is waiting and how to send it, and exits non-zero because nothing
-// was uploaded.
-func printWaitingForCheckpointPush(cmd *cobra.Command, errOut io.Writer) error {
+// names what is waiting and how to send it. --all is offered only where it is
+// accepted.
+func printWaitingForCheckpointPush(cmd *cobra.Command, errOut io.Writer, canPrompt bool) error {
 	outgoing, err := strategy.ListOutgoingCheckpoints(cmd.Context())
 	if err != nil {
 		return reportOutgoingErr(errOut, err)
 	}
 	if len(outgoing.Checkpoints) == 0 {
 		fmt.Fprintln(errOut, "No checkpoints are waiting to upload.")
-		return NewSilentError(errors.New("no checkpoints named"))
+		return nil
 	}
 	fmt.Fprintf(errOut, "%d waiting to upload:\n", len(outgoing.Checkpoints))
 	for _, oc := range outgoing.Checkpoints {
 		fmt.Fprintf(errOut, "  %s\n", checkpointPushLabel(oc.CheckpointID, oc.Ref))
 	}
-	fmt.Fprintln(errOut, "Upload with 'entire checkpoint push <checkpoint-id>@<commit>' or 'entire checkpoint push --all'.")
-	fmt.Fprintln(errOut, "See each one with 'entire checkpoint list --outgoing'.")
-	return NewSilentError(errors.New("no checkpoints named"))
+	if canPrompt {
+		fmt.Fprintln(errOut, "Upload them all with 'entire checkpoint push --all', or name each one as <checkpoint-id>@<commit>.")
+	} else {
+		fmt.Fprintln(errOut, "Upload with 'entire checkpoint push <checkpoint-id>@<commit>'.")
+	}
+	fmt.Fprintln(errOut, "Each checkpoint's commit is in 'entire checkpoint list --outgoing --json'.")
+	return nil
 }
 
 func checkpointPushLabel(cid id.CheckpointID, ref plumbing.ReferenceName) string {
@@ -227,29 +230,26 @@ func checkpointPushResults(report strategy.CheckpointPushReport) []checkpointPus
 }
 
 func writeCheckpointPushJSON(w io.Writer, report strategy.CheckpointPushReport) error {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(checkpointPushJSON{Remote: report.Remote, Results: checkpointPushResults(report)}); err != nil {
-		return fmt.Errorf("write checkpoint push JSON: %w", err)
-	}
-	return nil
+	return printJSON(w, checkpointPushJSON{Remote: report.Remote, Results: checkpointPushResults(report)})
 }
 
 func writeCheckpointPushText(w io.Writer, report strategy.CheckpointPushReport) {
-	for _, result := range checkpointPushResults(report) {
-		label := result.CheckpointID
-		if label == "" {
-			label = result.Ref
-		}
-		switch strategy.CheckpointPushStatus(result.Status) {
+	for _, outcome := range report.Outcomes {
+		cid, _ := checkpoint.ParseRef(outcome.Target.Ref)
+		label := checkpointPushLabel(cid, outcome.Target.Ref)
+		switch outcome.Status {
 		case strategy.CheckpointPushUploaded:
 			fmt.Fprintf(w, "%s  uploaded to %s\n", label, report.Remote)
 		case strategy.CheckpointPushChanged:
-			fmt.Fprintf(w, "%s  not sent: it changed since you looked; it is now %s. Check it with 'entire checkpoint list --outgoing'.\n", label, result.Commit)
+			if outcome.Commit.IsZero() {
+				fmt.Fprintf(w, "%s  not sent: it changed since you looked. Check it with 'entire checkpoint list --outgoing'.\n", label)
+				break
+			}
+			fmt.Fprintf(w, "%s  not sent: it changed since you looked; it is now %s. Check it with 'entire checkpoint list --outgoing'.\n", label, outcome.Commit)
 		case strategy.CheckpointPushNotWaiting:
 			fmt.Fprintf(w, "%s  not sent: it is not waiting to upload\n", label)
 		case strategy.CheckpointPushFailed:
-			fmt.Fprintf(w, "%s  failed: %s; it stays queued\n", label, result.Error)
+			fmt.Fprintf(w, "%s  failed: %v; it stays queued\n", label, outcome.Err)
 		}
 	}
 }
