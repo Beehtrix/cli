@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"os"
@@ -1373,6 +1374,260 @@ func TestToolWrapper_KeepCopyHoldingEntireIsDropped(t *testing.T) {
 			}
 			if f.exists("commit-msg.tool-old" + backupSuffix) {
 				t.Error("keep copy holding Entire's hook left behind")
+			}
+		})
+	}
+}
+
+// brainWrapper is entire-brain v0.4.0's pre-push hook (pushHookContent in
+// internal/cli/push_hook.go) with a plugin path that does not exist, so only
+// its chain runs: it execs "$0.pre-entire-brain", relative to its own path.
+const brainWrapper = `#!/bin/sh
+# entire-brain push hook
+# Tells the local entire-brain plugin that a push is transferring this
+# repo's commits, so it uploads its fact store (detached, best-effort).
+if [ -x '/nonexistent/entire-brain' ]; then
+  '/nonexistent/entire-brain' memory notify --event push </dev/null >/dev/null 2>&1 &
+fi
+# Chain: run the pre-existing hook with the original stdin and arguments;
+# its exit code decides the push, exactly as before.
+backup="$0.pre-entire-brain"
+if [ -x "$backup" ]; then exec "$backup" "$@"; fi
+`
+
+// notBrainWrapper is brainWrapper with a command after its exec, which runs
+// only when the copy is gone; uninstall must not take it for Brain's.
+const notBrainWrapper = brainWrapper + "echo 'no chained hook' >&2\nexit 1\n"
+
+// brainInstall does what entire-brain's connect does to pre-push: move the
+// hook it finds to pre-push.pre-entire-brain and put its wrapper in front.
+// wrapper is brainWrapper unless given.
+func (f *hooksFixture) brainInstall(wrapper ...string) {
+	f.t.Helper()
+	if err := os.Rename(filepath.Join(f.dir, "pre-push"), filepath.Join(f.dir, "pre-push.pre-entire-brain")); err != nil {
+		f.t.Fatal(err)
+	}
+	f.write("pre-push", cmp.Or(append(wrapper, brainWrapper)...))
+}
+
+// Uninstall takes Entire's hook out of entire-brain's chain, which runs
+// "$0.pre-entire-brain" and so never names the copy it runs. Brain's wrapper
+// stays in front of the user's hook if there is one, as Brain's own install
+// would have left it, and runs nothing of Entire's either way: in front of
+// Entire (right after connect) or behind it (Entire re-wrapped Brain on a
+// later install, leaving the old copy dormant until uninstall puts the
+// wrapper back).
+func TestRemoveHooks_AfterBrainWrapperLeavesNoEntireHook(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("runs POSIX shell hooks")
+	}
+	spec := specFor(t, prePushHook)
+	const brainCopy = "pre-push.pre-entire-brain"
+	for name, tc := range map[string]struct {
+		userHook bool
+		wrapper  string // brainWrapper if empty
+		setup    func(f *hooksFixture)
+		// copyIsUser: brainCopy holds the user's hook after uninstall;
+		// copyIsEntire: it still holds Entire's (a wrapper this fix leaves
+		// alone); otherwise it is gone.
+		copyIsUser, copyIsEntire bool
+		want                     string
+	}{
+		"brain in front, with a user hook": {
+			userHook:   true,
+			setup:      func(f *hooksFixture) { f.install(spec); f.brainInstall() },
+			copyIsUser: true, want: "user",
+		},
+		"brain in front, no user hook": {
+			setup: func(f *hooksFixture) { f.install(spec); f.brainInstall() },
+		},
+		"Entire re-wrapped brain, no user hook": {
+			setup: func(f *hooksFixture) { f.install(spec); f.brainInstall(); f.install(spec) },
+		},
+		// The re-wrap rotated the user's hook to an older copy, which cannot
+		// be told from any other; it stays there and is reported.
+		"Entire re-wrapped brain, user hook rotated away": {
+			userHook: true,
+			setup:    func(f *hooksFixture) { f.install(spec); f.brainInstall(); f.install(spec) },
+		},
+		// Not a moved copy of Entire's hook: Brain moved the user's own hook,
+		// and Brain's wrapper goes on running it after uninstall.
+		"brain wrapped the user's hook before Entire": {
+			userHook:   true,
+			setup:      func(f *hooksFixture) { f.brainInstall(); f.install(spec) },
+			copyIsUser: true, want: "user",
+		},
+		// Removing the copy would let the trailing exit 1 fail every push, so
+		// a wrapper that is not exactly Brain's keeps main's behaviour.
+		"not exactly brain's wrapper": {
+			wrapper:      notBrainWrapper,
+			setup:        func(f *hooksFixture) { f.install(spec); f.brainInstall(notBrainWrapper) },
+			copyIsEntire: true, want: "entire",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newHooksFixture(t)
+			bin := t.TempDir()
+			log := filepath.Join(t.TempDir(), "log")
+			writeExec(t, filepath.Join(bin, "entire"), "#!/bin/sh\necho entire >> '"+log+"'\ncat >/dev/null\n")
+			user := "#!/bin/sh\necho user >> '" + log + "'\n"
+			if tc.userHook {
+				f.write("pre-push", user)
+			}
+			tc.setup(f)
+
+			res, err := removeHooks(context.Background(), f.lockRoot, f.root, f.dir, restoreMovedHooks)
+			if err != nil {
+				t.Fatalf("removeHooks: %v", err)
+			}
+
+			assertHooks(t, f, map[string]string{"pre-push": cmp.Or(tc.wrapper, brainWrapper)})
+			switch {
+			case tc.copyIsUser:
+				assertHooks(t, f, map[string]string{brainCopy: user})
+			case tc.copyIsEntire:
+				if !carriesEntireMarker(f.root, brainCopy) {
+					t.Errorf("%s changed for a wrapper that is not Brain's", brainCopy)
+				}
+			case f.exists(brainCopy):
+				t.Errorf("%s left behind: %q", brainCopy, f.read(brainCopy))
+			}
+			if f.exists("pre-push" + backupSuffix) {
+				t.Errorf("pre-push%s left behind", backupSuffix)
+			}
+			if tc.userHook && !tc.copyIsUser && !slices.ContainsFunc(res.Older, func(n string) bool {
+				return strings.HasPrefix(n, "pre-push"+backupSuffix+".") && f.read(n) == user
+			}) {
+				t.Errorf("user hook not among the reported older copies %v", res.Older)
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), hookRunTimeout)
+			defer cancel()
+			if out, err := runHook(ctx, bin, filepath.Join(f.dir, "pre-push"), "origin", "/dev/null"); err != nil {
+				t.Fatalf("pre-push failed: %v\n%s", err, out)
+			}
+			data, err := os.ReadFile(log)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if got := strings.Join(strings.Fields(string(data)), ","); got != tc.want {
+				t.Errorf("pre-push after uninstall ran %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Layouts near Brain's that uninstall treats as main does: a hook that only
+// mentions the copy in a comment, and a literal-name wrapper over Entire
+// whose moved copy gets Brain's backed-up wrapper back. Brain's wrapper both
+// at the hook path and in .pre-entire still loses Entire's copy.
+func TestRemoveHooks_NearBrainLayouts(t *testing.T) {
+	t.Parallel()
+	spec := specFor(t, prePushHook)
+	const brainCopy = "pre-push.pre-entire-brain"
+	for name, tc := range map[string]struct {
+		hook, backup string // no backup if empty
+		extra        map[string]string
+		want         map[string]string
+		gone         []string
+	}{
+		"comment in a hook that does not chain": {
+			hook:   "#!/bin/sh\n# entire-brain push hook\n# backup=\"$0.pre-entire-brain\"\nexit 0\n",
+			backup: userHookV1,
+			want:   map[string]string{"pre-push" + backupSuffix: userHookV1, brainCopy: spec.content},
+		},
+		"literal wrapper over Entire, brain wrapper backed up": {
+			hook:   toolWrapper(brainCopy, "/dev/null"),
+			backup: brainWrapper,
+			want:   map[string]string{brainCopy: brainWrapper},
+			gone:   []string{"pre-push" + backupSuffix},
+		},
+		// An earlier reclaim for a literal wrapper saved the user's hook
+		// beside the copy; it goes back into the copy, which Brain runs.
+		"user hook kept beside brain's copy": {
+			hook:  brainWrapper,
+			extra: map[string]string{brainCopy + backupSuffix: userHookV1},
+			want:  map[string]string{brainCopy: userHookV1},
+			gone:  []string{brainCopy + backupSuffix},
+		},
+		// A backed-up hook that runs files relative to its own path would
+		// run something else if renamed, and Entire's copy is what runs it
+		// from .pre-entire, so the layout stays as on main.
+		"backed-up hook relative to its own path": {
+			hook:   brainWrapper,
+			backup: "#!/bin/sh\nexec \"$0.other\" \"$@\"\n",
+			want: map[string]string{
+				"pre-push" + backupSuffix: "#!/bin/sh\nexec \"$0.other\" \"$@\"\n",
+				brainCopy:                 spec.content,
+			},
+		},
+		"brain wrapper at the hook path and backed up": {
+			hook:   brainWrapper,
+			backup: brainWrapper,
+			gone:   []string{"pre-push" + backupSuffix, brainCopy},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newHooksFixture(t)
+			f.write("pre-push", tc.hook)
+			if tc.backup != "" {
+				f.write("pre-push"+backupSuffix, tc.backup)
+			}
+			for n, c := range tc.extra {
+				f.write(n, c)
+			}
+			f.write(brainCopy, spec.content)
+
+			if _, err := removeHooks(context.Background(), f.lockRoot, f.root, f.dir, restoreMovedHooks); err != nil {
+				t.Fatalf("removeHooks: %v", err)
+			}
+
+			assertHooks(t, f, map[string]string{"pre-push": tc.hook})
+			assertHooks(t, f, tc.want)
+			for _, n := range tc.gone {
+				if f.exists(n) {
+					t.Errorf("%s left behind", n)
+				}
+			}
+		})
+	}
+}
+
+// isBrainChain accepts Brain's wrapper as written, and nothing that would
+// fail or run something else once its copy is gone.
+func TestIsBrainChain(t *testing.T) {
+	t.Parallel()
+	f := newHooksFixture(t)
+	for name, tc := range map[string]struct {
+		content, hook string
+		want          bool
+	}{
+		"brain wrapper":                    {brainWrapper, prePushHook, true},
+		"quoted plugin path":               {strings.ReplaceAll(brainWrapper, "'/nonexistent/entire-brain'", `'/a b/it'\''s/entire-brain'`), prePushHook, true},
+		"delimiter inside the plugin path": {strings.ReplaceAll(brainWrapper, "'/nonexistent/entire-brain'", "'/a\n ]; then\nb/entire-brain'"), prePushHook, true},
+		"half-quoted plugin path":          {strings.ReplaceAll(brainWrapper, "'/nonexistent/entire-brain'", "/nonexistent/entire-brain'"), prePushHook, false},
+		"unquoted plugin path":             {strings.ReplaceAll(brainWrapper, "'/nonexistent/entire-brain'", "/nonexistent/entire-brain"), prePushHook, false},
+		"comment after the exec":           {brainWrapper + "\n# end\n", prePushHook, false},
+		"check before the exec":            {strings.Replace(brainWrapper, `if [ -x "$backup"`, "[ -f \"$backup$empty\" ] || exit 1\nif [ -x \"$backup\"", 1), prePushHook, false},
+		"suffix after the quote":           {strings.Replace(brainWrapper, `backup="$0.pre-entire-brain"`, `backup="$0.pre-entire-brain".v2`, 1), prePushHook, false},
+		"CRLF line endings":                {strings.ReplaceAll(brainWrapper, "\n", "\r\n"), prePushHook, false},
+		"code after the exec":              {notBrainWrapper, prePushHook, false},
+		"exec commented out":               {strings.Replace(brainWrapper, `if [ -x "$backup"`, `# if [ -x "$backup"`, 1), prePushHook, false},
+		"assignment commented out":         {strings.Replace(brainWrapper, `backup="$0`, `# backup="$0`, 1), prePushHook, false},
+		"no marker":                        {strings.Replace(brainWrapper, "# entire-brain push hook\n", "", 1), prePushHook, false},
+		"check that fails without it":      {"#!/bin/sh\n# entire-brain push hook\nbackup=\"$0.pre-entire-brain\"\n[ -x \"$backup\" ] && exec \"$backup\" \"$@\"\n", prePushHook, false},
+		"another hook":                     {brainWrapper, "pre-commit", false},
+		"Entire's hook mentioning it":      {specFor(t, prePushHook).content + "\n" + brainWrapper, prePushHook, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			file := "brain_" + strings.ReplaceAll(name, " ", "_")
+			f.write(file, tc.content)
+			if got := isBrainChain(f.root, file, tc.hook); got != tc.want {
+				t.Errorf("isBrainChain = %v, want %v", got, tc.want)
 			}
 		})
 	}
