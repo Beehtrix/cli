@@ -187,7 +187,7 @@ func TestReadPromptAnswer_TimeoutLeavesTheNextLineForTheNextReader(t *testing.T)
 	if _, err := readPromptAnswer(f, 50*time.Millisecond); !errors.Is(err, errPromptTimedOut) {
 		t.Fatalf("err = %v, want errPromptTimedOut", err)
 	}
-	if _, err := ptmx.Write([]byte("hunter2\n")); err != nil {
+	if _, err := ptmx.WriteString("hunter2\n"); err != nil {
 		t.Fatal(err)
 	}
 	line, err := readPromptAnswer(f, 2*time.Second)

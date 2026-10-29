@@ -80,7 +80,7 @@ var errPromptTimedOut = errors.New("no answer before the prompt timed out")
 // read still blocked when it gives up is left behind, and the caller's
 // terminal Close releases it (see interactive.PromptTTY.Close).
 func readPromptAnswer(r io.Reader, timeout time.Duration) (string, error) {
-	if d, ok := r.(interface{ SetReadDeadline(time.Time) error }); ok {
+	if d, ok := r.(interface{ SetReadDeadline(t time.Time) error }); ok {
 		if err := d.SetReadDeadline(time.Now().Add(timeout)); err == nil {
 			line, err := bufio.NewReader(r).ReadString('\n')
 			_ = d.SetReadDeadline(time.Time{}) //nolint:errcheck // the deadline was just set on the same handle
