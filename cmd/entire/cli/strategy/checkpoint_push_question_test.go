@@ -80,6 +80,24 @@ func TestFirstPushQuestion_ManualWithoutOuterCheckpointRefsHoldsQuietly(t *testi
 	assertRefsAbsentFromRemote(t, bareDir, refs, "an answer of manual holds this push")
 }
 
+// The old-hook warning runs before the question, while the policy is unset.
+// Answering manual on a clone whose hook does not pass the ref list must still
+// warn that the push cannot be checked.
+func TestFirstPushQuestion_ManualAnswerWarnsAboutAnOldHook(t *testing.T) {
+	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
+	prepareGitRefsPrePush(t, workDir, bareDir)
+	answerFirstPushQuestionWith(t, checkpointPushAnswerManual)
+	repo, err := gitrepo.OpenPath(workDir)
+	require.NoError(t, err)
+	defer repo.Close()
+	enqueueRefs(t, repo, refs)
+
+	stderr := captureStderrWriter(t)
+	require.NoError(t, NewManualCommitStrategy().PrePushFromGitHook(t.Context(), "origin"))
+
+	assert.Equal(t, 1, strings.Count(stderr.String(), "does not pass the refs being pushed"), "stderr:\n%s", stderr.String())
+}
+
 // The question can wait a long time. A policy chosen meanwhile, with
 // `entire configure` or by a push from another worktree, wins over the answer.
 func TestFirstPushQuestion_LateAnswerKeepsNewerChoice(t *testing.T) {

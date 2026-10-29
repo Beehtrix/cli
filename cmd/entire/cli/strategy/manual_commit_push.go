@@ -438,11 +438,14 @@ func (s *ManualCommitStrategy) prePushCheckpointRefs(ctx context.Context, ps pus
 	if fromGitHook {
 		answer, saved := askCheckpointPushPolicyOnFirstPush(ctx, repo)
 		if answer == checkpointPushAnswerManual {
-			// checkOuterPushUnderManualPolicy ran before the question, while the
-			// policy was unset, so this push's own checkpoint refs are checked again.
+			// CheckOuterPushHeldCheckpoints and the old-hook warning ran before
+			// the question, while the policy was unset, so both run again. The
+			// question is asked only while checkpoints wait, so the warning
+			// needs no count.
 			if err := refuseOuterPushAfterManualAnswer(ctx); err != nil {
 				return err
 			}
+			warnPrePushRefsUnknown(ctx, stderrWriter)
 			if !saved {
 				return nil
 			}
