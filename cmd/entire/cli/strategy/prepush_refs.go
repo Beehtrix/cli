@@ -145,6 +145,12 @@ func (r PrePushRef) checkpointRefName() string {
 	return r.RemoteRef
 }
 
+// sendsTag reports whether the line pushes a tag, the one kind of ref that can
+// name an annotated tag object.
+func (r PrePushRef) sendsTag() bool {
+	return strings.HasPrefix(r.LocalRef, "refs/tags/") || strings.HasPrefix(r.RemoteRef, "refs/tags/")
+}
+
 // WithPrePushRefsFrom parses git's pre-push ref list from r and records it. A
 // list that cannot be read leaves the refs unknown, as with an old hook, and
 // the user's push is not blocked over it.

@@ -167,8 +167,18 @@ func checkOuterPushOfHeldCommits(ctx context.Context, lines []PrePushRef, why st
 			tips[r.Hash()] = ref
 		}
 	}
+	if len(tips) == 0 {
+		return nil
+	}
 	for _, line := range lines {
-		if ref, held := tips[peelToCommit(repo, plumbing.NewHash(line.LocalSHA))]; held {
+		hash := plumbing.NewHash(line.LocalSHA)
+		ref, held := tips[hash]
+		// Only a tag can name a tag object, and peeling reads an object, which
+		// adds up on a first `git push --tags`.
+		if !held && line.sendsTag() {
+			ref, held = tips[peelToCommit(repo, hash)]
+		}
+		if held {
 			return fmt.Errorf("%w: this push sends %s, the current version of %s, and %s. %s",
 				ErrOuterPushCarriesHeldCheckpoints, line.LocalRef, ref, why, outerPushHowTo)
 		}
