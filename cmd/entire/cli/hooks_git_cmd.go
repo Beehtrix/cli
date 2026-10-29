@@ -229,27 +229,29 @@ func newHooksGitPostRewriteCmd() *cobra.Command {
 }
 
 // refuseOuterCheckpointPushWithHooksOff is the one pre-push check that runs
-// with Entire's hooks off. A repository set up for Entire may still hold
-// checkpoints back, whether its settings cannot be loaded or it is disabled
-// (which committed settings can do), and the user's own push must not send
-// them.
+// with Entire's hooks off for this branch: no .entire, Entire disabled (which
+// committed settings can do), or settings that do not load. The clone's policy
+// may still hold checkpoints back, and the user's own push must not send them.
 func refuseOuterCheckpointPushWithHooksOff(cmd *cobra.Command) error {
-	ctx := cmd.Context()
-	if !settings.IsSetUpAny(ctx) {
-		return nil
-	}
-	_, loadErr := settings.Load(ctx)
-	if os.Getenv(strategy.PrePushStdinRefsEnv) == "1" {
-		ctx = strategy.WithPrePushRefsFrom(ctx, cmd.InOrStdin())
-	}
-	check := strategy.CheckOuterPushWhileDisabled(ctx)
-	if loadErr != nil {
-		check = strategy.CheckOuterPushWithUnloadableSettings(ctx, loadErr)
-	}
-	if check != nil {
-		return fmt.Errorf("pre-push: %w", check)
+	if err := strategy.CheckOuterPushHeldCheckpoints(withPrePushRefsFromHook(cmd)); err != nil {
+		return fmt.Errorf("pre-push: %w", err)
 	}
 	return nil
+}
+
+// withPrePushRefsFromHook records what the hook line passed about git's ref
+// list (see strategy.PrePushStdinRefsEnv).
+func withPrePushRefsFromHook(cmd *cobra.Command) context.Context {
+	ctx := cmd.Context()
+	switch os.Getenv(strategy.PrePushStdinRefsEnv) {
+	case "1":
+		// The ref list git passes on stdin is what the user's own push sends,
+		// which Entire's own push cannot see otherwise.
+		return strategy.WithPrePushRefsFrom(ctx, cmd.InOrStdin())
+	case "0":
+		return strategy.WithPrePushRefsUnsaved(ctx)
+	}
+	return ctx
 }
 
 func newHooksGitPrePushCmd() *cobra.Command {
@@ -275,14 +277,8 @@ func newHooksGitPrePushCmd() *cobra.Command {
 			defer g.span.End()
 			g.logInvoked(slog.String("remote", remote))
 
-			ctx := g.ctx
-			// Only scripts that replay stdin to whatever runs after them set
-			// this (see strategy.PrePushStdinRefsEnv).
-			if os.Getenv(strategy.PrePushStdinRefsEnv) == "1" {
-				// The ref list git passes on stdin is what the user's own
-				// push sends, which Entire's own push cannot see otherwise.
-				ctx = strategy.WithPrePushRefsFrom(ctx, cmd.InOrStdin())
-			}
+			cmd.SetContext(g.ctx)
+			ctx := withPrePushRefsFromHook(cmd)
 
 			hookErr := g.strategy.PrePushFromGitHook(ctx, remote)
 			g.logCompleted(hookErr)

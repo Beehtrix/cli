@@ -76,7 +76,7 @@ func (s *ManualCommitStrategy) prePush(ctx context.Context, remote string, prote
 
 	// Before push_sessions and the sync-remote gate: those decide what Entire
 	// sends, while this is about what the user's own push sends, to any remote.
-	if err := checkOuterPushUnderManualPolicy(ctx); err != nil {
+	if err := CheckOuterPushHeldCheckpoints(ctx); err != nil {
 		return err
 	}
 	warnOuterPushUncheckable(ctx)

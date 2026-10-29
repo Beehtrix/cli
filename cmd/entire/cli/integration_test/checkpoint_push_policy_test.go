@@ -5,6 +5,7 @@ package integration
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
+	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/stretchr/testify/require"
 )
@@ -757,9 +759,106 @@ func TestCheckpointPushPolicy_DisabledRepositoryStillRefusesExplicitCheckpointPu
 	require.NoError(t, err, "a push without checkpoint refs is not refused: %s", output)
 }
 
+// gitPushArgsWithEnv is gitPushArgs with extra environment for the push.
+func gitPushArgsWithEnv(t *testing.T, env *TestEnv, extraEnv []string, args ...string) (string, error) {
+	t.Helper()
+	env.InstallRealPrePushHook()
+	cmd := execx.NonInteractive(t.Context(), "git", append([]string{"push"}, args...)...)
+	cmd.Dir = env.RepoDir
+	cmd.Env = append(env.cliEnv(), extraEnv...)
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+// The policy, the queue and the checkpoint refs belong to the clone, so what
+// the checked-out branch says about Entire must not decide whether a push may
+// send held checkpoints.
+func TestCheckpointPushPolicy_RefusalDoesNotDependOnTheCheckedOutBranch(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		extraEnv []string
+		switchTo func(t *testing.T, env *TestEnv)
+	}{
+		{name: "branch without .entire", switchTo: func(t *testing.T, env *TestEnv) {
+			t.Helper()
+			testutil.RunGit(t, env.RepoDir, "checkout", "-q", "--orphan", "before-entire")
+			testutil.RunGit(t, env.RepoDir, "rm", "-rfq", ".")
+			testutil.RunGit(t, env.RepoDir, "clean", "-fdxq")
+			require.NoError(t, os.WriteFile(filepath.Join(env.RepoDir, "README"), []byte("old\n"), 0o600))
+			testutil.RunGit(t, env.RepoDir, "add", "README")
+			testutil.RunGit(t, env.RepoDir, "commit", "-qm", "before entire")
+		}},
+		{name: "backend reads as git-branch", extraEnv: []string{"ENTIRE_CHECKPOINTS_PRIMARY=git-branch"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			env := newOutgoingEnv(t)
+			bareDir := env.SetupBareRemote()
+			setCheckpointPushPolicy(t, env, "manual")
+			createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+			if tt.switchTo != nil {
+				tt.switchTo(t, env)
+			}
+
+			for _, args := range [][]string{{"--mirror", "origin"}, {"origin", "refs/entire/*:refs/entire/*"}} {
+				output, err := gitPushArgsWithEnv(t, env, tt.extraEnv, args...)
+				require.Error(t, err, "git push %v must be refused: %s", args, output)
+				require.Contains(t, output, "--no-verify")
+			}
+			require.Empty(t, remoteCheckpointIDs(t, bareDir))
+		})
+	}
+}
+
+// gitPushWithUnsavedRefList pushes through a hook in the form the hook line
+// falls back to when it cannot save git's ref list (no usable TMPDIR).
+func gitPushWithUnsavedRefList(t *testing.T, env *TestEnv, args ...string) (string, error) {
+	t.Helper()
+	script := fmt.Sprintf("#!/bin/sh\n%s=0 exec %q hooks git pre-push \"$1\" < /dev/null\n", strategy.PrePushStdinRefsEnv, getTestBinary())
+	require.NoError(t, os.WriteFile(filepath.Join(env.RepoDir, ".git", "hooks", "pre-push"), []byte(script), 0o755))
+	cmd := execx.NonInteractive(t.Context(), "git", append([]string{"push"}, args...)...)
+	cmd.Dir = env.RepoDir
+	cmd.Env = env.cliEnv()
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+// When the hook cannot save git's ref list, the push cannot be checked. Under
+// manual with checkpoints waiting that must not let a mirror push through, and
+// the message must name the real cause, not an old hook.
+func TestCheckpointPushPolicy_UnsavedRefListRefusesUnderManual(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	bareDir := env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "manual")
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	env.InstallRealPrePushHook()
+
+	output, err := gitPushWithUnsavedRefList(t, env, "--mirror", "origin")
+
+	require.Error(t, err, "an unchecked push must not send held checkpoints: %s", output)
+	require.Contains(t, output, "TMPDIR")
+	require.NotContains(t, output, "does not pass the refs", "this is not an outdated hook")
+	require.Empty(t, remoteCheckpointIDs(t, bareDir))
+}
+
+func TestCheckpointPushPolicy_UnsavedRefListPassesUnderAutomatic(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	env.SetupBareRemote()
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+	env.InstallRealPrePushHook()
+
+	output, err := gitPushWithUnsavedRefList(t, env, "origin", "HEAD")
+
+	require.NoError(t, err, "nothing is held under automatic: %s", output)
+}
+
 // A checkpoints block that settings.Load accepts but the backend loader
-// rejects leaves the backend unknown. That must not read as "not git-refs",
-// which would let the push send checkpoint refs manual holds back.
+// rejects leaves the backend unknown. Checkpoint refs are refused from the
+// clone's policy alone, so an unknown backend does not let them through.
 func TestCheckpointPushPolicy_UnreadableBackendRefusesExplicitCheckpointPush(t *testing.T) {
 	t.Parallel()
 	env := newOutgoingEnv(t)
@@ -774,7 +873,6 @@ func TestCheckpointPushPolicy_UnreadableBackendRefusesExplicitCheckpointPush(t *
 	output, err := gitPushArgs(t, env, "--mirror", "origin")
 
 	require.Error(t, err, "an unreadable backend must not let checkpoint refs through: %s", output)
-	require.Contains(t, output, "checkpoints.primary.type", "the refusal names the problem")
 	require.Empty(t, remoteCheckpointIDs(t, bareDir))
 }
 
@@ -905,4 +1003,41 @@ func TestConfigure_PolicyNotSavedWhenBackendSwitchFails(t *testing.T) {
 	_, err := env.RunCLIWithError("configure", "--checkpoint-backend", "git-refs", "--checkpoint-push-policy", "manual")
 	require.Error(t, err, "the backend save must fail for this test to mean anything")
 	require.NoFileExists(t, gitCommonDirFile(t, env, settings.CheckpointPushPolicyFile), "manual must not be saved when the backend switch failed")
+}
+
+// The policy applies to git-refs only, so on git-branch status must not report
+// it, and a policy file it cannot read is not a warning there.
+func TestCheckpointPushPolicy_StatusIgnoresPolicyOnGitBranch(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	env.SetupBareRemote()
+	setCheckpointPushPolicy(t, env, "approved")
+	createCheckpointedCommit(t, env, "Some work", "work.go", "package work", "Some work")
+
+	var status struct {
+		Policy      string `json:"checkpoint_push_policy"`
+		PolicyError string `json:"checkpoint_push_policy_error"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(cliStdout(t, env, "status", "--json")), &status))
+	require.Empty(t, status.Policy)
+	require.Empty(t, status.PolicyError)
+	require.NotContains(t, cliStdout(t, env, "status"), "push policy")
+}
+
+// A checkpoints block that cannot be read is a config error to fix, not a
+// sign the repository uses git-branch.
+func TestCheckpointPush_UnreadableBackendNamesTheConfigError(t *testing.T) {
+	t.Parallel()
+	env := newOutgoingEnv(t)
+	env.SetupBareRemote()
+	env.CheckpointStore = ""
+	env.PatchSettings(map[string]any{
+		"checkpoints": map[string]any{"primary": map[string]any{"type": ""}},
+	})
+
+	_, stderr, err := runCheckpointPush(t, env, true, "--all")
+
+	require.Error(t, err)
+	require.NotContains(t, stderr, "git-branch")
+	require.Contains(t, stderr, "checkpoints.primary.type")
 }

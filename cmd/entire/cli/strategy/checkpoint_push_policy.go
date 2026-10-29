@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
@@ -75,52 +76,93 @@ func CheckpointsHeldForManualPush(ctx context.Context) (bool, error) {
 // content itself while the clone's policy holds checkpoints back.
 var ErrOuterPushCarriesHeldCheckpoints = errors.New("refusing to push checkpoint content")
 
-// checkOuterPushUnderManualPolicy refuses the user's push when it sends
-// checkpoint content itself (`--mirror`, an explicit refspec, the v1 branch)
-// and the policy is not automatic or cannot be read. Under manual, checkpoints
-// leave only through `entire checkpoint push`, and git has already chosen what
-// to send, so the whole push is refused. A deletion sends nothing and passes.
-// Without the hook's ref list there is nothing to check; pre-push warns then.
-func checkOuterPushUnderManualPolicy(ctx context.Context) error {
-	name, ok := outerPushCheckpointRefName(ctx)
-	if !ok {
-		return checkOuterPushOfHeldCommits(ctx)
-	}
-	isRefs, err := primaryBackendIsGitRefs(ctx)
-	if err != nil {
-		return fmt.Errorf("%w: this push includes %s, and the checkpoint backend could not be read (%w). %s",
-			ErrOuterPushCarriesHeldCheckpoints, name, err, outerPushHowTo)
-	}
-	if !isRefs {
-		return nil
-	}
+// ErrOuterPushUncheckable aborts a user push that cannot be checked for held
+// checkpoints because the hook could not save git's ref list.
+var ErrOuterPushUncheckable = errors.New("refusing a push that could not be checked")
 
-	repo, err := OpenRepository(ctx)
-	if err != nil {
-		return fmt.Errorf("%w: this push includes %s, and the checkpoint push policy could not be read (open repository: %w). %s",
-			ErrOuterPushCarriesHeldCheckpoints, name, err, outerPushHowTo)
+// CheckOuterPushHeldCheckpoints refuses the user's own push when it sends
+// checkpoint content that this clone's policy holds back: `--mirror`, a
+// refs/entire refspec, the v1 branch, or a waiting checkpoint's commit under
+// another name. Git has already chosen what to send when the hook runs, so the
+// whole push is refused. A deletion sends nothing and passes.
+//
+// The policy, the queue and the checkpoint refs belong to the whole clone, so
+// this decides from the policy file and the ref list git passed, never from the
+// checked-out branch's settings, and pre-push runs it whether or not Entire's
+// hooks are on for this branch. Checks run cheapest first: a push that sends
+// nothing, or a clone whose policy is automatic, costs no repository I/O.
+func CheckOuterPushHeldCheckpoints(ctx context.Context) error {
+	if prePushRefsUnsaved(ctx) {
+		return checkOuterPushUnchecked(ctx)
 	}
-	defer repo.Close()
-	automatic, err := automaticCheckpointDelivery(repo)
-	if err != nil {
-		return fmt.Errorf("%w: this push includes %s, and the checkpoint push policy could not be read (%w). %s",
-			ErrOuterPushCarriesHeldCheckpoints, name, err, outerPushHowTo)
-	}
-	if automatic {
+	lines := outerPushSendingLines(ctx)
+	if len(lines) == 0 {
 		return nil
 	}
-	return outerPushUnderManualError(name)
+	why, held := checkpointsHeldBecause(ctx)
+	if !held {
+		return nil
+	}
+	return checkOuterPushLines(ctx, lines, why)
 }
 
-// checkOuterPushOfHeldCommits refuses the user's push when a line whose source
-// is a commit or an expression sends the current version of a waiting
-// checkpoint, such as `git push origin <commit>:refs/heads/copy`. Only a
-// git-refs clone whose policy is not automatic compares commits, so an ordinary
-// push costs one policy read. When the repository or the queue cannot be read
-// there is nothing to compare against, and the push is not blocked over it.
-func checkOuterPushOfHeldCommits(ctx context.Context) error {
-	lines := outerPushCommitLines(ctx)
-	if len(lines) == 0 {
+// refuseOuterPushAfterManualAnswer re-checks the user's push once manual was
+// chosen for it at the first-push question. It takes the answer rather than
+// reading the policy, which may not have been saved.
+func refuseOuterPushAfterManualAnswer(ctx context.Context) error {
+	return checkOuterPushLines(ctx, outerPushSendingLines(ctx), "you just chose the manual checkpoint push policy")
+}
+
+// checkOuterPushLines refuses lines that send held checkpoint content; why
+// says what holds it back.
+func checkOuterPushLines(ctx context.Context, lines []PrePushRef, why string) error {
+	for _, line := range lines {
+		name := line.checkpointRefName()
+		if strings.HasPrefix(name, checkpoint.CheckpointRefPrefix) {
+			return outerPushHeldError(name, why)
+		}
+		// The v1 branch is the git-branch store, which the policy covers only
+		// on git-refs. Per-checkpoint refs need no such check: only git-refs
+		// writes them.
+		if isCheckpointRefName(name) {
+			if isRefs, err := primaryBackendIsGitRefs(ctx); err != nil || isRefs {
+				return outerPushHeldError(name, why)
+			}
+		}
+	}
+	return checkOuterPushOfHeldCommits(ctx, lines, why)
+}
+
+// checkpointsHeldBecause reports whether the clone's policy holds checkpoints
+// back, and why, for the refusal. An unreadable policy holds them.
+func checkpointsHeldBecause(ctx context.Context) (string, bool) {
+	policy, err := settings.LoadCheckpointPushPolicy(ctx)
+	if err != nil {
+		return fmt.Sprintf("the checkpoint push policy could not be read (%v)", err), true
+	}
+	if policy == settings.CheckpointPushPolicyAutomatic {
+		return "", false
+	}
+	return "this clone's checkpoint push policy is manual", true
+}
+
+func outerPushHeldError(name, why string) error {
+	return fmt.Errorf("%w: this push includes %s, and %s. %s", ErrOuterPushCarriesHeldCheckpoints, name, why, outerPushHowTo)
+}
+
+// checkOuterPushOfHeldCommits refuses the push when a line whose source is a
+// commit or an expression sends the current version of a waiting checkpoint,
+// such as `git push origin <commit>:refs/heads/copy`. When the repository or
+// the queue cannot be read there is nothing to compare against, and the push
+// is not blocked over it.
+func checkOuterPushOfHeldCommits(ctx context.Context, lines []PrePushRef, why string) error {
+	var commitLines []PrePushRef
+	for _, line := range lines {
+		if namesCommitNotRef(line.LocalRef) {
+			commitLines = append(commitLines, line)
+		}
+	}
+	if len(commitLines) == 0 {
 		return nil
 	}
 	repo, err := OpenRepository(ctx)
@@ -129,10 +171,6 @@ func checkOuterPushOfHeldCommits(ctx context.Context) error {
 		return nil
 	}
 	defer repo.Close()
-	automatic, policyErr := automaticCheckpointDelivery(repo)
-	if automatic || !primaryIsGitRefs(ctx) {
-		return nil
-	}
 	waiting, err := waitingCheckpointRefs(ctx, repo)
 	if err != nil {
 		logging.Warn(ctx, "pre-push: cannot read the checkpoint queue to check pushed commits", slog.String("error", err.Error()))
@@ -144,67 +182,50 @@ func checkOuterPushOfHeldCommits(ctx context.Context) error {
 			tips[r.Hash()] = ref
 		}
 	}
-	for _, line := range lines {
-		ref, held := tips[plumbing.NewHash(line.LocalSHA)]
-		if !held {
-			continue
+	for _, line := range commitLines {
+		if ref, held := tips[plumbing.NewHash(line.LocalSHA)]; held {
+			return fmt.Errorf("%w: this push sends %s, the current version of %s, and %s. %s",
+				ErrOuterPushCarriesHeldCheckpoints, line.LocalRef, ref, why, outerPushHowTo)
 		}
-		if policyErr != nil {
-			return fmt.Errorf("%w: this push sends %s, the current version of %s, and the checkpoint push policy could not be read (%w). %s",
-				ErrOuterPushCarriesHeldCheckpoints, line.LocalRef, ref, policyErr, outerPushHowTo)
-		}
-		return fmt.Errorf("%w: this push sends %s, the current version of %s, and this clone's checkpoint push policy is manual. %s",
-			ErrOuterPushCarriesHeldCheckpoints, line.LocalRef, ref, outerPushHowTo)
 	}
 	return nil
+}
+
+// checkOuterPushUnchecked refuses a push whose ref list the hook could not
+// save, while checkpoints are held and waiting: it might be a `--mirror`, and
+// there is no way to tell.
+func checkOuterPushUnchecked(ctx context.Context) error {
+	why, held := checkpointsHeldBecause(ctx)
+	if !held {
+		return nil
+	}
+	repo, err := OpenRepository(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: the hook could not save the list of refs this push sends, and %s. %s",
+			ErrOuterPushUncheckable, why, outerPushUncheckedHowTo)
+	}
+	defer repo.Close()
+	if waitingCheckpointCount(ctx, repo) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: the hook could not save the list of refs this push sends, so it cannot tell whether the push "+
+		"includes held checkpoints, and %s. %s", ErrOuterPushUncheckable, why, outerPushUncheckedHowTo)
 }
 
 const outerPushHowTo = "Leave checkpoint refs out of this push (avoid --mirror) and upload checkpoints with 'entire checkpoint push --all'. " +
 	"To push them anyway, run git push with --no-verify"
 
-// refuseOuterPushAfterManualAnswer refuses the user's push when it sends
-// checkpoint content itself and manual was just chosen for it. It takes the
-// answer rather than reading the policy, which may not have been saved. The
-// commit check does read it: it is the manual just saved, or a choice made
-// while the question waited, which wins over the answer.
-func refuseOuterPushAfterManualAnswer(ctx context.Context) error {
-	if name, ok := outerPushCheckpointRefName(ctx); ok {
-		return outerPushUnderManualError(name)
-	}
-	return checkOuterPushOfHeldCommits(ctx)
-}
+const outerPushUncheckedHowTo = "Check that TMPDIR exists and is writable, then push again. To push without the check, run git push with --no-verify"
 
-func outerPushUnderManualError(name string) error {
-	return fmt.Errorf("%w: this push includes %s, and this clone's checkpoint push policy is manual. %s",
-		ErrOuterPushCarriesHeldCheckpoints, name, outerPushHowTo)
-}
-
-// CheckOuterPushWhileDisabled applies checkOuterPushUnderManualPolicy to a
-// repository with Entire disabled: its hooks are off, but the clone's policy
-// still holds checkpoints back from the user's own push.
-func CheckOuterPushWhileDisabled(ctx context.Context) error {
-	return checkOuterPushUnderManualPolicy(ctx)
-}
-
-// CheckOuterPushWithUnloadableSettings refuses the user's push when it sends
-// checkpoint content and Entire's settings could not be loaded, which turns
-// its git hooks off. Neither the backend nor the policy is known then, so the
-// push may be publishing checkpoints that manual holds back.
-func CheckOuterPushWithUnloadableSettings(ctx context.Context, loadErr error) error {
-	name, ok := outerPushCheckpointRefName(ctx)
-	if !ok {
-		return nil
-	}
-	return fmt.Errorf("%w: this push includes %s, and Entire's settings could not be read (%w). %s",
-		ErrOuterPushCarriesHeldCheckpoints, name, loadErr, outerPushHowTo)
-}
-
-// warnOuterPushUncheckable warns, under manual with checkpoints waiting, that
+// warnOuterPushUncheckable warns, while checkpoints are held and waiting, that
 // an old hook line cannot show what the user's own push sends. It runs before
 // the push_sessions and sync-remote gates: those decide what Entire sends, but
 // the user's push can carry checkpoint refs to any remote.
 func warnOuterPushUncheckable(ctx context.Context) {
-	if prePushRefsKnown(ctx) || !primaryIsGitRefs(ctx) {
+	if prePushRefsKnown(ctx) || prePushRefsUnsaved(ctx) {
+		return
+	}
+	if _, held := checkpointsHeldBecause(ctx); !held {
 		return
 	}
 	repo, err := OpenRepository(ctx)
@@ -212,12 +233,30 @@ func warnOuterPushUncheckable(ctx context.Context) {
 		return
 	}
 	defer repo.Close()
-	if automatic, err := automaticCheckpointDelivery(repo); err != nil || automatic {
-		return
-	}
 	if waitingCheckpointCount(ctx, repo) > 0 {
 		warnPrePushRefsUnknown(ctx, stderrWriter)
 	}
+}
+
+// CheckpointRefExists reports whether checkpointID has its own checkpoint ref
+// locally, whether or not it is queued.
+func CheckpointRefExists(ctx context.Context, checkpointID id.CheckpointID) (bool, error) {
+	ref, err := checkpoint.RefName(checkpointID)
+	if err != nil {
+		return false, fmt.Errorf("checkpoint ref for %s: %w", checkpointID, err)
+	}
+	repo, err := OpenRepository(ctx)
+	if err != nil {
+		return false, fmt.Errorf("open repository: %w", err)
+	}
+	defer repo.Close()
+	if _, err := repo.Reference(ref, true); err != nil {
+		if errors.Is(err, plumbing.ErrReferenceNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read %s: %w", ref, err)
+	}
+	return true, nil
 }
 
 // CheckpointWaiting reports whether checkpointID has a queued ref present
@@ -238,15 +277,6 @@ func CheckpointWaiting(ctx context.Context, checkpointID id.CheckpointID) (bool,
 	}
 	_, ok := waiting[ref]
 	return ok, nil
-}
-
-// outerPushCheckpointRefName names a checkpoint ref the user's own push sends.
-func outerPushCheckpointRefName(ctx context.Context) (string, bool) {
-	outer, ok := outerPushCheckpointRef(ctx)
-	if !ok {
-		return "", false
-	}
-	return outer.checkpointRefName(), true
 }
 
 // announceCheckpointPushPolicy is the pre-push hook's view of the policy. It
@@ -330,7 +360,11 @@ type CheckpointPushReport struct {
 // and the policy only governs what uploads without being named. It returns
 // ErrOutgoingNeedsGitRefs on the git-branch backend.
 func PushCheckpoints(ctx context.Context, targets []CheckpointPushRequest) (CheckpointPushReport, error) {
-	if !primaryIsGitRefs(ctx) {
+	isRefs, err := primaryBackendIsGitRefs(ctx)
+	if err != nil {
+		return CheckpointPushReport{}, err
+	}
+	if !isRefs {
 		return CheckpointPushReport{}, ErrOutgoingNeedsGitRefs
 	}
 	syncRemote, err := ResolveCheckpointSyncRemote(ctx)

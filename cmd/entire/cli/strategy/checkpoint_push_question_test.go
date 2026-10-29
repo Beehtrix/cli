@@ -127,4 +127,3 @@ func TestFirstPushQuestion_ManualRefusesPushSendingHeldCommit(t *testing.T) {
 	require.ErrorIs(t, err, ErrOuterPushCarriesHeldCheckpoints)
 	assertRefsAbsentFromRemote(t, bareDir, refs, "Entire's own flush sends nothing either")
 }
-
