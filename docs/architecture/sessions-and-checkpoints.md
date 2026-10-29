@@ -292,8 +292,11 @@ commit.
   A saved commit is read first without a comment prefix, and with the
   configured one (`#` under `auto`, as git's trailer grammar reads it) only
   when that finds nothing and the message names a checkpoint. Prepare-commit-msg
-  reads the config in each step that needs it (squash, redo, amend,
-  stamping), so one hook can read it several times.
+  reads the config once and reuses it in each step that needs it (squash,
+  redo, amend, stamping), as `git commit` itself reads its config once; it
+  and post-commit likewise ask for the git dir once. A failed read is not
+  kept, so the next step asks again. Each hook is its own process, so
+  prepare-commit-msg and post-commit each read for themselves.
 - **Read-only views.** `explain <commit>`, `explain --commit`, the branch
   listing, the export and the review re-run guard read with `#` and no git
   config (`CommitCheckpoint`): the final trailer block's last ID, or the

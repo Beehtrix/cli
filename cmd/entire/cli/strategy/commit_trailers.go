@@ -2,11 +2,13 @@ package strategy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/telemetry"
@@ -26,15 +28,57 @@ type commentConfig struct {
 	autoRule trailers.AutoRule // how this git resolves "auto"; read only when prefix is "auto"
 }
 
-// gitCommentConfig reads commentConfig in one git config call, and one
-// git --version call when "auto" is set. It is the only reader of git's
-// comment config. Only the configured values count: the hooks cannot see
-// `git commit --cleanup=<mode>`.
+// commentConfigKey holds a commit hook's comment config (withCommentConfig).
+type commentConfigKey struct{}
+
+type commentConfigMemo struct {
+	mu   sync.Mutex
+	read bool
+	cfg  commentConfig
+}
+
+// withCommentConfig gives a commit hook one successful read of git's comment
+// config: prepare-commit-msg's squash, redo, amend and stamping steps each
+// need it, and git commit itself reads its config only once.
+func withCommentConfig(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(commentConfigKey{}).(*commentConfigMemo); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, commentConfigKey{}, &commentConfigMemo{})
+}
+
+// gitCommentConfig returns git's comment config; every read of it goes
+// through here. Only the configured values count: the hooks cannot
+// see `git commit --cleanup=<mode>`. Inside a commit hook (withCommentConfig)
+// git is asked until it answers once; a failed read yields git's defaults.
 func gitCommentConfig(ctx context.Context) commentConfig {
-	cfg := commentConfig{prefix: trailers.DefaultCommentPrefix, status: true}
+	memo, ok := ctx.Value(commentConfigKey{}).(*commentConfigMemo)
+	if !ok {
+		cfg, _ := readGitCommentConfig(ctx)
+		return cfg
+	}
+	memo.mu.Lock()
+	defer memo.mu.Unlock()
+	if !memo.read {
+		cfg, ok := readGitCommentConfig(ctx)
+		if !ok {
+			return cfg // not cached: a later call asks again
+		}
+		memo.cfg, memo.read = cfg, true
+	}
+	return memo.cfg
+}
+
+// readGitCommentConfig reads commentConfig in one git config call, and one
+// git --version call when "auto" is set. ok is false when either call failed,
+// leaving git's defaults in their place; config that is not set is a
+// successful read.
+func readGitCommentConfig(ctx context.Context) (cfg commentConfig, ok bool) {
+	cfg = commentConfig{prefix: trailers.DefaultCommentPrefix, status: true}
 	out, err := exec.CommandContext(ctx, "git", "config", "--get-regexp", `^(core\.comment(char|string)|commit\.(cleanup|status))$`).Output()
 	if err != nil {
-		return cfg // unset, or unreadable
+		var exitErr *exec.ExitError
+		return cfg, errors.As(err, &exitErr) && exitErr.ExitCode() == 1 // 1: none set
 	}
 	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
 		key, value, hasValue := strings.Cut(line, " ")
@@ -50,9 +94,11 @@ func gitCommentConfig(ctx context.Context) commentConfig {
 		}
 	}
 	if cfg.prefix == autoCommentChar {
-		cfg.autoRule = autoRuleForGitVersion(telemetry.GitVersion(ctx))
+		version := telemetry.GitVersion(ctx)
+		cfg.autoRule = autoRuleForGitVersion(version)
+		return cfg, version != ""
 	}
-	return cfg
+	return cfg, true
 }
 
 // autoRuleForGitVersion returns the core.commentChar=auto rule of git at

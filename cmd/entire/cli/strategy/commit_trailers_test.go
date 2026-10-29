@@ -2,9 +2,12 @@ package strategy
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
@@ -99,4 +102,53 @@ func TestCommitCheckpoint(t *testing.T) {
 			assert.Equal(t, tt.want, got.String())
 		})
 	}
+}
+
+// A commit hook reads git's comment config once: a config changed while the
+// hook runs is not picked up, as git commit itself read its config at start.
+func TestGitCommentConfig_HookReadsOnce(t *testing.T) {
+	testutil.IsolateGitConfigEnv(t)
+	dir := resolvedTempDir(t)
+	testutil.InitRepo(t, dir)
+	testutil.RunGit(t, dir, "config", "core.commentChar", ";")
+	t.Chdir(dir)
+	ctx := withCommentConfig(context.Background())
+
+	assert.Equal(t, ";", gitCommentConfig(ctx).prefix)
+	testutil.RunGit(t, dir, "config", "core.commentChar", "%")
+	assert.Equal(t, ";", gitCommentConfig(ctx).prefix, "the hook keeps its first read")
+	assert.Equal(t, "%", gitCommentConfig(context.Background()).prefix, "outside a hook every call reads")
+}
+
+// A read that fails yields git's defaults, not the config, so the hook must
+// read again rather than keep them.
+func TestGitCommentConfig_HookRetriesAFailedRead(t *testing.T) {
+	t.Run("done context", func(t *testing.T) {
+		testutil.IsolateGitConfigEnv(t)
+		dir := resolvedTempDir(t)
+		testutil.InitRepo(t, dir)
+		testutil.RunGit(t, dir, "config", "core.commentChar", ";")
+		t.Chdir(dir)
+		ctx := withCommentConfig(context.Background())
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+
+		assert.Equal(t, "#", gitCommentConfig(cancelled).prefix, "precondition: a failed read falls back to git's default")
+		assert.Equal(t, ";", gitCommentConfig(ctx).prefix, "the fallback must not be cached")
+	})
+	t.Run("unreadable config", func(t *testing.T) {
+		testutil.IsolateGitConfigEnv(t)
+		dir := resolvedTempDir(t)
+		testutil.InitRepo(t, dir)
+		configPath := filepath.Join(dir, ".git", "config")
+		valid, err := os.ReadFile(configPath)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(configPath, append(valid, []byte("[core\ncommentChar = %\n")...), 0o600))
+		t.Chdir(dir)
+		ctx := withCommentConfig(context.Background())
+
+		assert.Equal(t, "#", gitCommentConfig(ctx).prefix, "precondition: a broken config falls back to git's default")
+		require.NoError(t, os.WriteFile(configPath, append(valid, []byte("[core]\ncommentChar = %\n")...), 0o600))
+		assert.Equal(t, "%", gitCommentConfig(ctx).prefix, "the fallback must not be cached")
+	})
 }
