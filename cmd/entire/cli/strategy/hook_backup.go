@@ -526,6 +526,41 @@ func namesFile(data []byte, file string) bool {
 	}
 }
 
+// runsRelative: name is a regular file, not Entire's, that, placed at the
+// path at, runs moved through a path relative to its own: "$0<suffix>" or
+// "${0}<suffix>", where moved is at+suffix. entire-brain's pre-push wrapper
+// chains to "$0.pre-entire-brain" this way, behind an [ -x ] check. Such a
+// wrapper stops running moved once it is itself moved, as Entire's install
+// moves it to .pre-entire, so only uninstall, which puts the wrapper back at
+// the hook path, has to look for it.
+func runsRelative(root *os.Root, name, at, moved string) bool {
+	suffix, ok := strings.CutPrefix(moved, at)
+	if !ok || len(suffix) < 2 || suffix[0] != '.' {
+		return false
+	}
+	data, err := osroot.ReadFileNoFollow(root, name)
+	if err != nil || bytes.Contains(data, []byte(entireHookMarker)) {
+		return false
+	}
+	return endsFileName(data, "$0"+suffix) || endsFileName(data, "${0}"+suffix)
+}
+
+// endsFileName finds ref in data followed by a byte that cannot continue a
+// file name, so "$0.pre-entire-brain" does not match "$0.pre-entire-brain.old".
+func endsFileName(data []byte, ref string) bool {
+	for i := 0; ; {
+		j := bytes.Index(data[i:], []byte(ref))
+		if j < 0 {
+			return false
+		}
+		end := i + j + len(ref)
+		if end == len(data) || !isFileNameByte(data[end]) {
+			return true
+		}
+		i = end
+	}
+}
+
 func isFileNameByte(b byte) bool {
 	return b == '.' || isHookNameByte(b)
 }
@@ -691,7 +726,9 @@ func restoreLegacy(root *os.Root, hook string) error {
 // manager's wrapper runs by name gets the user's hook back if the manager
 // moved Entire's onto it, and the keep copy goes. A moved copy of Entire's
 // hook that no install has reclaimed yet becomes noopMovedHook, so the wrapper
-// the caller restores does not go on running Entire's hook.
+// the caller restores does not go on running Entire's hook. A wrapper that
+// finds the copy relative to its own path (see runsRelative) is written to
+// work without it, so there the copy is removed instead.
 func restoreWrapped(root *os.Root, hook string) error {
 	moved, err := movedHookCopies(root, hook)
 	if err != nil {
@@ -707,12 +744,16 @@ func restoreWrapped(root *os.Root, hook string) error {
 		switch {
 		case carriesEntireMarker(root, m) && keepExists:
 			err = root.Rename(keep, m)
-		case carriesEntireMarker(root, m) && runsByName(root, hook, m):
+		case carriesEntireMarker(root, m) && (runsByName(root, hook, m) || runsRelative(root, hook, hook, m)):
 			// The manager installed over Entire before any reclaim: the user's
 			// hook is still in .pre-entire, which the wrapper does not run.
-			if hookFileExists(root, backup) && !carriesEntireMarker(root, backup) && !runsByName(root, backup, m) {
+			switch {
+			case hookFileExists(root, backup) && !carriesEntireMarker(root, backup) &&
+				!runsByName(root, backup, m) && !runsRelative(root, backup, hook, m):
 				err = root.Rename(backup, m)
-			} else {
+			case runsRelative(root, hook, hook, m):
+				err = root.Remove(m)
+			default:
 				_, err = writeHookFile(root, m, noopMovedHook)
 			}
 		case carriesEntireMarker(root, m) && carriesEntireMarker(root, hook) && runsByName(root, backup, m):
@@ -720,6 +761,11 @@ func restoreWrapped(root *os.Root, hook string) error {
 			// caller restores to the hook path. The user's hook it rotated away
 			// cannot be told from any other older copy.
 			_, err = writeHookFile(root, m, noopMovedHook)
+		case carriesEntireMarker(root, m) && carriesEntireMarker(root, hook) && runsRelative(root, backup, hook, m):
+			// Entire backed up a wrapper that runs m relative to its own path,
+			// so m was dormant; the caller restores the wrapper to the hook
+			// path, where it would run m again.
+			err = root.Remove(m)
 		case keepExists && sameHookFile(root, keep, m):
 			err = root.Remove(keep)
 		}
