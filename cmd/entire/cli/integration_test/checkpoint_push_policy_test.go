@@ -677,6 +677,16 @@ func TestCheckpointPushPolicy_ManualRefusesExplicitCheckpointPush(t *testing.T) 
 			t.Helper()
 			return []string{"origin", "HEAD", onlyOutgoingRef(t, env) + "~0:refs/heads/held-copy"}
 		}},
+		{name: "branch at the checkpoint's commit", args: func(t *testing.T, env *TestEnv) []string {
+			t.Helper()
+			testutil.RunGit(t, env.RepoDir, "branch", "held-copy", onlyOutgoingRef(t, env))
+			return []string{"origin", "HEAD", "held-copy"}
+		}},
+		{name: "tag at the checkpoint's commit", args: func(t *testing.T, env *TestEnv) []string {
+			t.Helper()
+			testutil.RunGit(t, env.RepoDir, "tag", "held-tag", onlyOutgoingRef(t, env))
+			return []string{"origin", "HEAD", "refs/tags/held-tag"}
+		}},
 		{name: "v1 branch", args: func(t *testing.T, env *TestEnv) []string {
 			t.Helper()
 			// -f: the fixture may already have a v1 branch.
