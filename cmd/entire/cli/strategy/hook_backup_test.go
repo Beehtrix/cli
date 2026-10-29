@@ -1528,7 +1528,8 @@ func TestRemoveHooks_NearBrainLayouts(t *testing.T) {
 	spec := specFor(t, prePushHook)
 	const brainCopy = "pre-push.pre-entire-brain"
 	for name, tc := range map[string]struct {
-		hook, backup string
+		hook, backup string // no backup if empty
+		extra        map[string]string
 		want         map[string]string
 		gone         []string
 	}{
@@ -1543,6 +1544,22 @@ func TestRemoveHooks_NearBrainLayouts(t *testing.T) {
 			want:   map[string]string{brainCopy: brainWrapper},
 			gone:   []string{"pre-push" + backupSuffix},
 		},
+		// An earlier reclaim for a literal wrapper saved the user's hook
+		// beside the copy; it goes back into the copy, which Brain runs.
+		"user hook kept beside brain's copy": {
+			hook:  brainWrapper,
+			extra: map[string]string{brainCopy + backupSuffix: userHookV1},
+			want:  map[string]string{brainCopy: userHookV1},
+			gone:  []string{brainCopy + backupSuffix},
+		},
+		// A backed-up hook that runs files relative to its own path would
+		// run something else if renamed, so it stays; Entire's copy goes.
+		"backed-up hook relative to its own path": {
+			hook:   brainWrapper,
+			backup: "#!/bin/sh\nexec \"$0.other\" \"$@\"\n",
+			want:   map[string]string{"pre-push" + backupSuffix: "#!/bin/sh\nexec \"$0.other\" \"$@\"\n"},
+			gone:   []string{brainCopy},
+		},
 		"brain wrapper at the hook path and backed up": {
 			hook:   brainWrapper,
 			backup: brainWrapper,
@@ -1553,7 +1570,12 @@ func TestRemoveHooks_NearBrainLayouts(t *testing.T) {
 			t.Parallel()
 			f := newHooksFixture(t)
 			f.write("pre-push", tc.hook)
-			f.write("pre-push"+backupSuffix, tc.backup)
+			if tc.backup != "" {
+				f.write("pre-push"+backupSuffix, tc.backup)
+			}
+			for n, c := range tc.extra {
+				f.write(n, c)
+			}
 			f.write(brainCopy, spec.content)
 
 			if _, err := removeHooks(context.Background(), f.lockRoot, f.root, f.dir, restoreMovedHooks); err != nil {
@@ -1580,21 +1602,22 @@ func TestIsBrainChain(t *testing.T) {
 		content, hook string
 		want          bool
 	}{
-		"brain wrapper":               {brainWrapper, prePushHook, true},
-		"quoted plugin path":          {strings.ReplaceAll(brainWrapper, "'/nonexistent/entire-brain'", `'/a b/it'\''s/entire-brain'`), prePushHook, true},
-		"half-quoted plugin path":     {strings.ReplaceAll(brainWrapper, "'/nonexistent/entire-brain'", "/nonexistent/entire-brain'"), prePushHook, false},
-		"unquoted plugin path":        {strings.ReplaceAll(brainWrapper, "'/nonexistent/entire-brain'", "/nonexistent/entire-brain"), prePushHook, false},
-		"comment after the exec":      {brainWrapper + "\n# end\n", prePushHook, false},
-		"check before the exec":       {strings.Replace(brainWrapper, `if [ -x "$backup"`, "[ -f \"$backup$empty\" ] || exit 1\nif [ -x \"$backup\"", 1), prePushHook, false},
-		"suffix after the quote":      {strings.Replace(brainWrapper, `backup="$0.pre-entire-brain"`, `backup="$0.pre-entire-brain".v2`, 1), prePushHook, false},
-		"CRLF line endings":           {strings.ReplaceAll(brainWrapper, "\n", "\r\n"), prePushHook, false},
-		"code after the exec":         {notBrainWrapper, prePushHook, false},
-		"exec commented out":          {strings.Replace(brainWrapper, `if [ -x "$backup"`, `# if [ -x "$backup"`, 1), prePushHook, false},
-		"assignment commented out":    {strings.Replace(brainWrapper, `backup="$0`, `# backup="$0`, 1), prePushHook, false},
-		"no marker":                   {strings.Replace(brainWrapper, "# entire-brain push hook\n", "", 1), prePushHook, false},
-		"check that fails without it": {"#!/bin/sh\n# entire-brain push hook\nbackup=\"$0.pre-entire-brain\"\n[ -x \"$backup\" ] && exec \"$backup\" \"$@\"\n", prePushHook, false},
-		"another hook":                {brainWrapper, "pre-commit", false},
-		"Entire's hook mentioning it": {specFor(t, prePushHook).content + "\n" + brainWrapper, prePushHook, false},
+		"brain wrapper":                    {brainWrapper, prePushHook, true},
+		"quoted plugin path":               {strings.ReplaceAll(brainWrapper, "'/nonexistent/entire-brain'", `'/a b/it'\''s/entire-brain'`), prePushHook, true},
+		"delimiter inside the plugin path": {strings.ReplaceAll(brainWrapper, "'/nonexistent/entire-brain'", "'/a\n ]; then\nb/entire-brain'"), prePushHook, true},
+		"half-quoted plugin path":          {strings.ReplaceAll(brainWrapper, "'/nonexistent/entire-brain'", "/nonexistent/entire-brain'"), prePushHook, false},
+		"unquoted plugin path":             {strings.ReplaceAll(brainWrapper, "'/nonexistent/entire-brain'", "/nonexistent/entire-brain"), prePushHook, false},
+		"comment after the exec":           {brainWrapper + "\n# end\n", prePushHook, false},
+		"check before the exec":            {strings.Replace(brainWrapper, `if [ -x "$backup"`, "[ -f \"$backup$empty\" ] || exit 1\nif [ -x \"$backup\"", 1), prePushHook, false},
+		"suffix after the quote":           {strings.Replace(brainWrapper, `backup="$0.pre-entire-brain"`, `backup="$0.pre-entire-brain".v2`, 1), prePushHook, false},
+		"CRLF line endings":                {strings.ReplaceAll(brainWrapper, "\n", "\r\n"), prePushHook, false},
+		"code after the exec":              {notBrainWrapper, prePushHook, false},
+		"exec commented out":               {strings.Replace(brainWrapper, `if [ -x "$backup"`, `# if [ -x "$backup"`, 1), prePushHook, false},
+		"assignment commented out":         {strings.Replace(brainWrapper, `backup="$0`, `# backup="$0`, 1), prePushHook, false},
+		"no marker":                        {strings.Replace(brainWrapper, "# entire-brain push hook\n", "", 1), prePushHook, false},
+		"check that fails without it":      {"#!/bin/sh\n# entire-brain push hook\nbackup=\"$0.pre-entire-brain\"\n[ -x \"$backup\" ] && exec \"$backup\" \"$@\"\n", prePushHook, false},
+		"another hook":                     {brainWrapper, "pre-commit", false},
+		"Entire's hook mentioning it":      {specFor(t, prePushHook).content + "\n" + brainWrapper, prePushHook, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
