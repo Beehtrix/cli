@@ -167,6 +167,51 @@ func TestTrailerAuthority_ParagraphAddedBelowTheStampedTrailer(t *testing.T) {
 		"the session's work belongs in the checkpoint prepare stamped, wherever the message moved it")
 }
 
+// Once post-commit creates the checkpoint of a stamped trailer moved out of
+// the last paragraph, the commands that write into a commit's checkpoint must
+// find it too: attach joins it instead of rewriting the commit under a second
+// checkpoint, and `explain --commit --generate` resolves it.
+func TestTrailerAuthority_StampedTrailerBelowAParagraphStaysLinked(t *testing.T) {
+	t.Parallel()
+	env := NewFeatureBranchEnv(t)
+	git := gitWithEntireCommitHooksEnv(t, env)
+	editors := t.TempDir()
+	writeScripts(t, editors, map[string]string{
+		"append": "#!/bin/sh\nprintf '\\nRefs: JIRA-123\\n' >> \"$1\"\n",
+	})
+	authorityAgentTurn(env, "mine.txt", "my agent work\n")
+	_, err := git(nil, "add", "mine.txt")
+	require.NoError(t, err)
+	editor := "GIT_EDITOR=" + shellQuote(filepath.ToSlash(filepath.Join(editors, "append")))
+	out, err := git([]string{editor}, "commit", "--no-gpg-sign", "-m", "My change", "-e")
+	require.NoError(t, err, out)
+
+	head := env.GetHeadHash()
+	recorded := env.GetCommitMessage(head)
+	require.Empty(t, trailers.ParseLastParagraphCheckpoints(recorded, ""), "precondition: the stamped trailer is no longer in the last paragraph: %q", recorded)
+	ids := trailers.ParseAllCheckpoints(recorded)
+	require.Len(t, ids, 1, "precondition: the commit keeps the stamped trailer: %q", recorded)
+	stamped := ids[0].String()
+	require.True(t, advCheckpointStored(env, stamped), "precondition: post-commit created the stamped checkpoint")
+
+	sessionID := "attach-research-session"
+	tb := NewTranscriptBuilder()
+	tb.AddUserMessage("explain the change")
+	tb.AddAssistantMessage("It adds mine.txt.")
+	require.NoError(t, tb.WriteToFile(filepath.Join(env.ClaudeProjectDir, sessionID+".jsonl")))
+	attachOut := env.RunCLI("session", "attach", sessionID, "-a", agentClaudeCode, "-f")
+	require.Contains(t, attachOut, "Added to existing checkpoint "+stamped, "attach must join the stamped checkpoint: %s", attachOut)
+	require.Equal(t, head, env.GetHeadHash(), "attach must not rewrite the commit")
+
+	// An unknown provider fails before any provider call, after the commit's
+	// checkpoint is resolved.
+	env.PatchSettings(map[string]any{"summary_generation": map[string]any{"provider": "no-such-provider"}})
+	genOut, genErr := env.RunCLIWithError("checkpoint", "explain", "--commit", head, "--generate")
+	require.Error(t, genErr)
+	require.NotContains(t, genOut, "only outside its final trailer block", "--generate must resolve the stamped checkpoint")
+	require.Contains(t, genOut, "no-such-provider", "--generate must reach summary generation: %s", genOut)
+}
+
 // An amend that restores the session's last trailer and is then cancelled
 // must not leave that existing ID looking like a later commit's own stamp. A
 // follow-up commit naming it gets a trailer of its own, and its work is

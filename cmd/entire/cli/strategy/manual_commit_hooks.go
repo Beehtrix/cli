@@ -1388,7 +1388,7 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 	}
 
 	// Condense into the trailer prepare stamped, never into an inherited one.
-	ids, stamped, redone := linkedTrailersOf(ctx, commit)
+	ids, stamped, redone, moved := linkedTrailersOf(ctx, commit)
 	checkpointID, targetPreexisting, found := s.condensationTarget(ctx, repo, ids, stamped)
 	openRepoSpan.End()
 
@@ -1403,6 +1403,9 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 	}
 	if targetPreexisting {
 		ctx = withPreexistingTarget(ctx)
+	}
+	if slices.Contains(moved, checkpointID) {
+		ctx = withRecordedCommitLink(ctx, head.Hash().String())
 	}
 
 	_, findSessionsSpan := perf.Start(ctx, "find_sessions_for_worktree")

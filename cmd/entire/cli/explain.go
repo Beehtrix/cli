@@ -637,12 +637,8 @@ func runExplainAuto(ctx context.Context, w, errW io.Writer, target string, noPag
 	cpID, hasCheckpoint := checkpointForCommit(ctx, commit.Message, generate)
 	linkVia := "its Entire-Checkpoint trailer"
 	if !hasCheckpoint {
-		// A commit linked by `entire session attach --commit` carries no
-		// trailer; its checkpoint names it instead. Most recent wins.
-		if linked := checkpoint.CheckpointsLinkedToWithStubs(ctx, lookup.store, lookup.committed, hash.String(), commit.Committer.When); len(linked) > 0 {
-			cpID, hasCheckpoint = linked[0], true
-			linkVia = "a link recorded by entire session attach"
-			fmt.Fprintf(errW, "Note: commit %s has no Entire-Checkpoint trailer; checkpoint %s names it in a link recorded by entire session attach. The CLI can't verify who recorded the link: anyone who can push checkpoints can name any commit.\n", abbreviateCommitHash(lookup.repo, hash), cpID)
+		if cpID, hasCheckpoint = recordedLinkCheckpoint(ctx, errW, lookup, commit); hasCheckpoint {
+			linkVia = recordedLinkVia
 		}
 	}
 	if !hasCheckpoint {
@@ -2797,6 +2793,15 @@ func runExplainCommit(ctx context.Context, w, errW io.Writer, commitRef string, 
 
 	// Extract Entire-Checkpoint trailer
 	checkpointID, hasCheckpoint := checkpointForCommit(ctx, commit.Message, generate)
+	linkVia := "its Entire-Checkpoint trailer"
+	if !hasCheckpoint {
+		if lookup, lookupErr := newExplainCheckpointLookup(ctx); lookupErr == nil {
+			defer lookup.Close()
+			if checkpointID, hasCheckpoint = recordedLinkCheckpoint(ctx, errW, lookup, commit); hasCheckpoint {
+				linkVia = recordedLinkVia
+			}
+		}
+	}
 	if !hasCheckpoint {
 		// Side-effect modes must error so scripts can distinguish "done"
 		// from "didn't happen"; read-only modes print a friendly message.
@@ -2810,9 +2815,24 @@ func runExplainCommit(ctx context.Context, w, errW io.Writer, commitRef string, 
 	// Delegate to checkpoint detail view, forwarding the full flag set so
 	// --generate / --raw-transcript / --force work via --commit as well.
 	if err := runExplainCheckpoint(ctx, w, errW, checkpointID.String(), noPager, verbose, full, rawTranscript, generate, force, searchAll, summaryTimeoutSeconds); err != nil {
-		return trailerCheckpointError(ctx, repo, hash, checkpointID, "its Entire-Checkpoint trailer", err)
+		return trailerCheckpointError(ctx, repo, hash, checkpointID, linkVia, err)
 	}
 	return nil
+}
+
+const recordedLinkVia = "a link recorded by entire session attach"
+
+// recordedLinkCheckpoint returns the most recent checkpoint whose recorded
+// links name commit, for a commit with no linking trailer: one `entire session
+// attach --commit` linked, or one whose stamped trailer a later paragraph
+// moved out of the last. It notes on errW that the link can't be verified.
+func recordedLinkCheckpoint(ctx context.Context, errW io.Writer, lookup *explainCheckpointLookup, commit *object.Commit) (id.CheckpointID, bool) {
+	linked := checkpoint.CheckpointsLinkedToWithStubs(ctx, lookup.store, lookup.committed, commit.Hash.String(), commit.Committer.When)
+	if len(linked) == 0 {
+		return id.EmptyCheckpointID, false
+	}
+	fmt.Fprintf(errW, "Note: commit %s has no Entire-Checkpoint trailer; checkpoint %s names it in a link recorded by entire session attach. The CLI can't verify who recorded the link: anyone who can push checkpoints can name any commit.\n", abbreviateCommitHash(lookup.repo, commit.Hash), linked[0])
+	return linked[0], true
 }
 
 // checkpointForCommit returns the checkpoint a commit's trailer names.

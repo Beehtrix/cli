@@ -642,8 +642,9 @@ type attachLinkMode int
 
 const (
 	// attachJoinExisting: the commit's last paragraph already carries an
-	// Entire-Checkpoint trailer; the session joins that checkpoint and history
-	// is unchanged.
+	// Entire-Checkpoint trailer, or post-commit recorded an unpushed commit in
+	// its checkpoint; the session joins that checkpoint and history is
+	// unchanged.
 	attachJoinExisting attachLinkMode = iota
 	// attachAddTrailer: no remote branch holds the commit. The trailer is
 	// added, rewriting the commit and any after it: nobody else has them, and
@@ -659,8 +660,9 @@ const (
 type attachLinkPlan struct {
 	target *object.Commit
 	mode   attachLinkMode
-	// linked is the checkpoint target's trailer links (attachJoinExisting
-	// only), resolved once with git config (strategy.LinkedCheckpoints).
+	// linked is the checkpoint target links to (attachJoinExisting only): its
+	// last-paragraph trailer, resolved once with git config
+	// (strategy.LinkedCheckpoints), or the checkpoint that records it.
 	linked id.CheckpointID
 	// holder is a remote whose branches hold target, empty when none does (or,
 	// when joining, none could be reached).
@@ -703,6 +705,14 @@ func planAttachLink(ctx context.Context, repo *git.Repository, headCommit *objec
 	}
 	if holder != "" {
 		return attachLinkPlan{target: target, mode: attachRecordLink, remote: pushTo, holder: holder, checkedRemotes: remotes}, nil
+	}
+	// A paragraph added below the trailer prepare stamped leaves no trailer in
+	// the last one; post-commit recorded the commit in that checkpoint
+	// instead. Join it rather than rewrite the commit under a second one.
+	if store, openErr := openAttachStore(ctx, repo, opts.committedRefs(ctx)); openErr == nil {
+		if recorded, ok := checkpointLinkedTo(ctx, store, target); ok {
+			return attachLinkPlan{target: target, mode: attachJoinExisting, linked: recorded, remote: pushTo, checkedRemotes: remotes}, nil
+		}
 	}
 	if len(unreachable) > 0 {
 		// Absence from a remote we couldn't reach proves nothing; rewriting a
