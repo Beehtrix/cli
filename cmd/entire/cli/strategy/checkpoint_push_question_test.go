@@ -219,3 +219,45 @@ func TestFirstPushQuestion_LostRaceToManualStillRefusesHeldRefs(t *testing.T) {
 	require.ErrorIs(t, err, ErrOuterPushCarriesHeldCheckpoints)
 	assertRefsAbsentFromRemote(t, bareDir, refs, "the stored manual holds this push")
 }
+
+// The old-hook warning before the question ran while the policy was unset, so
+// a manual policy stored meanwhile must still bring it.
+func TestFirstPushQuestion_LostRaceToManualWarnsAboutAnOldHook(t *testing.T) {
+	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
+	prepareGitRefsPrePush(t, workDir, bareDir)
+	t.Setenv(interactive.EnvTestTTY, "1")
+	previous := askCheckpointPushQuestion
+	askCheckpointPushQuestion = func() checkpointPushQuestionAnswer {
+		require.NoError(t, settings.SaveCheckpointPushPolicy(t.Context(), settings.CheckpointPushPolicyManual))
+		return checkpointPushAnswerAutomatic
+	}
+	t.Cleanup(func() { askCheckpointPushQuestion = previous })
+	repo, err := gitrepo.OpenPath(workDir)
+	require.NoError(t, err)
+	defer repo.Close()
+	enqueueRefs(t, repo, refs)
+
+	stderr := captureStderrWriter(t)
+	require.NoError(t, NewManualCommitStrategy().PrePushFromGitHook(t.Context(), "origin"))
+
+	assert.Equal(t, 1, strings.Count(stderr.String(), "does not pass the refs being pushed"), "stderr:\n%s", stderr.String())
+}
+
+// When the hook could not save the ref list, the push on which the user
+// answers manual may be a `--mirror`; it is refused, as the next one would be.
+func TestFirstPushQuestion_ManualRefusesPushWhoseRefsWereNotSaved(t *testing.T) {
+	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
+	prepareGitRefsPrePush(t, workDir, bareDir)
+	answerFirstPushQuestionWith(t, checkpointPushAnswerManual)
+	repo, err := gitrepo.OpenPath(workDir)
+	require.NoError(t, err)
+	defer repo.Close()
+	enqueueRefs(t, repo, refs)
+
+	captureStderrWriter(t)
+	err = NewManualCommitStrategy().PrePushFromGitHook(WithPrePushRefsUnsaved(t.Context()), "origin")
+
+	require.ErrorIs(t, err, ErrOuterPushUncheckable)
+	assert.Contains(t, err.Error(), "you just chose the manual checkpoint push policy")
+	assertRefsAbsentFromRemote(t, bareDir, refs, "Entire's own flush sends nothing either")
+}
