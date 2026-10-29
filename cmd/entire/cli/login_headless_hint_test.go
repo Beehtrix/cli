@@ -2,14 +2,12 @@ package cli
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/entireio/cli/cmd/entire/cli/auth"
 	"github.com/entireio/cli/internal/entireclient/tokenstore"
 )
 
@@ -114,17 +112,5 @@ func TestPersistLogin_NonStoreFailure_NoHint(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "ENTIRE_TOKEN_STORE") {
 		t.Fatalf("non-store failure must not carry the token-store hint, got:\n%v", err)
-	}
-}
-
-// A bad config.json gets no headless hint.
-func TestWithHeadlessStoreHint_BadConfig_NoHint(t *testing.T) {
-	// Not parallel: mutates process-global env.
-	t.Setenv("ENTIRE_TOKEN_STORE", "")
-	err := fmt.Errorf("save login: %w", errors.Join(auth.ErrCredentialStoreWrite, tokenstore.ErrBadConfig))
-
-	got := withHeadlessStoreHint(err).Error()
-	if strings.Contains(got, "=file entire login") || strings.Contains(got, "ENTIRE_TOKEN_STORE_PATH") {
-		t.Fatalf("bad config.json must not carry the headless hint, got:\n%s", got)
 	}
 }

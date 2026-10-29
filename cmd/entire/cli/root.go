@@ -191,20 +191,20 @@ func NewRootCmd() *cobra.Command {
 	)
 
 	// Noun groups (canonical homes for subcommands).
-	cmd.AddCommand(inGroup(newSessionsCmd(), groupSessions))                              // 'session' (with 'sessions' as Cobra alias)
-	cmd.AddCommand(inGroup(newCheckpointGroupCmd(), groupSessions))                       // 'checkpoint' / 'cp' / 'checkpoints'
-	experimental.Register(cmd, newTokensGroupCmd())                                       // 'tokens' (experimental)
-	cmd.AddCommand(inGroup(newAgentGroupCmd(), groupSetup))                               // 'agent'
-	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newAuthCmd(), groupAccount)))         // 'auth'
-	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newDoctorCmd(), groupSetup)))         // 'doctor' (group: trace/logs/bundle)
-	cmd.AddCommand(exemptFromEntireDirCheck(newLabsCmd()))                                // 'labs' (experimental workflow discovery)
-	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newPluginGroupCmd(), groupSetup)))    // 'plugin' (managed install/list/remove)
-	experimental.Register(cmd, newImportCmd())                                            // 'import' (experimental; import pre-existing agent history)
-	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newClusterCmd(), groupControlPlane))) // 'cluster' — control-plane cluster catalog
-	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newOrgCmd(), groupControlPlane)))     // 'org' — control-plane org management
-	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newProjectCmd(), groupControlPlane))) // 'project' — control-plane project management
-	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newRepoCmd(), groupControlPlane)))    // 'repo' — control-plane repo lifecycle
-	cmd.AddCommand(inGroup(newTrailCmd(), groupTrails))                                   // 'trail' — trails across repositories and branches
+	cmd.AddCommand(inGroup(newSessionsCmd(), groupSessions))                                             // 'session' (with 'sessions' as Cobra alias)
+	cmd.AddCommand(inGroup(newCheckpointGroupCmd(), groupSessions))                                      // 'checkpoint' / 'cp' / 'checkpoints'
+	experimental.Register(cmd, newTokensGroupCmd())                                                      // 'tokens' (experimental)
+	cmd.AddCommand(inGroup(newAgentGroupCmd(), groupSetup))                                              // 'agent'
+	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newAuthCmd(), groupAccount)))                        // 'auth'
+	cmd.AddCommand(exemptFromConfigCheck(exemptFromEntireDirCheck(inGroup(newDoctorCmd(), groupSetup)))) // 'doctor' (group: trace/logs/bundle)
+	cmd.AddCommand(exemptFromEntireDirCheck(newLabsCmd()))                                               // 'labs' (experimental workflow discovery)
+	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newPluginGroupCmd(), groupSetup)))                   // 'plugin' (managed install/list/remove)
+	experimental.Register(cmd, newImportCmd())                                                           // 'import' (experimental; import pre-existing agent history)
+	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newClusterCmd(), groupControlPlane)))                // 'cluster' — control-plane cluster catalog
+	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newOrgCmd(), groupControlPlane)))                    // 'org' — control-plane org management
+	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newProjectCmd(), groupControlPlane)))                // 'project' — control-plane project management
+	cmd.AddCommand(exemptFromEntireDirCheck(inGroup(newRepoCmd(), groupControlPlane)))                   // 'repo' — control-plane repo lifecycle
+	cmd.AddCommand(inGroup(newTrailCmd(), groupTrails))                                                  // 'trail' — trails across repositories and branches
 
 	// Top-level lifecycle and standalone commands.
 	experimental.Register(cmd, cliReview.NewCommand(buildReviewDeps())) // `review` (experimental)
@@ -231,10 +231,10 @@ func NewRootCmd() *cobra.Command {
 	// Hidden infrastructure.
 	cmd.AddCommand(newMCPCmd(cmd)) // MCP stdio server for MCP-host agents
 	cmd.AddCommand(exemptFromConfigCheck(newHooksCmd()))
-	cmd.AddCommand(newSendAnalyticsCmd())
-	cmd.AddCommand(newCurlBashPostInstallCmd())
-	cmd.AddCommand(newRefreshTrailEnablementCmd())
-	cmd.AddCommand(newSweepSessionsCmd())
+	cmd.AddCommand(exemptFromConfigCheck(newSendAnalyticsCmd()))
+	cmd.AddCommand(exemptFromConfigCheck(newCurlBashPostInstallCmd()))
+	cmd.AddCommand(exemptFromConfigCheck(newRefreshTrailEnablementCmd()))
+	cmd.AddCommand(exemptFromConfigCheck(newSweepSessionsCmd()))
 
 	// Experimental command (developer-only visibility; setup/tune runners).
 	experimental.Register(cmd, newRunnerCmd()) // 'runner' (experimental)
@@ -245,14 +245,15 @@ func NewRootCmd() *cobra.Command {
 	cmd.SetHelpCommand(exemptFromConfigCheck(NewHelpCmd(cmd)))
 
 	// Materialize cobra's `completion` command now, so it can be exempted from
-	// the `.entire` check. It prints a shell script and reads nothing from the
-	// repo, and users eval it from a shell rc — a broken repo must not be able
-	// to break someone's shell startup. Cobra calls this again during
-	// ExecuteC, where it returns early because the command already exists.
+	// the `.entire` and config.json checks. It prints a shell script and reads
+	// nothing from the repo or the token store, and users eval it from a shell
+	// rc — a broken repo or config must not be able to break someone's shell
+	// startup. Cobra calls this again during ExecuteC, where it returns early
+	// because the command already exists.
 	cmd.InitDefaultCompletionCmd()
 	for _, c := range cmd.Commands() {
 		if c.Name() == "completion" {
-			exemptFromEntireDirCheck(c)
+			exemptFromConfigCheck(exemptFromEntireDirCheck(c))
 		}
 	}
 
