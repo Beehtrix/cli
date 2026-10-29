@@ -721,8 +721,8 @@ func isBrainChain(root *os.Root, name, hook string) bool {
 	if !ok {
 		return false
 	}
-	self, _, ok := strings.Cut(rest, " ]; then\n")
-	if !ok || !isShellSingleQuoted(self) {
+	self := singleQuotedPrefix(rest)
+	if self == "" {
 		return false
 	}
 	return text == head+self+" ]; then\n"+
@@ -734,31 +734,50 @@ func isBrainChain(root *os.Root, name, hook string) bool {
 		brainChainExec+"\n"
 }
 
-// isShellSingleQuoted: s is one word quoted the way entire-brain quotes its
-// plugin path: wrapped in single quotes, each quote inside written as '\”.
-func isShellSingleQuoted(s string) bool {
-	if len(s) < 2 || s[0] != '\'' || s[len(s)-1] != '\'' {
-		return false
+// singleQuotedPrefix returns the word at the start of s quoted the way
+// entire-brain quotes its plugin path ('...' runs joined by \'), or "" if s
+// does not start with one.
+func singleQuotedPrefix(s string) string {
+	n := 0
+	for strings.HasPrefix(s[n:], "'") {
+		end := strings.IndexByte(s[n+1:], '\'')
+		if end < 0 {
+			return ""
+		}
+		n += end + 2
+		if !strings.HasPrefix(s[n:], `\''`) {
+			return s[:n]
+		}
+		n += 2
 	}
-	return !strings.Contains(strings.ReplaceAll(s[1:len(s)-1], `'\''`, ""), "'")
+	return ""
+}
+
+// mentionsOwnPath: name refers to $0, so renaming it could change what it
+// runs. Any mention counts; such a hook is left where it is.
+func mentionsOwnPath(root *os.Root, name string) bool {
+	data, err := osroot.ReadFileNoFollow(root, name)
+	return err != nil || bytes.Contains(data, []byte("$0")) || bytes.Contains(data, []byte("${0"))
 }
 
 // restoreBrainChain is restoreWrapped for entire-brain's wrapper. With the
 // wrapper at hook (Brain installed over Entire), the user's hook in
 // .pre-entire goes into the copy, where the wrapper runs it, as Brain's own
-// install would have left it; with none, the copy goes. With Entire's hook at
-// hook and the wrapper backed up (Entire re-wrapped Brain), the copy was
-// dormant, and the caller is about to put the wrapper back where it would run
-// it, so the copy goes. Reports whether it handled m.
+// install would have left it; with none, or with one that refers to $0 and
+// so could change if moved (it stays in .pre-entire), the copy goes. With
+// Entire's hook at hook and the wrapper backed up (Entire re-wrapped Brain),
+// the copy was dormant, and the caller is about to put the wrapper back
+// where it would run it, so the copy goes. A keep copy beside m is left to
+// restoreWrapped's usual path. Reports whether it handled m.
 func restoreBrainChain(root *os.Root, hook, m string) (bool, error) {
-	if m != hook+brainMovedSuffix || !carriesEntireMarker(root, m) {
-		return false, nil
+	if m != hook+brainMovedSuffix || !carriesEntireMarker(root, m) || hookFileExists(root, m+backupSuffix) {
+		return false, nil // a keep copy holds the user's hook: restore it as for any wrapper
 	}
 	backup := hook + backupSuffix
 	switch {
 	case isBrainChain(root, hook, hook):
 		if hookFileExists(root, backup) && !carriesEntireMarker(root, backup) &&
-			!isBrainChain(root, backup, hook) && !runsByName(root, backup, m) {
+			!isBrainChain(root, backup, hook) && !runsByName(root, backup, m) && !mentionsOwnPath(root, backup) {
 			return true, root.Rename(backup, m) //nolint:wrapcheck // caller adds the file name
 		}
 		return true, root.Remove(m) //nolint:wrapcheck // caller adds the file name
