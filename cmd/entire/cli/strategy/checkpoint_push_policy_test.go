@@ -46,7 +46,7 @@ func TestCheckpointPushOutcomes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			outcomes := checkpointPushOutcomes(targets, waiting, tt.result, tt.flushErr)
+			outcomes := checkpointPushOutcomes(targets, waiting, nil, tt.result, tt.flushErr)
 			got := make([]CheckpointPushStatus, 0, len(outcomes))
 			for _, outcome := range outcomes {
 				got = append(got, outcome.Status)

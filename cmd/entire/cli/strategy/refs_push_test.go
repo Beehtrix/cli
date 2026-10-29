@@ -717,6 +717,28 @@ func TestPushQueuedCheckpointRefs_OPFFailureWithholdsPush(t *testing.T) {
 	assertRefsAbsentFromRemote(t, bareDir, refs, "withheld push must not reach the remote")
 }
 
+// A push of named refs must not read, warn about or fail on refs it was not
+// asked to send.
+func TestPartitionCheckpointRefPushes_UnnamedUnreadableRefWaits(t *testing.T) {
+	workDir, _, refs := setupRepoWithCheckpointRefs(t)
+	t.Chdir(workDir)
+	repo, err := git.PlainOpen(workDir)
+	require.NoError(t, err)
+	loop := plumbing.ReferenceName("refs/entire/loop")
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewSymbolicReference(refs[0], loop)))
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewSymbolicReference(loop, refs[0])))
+	entries := []checkpoint.PushQueueEntry{{Ref: refs[0]}, {Ref: refs[1]}}
+
+	part := partitionCheckpointRefPushes(repo, entries,
+		checkpointRefSelection{refs: map[plumbing.ReferenceName]plumbing.Hash{refs[1]: plumbing.ZeroHash}})
+
+	assert.Empty(t, part.unreadable, "a ref nobody named is not read")
+	require.Len(t, part.waiting, 1)
+	assert.Equal(t, refs[0], part.waiting[0].Ref)
+	require.Len(t, part.ready, 1)
+	assert.Equal(t, refs[1], part.ready[0].name)
+}
+
 // A queued ref that cannot be read (here a symbolic-ref loop, which fails with
 // something other than not-found) has no tip to pin. It must still stay queued
 // and be reported, not be withheld silently or pruned as stale.

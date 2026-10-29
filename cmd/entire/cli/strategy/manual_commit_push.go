@@ -548,6 +548,13 @@ func partitionCheckpointRefPushes(
 		readErrs: make(map[plumbing.ReferenceName]error),
 	}
 	for _, entry := range entries {
+		// A ref the selection leaves out waits untouched: a push of named refs
+		// does not read, prune or report the others.
+		pin, selected := selection.pin(entry.Ref)
+		if !selected {
+			part.waiting = append(part.waiting, entry)
+			continue
+		}
 		ref, err := repo.Reference(entry.Ref, true)
 		if errors.Is(err, plumbing.ErrReferenceNotFound) {
 			part.stale = append(part.stale, entry)
@@ -559,10 +566,7 @@ func partitionCheckpointRefPushes(
 			continue
 		}
 		candidate := checkpointRefPush{token: entry, name: entry.Ref, hash: ref.Hash()}
-		pin, selected := selection.pin(entry.Ref)
 		switch {
-		case !selected:
-			part.waiting = append(part.waiting, entry)
 		case !pin.IsZero() && pin != candidate.hash:
 			part.changed = append(part.changed, candidate)
 		default:
