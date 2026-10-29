@@ -161,7 +161,7 @@ func checkOuterPushOfHeldCommits(ctx context.Context) error {
 	return nil
 }
 
-const outerPushHowTo = "Leave checkpoint refs out of this push (avoid --mirror) and upload checkpoints with 'entire checkpoint push'. " +
+const outerPushHowTo = "Leave checkpoint refs out of this push (avoid --mirror) and upload checkpoints with 'entire checkpoint push --all'. " +
 	"To push them anyway, run git push with --no-verify"
 
 // CheckOuterPushWithUnloadableSettings refuses the user's push when it sends
@@ -233,7 +233,7 @@ func announceCheckpointPushPolicy(ctx context.Context, repo *git.Repository) boo
 		return true
 	}
 	if waiting := waitingCheckpointCount(ctx, repo); waiting > 0 {
-		fmt.Fprintf(stderrWriter, "[entire] %s waiting, upload with: entire checkpoint push\n", pluralCheckpoints(waiting))
+		fmt.Fprintf(stderrWriter, "[entire] %s waiting, upload with: entire checkpoint push --all\n", pluralCheckpoints(waiting))
 	}
 	return false
 }
@@ -242,12 +242,11 @@ func announceCheckpointPushPolicy(ctx context.Context, repo *git.Repository) boo
 // `entire checkpoint list --outgoing` lists. A queue that cannot be read
 // counts as zero: the line it feeds is a reminder, not a report.
 func waitingCheckpointCount(ctx context.Context, repo *git.Repository) int {
-	queued, err := peekCheckpointQueue(ctx, repo)
+	waiting, err := waitingCheckpointRefs(ctx, repo)
 	if err != nil {
 		return 0
 	}
-	existing, _ := partitionLocalRefs(repo, queued)
-	return len(existing)
+	return len(waiting)
 }
 
 func pluralCheckpoints(n int) string {

@@ -156,20 +156,13 @@ func readOutgoingCheckpoint(ctx context.Context, store checkpoint.PersistentStor
 	}
 	row.createdAt = first.CreatedAt
 	row.sessionIDs = append(row.sessionIDs, first.SessionID)
-	for i := 1; i < row.sessionCount; i++ {
-		meta, err := store.ReadSessionMetadata(ctx, oc.CheckpointID, i)
-		if err != nil {
-			row.err = fmt.Errorf("read session metadata: %w", err)
-			return row
-		}
-		row.sessionIDs = append(row.sessionIDs, meta.SessionID)
-	}
 	latest := first
-	if row.sessionCount > 1 {
-		if latest, err = store.ReadSessionMetadata(ctx, oc.CheckpointID, row.sessionCount-1); err != nil {
+	for i := 1; i < row.sessionCount; i++ {
+		if latest, err = store.ReadSessionMetadata(ctx, oc.CheckpointID, i); err != nil {
 			row.err = fmt.Errorf("read session metadata: %w", err)
 			return row
 		}
+		row.sessionIDs = append(row.sessionIDs, latest.SessionID)
 	}
 	row.agent = string(latest.Agent)
 	if latest.Summary != nil {
@@ -303,9 +296,9 @@ func outgoingHeadline(info checkpointSyncInfo, n int, dest string) string {
 	case info.PushPolicyErr != "":
 		return fmt.Sprintf("'git push' sends none of these until the checkpoint push policy can be read. %s %s queued:", count, beVerb(n))
 	case info.PushPolicy == settings.CheckpointPushPolicyManual && dest != "":
-		return fmt.Sprintf("%s %s waiting for 'entire checkpoint push', which sends them to %s:", count, beVerb(n), dest)
+		return fmt.Sprintf("%s %s waiting for 'entire checkpoint push --all', which sends them to %s:", count, beVerb(n), dest)
 	case info.PushPolicy == settings.CheckpointPushPolicyManual:
-		return fmt.Sprintf("%s %s waiting for 'entire checkpoint push':", count, beVerb(n))
+		return fmt.Sprintf("%s %s waiting for 'entire checkpoint push --all':", count, beVerb(n))
 	case info.Err != "":
 		return fmt.Sprintf("'git push' sends none of these until that is fixed. %s %s queued:", count, beVerb(n))
 	case dest == "":

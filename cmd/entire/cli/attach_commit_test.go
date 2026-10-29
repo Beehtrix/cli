@@ -15,6 +15,7 @@ import (
 	checkpointid "github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/interactive"
 	"github.com/entireio/cli/cmd/entire/cli/session"
+	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/entireio/cli/cmd/entire/cli/trailers"
@@ -222,11 +223,11 @@ func TestAttachCommit_PushedHeadIsDeliveredOnGitRefs(t *testing.T) {
 
 func setAttachCheckpointPushPolicy(t *testing.T, policy string) {
 	t.Helper()
-	dir := filepath.Join(mustGetwd(t), ".git", "entire")
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	path := filepath.Join(mustGetwd(t), ".git", filepath.FromSlash(settings.CheckpointPushPolicyFile))
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "preferences.json"), []byte(`{"checkpoint_push_policy":"`+policy+`"}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(policy+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -313,8 +314,8 @@ func TestAttachCommit_UnreadablePolicyIsAnError(t *testing.T) {
 	setAttachCheckpointPushPolicy(t, "approved")
 
 	out, err := attachHeadless(t, "attach-unreadable-policy", attachOptions{})
-	if err == nil || !strings.Contains(err.Error(), "preferences.json") {
-		t.Fatalf("expected an error naming preferences.json, got %v\n%s", err, out)
+	if err == nil || !strings.Contains(err.Error(), "checkpoint-push-policy") {
+		t.Fatalf("expected an error naming the policy file, got %v\n%s", err, out)
 	}
 	if refs := remoteCheckpointRefs(t, remote); refs != "" {
 		t.Fatalf("an unreadable policy uploaded checkpoint refs:\n%s", refs)
@@ -338,8 +339,8 @@ func TestAttachCommit_RetryWithUnreadablePolicyNamesTheFile(t *testing.T) {
 
 	var out bytes.Buffer
 	err := runAttach(context.Background(), &out, &out, sessionID, agent.AgentNameClaudeCode, attachOptions{})
-	if err == nil || !strings.Contains(err.Error(), "preferences.json") {
-		t.Fatalf("expected an error naming preferences.json, got %v\n%s", err, out.String())
+	if err == nil || !strings.Contains(err.Error(), "checkpoint-push-policy") {
+		t.Fatalf("expected an error naming the policy file, got %v\n%s", err, out.String())
 	}
 }
 

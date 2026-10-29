@@ -18,6 +18,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 	"github.com/entireio/cli/cmd/entire/cli/trailers"
 )
@@ -579,12 +580,9 @@ func TestPushQueuedCheckpointRefs_ManualPolicyHoldsRefs(t *testing.T) {
 	workDir, bareDir, refs := setupRepoWithCheckpointRefs(t)
 	t.Chdir(workDir)
 	paths.ClearWorktreeRootCache()
-	require.NoError(t, os.MkdirAll(filepath.Join(workDir, ".git", "entire"), 0o755))
-	require.NoError(t, os.WriteFile(
-		filepath.Join(workDir, ".git", "entire", "preferences.json"),
-		[]byte(`{"checkpoint_push_policy":"manual"}`),
-		0o600,
-	))
+	policyFile := filepath.Join(workDir, ".git", filepath.FromSlash(settings.CheckpointPushPolicyFile))
+	require.NoError(t, os.MkdirAll(filepath.Dir(policyFile), 0o755))
+	require.NoError(t, os.WriteFile(policyFile, []byte("manual\n"), 0o600))
 
 	repo, err := git.PlainOpen(workDir)
 	require.NoError(t, err)
