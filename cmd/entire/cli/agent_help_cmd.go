@@ -106,6 +106,7 @@ var agentHelpClassification = map[string]agentHelpFacts{
 	"checkpoint delete":  {agentHelpAudienceUserOwned, false},  // destructive, irreversible on remotes
 	"checkpoint explain": {agentHelpAudienceTaskDriven, false}, // --generate writes a summary
 	"checkpoint list":    {agentHelpAudienceReadOnly, false},
+	"checkpoint push":    {agentHelpAudienceUserOwned, false}, // uploads checkpoints the user may be holding back
 	"checkpoint search":  {agentHelpAudienceReadOnly, false},
 	"checkpoint tokens":  {agentHelpAudienceReadOnly, false},
 
@@ -246,6 +247,13 @@ var agentHelpGuidance = map[string]string{
 
 	"checkpoint delete": "Destructive and irreversible on the remote. Never run this unless the user\n" +
 		"explicitly asks to delete that checkpoint; do not pass --force on your own.",
+
+	"checkpoint push": "Uploads checkpoints the user may be keeping on this machine on purpose.\n" +
+		"Never run this unless the user explicitly asks to upload those checkpoints.\n" +
+		"Without a terminal it accepts only <checkpoint-id>@<commit>; get the commit\n" +
+		"from `checkpoints[].commit` in `entire checkpoint list --outgoing --json`.\n" +
+		"A result with status `changed` means the checkpoint moved since that read:\n" +
+		"read the listing again and ask the user before uploading the new version.",
 }
 
 // agentHelpProjectTrailGuidance replaces agentHelpGuidance for commands in the
