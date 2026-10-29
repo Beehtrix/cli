@@ -28,7 +28,6 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
-	"github.com/entireio/cli/cmd/entire/cli/trailers"
 	"github.com/entireio/cli/cmd/entire/cli/validation"
 	"github.com/entireio/cli/cmd/entire/cli/versioninfo"
 	"github.com/entireio/cli/perf"
@@ -451,7 +450,7 @@ type attachCheckpoint struct {
 // An existing checkpoint is fetched and verified first, so it is never rebuilt
 // from scratch under its ID. Nothing is written.
 func resolveAttachCheckpoint(ctx, logCtx context.Context, repo *git.Repository, refs cpkg.PersistentRefs, plan attachLinkPlan, sessionID string, opts attachOptions) (attachCheckpoint, error) {
-	checkpointID, isExistingCheckpoint := resolveCheckpointID(ctx, plan.target)
+	checkpointID, isExistingCheckpoint := resolveCheckpointID(ctx, plan)
 	// A pushed commit an earlier attach already linked has no trailer to find
 	// its checkpoint by; its checkpoint names it instead. Join that one, as the
 	// trailer paths do, rather than start a second checkpoint for the commit.
@@ -642,8 +641,10 @@ func redeliverAttachedCheckpoint(ctx context.Context, w, errW io.Writer, plan at
 type attachLinkMode int
 
 const (
-	// attachJoinExisting: the commit already carries an Entire-Checkpoint
-	// trailer; the session joins that checkpoint and history is unchanged.
+	// attachJoinExisting: the commit's final trailer block already carries an
+	// Entire-Checkpoint trailer, or post-commit recorded an unpushed commit in
+	// its checkpoint; the session joins that checkpoint and history is
+	// unchanged.
 	attachJoinExisting attachLinkMode = iota
 	// attachAddTrailer: no remote branch holds the commit. The trailer is
 	// added, rewriting the commit and any after it: nobody else has them, and
@@ -659,6 +660,10 @@ const (
 type attachLinkPlan struct {
 	target *object.Commit
 	mode   attachLinkMode
+	// linked is the checkpoint target links to (attachJoinExisting only): its
+	// last-paragraph trailer, resolved once with git config
+	// (strategy.LinkedCheckpoints), or the checkpoint that records it.
+	linked id.CheckpointID
 	// holder is a remote whose branches hold target, empty when none does (or,
 	// when joining, none could be reached).
 	holder string
@@ -683,7 +688,7 @@ func planAttachLink(ctx context.Context, repo *git.Repository, headCommit *objec
 		}
 	}
 	remotes := attachRemotesToCheck(ctx)
-	if len(trailers.ParseAllCheckpoints(target.Message)) > 0 {
+	if linked := strategy.LinkedCheckpoints(ctx, target.Message); len(linked) > 0 {
 		// Joining changes no history, so whether the commit is pushed only
 		// decides when the checkpoint goes out: now if it is, since there may be
 		// no later push of it, else with the next git push. A remote that can't
@@ -692,7 +697,7 @@ func planAttachLink(ctx context.Context, repo *git.Repository, headCommit *objec
 		if err != nil {
 			return attachLinkPlan{}, err
 		}
-		return attachLinkPlan{target: target, mode: attachJoinExisting, remote: pushTo, holder: holder, checkedRemotes: remotes}, nil
+		return attachLinkPlan{target: target, mode: attachJoinExisting, linked: linked[len(linked)-1], remote: pushTo, holder: holder, checkedRemotes: remotes}, nil
 	}
 	holder, pushTo, unreachable, err := remoteHoldingPushedCommit(ctx, target, remotes)
 	if err != nil {
@@ -700,6 +705,14 @@ func planAttachLink(ctx context.Context, repo *git.Repository, headCommit *objec
 	}
 	if holder != "" {
 		return attachLinkPlan{target: target, mode: attachRecordLink, remote: pushTo, holder: holder, checkedRemotes: remotes}, nil
+	}
+	// A paragraph added below the trailer prepare stamped leaves no trailer in
+	// the final block; post-commit recorded the commit in that checkpoint
+	// instead. Join it rather than rewrite the commit under a second one.
+	if store, openErr := openAttachStore(ctx, repo, opts.committedRefs(ctx)); openErr == nil {
+		if recorded, ok := checkpointLinkedTo(ctx, store, target); ok {
+			return attachLinkPlan{target: target, mode: attachJoinExisting, linked: recorded, remote: pushTo, checkedRemotes: remotes}, nil
+		}
 	}
 	if len(unreachable) > 0 {
 		// Absence from a remote we couldn't reach proves nothing; rewriting a
@@ -1366,10 +1379,10 @@ func suggestFetchCommand(ctx context.Context, refspec string) string {
 	return fmt.Sprintf("git fetch %s %s", resolveCheckpointFetchTarget(ctx), refspec)
 }
 
-func resolveCheckpointID(ctx context.Context, headCommit *object.Commit) (id.CheckpointID, bool) {
-	existing := trailers.ParseAllCheckpoints(headCommit.Message)
-	if len(existing) > 0 {
-		return existing[len(existing)-1], true
+// resolveCheckpointID returns the checkpoint plan's commit links, or a new ID.
+func resolveCheckpointID(ctx context.Context, plan attachLinkPlan) (id.CheckpointID, bool) {
+	if plan.mode == attachJoinExisting {
+		return plan.linked, true
 	}
 
 	cpID, err := cpkg.GenerateCheckpointID(ctx)
