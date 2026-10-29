@@ -22,8 +22,10 @@ type checkpointPushFlags struct {
 
 // checkpointPushJSON is `entire checkpoint push --json`. Results is never null.
 type checkpointPushJSON struct {
-	Remote  string                     `json:"checkpoint_sync_remote"`
+	Remote  string                     `json:"checkpoint_sync_remote,omitempty"`
 	Results []checkpointPushResultJSON `json:"results"`
+	// Error is set when the command failed before it could report results.
+	Error string `json:"error,omitempty"`
 }
 
 type checkpointPushResultJSON struct {
@@ -66,7 +68,19 @@ Examples:
   entire checkpoint push <id>@<commit> --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cmd.SilenceUsage = true
-			return runCheckpointPush(cmd, args, flags, canPrompt())
+			if !flags.json {
+				return runCheckpointPush(cmd, args, flags, canPrompt())
+			}
+			// --json callers read stdout as JSON, failures included.
+			out := &countingWriter{w: cmd.OutOrStdout()}
+			cmd.SetOut(out)
+			err := runCheckpointPush(cmd, args, flags, canPrompt())
+			if err != nil && out.n == 0 {
+				if jsonErr := printJSON(out.w, checkpointPushJSON{Results: []checkpointPushResultJSON{}, Error: err.Error()}); jsonErr != nil {
+					return jsonErr
+				}
+			}
+			return err
 		},
 	}
 	cmd.Flags().BoolVar(&flags.all, "all", false, "Upload every waiting checkpoint (needs a terminal)")
@@ -131,7 +145,8 @@ func runCheckpointPush(cmd *cobra.Command, args []string, flags checkpointPushFl
 		writeCheckpointPushText(out, report)
 	}
 	for _, outcome := range report.Outcomes {
-		if outcome.Status != strategy.CheckpointPushUploaded {
+		// Already uploaded is done, not a failure; everything else is.
+		if outcome.Status != strategy.CheckpointPushUploaded && outcome.Status != strategy.CheckpointPushNotWaiting {
 			return NewSilentError(errors.New("some checkpoints were not uploaded"))
 		}
 	}
@@ -252,8 +267,23 @@ func writeCheckpointPushText(w io.Writer, report strategy.CheckpointPushReport) 
 			fmt.Fprintf(w, "%s  not sent: it changed since you looked; it is now %s. Check it with 'entire checkpoint list --outgoing'.\n", label, outcome.Commit)
 		case strategy.CheckpointPushNotWaiting:
 			fmt.Fprintf(w, "%s  not sent: it is not waiting to upload\n", label)
+		case strategy.CheckpointPushNotFound:
+			fmt.Fprintf(w, "%s  not sent: there is no checkpoint with this ID here\n", label)
 		case strategy.CheckpointPushFailed:
 			fmt.Fprintf(w, "%s  failed: %v; it stays queued\n", label, outcome.Err)
 		}
 	}
+}
+
+// countingWriter records whether anything was written, so a --json run that
+// failed before reporting can still put JSON on stdout.
+type countingWriter struct {
+	w io.Writer
+	n int
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += n
+	return n, err //nolint:wrapcheck // a pass-through writer
 }

@@ -149,27 +149,46 @@ func readOutgoingCheckpoint(ctx context.Context, store checkpoint.PersistentStor
 	if row.sessionCount == 0 {
 		return row
 	}
-	first, err := store.ReadSessionMetadata(ctx, oc.CheckpointID, 0)
+	first, latest, ids, err := readOutgoingSessions(row.sessionCount, func(i int) (*checkpoint.Metadata, error) {
+		return store.ReadSessionMetadata(ctx, oc.CheckpointID, i)
+	})
 	if err != nil {
-		row.err = fmt.Errorf("read session metadata: %w", err)
+		row.err = err
 		return row
 	}
 	row.createdAt = first.CreatedAt
-	row.sessionIDs = append(row.sessionIDs, first.SessionID)
-	latest := first
-	for i := 1; i < row.sessionCount; i++ {
-		if latest, err = store.ReadSessionMetadata(ctx, oc.CheckpointID, i); err != nil {
-			row.err = fmt.Errorf("read session metadata: %w", err)
-			return row
-		}
-		row.sessionIDs = append(row.sessionIDs, latest.SessionID)
-	}
+	row.sessionIDs = ids
 	row.agent = string(latest.Agent)
 	if latest.Summary != nil {
 		row.summary = latest.Summary.Intent
 	}
 	row.prompt = readLatestCommittedSessionPrompt(ctx, store, oc.CheckpointID, row.sessionCount)
 	return row
+}
+
+// readOutgoingSessions reads a checkpoint's sessions for its row. The first
+// and last must be readable, since they give the row's date, agent and
+// summary; a session between them only adds its ID, so one that cannot be
+// read leaves its ID out instead of failing the row.
+func readOutgoingSessions(count int, read func(int) (*checkpoint.Metadata, error)) (first, latest *checkpoint.Metadata, ids []string, err error) {
+	first, err = read(0)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read session metadata: %w", err)
+	}
+	ids = append(ids, first.SessionID)
+	latest = first
+	for i := 1; i < count; i++ {
+		meta, readErr := read(i)
+		if readErr != nil {
+			if i == count-1 {
+				return nil, nil, nil, fmt.Errorf("read session metadata: %w", readErr)
+			}
+			continue
+		}
+		ids = append(ids, meta.SessionID)
+		latest = meta
+	}
+	return first, latest, ids, nil
 }
 
 func (l outgoingListing) json() outgoingCheckpointsJSON {
