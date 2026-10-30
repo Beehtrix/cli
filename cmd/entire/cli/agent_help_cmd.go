@@ -290,7 +290,13 @@ var agentHelpProjectTrailGuidance = map[string]string{
 		"(e.g. review) a whole project trail, cover every change. Checkout and\n" +
 		"review need a clone of that repository: do the ones in this clone and\n" +
 		"tell the user which changes need another clone instead of skipping\n" +
-		"them silently.",
+		"them silently. A change's merge state is changes[].mergeability: its\n" +
+		"gates (approvals, checks, findings, up_to_date) are under .gates and\n" +
+		"its CI runs, with details_url links, under .checks.runs. mergeability\n" +
+		"is null for merged or closed changes other than the current one, when\n" +
+		"the server has no snapshot yet, and when it could not be read; only a\n" +
+		"failed read prints a warning on stderr. Null is unknown, never\n" +
+		"mergeable.",
 }
 
 // agentHelpTrailSandboxGuidance is shared by both trail models. Agent sandboxes
