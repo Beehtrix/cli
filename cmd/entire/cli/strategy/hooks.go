@@ -515,6 +515,9 @@ func AnyGitHookInstalled(ctx context.Context) bool {
 // Skipping it also skips refreshing copies another tool moved aside, which is
 // safe: such a copy only runs from that tool's wrapper, and a wrapper in the
 // hook's place lacks the marker, so the hook reads Absent and is reinstalled.
+// The exception is entire-brain's pre-push wrapper, which reads as current as
+// the copy it runs; a stale copy is rewritten in place and the wrapper is left
+// alone.
 func ReinstallGitHooks(ctx context.Context) (int, error) {
 	return installGitHooks(ctx, true, hookSettingsFromConfig(ctx), true)
 }
@@ -583,7 +586,12 @@ func hookStateIn(root *os.Root, hook string) GitHookState {
 	}
 	content := string(data)
 	if !strings.Contains(content, entireHookMarker) {
-		return GitHooksAbsent
+		// Brain's wrapper runs Entire's hook from its moved copy, so classify that.
+		moved, ok := brainChainedEntireHook(root, hook, content)
+		if !ok {
+			return GitHooksAbsent
+		}
+		content = moved
 	}
 	if entireHookLineRunsFromWorkingTree(content) {
 		return GitHooksOutdated
@@ -593,6 +601,127 @@ func hookStateIn(root *os.Root, hook string) GitHookState {
 		return GitHooksOutdated
 	}
 	return GitHooksCurrent
+}
+
+// The entire-brain plugin puts its pre-push hook in front of the one it finds,
+// moving that to <hook>.pre-entire-brain, and its hook ends by exec'ing the copy
+// with git's stdin and arguments. Entire's hook there still runs as it did, so
+// the set reads as current as that copy is, and EnsureSetup does not back
+// Brain's hook up and wrap it on the next turn.
+const (
+	brainHookMarker   = "# entire-brain push hook"
+	brainBackupSuffix = ".pre-entire-brain"
+	brainChainLine    = `backup="$0` + brainBackupSuffix + `"`
+	brainExecLine     = `if [ -x "$backup" ]; then exec "$backup" "$@"; fi`
+)
+
+// isBrainWrapper reports whether content is Brain's wrapper with its chain
+// intact: the marker, the assignment and the exec each on a line of its own, so
+// a chain that was commented out or removed does not count.
+func isBrainWrapper(content string) bool {
+	var marker, assign, execs bool
+	for line := range strings.Lines(content) {
+		switch strings.TrimSpace(line) {
+		case brainHookMarker:
+			marker = true
+		case brainChainLine:
+			assign = true
+		case brainExecLine:
+			execs = true
+		}
+	}
+	return marker && assign && execs
+}
+
+// brainChainedEntireHook returns the content of pre-push.pre-entire-brain when
+// hook is pre-push (the only hook Brain wraps), content is Brain's wrapper and
+// git can run it, and the copy it runs is Entire's hook that the wrapper's
+// [ -x ] guard lets run. Like hook, the copy is read NoFollow. Windows has no
+// execute bit to check, so there both only have to be regular files.
+func brainChainedEntireHook(root *os.Root, hook, content string) (string, bool) {
+	if hook != prePushHook || !isBrainWrapper(content) {
+		return "", false
+	}
+	moved := hook + brainBackupSuffix
+	if !isRunnableHookFile(root, hook) || !isRunnableHookFile(root, moved) {
+		return "", false
+	}
+	data, err := osroot.ReadFileNoFollow(root, moved)
+	if err != nil || !strings.Contains(string(data), entireHookMarker) {
+		return "", false
+	}
+	return string(data), true
+}
+
+// withCurrentEntireLine returns content, a pre-push hook the user edited, with
+// its one line that runs Entire's pre-push handler replaced by the one in
+// current, and the user's lines as they are. It reports false when content
+// does not have exactly one such line, since then which line is Entire's is a
+// guess.
+func withCurrentEntireLine(content, current string) (string, bool) {
+	const runsEntire = ` hooks git pre-push "$1"`
+	var line string
+	for l := range strings.Lines(current) {
+		if strings.Contains(l, runsEntire) {
+			line = strings.TrimSuffix(l, "\n")
+			break
+		}
+	}
+	if line == "" {
+		return "", false
+	}
+	lines := strings.SplitAfter(content, "\n")
+	at := -1
+	for i, l := range lines {
+		if !strings.Contains(l, runsEntire) {
+			continue
+		}
+		if at >= 0 {
+			return "", false
+		}
+		at = i
+	}
+	if at < 0 {
+		return "", false
+	}
+	end := ""
+	if strings.HasSuffix(lines[at], "\n") {
+		end = "\n"
+	}
+	lines[at] = line + end
+	return strings.Join(lines, ""), true
+}
+
+// isCurrentPrePushHook reports whether content is exactly the pre-push hook
+// Entire writes today, chained to a backup or not, for the prefix its own line
+// runs. Like isPrePushBeforeRefList, nothing looser counts.
+func isCurrentPrePushHook(content string) bool {
+	_, rest, ok := strings.Cut(content, PrePushStdinRefsEnv+"=1 ")
+	if !ok {
+		return false
+	}
+	prefix, _, ok := strings.Cut(rest, ` hooks git pre-push "$1" < "$_entire_refs"`)
+	if !ok {
+		return false
+	}
+	for _, spec := range buildHookSpecs(prefix) {
+		if spec.name == prePushHook {
+			return content == spec.content || content == generateChainedContent(spec.content, prePushHook)
+		}
+	}
+	return false
+}
+
+// isRunnableHookFile reports whether name in root is a regular file (not
+// followed if it is a symlink) with an execute bit, which is what git and a
+// [ -x ] guard need. Windows has no execute bit, so there it only has to be a
+// regular file.
+func isRunnableHookFile(root *os.Root, name string) bool {
+	info, err := root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	return runtime.GOOS == goosWindows || info.Mode().Perm()&0o111 != 0
 }
 
 // entireHookLineRunsFromWorkingTree reports whether the hook's OWN Entire
@@ -943,6 +1072,69 @@ func installHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string,
 				slog.String("placeholder_copies", strings.Join(wrapped.placeholder, ",")))
 		}
 
+		// Brain's wrapper already runs Entire's hook from its moved copy: write
+		// Entire's hook there, chained to the user's backup as it would be at
+		// the hook path, and leave the wrapper alone. Backing the wrapper up to
+		// .pre-entire would leave the copy orphaned, since Brain's chain is
+		// relative to $0. Other moved copies are refreshed first, as below: the
+		// backup the copy chains to may be a wrapper that runs one of them.
+		//
+		// The copy itself is only rewritten when it reads Outdated or is exactly
+		// a hook Entire writes today. In one the user added lines to, only
+		// Entire's own line is brought up to date: the user's lines are not
+		// drift (see isPrePushBeforeRefList), and the copy is the only place
+		// they run.
+		if data, rerr := osroot.ReadFileNoFollow(root, spec.name); rerr == nil {
+			if copied, ok := brainChainedEntireHook(root, spec.name, string(data)); ok {
+				brainCopy := spec.name + brainBackupSuffix
+				moved, err := refreshMovedEntireHooks(root, spec.name, spec.content, brainCopy)
+				if err != nil {
+					return installedCount, fmt.Errorf("failed to update the copy of Entire's %s hook another tool moved aside: %w", spec.name, err)
+				}
+				if len(moved) > 0 {
+					logging.Info(ctx, "updated moved copies of Entire's git hook", slog.String("hook", spec.name), slog.String("copies", strings.Join(moved, ",")))
+				}
+				if hookStateIn(root, spec.name) != GitHooksOutdated && !isCurrentPrePushHook(copied) {
+					// Reached only by `entire enable` and `entire configure`: an
+					// agent turn reinstalls only hooks that read Outdated, and
+					// this copy reads Current. Leaving Entire's line as it was
+					// would keep an older one that ignores Entire's exit status
+					// (`|| true`), or another command prefix than the one asked
+					// for, while the install reports success.
+					updated, ok := withCurrentEntireLine(copied, spec.content)
+					if !ok {
+						fmt.Fprintf(stderrWriter, "[entire] Warning: %s has changes of your own and Entire could not find the one line there that runs it, so Entire's %s hook in it was not updated. To update it, remove your changes from it and re-run 'entire enable'.\n",
+							filepath.Join(hooksDir, brainCopy), spec.name)
+						logging.Warn(ctx, "left an edited copy of Entire's git hook behind entire-brain's wrapper as it is", slog.String("hook", spec.name), slog.String("copy", brainCopy))
+						continue
+					}
+					written, err := writeHookFile(root, brainCopy, updated)
+					if err != nil {
+						return installedCount, fmt.Errorf("failed to update the copy of Entire's %s hook that entire-brain runs: %w", spec.name, err)
+					}
+					if written {
+						installedCount++
+						fmt.Fprintf(stderrWriter, "[entire] Updated the line that runs Entire in %s; the lines you added there are kept.\n", filepath.Join(hooksDir, brainCopy))
+						logging.Info(ctx, "updated Entire's line in an edited copy of its git hook behind entire-brain's wrapper", slog.String("hook", spec.name), slog.String("copy", brainCopy))
+					}
+					continue
+				}
+				content := spec.content
+				if hookFileExists(root, backupName) && !carriesEntireMarker(root, backupName) {
+					content = generateChainedContent(spec.content, spec.name)
+				}
+				written, err := writeHookFile(root, brainCopy, content)
+				if err != nil {
+					return installedCount, fmt.Errorf("failed to update the copy of Entire's %s hook that entire-brain runs: %w", spec.name, err)
+				}
+				if written {
+					installedCount++
+					logging.Info(ctx, "updated Entire's git hook behind entire-brain's wrapper", slog.String("hook", spec.name), slog.String("copy", brainCopy))
+				}
+				continue
+			}
+		}
+
 		// Back up existing non-Entire hooks. A symlinked hook is one of those:
 		// Entire never installs a link, so it belongs to the user or another
 		// tool. Refusing to read through it must not mean quietly replacing it,
@@ -972,7 +1164,7 @@ func installHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string,
 			}
 		}
 
-		moved, err := refreshMovedEntireHooks(root, spec.name, spec.content)
+		moved, err := refreshMovedEntireHooks(root, spec.name, spec.content, "")
 		if err != nil {
 			return installedCount, fmt.Errorf("failed to update the copy of Entire's %s hook another tool moved aside: %w", spec.name, err)
 		}
