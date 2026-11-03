@@ -2026,7 +2026,9 @@ func TestCheckGitHookState_BrainPrePushWrapper(t *testing.T) {
 	execCommentedOut := strings.Replace(brainPrePushWrapper, `if [ -x "$backup" ]`, `# if [ -x "$backup" ]`, 1)
 	exitsFirst := strings.Replace(brainPrePushWrapper, `backup="$0`, "exit 0\n"+`backup="$0`, 1)
 	exitsInCondition := strings.Replace(brainPrePushWrapper, `backup="$0`, `[ -n "$SKIP" ] && exit 0`+"\n"+`backup="$0`, 1)
-	chainNotLast := brainPrePushWrapper + "echo after\n"
+	commandAfterChain := brainPrePushWrapper + "echo after\n"
+	echoesExit := strings.Replace(brainPrePushWrapper, `backup="$0`, "echo exit\n"+`backup="$0`, 1)
+	exitInPath := strings.ReplaceAll(brainPrePushWrapper, "/home/me/.local", "/home/my exit dir/.local")
 	for _, tc := range []struct {
 		name        string
 		wrapper     string
@@ -2045,7 +2047,11 @@ func TestCheckGitHookState_BrainPrePushWrapper(t *testing.T) {
 		// The chain only counts when the hook gets to it.
 		{name: "wrapper exits before its chain", wrapper: exitsFirst, moved: current, want: GitHooksAbsent},
 		{name: "wrapper may exit before its chain", wrapper: exitsInCondition, moved: current, want: GitHooksAbsent},
-		{name: "chain is not the wrapper's last command", wrapper: chainNotLast, moved: current, want: GitHooksAbsent},
+		// The exec replaces the shell, so what follows it does not matter, and
+		// exit as a word inside a command does not end the hook.
+		{name: "command after the chain", wrapper: commandAfterChain, moved: current, want: GitHooksCurrent},
+		{name: "exit as an argument before the chain", wrapper: echoesExit, moved: current, want: GitHooksCurrent},
+		{name: "exit in Brain's quoted path", wrapper: exitInPath, moved: current, want: GitHooksCurrent},
 		{name: "moved copy not executable", wrapper: brainPrePushWrapper, moved: current, movedMode: 0o644, want: GitHooksAbsent},
 		{name: "wrapper not executable", wrapper: brainPrePushWrapper, wrapperMode: 0o644, moved: current, want: GitHooksAbsent},
 		// Only group and other may execute: git and Brain's [ -x ] check the

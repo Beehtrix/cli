@@ -616,42 +616,51 @@ const (
 )
 
 // isBrainWrapper reports whether content is Brain's wrapper with its chain
-// intact: the marker on a line of its own, and the assignment and the exec as
-// its last two commands, so a chain that was commented out, removed or moved
-// does not count. No command before them may exit, exec or return, which would
-// end the hook before it reaches the chain. Anything else reads as another
-// tool's hook, which Entire re-wraps as it does on main.
+// intact: the marker, then the assignment and the exec each on a line of its
+// own, so a chain that was commented out or removed does not count. No command
+// before the exec may start with exit, exec or return, which would end the
+// hook before the chain runs; commands after it are fine, since the exec
+// replaces the shell. Anything else reads as another tool's hook, which Entire
+// re-wraps as it does on main.
 func isBrainWrapper(content string) bool {
-	marker := false
-	var commands []string
+	marker, assigned := false, false
 	for line := range strings.Lines(content) {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == brainHookMarker {
+		switch {
+		case trimmed == brainHookMarker:
 			marker = true
-		}
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		commands = append(commands, trimmed)
-	}
-	n := len(commands)
-	if !marker || n < 2 || commands[n-2] != brainChainLine || commands[n-1] != brainExecLine {
-		return false
-	}
-	for _, command := range commands[:n-2] {
-		for _, word := range strings.FieldsFunc(command, isShellSeparator) {
-			if word == "exit" || word == "exec" || word == "return" {
-				return false
-			}
+		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
+		case trimmed == brainChainLine:
+			assigned = true
+		case trimmed == brainExecLine:
+			return marker && assigned
+		case endsShell(trimmed):
+			return false
 		}
 	}
-	return true
+	return false
 }
 
-// isShellSeparator splits a shell line into words around the operators that
-// can put a command such as exit after another one.
-func isShellSeparator(r rune) bool {
-	return r == ' ' || r == '\t' || r == ';' || r == '&' || r == '|' || r == '(' || r == ')' || r == '{' || r == '}'
+// endsShell reports whether a shell line has a command that starts with exit,
+// exec or return: the line is split at ; & and |, and the keywords that can
+// open a command (if, then, ! and so on) are skipped. Words inside a command,
+// such as an argument or a quoted path, do not count. Quoting is not parsed,
+// so a ; inside quotes can still make a word count; that errs toward reading
+// the wrapper as not Brain's, which is what main does with every wrapper.
+func endsShell(line string) bool {
+	for _, command := range strings.FieldsFunc(line, func(r rune) bool { return r == ';' || r == '&' || r == '|' }) {
+		for _, word := range strings.Fields(command) {
+			word = strings.TrimLeft(word, "({")
+			if word == "" || slices.Contains([]string{"if", "then", "else", "elif", "do", "while", "until", "!"}, word) {
+				continue
+			}
+			if word == "exit" || word == "exec" || word == "return" {
+				return true
+			}
+			break
+		}
+	}
+	return false
 }
 
 // brainChainedEntireHook returns the content of pre-push.pre-entire-brain when
@@ -751,16 +760,22 @@ func isCurrentPrePushHook(content string) bool {
 }
 
 // isRunnableHookFile reports whether name in root is a regular file (not
-// followed if it is a symlink) that this process may execute, which is what git
-// and a [ -x ] guard need: not just any execute bit, but one access(X_OK)
-// grants us (see canExecuteHook). Windows has no execute bit, so there it only
-// has to be a regular file.
+// followed if it is a symlink) that this process may read and execute, which
+// is what git and a [ -x ] guard need of a shell hook: not just any execute
+// bit, but one the kernel grants us (see canExecuteHook), asked about the file
+// opened through root. Windows has no execute bit, so there it only has to be
+// a regular file.
 func isRunnableHookFile(root *os.Root, name string) bool {
-	info, err := root.Lstat(name)
+	f, err := osroot.OpenNoFollow(root, name)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		return false
 	}
-	return canExecuteHook(filepath.Join(root.Name(), name))
+	return canExecuteHook(f, info)
 }
 
 // entireHookLineRunsFromWorkingTree reports whether the hook's OWN Entire
@@ -1139,7 +1154,9 @@ func installHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string,
 					// this copy reads Current. Leaving Entire's line as it was
 					// would keep an older one that ignores Entire's exit status
 					// (`|| true`), or another command prefix than the one asked
-					// for, while the install reports success.
+					// for, while the install reports success. A copy that reads
+					// Outdated (its Entire line runs the removed local-dev
+					// launcher) is rewritten whole below, as on main.
 					updated, ok := withCurrentEntireLine(copied, spec.content)
 					if !ok {
 						fmt.Fprintf(stderrWriter, "[entire] Warning: %s has changes of your own and Entire could not find the one line there that runs it, so Entire's %s hook in it was not updated. To update it, remove your changes from it and re-run 'entire enable'.\n",

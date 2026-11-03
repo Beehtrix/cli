@@ -2,12 +2,36 @@
 
 package strategy
 
-import "golang.org/x/sys/unix"
+import (
+	"io/fs"
+	"os"
+	"slices"
+	"syscall"
+)
 
-// canExecuteHook reports whether this process may execute the file at path. It
-// asks the kernel with access(X_OK), which is what git does before it runs a
-// hook and what sh's [ -x ] does, so ownership, the permission class that
-// applies, POSIX ACLs and root all count the same way they do for them.
-func canExecuteHook(path string) bool {
-	return unix.Access(path, unix.X_OK) == nil
+// canExecuteByMode is canExecuteHook from the mode bits alone, for when the
+// kernel cannot be asked through the descriptor: the one permission class the
+// kernel checks for this process (owner, group or other), as access(X_OK)
+// does, and any execute bit for root. It cannot see POSIX ACLs.
+func canExecuteByMode(info fs.FileInfo) bool {
+	perm := info.Mode().Perm()
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return perm&0o111 != 0
+	}
+	uid := os.Getuid()
+	if uid == 0 {
+		return perm&0o111 != 0
+	}
+	if int(st.Uid) == uid {
+		return perm&0o100 != 0
+	}
+	gid := int(st.Gid)
+	if gid == os.Getgid() {
+		return perm&0o010 != 0
+	}
+	if groups, err := os.Getgroups(); err == nil && slices.Contains(groups, gid) {
+		return perm&0o010 != 0
+	}
+	return perm&0o001 != 0
 }
