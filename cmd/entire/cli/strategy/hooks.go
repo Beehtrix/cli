@@ -1095,20 +1095,21 @@ func installHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string,
 				if len(moved) > 0 {
 					logging.Info(ctx, "updated moved copies of Entire's git hook", slog.String("hook", spec.name), slog.String("copies", strings.Join(moved, ",")))
 				}
-				if hookStateIn(root, spec.name) != GitHooksOutdated && !isCurrentPrePushHook(copied) {
-					// Reached only by `entire enable` and `entire configure`: an
-					// agent turn reinstalls only hooks that read Outdated, and
-					// this copy reads Current. Leaving Entire's line as it was
-					// would keep an older one that ignores Entire's exit status
-					// (`|| true`), or another command prefix than the one asked
-					// for, while the install reports success.
-					updated, ok := withCurrentEntireLine(copied, spec.content)
-					if !ok {
-						fmt.Fprintf(stderrWriter, "[entire] Warning: %s has changes of your own and Entire could not find the one line there that runs it, so Entire's %s hook in it was not updated. To update it, remove your changes from it and re-run 'entire enable'.\n",
-							filepath.Join(hooksDir, brainCopy), spec.name)
-						logging.Warn(ctx, "left an edited copy of Entire's git hook behind entire-brain's wrapper as it is", slog.String("hook", spec.name), slog.String("copy", brainCopy))
-						continue
-					}
+				content := spec.content
+				if hookFileExists(root, backupName) && !carriesEntireMarker(root, backupName) {
+					content = generateChainedContent(spec.content, spec.name)
+				}
+
+				// Replace only Entire's invocation when the copy has user-added
+				// lines. This is important for an outdated copy: an old launcher
+				// does not mean the user did not also add lines to the hook. An
+				// exact generated legacy copy is refreshed wholesale.
+				updated, ok := withCurrentEntireLine(copied, content)
+				// Generated legacy hooks can have an older header, so a
+				// different replacement alone is not evidence of an edit. An
+				// additional line is: retain those copies while refreshing the
+				// invocation, and replace exact generated copies wholesale.
+				if ok && updated != content && len(strings.Split(copied, "\n")) > len(strings.Split(content, "\n")) {
 					written, err := writeHookFile(root, brainCopy, updated)
 					if err != nil {
 						return installedCount, fmt.Errorf("failed to update the copy of Entire's %s hook that entire-brain runs: %w", spec.name, err)
@@ -1120,7 +1121,14 @@ func installHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string,
 					}
 					continue
 				}
-				content := spec.content
+				// If the Entire line cannot be identified, leave the copy intact
+				// rather than risking user edits.
+				if !ok {
+					fmt.Fprintf(stderrWriter, "[entire] Warning: %s has changes of your own and Entire could not find the one line there that runs it, so Entire's %s hook in it was not updated. To update it, remove your changes from it and re-run 'entire enable'.\n",
+						filepath.Join(hooksDir, brainCopy), spec.name)
+					logging.Warn(ctx, "left an edited copy of Entire's git hook behind entire-brain's wrapper as it is", slog.String("hook", spec.name), slog.String("copy", brainCopy))
+					continue
+				}
 				if hookFileExists(root, backupName) && !carriesEntireMarker(root, backupName) {
 					content = generateChainedContent(spec.content, spec.name)
 				}
@@ -1289,6 +1297,40 @@ func removeHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string, 
 
 	for _, hook := range gitHookNames {
 		backupName := hook + backupSuffix
+
+		// entire-brain keeps its wrapper at the hook path and runs Entire's
+		// hook from a moved copy. Remove Entire from that chain without
+		// deleting Brain's wrapper: put the user's backup in the moved slot,
+		// or leave a no-op there when there is no user hook to restore.
+		if data, readErr := osroot.ReadFileNoFollow(root, hook); readErr == nil {
+			if _, ok := brainChainedEntireHook(root, hook, string(data)); ok {
+				brainCopy := hook + brainBackupSuffix
+				switch {
+				case hookFileExists(root, backupName) && !carriesEntireMarker(root, backupName):
+					if err := replaceWithOwnCopy(root, backupName, brainCopy); err != nil {
+						removeErrors = append(removeErrors, fmt.Sprintf("restore %s into %s: %v", backupName, brainCopy, err))
+						continue
+					}
+					if err := root.Remove(backupName); err != nil {
+						removeErrors = append(removeErrors, fmt.Sprintf("remove %s: %v", backupName, err))
+						continue
+					}
+				default:
+					if _, err := writeHookFile(root, brainCopy, noopMovedHook); err != nil {
+						removeErrors = append(removeErrors, fmt.Sprintf("replace %s with a no-op: %v", brainCopy, err))
+						continue
+					}
+					if hookFileExists(root, backupName) && carriesEntireMarker(root, backupName) {
+						if err := root.Remove(backupName); err != nil {
+							removeErrors = append(removeErrors, fmt.Sprintf("remove %s: %v", backupName, err))
+							continue
+						}
+					}
+				}
+				res.Removed++
+				continue
+			}
+		}
 
 		// Remove the hook if it contains our marker. A symlink at the path is
 		// present but never ours, so it is left alone and, like any other
