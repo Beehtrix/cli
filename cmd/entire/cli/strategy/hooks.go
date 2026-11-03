@@ -617,7 +617,9 @@ const (
 )
 
 // brainWrapperPattern is the whole pre-push hook entire-brain writes, with
-// only the quoted path to its plugin binary left open. Matching it whole is
+// only the path to its plugin binary left open, single-quoted as Brain's
+// shellSingleQuote writes it (an embedded quote closes the quoting, adds an
+// escaped quote and reopens it). Matching it whole is
 // what makes the chain count: a wrapper with any line added, removed or
 // changed (an early exit, the chain inside a condition, another backup=)
 // reads as another tool's hook, which Entire re-wraps as it does on main.
@@ -625,8 +627,8 @@ var brainWrapperPattern = regexp.MustCompile(`\A#!/bin/sh
 ` + regexp.QuoteMeta(brainHookMarker) + `
 # Tells the local entire-brain plugin that a push is transferring this
 # repo's commits, so it uploads its fact store \(detached, best-effort\)\.
-if \[ -x ('[^'\n]+') \]; then
-  ('[^'\n]+') memory notify --event push </dev/null >/dev/null 2>&1 &
+if \[ -x ('(?:[^'\n]|'\\'')+') \]; then
+  ('(?:[^'\n]|'\\'')+') memory notify --event push </dev/null >/dev/null 2>&1 &
 fi
 # Chain: run the pre-existing hook with the original stdin and arguments;
 # its exit code decides the push, exactly as before\.

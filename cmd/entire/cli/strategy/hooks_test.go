@@ -2029,6 +2029,7 @@ func TestCheckGitHookState_BrainPrePushWrapper(t *testing.T) {
 	commandAfterChain := brainPrePushWrapper + "echo after\n"
 	echoesExit := strings.Replace(brainPrePushWrapper, `backup="$0`, "echo exit\n"+`backup="$0`, 1)
 	exitInPath := strings.ReplaceAll(brainPrePushWrapper, "/home/me/.local", "/home/my exit dir/.local")
+	quoteInPath := strings.ReplaceAll(brainPrePushWrapper, "/home/me/.local", `/home/o'\''brien/.local`)
 	chainInFalse := strings.Replace(strings.Replace(brainPrePushWrapper, `backup="$0`, "if false; then\n"+`backup="$0`, 1), `"$@"; fi`+"\n", `"$@"; fi`+"\nfi\n", 1)
 	caseExit := strings.Replace(brainPrePushWrapper, `backup="$0`, `case "$1" in origin) exit 0;; esac`+"\n"+`backup="$0`, 1)
 	secondBackup := strings.Replace(brainPrePushWrapper, `if [ -x "$backup" ]`, "backup=/dev/null\n"+`if [ -x "$backup" ]`, 1)
@@ -2060,6 +2061,7 @@ func TestCheckGitHookState_BrainPrePushWrapper(t *testing.T) {
 		{name: "second backup assignment", wrapper: secondBackup, moved: current, want: GitHooksAbsent},
 		{name: "two different plugin paths", wrapper: otherPlugin, moved: current, want: GitHooksAbsent},
 		{name: "exit in Brain's quoted path", wrapper: exitInPath, moved: current, want: GitHooksCurrent},
+		{name: "quote in Brain's path", wrapper: quoteInPath, moved: current, want: GitHooksCurrent},
 		{name: "moved copy not executable", wrapper: brainPrePushWrapper, moved: current, movedMode: 0o644, want: GitHooksAbsent},
 		{name: "wrapper not executable", wrapper: brainPrePushWrapper, wrapperMode: 0o644, moved: current, want: GitHooksAbsent},
 		// Only group and other may execute: git and Brain's [ -x ] check the
