@@ -2281,6 +2281,40 @@ func TestInstallGitHooks_BrainCopyKeepsUserAdditions(t *testing.T) {
 	}
 }
 
+// Updating Entire's line in a copy the user added lines to keeps the copy's
+// mode, so a private (0700) copy doesn't become readable by everyone.
+func TestInstallGitHooks_BrainCopyWithUserLineKeepsItsMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no Unix permission bits on Windows")
+	}
+	const userLine = "echo custom >> /tmp/custom.log\n"
+	currentLine := prePushHookLine(bareEntireHookCmd) + "\n"
+	for _, mode := range []os.FileMode{0o700, 0o750, 0o755} {
+		t.Run(mode.String(), func(t *testing.T) {
+			_, hooksDir := initHooksTestRepo(t)
+			ctx := context.Background()
+			_, err := InstallGitHook(ctx, true, false)
+			require.NoError(t, err)
+			prePush := filepath.Join(hooksDir, prePushHook)
+			movedPath := prePush + ".pre-entire-brain"
+			require.NoError(t, os.Remove(prePush))
+			require.NoError(t, os.WriteFile(movedPath, []byte(oldPrePushHeader+oldPrePushUnguardedLine+userLine), 0o600))
+			require.NoError(t, os.Chmod(movedPath, mode))
+			require.NoError(t, os.WriteFile(prePush, []byte(brainPrePushWrapper), 0o755))
+
+			_, err = InstallGitHook(ctx, true, false)
+			require.NoError(t, err)
+
+			data, err := os.ReadFile(movedPath)
+			require.NoError(t, err)
+			require.Equal(t, oldPrePushHeader+currentLine+userLine, string(data))
+			info, err := os.Stat(movedPath)
+			require.NoError(t, err)
+			require.Equal(t, mode, info.Mode().Perm())
+		})
+	}
+}
+
 // `entire configure --absolute-git-hook-path` over Brain's layout puts the
 // absolute path in the copy Brain runs even when the user added lines to it, so
 // a GUI client without entire on PATH still runs Entire's pre-push handler.

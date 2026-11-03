@@ -1253,10 +1253,16 @@ func updateEditedBrainCopy(ctx context.Context, root *os.Root, hooksDir string, 
 		logging.Warn(ctx, "left an edited copy of Entire's git hook behind entire-brain's wrapper as it is", slog.String("hook", spec.name), slog.String("copy", brainCopy))
 		return 0, true, nil
 	}
+	// The copy holds the user's own lines, so it keeps the access they gave
+	// it: a 0700 copy stays private instead of turning world-readable.
+	perm := fs.FileMode(0o755)
+	if info, err := root.Lstat(brainCopy); err == nil {
+		perm = info.Mode().Perm() | 0o700
+	}
 	if err := brainCopyUnchanged(root, hooksDir, brainCopy, copied); err != nil {
 		return 0, true, err
 	}
-	written, err := writeHookFile(root, brainCopy, updated)
+	written, err := writeHookFileMode(root, brainCopy, updated, perm)
 	if err != nil {
 		return 0, true, fmt.Errorf("failed to update the copy of Entire's %s hook that entire-brain runs: %w", spec.name, err)
 	}
@@ -1292,14 +1298,19 @@ func brainCopyUnchanged(root *os.Root, hooksDir, brainCopy, read string) error {
 // through an atomic rename like this one.) The 0o755 is applied to the temp file
 // before the rename, so the hook lands executable regardless of umask.
 func writeHookFile(root *os.Root, name, content string) (bool, error) {
+	// Git hooks must be executable (0o755)
+	return writeHookFileMode(root, name, content, 0o755)
+}
+
+// writeHookFileMode is writeHookFile with the mode the written file gets.
+func writeHookFileMode(root *os.Root, name, content string, perm fs.FileMode) (bool, error) {
 	// Check if file already exists with same content
 	existing, err := osroot.ReadFileNoFollow(root, name)
 	if err == nil && string(existing) == content {
 		return false, nil // Already up to date
 	}
 
-	// Git hooks must be executable (0o755)
-	if err := jsonutil.WriteFileAtomicIn(root, name, []byte(content), 0o755); err != nil {
+	if err := jsonutil.WriteFileAtomicIn(root, name, []byte(content), perm); err != nil {
 		return false, fmt.Errorf("failed to write hook file %s: %w", name, err)
 	}
 	return true, nil
