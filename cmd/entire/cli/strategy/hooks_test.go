@@ -2029,6 +2029,10 @@ func TestCheckGitHookState_BrainPrePushWrapper(t *testing.T) {
 	commandAfterChain := brainPrePushWrapper + "echo after\n"
 	echoesExit := strings.Replace(brainPrePushWrapper, `backup="$0`, "echo exit\n"+`backup="$0`, 1)
 	exitInPath := strings.ReplaceAll(brainPrePushWrapper, "/home/me/.local", "/home/my exit dir/.local")
+	chainInFalse := strings.Replace(strings.Replace(brainPrePushWrapper, `backup="$0`, "if false; then\n"+`backup="$0`, 1), `"$@"; fi`+"\n", `"$@"; fi`+"\nfi\n", 1)
+	caseExit := strings.Replace(brainPrePushWrapper, `backup="$0`, `case "$1" in origin) exit 0;; esac`+"\n"+`backup="$0`, 1)
+	secondBackup := strings.Replace(brainPrePushWrapper, `if [ -x "$backup" ]`, "backup=/dev/null\n"+`if [ -x "$backup" ]`, 1)
+	otherPlugin := strings.Replace(brainPrePushWrapper, "'/home/me/.local/share/entire/plugins/bin/entire-brain' memory", "'/tmp/other' memory", 1)
 	for _, tc := range []struct {
 		name        string
 		wrapper     string
@@ -2047,10 +2051,14 @@ func TestCheckGitHookState_BrainPrePushWrapper(t *testing.T) {
 		// The chain only counts when the hook gets to it.
 		{name: "wrapper exits before its chain", wrapper: exitsFirst, moved: current, want: GitHooksAbsent},
 		{name: "wrapper may exit before its chain", wrapper: exitsInCondition, moved: current, want: GitHooksAbsent},
-		// The exec replaces the shell, so what follows it does not matter, and
-		// exit as a word inside a command does not end the hook.
-		{name: "command after the chain", wrapper: commandAfterChain, moved: current, want: GitHooksCurrent},
-		{name: "exit as an argument before the chain", wrapper: echoesExit, moved: current, want: GitHooksCurrent},
+		// Only Brain's wrapper exactly, for any one plugin path, counts: any
+		// edit, harmless or not, reads as another tool's hook, as on main.
+		{name: "command after the chain", wrapper: commandAfterChain, moved: current, want: GitHooksAbsent},
+		{name: "echo before the chain", wrapper: echoesExit, moved: current, want: GitHooksAbsent},
+		{name: "chain inside a false condition", wrapper: chainInFalse, moved: current, want: GitHooksAbsent},
+		{name: "case that exits before the chain", wrapper: caseExit, moved: current, want: GitHooksAbsent},
+		{name: "second backup assignment", wrapper: secondBackup, moved: current, want: GitHooksAbsent},
+		{name: "two different plugin paths", wrapper: otherPlugin, moved: current, want: GitHooksAbsent},
 		{name: "exit in Brain's quoted path", wrapper: exitInPath, moved: current, want: GitHooksCurrent},
 		{name: "moved copy not executable", wrapper: brainPrePushWrapper, moved: current, movedMode: 0o644, want: GitHooksAbsent},
 		{name: "wrapper not executable", wrapper: brainPrePushWrapper, wrapperMode: 0o644, moved: current, want: GitHooksAbsent},

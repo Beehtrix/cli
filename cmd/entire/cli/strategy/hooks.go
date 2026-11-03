@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -615,52 +616,29 @@ const (
 	brainExecLine     = `if [ -x "$backup" ]; then exec "$backup" "$@"; fi`
 )
 
-// isBrainWrapper reports whether content is Brain's wrapper with its chain
-// intact: the marker, then the assignment and the exec each on a line of its
-// own, so a chain that was commented out or removed does not count. No command
-// before the exec may start with exit, exec or return, which would end the
-// hook before the chain runs; commands after it are fine, since the exec
-// replaces the shell. Anything else reads as another tool's hook, which Entire
-// re-wraps as it does on main.
-func isBrainWrapper(content string) bool {
-	marker, assigned := false, false
-	for line := range strings.Lines(content) {
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case trimmed == brainHookMarker:
-			marker = true
-		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
-		case trimmed == brainChainLine:
-			assigned = true
-		case trimmed == brainExecLine:
-			return marker && assigned
-		case endsShell(trimmed):
-			return false
-		}
-	}
-	return false
-}
+// brainWrapperPattern is the whole pre-push hook entire-brain writes, with
+// only the quoted path to its plugin binary left open. Matching it whole is
+// what makes the chain count: a wrapper with any line added, removed or
+// changed (an early exit, the chain inside a condition, another backup=)
+// reads as another tool's hook, which Entire re-wraps as it does on main.
+var brainWrapperPattern = regexp.MustCompile(`\A#!/bin/sh
+` + regexp.QuoteMeta(brainHookMarker) + `
+# Tells the local entire-brain plugin that a push is transferring this
+# repo's commits, so it uploads its fact store \(detached, best-effort\)\.
+if \[ -x ('[^'\n]+') \]; then
+  ('[^'\n]+') memory notify --event push </dev/null >/dev/null 2>&1 &
+fi
+# Chain: run the pre-existing hook with the original stdin and arguments;
+# its exit code decides the push, exactly as before\.
+` + regexp.QuoteMeta(brainChainLine) + `
+` + regexp.QuoteMeta(brainExecLine) + `
+\z`)
 
-// endsShell reports whether a shell line has a command that starts with exit,
-// exec or return: the line is split at ; & and |, and the keywords that can
-// open a command (if, then, ! and so on) are skipped. Words inside a command,
-// such as an argument or a quoted path, do not count. Quoting is not parsed,
-// so a ; inside quotes can still make a word count; that errs toward reading
-// the wrapper as not Brain's, which is what main does with every wrapper.
-func endsShell(line string) bool {
-	for _, command := range strings.FieldsFunc(line, func(r rune) bool { return r == ';' || r == '&' || r == '|' }) {
-		for _, word := range strings.Fields(command) {
-			word = strings.TrimLeft(word, "({")
-			if word == "" || slices.Contains([]string{"if", "then", "else", "elif", "do", "while", "until", "!"}, word) {
-				continue
-			}
-			if word == "exit" || word == "exec" || word == "return" {
-				return true
-			}
-			break
-		}
-	}
-	return false
+// isBrainWrapper reports whether content is exactly Brain's wrapper, for one
+// plugin path (see brainWrapperPattern).
+func isBrainWrapper(content string) bool {
+	m := brainWrapperPattern.FindStringSubmatch(content)
+	return m != nil && m[1] == m[2]
 }
 
 // brainChainedEntireHook returns the content of pre-push.pre-entire-brain when
@@ -760,22 +738,16 @@ func isCurrentPrePushHook(content string) bool {
 }
 
 // isRunnableHookFile reports whether name in root is a regular file (not
-// followed if it is a symlink) that this process may read and execute, which
-// is what git and a [ -x ] guard need of a shell hook: not just any execute
-// bit, but one the kernel grants us (see canExecuteHook), asked about the file
-// opened through root. Windows has no execute bit, so there it only has to be
-// a regular file.
+// followed if it is a symlink) that this process may execute, which is what
+// git and a [ -x ] guard need: not just any execute bit, but one the kernel
+// grants us (see canExecuteHook). Windows has no execute bit, so there it only
+// has to be a regular file.
 func isRunnableHookFile(root *os.Root, name string) bool {
-	f, err := osroot.OpenNoFollow(root, name)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	info, err := f.Stat()
+	info, err := root.Lstat(name)
 	if err != nil || !info.Mode().IsRegular() {
 		return false
 	}
-	return canExecuteHook(f, info)
+	return canExecuteHook(root, name)
 }
 
 // entireHookLineRunsFromWorkingTree reports whether the hook's OWN Entire

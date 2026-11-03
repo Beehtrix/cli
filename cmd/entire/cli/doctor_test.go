@@ -2204,8 +2204,19 @@ func TestCheckGitHooks_BrainPrePushWrapper(t *testing.T) {
 	require.NoError(t, err)
 	prePush := filepath.Join(dir, ".git", "hooks", "pre-push")
 	require.NoError(t, os.Rename(prePush, prePush+".pre-entire-brain"))
-	wrapper := "#!/bin/sh\n# entire-brain push hook\n" +
-		"backup=\"$0.pre-entire-brain\"\nif [ -x \"$backup\" ]; then exec \"$backup\" \"$@\"; fi\n"
+	// What entire-brain v0.4.0 writes, but for the plugin path.
+	wrapper := `#!/bin/sh
+# entire-brain push hook
+# Tells the local entire-brain plugin that a push is transferring this
+# repo's commits, so it uploads its fact store (detached, best-effort).
+if [ -x '/home/me/.local/share/entire/plugins/pkg/brain/entire-brain' ]; then
+  '/home/me/.local/share/entire/plugins/pkg/brain/entire-brain' memory notify --event push </dev/null >/dev/null 2>&1 &
+fi
+# Chain: run the pre-existing hook with the original stdin and arguments;
+# its exit code decides the push, exactly as before.
+backup="$0.pre-entire-brain"
+if [ -x "$backup" ]; then exec "$backup" "$@"; fi
+`
 	require.NoError(t, os.WriteFile(prePush, []byte(wrapper), 0o755))
 
 	for _, force := range []bool{false, true} {

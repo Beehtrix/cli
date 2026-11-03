@@ -3,35 +3,22 @@
 package strategy
 
 import (
-	"io/fs"
 	"os"
-	"slices"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-// canExecuteByMode is canExecuteHook from the mode bits alone, for when the
-// kernel cannot be asked through the descriptor: the one permission class the
-// kernel checks for this process (owner, group or other), as access(X_OK)
-// does, and any execute bit for root. It cannot see POSIX ACLs.
-func canExecuteByMode(info fs.FileInfo) bool {
-	perm := info.Mode().Perm()
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return perm&0o111 != 0
+// canExecuteHook reports whether this process may execute name, a file
+// directly in root. It asks the kernel with faccessat(X_OK) relative to the
+// root's own directory descriptor, with the real ids, which is git's
+// access(X_OK) before it runs a hook and what sh's [ -x ] asks, so ownership,
+// the permission class that applies, POSIX ACLs and root count as they do for
+// them, and no path is resolved outside the root.
+func canExecuteHook(root *os.Root, name string) bool {
+	dir, err := root.Open(".")
+	if err != nil {
+		return false
 	}
-	uid := os.Getuid()
-	if uid == 0 {
-		return perm&0o111 != 0
-	}
-	if int(st.Uid) == uid {
-		return perm&0o100 != 0
-	}
-	gid := int(st.Gid)
-	if gid == os.Getgid() {
-		return perm&0o010 != 0
-	}
-	if groups, err := os.Getgroups(); err == nil && slices.Contains(groups, gid) {
-		return perm&0o010 != 0
-	}
-	return perm&0o001 != 0
+	defer dir.Close()
+	return unix.Faccessat(int(dir.Fd()), name, unix.X_OK, 0) == nil
 }

@@ -2,10 +2,7 @@
 
 package strategy
 
-import (
-	"io/fs"
-	"os"
-)
+import "os"
 
 // canExecuteHook: Windows has no execute bit, so any regular file can run.
-func canExecuteHook(*os.File, fs.FileInfo) bool { return true }
+func canExecuteHook(*os.Root, string) bool { return true }
