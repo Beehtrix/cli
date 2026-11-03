@@ -713,15 +713,16 @@ func isCurrentPrePushHook(content string) bool {
 }
 
 // isRunnableHookFile reports whether name in root is a regular file (not
-// followed if it is a symlink) with an execute bit, which is what git and a
-// [ -x ] guard need. Windows has no execute bit, so there it only has to be a
-// regular file.
+// followed if it is a symlink) that this process may execute, which is what git
+// and a [ -x ] guard need: the owner's execute bit when we own it, not just any
+// execute bit (see canExecuteHook). Windows has no execute bit, so there it only
+// has to be a regular file.
 func isRunnableHookFile(root *os.Root, name string) bool {
 	info, err := root.Lstat(name)
 	if err != nil || !info.Mode().IsRegular() {
 		return false
 	}
-	return runtime.GOOS == goosWindows || info.Mode().Perm()&0o111 != 0
+	return canExecuteHook(info)
 }
 
 // entireHookLineRunsFromWorkingTree reports whether the hook's OWN Entire

@@ -2030,6 +2030,7 @@ func TestCheckGitHookState_BrainPrePushWrapper(t *testing.T) {
 		wrapperMode os.FileMode // 0 means 0o755
 		moved       string      // "" leaves pre-push.pre-entire-brain absent
 		movedMode   os.FileMode // 0 means 0o755
+		notRoot     bool        // the case relies on the owner's bit, which root ignores
 		want        GitHookState
 	}{
 		{name: "chains to Entire's current hook", wrapper: brainPrePushWrapper, moved: current, want: GitHooksCurrent},
@@ -2040,11 +2041,19 @@ func TestCheckGitHookState_BrainPrePushWrapper(t *testing.T) {
 		{name: "chain exec commented out", wrapper: execCommentedOut, moved: current, want: GitHooksAbsent},
 		{name: "moved copy not executable", wrapper: brainPrePushWrapper, moved: current, movedMode: 0o644, want: GitHooksAbsent},
 		{name: "wrapper not executable", wrapper: brainPrePushWrapper, wrapperMode: 0o644, moved: current, want: GitHooksAbsent},
+		// Only group and other may execute: git and Brain's [ -x ] check the
+		// owner's bit for the owner, so neither runs the file.
+		{name: "moved copy executable by group and other only", wrapper: brainPrePushWrapper, moved: current, movedMode: 0o655, notRoot: true, want: GitHooksAbsent},
+		{name: "wrapper executable by group and other only", wrapper: brainPrePushWrapper, wrapperMode: 0o655, moved: current, notRoot: true, want: GitHooksAbsent},
+		{name: "both executable by the owner only", wrapper: brainPrePushWrapper, wrapperMode: 0o700, moved: current, movedMode: 0o700, want: GitHooksCurrent},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			if (tc.movedMode != 0 || tc.wrapperMode != 0) && runtime.GOOS == goosWindows {
 				t.Skip("Windows has no execute bit")
+			}
+			if tc.notRoot && os.Geteuid() == 0 {
+				t.Skip("root may execute a file with any execute bit")
 			}
 			dir := t.TempDir()
 			writeCurrentManagedHooks(t, dir)
