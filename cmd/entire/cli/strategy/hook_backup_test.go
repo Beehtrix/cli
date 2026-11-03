@@ -1602,6 +1602,14 @@ func TestRemoveHooks_NearBrainLayouts(t *testing.T) {
 				brainCopy:                 spec.content,
 			},
 		},
+		"backed-up python hook using sys.argv": {
+			hook:   brainWrapper,
+			backup: "#!/usr/bin/env python3\nimport os, sys\nos.execv(sys.argv[0] + '.other', ['x'])\n",
+			want: map[string]string{
+				"pre-push" + backupSuffix: "#!/usr/bin/env python3\nimport os, sys\nos.execv(sys.argv[0] + '.other', ['x'])\n",
+				brainCopy:                 spec.content,
+			},
+		},
 		// Moving a hook that names the copy into the copy could make it run
 		// itself, and removing the copy would leave nothing running it.
 		"backed-up hook naming the copy": {

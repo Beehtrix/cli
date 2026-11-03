@@ -754,8 +754,14 @@ func singleQuotedPrefix(s string) string {
 }
 
 // ownPathRefs are the usual ways a hook finds its own path: sh's $0, bash's
-// BASH_SOURCE, and the script-path names of Python, Ruby, Perl and Node.
-var ownPathRefs = [][]byte{[]byte("$0"), []byte("${0"), []byte("BASH_SOURCE"), []byte("__file__"), []byte("__FILE__"), []byte("__filename"), []byte("__dirname")}
+// BASH_SOURCE, and the script-path and argv names of Python, Ruby, Perl and
+// Node. Best effort: a hook that finds its path some other way is moved like
+// any other, as Entire's and Brain's installs move it.
+var ownPathRefs = [][]byte{
+	[]byte("$0"), []byte("${0"), []byte("BASH_SOURCE"),
+	[]byte("__file__"), []byte("sys.argv"), []byte("__FILE__"),
+	[]byte("__filename"), []byte("__dirname"), []byte("process.argv"),
+}
 
 // mentionsOwnPath: name refers to its own path, so renaming it could change
 // what it runs. Any mention counts.
