@@ -113,6 +113,13 @@ func (f *hooksFixture) exists(name string) bool {
 	return err == nil
 }
 
+func (f *hooksFixture) chmod(name string, mode os.FileMode) {
+	f.t.Helper()
+	if err := os.Chmod(filepath.Join(f.dir, name), mode); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
 func (f *hooksFixture) install(specs ...hookSpec) {
 	f.t.Helper()
 	if _, err := installHooks(context.Background(), f.lockRoot, f.root, f.dir, specs, backupClock); err != nil {
@@ -1414,9 +1421,9 @@ func (f *hooksFixture) brainInstall(wrapper ...string) {
 // "$0.pre-entire-brain" and so never names the copy it runs. Brain's wrapper
 // stays in front of the user's hook if there is one, as Brain's own install
 // would have left it, and runs nothing of Entire's either way: in front of
-// Entire (right after connect) or behind it (Entire re-wrapped Brain on a
-// later install, leaving the old copy dormant until uninstall puts the
-// wrapper back).
+// Entire (right after connect or a later install) or behind it (Entire
+// re-wrapped a Brain wrapper that could not run, leaving the old copy dormant
+// until uninstall puts the wrapper back).
 func TestRemoveHooks_AfterBrainWrapperLeavesNoEntireHook(t *testing.T) {
 	t.Parallel()
 	if runtime.GOOS == "windows" {
@@ -1442,14 +1449,29 @@ func TestRemoveHooks_AfterBrainWrapperLeavesNoEntireHook(t *testing.T) {
 		"brain in front, no user hook": {
 			setup: func(f *hooksFixture) { f.install(spec); f.brainInstall() },
 		},
-		"Entire re-wrapped brain, no user hook": {
+		"Entire installed again after brain, no user hook": {
 			setup: func(f *hooksFixture) { f.install(spec); f.brainInstall(); f.install(spec) },
 		},
-		// The re-wrap rotated the user's hook to an older copy, which cannot
-		// be told from any other; it stays there and is reported.
-		"Entire re-wrapped brain, user hook rotated away": {
+		// A later install leaves Brain's wrapper in front, so this ends as
+		// "brain in front, with a user hook".
+		"Entire installed again after brain, with a user hook": {
+			userHook:   true,
+			setup:      func(f *hooksFixture) { f.install(spec); f.brainInstall(); f.install(spec) },
+			copyIsUser: true, want: "user",
+		},
+		// A wrapper that cannot run does not count as installed, so the later
+		// install re-wraps it and rotates the user's hook to an older copy,
+		// which cannot be told from any other; it stays there and is reported.
+		// The wrapper's mode is put back so the push below runs it.
+		"Entire re-wrapped a non-executable brain, user hook rotated away": {
 			userHook: true,
-			setup:    func(f *hooksFixture) { f.install(spec); f.brainInstall(); f.install(spec) },
+			setup: func(f *hooksFixture) {
+				f.install(spec)
+				f.brainInstall()
+				f.chmod("pre-push", 0o644)
+				f.install(spec)
+				f.chmod("pre-push"+backupSuffix, 0o755)
+			},
 		},
 		// Not a moved copy of Entire's hook: Brain moved the user's own hook,
 		// and Brain's wrapper goes on running it after uninstall.
