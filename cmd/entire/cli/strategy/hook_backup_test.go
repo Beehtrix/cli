@@ -1585,6 +1585,33 @@ func TestRemoveHooks_NearBrainLayouts(t *testing.T) {
 				brainCopy:                 spec.content,
 			},
 		},
+		// The same goes for the other usual ways a script finds its own path.
+		"backed-up bash hook using BASH_SOURCE": {
+			hook:   brainWrapper,
+			backup: "#!/bin/bash\nexec \"${BASH_SOURCE[0]}.other\" \"$@\"\n",
+			want: map[string]string{
+				"pre-push" + backupSuffix: "#!/bin/bash\nexec \"${BASH_SOURCE[0]}.other\" \"$@\"\n",
+				brainCopy:                 spec.content,
+			},
+		},
+		"backed-up python hook using __file__": {
+			hook:   brainWrapper,
+			backup: "#!/usr/bin/env python3\nimport os\nos.execv(__file__ + '.other', ['x'])\n",
+			want: map[string]string{
+				"pre-push" + backupSuffix: "#!/usr/bin/env python3\nimport os\nos.execv(__file__ + '.other', ['x'])\n",
+				brainCopy:                 spec.content,
+			},
+		},
+		// Moving a hook that names the copy into the copy could make it run
+		// itself, and removing the copy would leave nothing running it.
+		"backed-up hook naming the copy": {
+			hook:   brainWrapper,
+			backup: "#!/bin/sh\n# runs before pre-push.pre-entire-brain\nexit 0\n",
+			want: map[string]string{
+				"pre-push" + backupSuffix: "#!/bin/sh\n# runs before pre-push.pre-entire-brain\nexit 0\n",
+				brainCopy:                 spec.content,
+			},
+		},
 		"brain wrapper at the hook path and backed up": {
 			hook:   brainWrapper,
 			backup: brainWrapper,

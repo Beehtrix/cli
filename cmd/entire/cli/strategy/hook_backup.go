@@ -753,18 +753,23 @@ func singleQuotedPrefix(s string) string {
 	return ""
 }
 
-// mentionsOwnPath: name refers to $0, so renaming it could change what it
-// runs. Any mention counts.
+// ownPathRefs are the usual ways a hook finds its own path: sh's $0, bash's
+// BASH_SOURCE, and the script-path names of Python, Ruby, Perl and Node.
+var ownPathRefs = [][]byte{[]byte("$0"), []byte("${0"), []byte("BASH_SOURCE"), []byte("__file__"), []byte("__FILE__"), []byte("__filename"), []byte("__dirname")}
+
+// mentionsOwnPath: name refers to its own path, so renaming it could change
+// what it runs. Any mention counts.
 func mentionsOwnPath(root *os.Root, name string) bool {
 	data, err := osroot.ReadFileNoFollow(root, name)
-	return err != nil || bytes.Contains(data, []byte("$0")) || bytes.Contains(data, []byte("${0"))
+	return err != nil || slices.ContainsFunc(ownPathRefs, func(ref []byte) bool { return bytes.Contains(data, ref) })
 }
 
 // restoreBrainChain is restoreWrapped for entire-brain's wrapper. With the
 // wrapper at hook (Brain installed over Entire), the user's hook in
 // .pre-entire goes into the copy, where the wrapper runs it, as Brain's own
 // install would have left it; with none, the copy goes. A hook there that
-// refers to $0 could change if moved, so that layout is left as on main. With
+// refers to its own path or names the copy could change if moved, so that
+// layout is left as on main. With
 // Entire's hook at hook and the wrapper backed up (Entire re-wrapped Brain),
 // the copy was dormant, and the caller is about to put the wrapper back
 // where it would run it, so the copy goes. A keep copy beside m is left to
@@ -774,17 +779,16 @@ func restoreBrainChain(root *os.Root, hook, m string) (bool, error) {
 		return false, nil // a keep copy holds the user's hook: restore it as for any wrapper
 	}
 	backup := hook + backupSuffix
+	userBackup := hookFileExists(root, backup) && !carriesEntireMarker(root, backup) && !isBrainChain(root, backup, hook)
 	switch {
-	case isBrainChain(root, hook, hook) && hookFileExists(root, backup) && mentionsOwnPath(root, backup) &&
-		!carriesEntireMarker(root, backup) && !isBrainChain(root, backup, hook):
-		// Moving it could change what it runs, and removing the copy would
-		// stop Entire's copy running it from .pre-entire: leave all as is.
+	case isBrainChain(root, hook, hook) && userBackup && (mentionsOwnPath(root, backup) || runsByName(root, backup, m)):
+		// Moving it could change what it runs (or make it run itself), and
+		// removing the copy would stop Entire's copy running it from
+		// .pre-entire: leave all as is.
 		return false, nil
+	case isBrainChain(root, hook, hook) && userBackup:
+		return true, root.Rename(backup, m) //nolint:wrapcheck // caller adds the file name
 	case isBrainChain(root, hook, hook):
-		if hookFileExists(root, backup) && !carriesEntireMarker(root, backup) &&
-			!isBrainChain(root, backup, hook) && !runsByName(root, backup, m) {
-			return true, root.Rename(backup, m) //nolint:wrapcheck // caller adds the file name
-		}
 		return true, root.Remove(m) //nolint:wrapcheck // caller adds the file name
 	case carriesEntireMarker(root, hook) && isBrainChain(root, backup, hook):
 		return true, root.Remove(m) //nolint:wrapcheck // caller adds the file name
