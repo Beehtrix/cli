@@ -2,37 +2,12 @@
 
 package strategy
 
-import (
-	"io/fs"
-	"os"
-	"slices"
-	"syscall"
-)
+import "golang.org/x/sys/unix"
 
-// canExecuteHook reports whether this process may execute a file with info,
-// using the one permission class the kernel checks (owner, group or other)
-// the way git's and sh's access(X_OK) does. A file with only group or other
-// execute bits is not runnable by its owner, so git skips it as a hook and
-// Brain's [ -x ] guard skips it as a chained copy.
-func canExecuteHook(info fs.FileInfo) bool {
-	perm := info.Mode().Perm()
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return perm&0o111 != 0
-	}
-	euid := os.Geteuid()
-	if euid == 0 {
-		return perm&0o111 != 0
-	}
-	if int(st.Uid) == euid {
-		return perm&0o100 != 0
-	}
-	gid := int(st.Gid)
-	if gid == os.Getegid() {
-		return perm&0o010 != 0
-	}
-	if groups, err := os.Getgroups(); err == nil && slices.Contains(groups, gid) {
-		return perm&0o010 != 0
-	}
-	return perm&0o001 != 0
+// canExecuteHook reports whether this process may execute the file at path. It
+// asks the kernel with access(X_OK), which is what git does before it runs a
+// hook and what sh's [ -x ] does, so ownership, the permission class that
+// applies, POSIX ACLs and root all count the same way they do for them.
+func canExecuteHook(path string) bool {
+	return unix.Access(path, unix.X_OK) == nil
 }

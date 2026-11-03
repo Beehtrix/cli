@@ -616,21 +616,42 @@ const (
 )
 
 // isBrainWrapper reports whether content is Brain's wrapper with its chain
-// intact: the marker, the assignment and the exec each on a line of its own, so
-// a chain that was commented out or removed does not count.
+// intact: the marker on a line of its own, and the assignment and the exec as
+// its last two commands, so a chain that was commented out, removed or moved
+// does not count. No command before them may exit, exec or return, which would
+// end the hook before it reaches the chain. Anything else reads as another
+// tool's hook, which Entire re-wraps as it does on main.
 func isBrainWrapper(content string) bool {
-	var marker, assign, execs bool
+	marker := false
+	var commands []string
 	for line := range strings.Lines(content) {
-		switch strings.TrimSpace(line) {
-		case brainHookMarker:
+		trimmed := strings.TrimSpace(line)
+		if trimmed == brainHookMarker {
 			marker = true
-		case brainChainLine:
-			assign = true
-		case brainExecLine:
-			execs = true
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		commands = append(commands, trimmed)
+	}
+	n := len(commands)
+	if !marker || n < 2 || commands[n-2] != brainChainLine || commands[n-1] != brainExecLine {
+		return false
+	}
+	for _, command := range commands[:n-2] {
+		for _, word := range strings.FieldsFunc(command, isShellSeparator) {
+			if word == "exit" || word == "exec" || word == "return" {
+				return false
+			}
 		}
 	}
-	return marker && assign && execs
+	return true
+}
+
+// isShellSeparator splits a shell line into words around the operators that
+// can put a command such as exit after another one.
+func isShellSeparator(r rune) bool {
+	return r == ' ' || r == '\t' || r == ';' || r == '&' || r == '|' || r == '(' || r == ')' || r == '{' || r == '}'
 }
 
 // brainChainedEntireHook returns the content of pre-push.pre-entire-brain when
@@ -655,9 +676,12 @@ func brainChainedEntireHook(root *os.Root, hook, content string) (string, bool) 
 
 // withCurrentEntireLine returns content, a pre-push hook the user edited, with
 // its one line that runs Entire's pre-push handler replaced by the one in
-// current, and the user's lines as they are. It reports false when content
-// does not have exactly one such line, since then which line is Entire's is a
-// guess.
+// current, and the user's lines as they are. That line has to be, exactly, one
+// Entire wrote (see isEntirePrePushLine), not continued from or onto another
+// line. It reports false when content has no such line, more than one, or
+// another line that is not a comment and runs Entire's handler (in a condition
+// of the user's, say), since then replacing the line would change what the
+// user wrote, or which line is Entire's is a guess.
 func withCurrentEntireLine(content, current string) (string, bool) {
 	const runsEntire = ` hooks git pre-push "$1"`
 	var line string
@@ -673,10 +697,12 @@ func withCurrentEntireLine(content, current string) (string, bool) {
 	lines := strings.SplitAfter(content, "\n")
 	at := -1
 	for i, l := range lines {
-		if !strings.Contains(l, runsEntire) {
+		text := strings.TrimSuffix(l, "\n")
+		if !strings.Contains(text, runsEntire) || strings.HasPrefix(strings.TrimSpace(text), "#") {
 			continue
 		}
-		if at >= 0 {
+		continued := strings.HasSuffix(text, `\`) || (i > 0 && strings.HasSuffix(strings.TrimSuffix(lines[i-1], "\n"), `\`))
+		if at >= 0 || continued || !isEntirePrePushLine(text) {
 			return "", false
 		}
 		at = i
@@ -690,6 +716,18 @@ func withCurrentEntireLine(content, current string) (string, bool) {
 	}
 	lines[at] = line + end
 	return strings.Join(lines, ""), true
+}
+
+// isEntirePrePushLine reports whether line is exactly a line Entire's pre-push
+// hook has run its handler with: today's, for any command prefix, or one from
+// before the ref list (see isPrePushBeforeRefList).
+func isEntirePrePushLine(line string) bool {
+	if _, rest, ok := strings.Cut(line, PrePushStdinRefsEnv+"=1 "); ok {
+		if prefix, _, ok := strings.Cut(rest, ` hooks git pre-push "$1" < "$_entire_refs"`); ok && line == prePushHookLine(prefix) {
+			return true
+		}
+	}
+	return isPrePushBeforeRefList(prePushHeaderBeforeRefList + line + "\n")
 }
 
 // isCurrentPrePushHook reports whether content is exactly the pre-push hook
@@ -714,15 +752,15 @@ func isCurrentPrePushHook(content string) bool {
 
 // isRunnableHookFile reports whether name in root is a regular file (not
 // followed if it is a symlink) that this process may execute, which is what git
-// and a [ -x ] guard need: the owner's execute bit when we own it, not just any
-// execute bit (see canExecuteHook). Windows has no execute bit, so there it only
+// and a [ -x ] guard need: not just any execute bit, but one access(X_OK)
+// grants us (see canExecuteHook). Windows has no execute bit, so there it only
 // has to be a regular file.
 func isRunnableHookFile(root *os.Root, name string) bool {
 	info, err := root.Lstat(name)
 	if err != nil || !info.Mode().IsRegular() {
 		return false
 	}
-	return canExecuteHook(info)
+	return canExecuteHook(filepath.Join(root.Name(), name))
 }
 
 // entireHookLineRunsFromWorkingTree reports whether the hook's OWN Entire
@@ -1109,6 +1147,9 @@ func installHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string,
 						logging.Warn(ctx, "left an edited copy of Entire's git hook behind entire-brain's wrapper as it is", slog.String("hook", spec.name), slog.String("copy", brainCopy))
 						continue
 					}
+					if err := brainCopyUnchanged(root, hooksDir, brainCopy, copied); err != nil {
+						return installedCount, err
+					}
 					written, err := writeHookFile(root, brainCopy, updated)
 					if err != nil {
 						return installedCount, fmt.Errorf("failed to update the copy of Entire's %s hook that entire-brain runs: %w", spec.name, err)
@@ -1123,6 +1164,9 @@ func installHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string,
 				content := spec.content
 				if hookFileExists(root, backupName) && !carriesEntireMarker(root, backupName) {
 					content = generateChainedContent(spec.content, spec.name)
+				}
+				if err := brainCopyUnchanged(root, hooksDir, brainCopy, copied); err != nil {
+					return installedCount, err
 				}
 				written, err := writeHookFile(root, brainCopy, content)
 				if err != nil {
@@ -1195,6 +1239,20 @@ func installHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string,
 		}
 	}
 	return installedCount, nil
+}
+
+// brainCopyUnchanged reports an error when the copy Brain runs is no longer
+// what install read and classified, as hookUnchanged does for the hook path:
+// another tool replaced it while Entire was installing, so it is left as it is.
+func brainCopyUnchanged(root *os.Root, hooksDir, brainCopy, read string) error {
+	afterHookBackup(brainCopy)
+	data, err := osroot.ReadFileNoFollow(root, brainCopy)
+	if err == nil && string(data) == read {
+		return nil
+	}
+	return fmt.Errorf("%w: %s changed while Entire was updating it; "+
+		"it was left as it is, so re-run 'entire enable' to update it",
+		errHookChangedDuringInstall, filepath.Join(hooksDir, brainCopy))
 }
 
 // writeHookFile writes a hook file if it doesn't exist or has different content.
