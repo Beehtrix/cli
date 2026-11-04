@@ -414,9 +414,7 @@ func (s *ManualCommitStrategy) findSessionsForWorktreeFromStates(ctx context.Con
 const recentSessionWindow = 15 * time.Minute
 
 // resolveWorktreeCandidates reduces fallback candidates to a linkable set.
-// All from one worktree: linked (the supported concurrent-session case),
-// except sessions idle beyond recentSessionWindow, which are no more likely
-// to be this commit's than they are in the multi-worktree case below.
+// All from one worktree: linked (the supported concurrent-session case).
 // Spanning several worktrees: filter to recently-interacting sessions and
 // link only if a single worktree remains — days-idle stragglers must not
 // veto the obviously-live session, but between two live worktrees there is
@@ -428,10 +426,10 @@ func resolveWorktreeCandidates(ctx context.Context, worktreePath string, candida
 	if len(candidates) == 0 {
 		return nil, false
 	}
-	cutoff := time.Now().Add(-recentSessionWindow)
 	if matches := sessionsFromSingleWorktree(candidates); matches != nil {
-		return withoutIdleSessions(ctx, worktreePath, matches, cutoff), false
+		return matches, false
 	}
+	cutoff := time.Now().Add(-recentSessionWindow)
 	var live []*SessionState
 	for _, state := range candidates {
 		if state.LastInteractionTime != nil && state.LastInteractionTime.After(cutoff) {
@@ -447,13 +445,23 @@ func resolveWorktreeCandidates(ctx context.Context, worktreePath string, candida
 	return nil, true
 }
 
-// withoutIdleSessions drops the sessions whose last recorded interaction is
-// older than cutoff. A session with no recorded interaction is kept: how long
-// it has been idle is unknown.
-func withoutIdleSessions(ctx context.Context, worktreePath string, states []*SessionState, cutoff time.Time) []*SessionState {
+// withoutIdleSessions drops, from the fallback's matches of a commit with no
+// session homed in its worktree, the sessions idle beyond recentSessionWindow:
+// they are no more likely to be this commit's than they are when the
+// candidates span several worktrees. When all candidates came from one
+// worktree, resolveWorktreeCandidates links them without that check, and
+// post-commit would condense a session idle for days into every commit made
+// here. Kept: a session with no recorded interaction (how long it has been
+// idle is unknown), and one mid-turn whose turn started within
+// activeSessionInteractionThreshold, since LastInteractionTime only moves at
+// turn boundaries. Only commit linking applies this; amend and post-rewrite
+// still find the sessions they keep the existing links of.
+func withoutIdleSessions(ctx context.Context, worktreePath string, states []*SessionState) []*SessionState {
+	cutoff := time.Now().Add(-recentSessionWindow)
 	var kept []*SessionState
 	for _, state := range states {
-		if state.LastInteractionTime != nil && !state.LastInteractionTime.After(cutoff) {
+		last := state.LastInteractionTime
+		if last != nil && !last.After(cutoff) && !(state.Phase.IsActive() && isRecentInteraction(last)) {
 			logging.Debug(logging.WithComponent(ctx, "checkpoint"),
 				"session matching: fallback session idle beyond the recent window; not linked",
 				slog.String("commit_worktree", worktreePath),
