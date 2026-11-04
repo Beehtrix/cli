@@ -414,7 +414,9 @@ func (s *ManualCommitStrategy) findSessionsForWorktreeFromStates(ctx context.Con
 const recentSessionWindow = 15 * time.Minute
 
 // resolveWorktreeCandidates reduces fallback candidates to a linkable set.
-// All from one worktree: linked (the supported concurrent-session case).
+// All from one worktree: linked (the supported concurrent-session case),
+// except sessions idle beyond recentSessionWindow, which are no more likely
+// to be this commit's than they are in the multi-worktree case below.
 // Spanning several worktrees: filter to recently-interacting sessions and
 // link only if a single worktree remains — days-idle stragglers must not
 // veto the obviously-live session, but between two live worktrees there is
@@ -426,10 +428,10 @@ func resolveWorktreeCandidates(ctx context.Context, worktreePath string, candida
 	if len(candidates) == 0 {
 		return nil, false
 	}
-	if matches := sessionsFromSingleWorktree(candidates); matches != nil {
-		return matches, false
-	}
 	cutoff := time.Now().Add(-recentSessionWindow)
+	if matches := sessionsFromSingleWorktree(candidates); matches != nil {
+		return withoutIdleSessions(ctx, worktreePath, matches, cutoff), false
+	}
 	var live []*SessionState
 	for _, state := range candidates {
 		if state.LastInteractionTime != nil && state.LastInteractionTime.After(cutoff) {
@@ -443,6 +445,25 @@ func resolveWorktreeCandidates(ctx context.Context, worktreePath string, candida
 	}
 	warnAmbiguousWorktreeSessions(ctx, worktreePath, candidates)
 	return nil, true
+}
+
+// withoutIdleSessions drops the sessions whose last recorded interaction is
+// older than cutoff. A session with no recorded interaction is kept: how long
+// it has been idle is unknown.
+func withoutIdleSessions(ctx context.Context, worktreePath string, states []*SessionState, cutoff time.Time) []*SessionState {
+	var kept []*SessionState
+	for _, state := range states {
+		if state.LastInteractionTime != nil && !state.LastInteractionTime.After(cutoff) {
+			logging.Debug(logging.WithComponent(ctx, "checkpoint"),
+				"session matching: fallback session idle beyond the recent window; not linked",
+				slog.String("commit_worktree", worktreePath),
+				slog.String("session_id", state.SessionID),
+				slog.String("session_worktree", state.WorktreePath))
+			continue
+		}
+		kept = append(kept, state)
+	}
+	return kept
 }
 
 // warnAmbiguousWorktreeSessions surfaces refused fallback matches: live
