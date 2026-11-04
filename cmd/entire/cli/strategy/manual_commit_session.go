@@ -451,17 +451,13 @@ func resolveWorktreeCandidates(ctx context.Context, worktreePath string, candida
 // candidates span several worktrees. When all candidates came from one
 // worktree, resolveWorktreeCandidates links them without that check, and
 // post-commit would condense a session idle for days into every commit made
-// here. Kept: a session with no recorded interaction (how long it has been
-// idle is unknown), and one mid-turn whose turn started within
-// activeSessionInteractionThreshold, since LastInteractionTime only moves at
-// turn boundaries. Only commit linking applies this; amend and post-rewrite
-// still find the sessions they keep the existing links of.
+// here. Only commit linking applies this; amend and post-rewrite still find
+// the sessions they keep the existing links of.
 func withoutIdleSessions(ctx context.Context, worktreePath string, states []*SessionState) []*SessionState {
-	cutoff := time.Now().Add(-recentSessionWindow)
+	now := time.Now()
 	var kept []*SessionState
 	for _, state := range states {
-		last := state.LastInteractionTime
-		if last != nil && !last.After(cutoff) && !(state.Phase.IsActive() && isRecentInteraction(last)) {
+		if idleBeyondRecentWindow(state, now) {
 			logging.Debug(logging.WithComponent(ctx, "checkpoint"),
 				"session matching: fallback session idle beyond the recent window; not linked",
 				slog.String("commit_worktree", worktreePath),
@@ -472,6 +468,24 @@ func withoutIdleSessions(ctx context.Context, worktreePath string, states []*Ses
 		kept = append(kept, state)
 	}
 	return kept
+}
+
+// idleBeyondRecentWindow reports whether state last interacted before
+// recentSessionWindow and shows no other sign of still working. A session with
+// no recorded interaction is not: how long it has been idle is unknown.
+// LastInteractionTime only moves at turn boundaries, so a session mid-turn
+// (within activeSessionInteractionThreshold) or with a background subagent in
+// flight (hasFreshLiveTaskRecord) is not either: either may be making this
+// commit.
+func idleBeyondRecentWindow(state *SessionState, now time.Time) bool {
+	last := state.LastInteractionTime
+	if last == nil || last.After(now.Add(-recentSessionWindow)) {
+		return false
+	}
+	if state.Phase.IsActive() && isRecentInteraction(last) {
+		return false
+	}
+	return !hasFreshLiveTaskRecord(state, now)
 }
 
 // warnAmbiguousWorktreeSessions surfaces refused fallback matches: live

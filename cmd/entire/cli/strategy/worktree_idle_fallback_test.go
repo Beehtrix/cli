@@ -14,12 +14,12 @@ import (
 
 // Uses t.Chdir — do NOT add t.Parallel().
 
-// saveSiblingSession saves a session homed in dir with the given phase and
-// last interaction.
-func saveSiblingSession(t *testing.T, s *ManualCommitStrategy, dir, id string, phase session.Phase, last *time.Time) {
+// saveSiblingSession saves a session homed in dir with the given phase, last
+// interaction and task records.
+func saveSiblingSession(t *testing.T, s *ManualCommitStrategy, dir, id string, phase session.Phase, last *time.Time, tasks ...session.TaskRecord) {
 	t.Helper()
 	ctx := context.Background()
-	state := &SessionState{SessionID: id, WorktreePath: dir, LastInteractionTime: last}
+	state := &SessionState{SessionID: id, WorktreePath: dir, LastInteractionTime: last, TaskRecords: tasks}
 	saveSessionMatchState(ctx, t, s, dir, state)
 	state.Phase = phase
 	require.NoError(t, s.saveSessionState(ctx, state))
@@ -30,8 +30,9 @@ func saveSiblingSession(t *testing.T, s *ManualCommitStrategy, dir, id string, p
 // recentSessionWindow is not plausibly the commit's session, so it is not
 // linked: post-commit would otherwise condense its whole transcript into every
 // commit made here (cli issue 2979). Kept: a session with no recorded
-// interaction, as before, and one mid-turn whose turn started within
-// activeSessionInteractionThreshold.
+// interaction, as before, one mid-turn whose turn started within
+// activeSessionInteractionThreshold, and one whose background subagent is
+// still running.
 func TestCommitLinking_FallbackSkipsSiblingSessionsIdleBeyondTheWindow(t *testing.T) {
 	now := time.Now()
 	twoDaysAgo := now.Add(-48 * time.Hour)
@@ -41,24 +42,29 @@ func TestCommitLinking_FallbackSkipsSiblingSessionsIdleBeyondTheWindow(t *testin
 	type sess struct {
 		phase session.Phase
 		last  *time.Time
+		tasks []session.TaskRecord
 	}
+	inFlight := []session.TaskRecord{{ToolUseID: "call_bg", AgentID: "child", StartedAt: justPast}}
+	finished := []session.TaskRecord{{ToolUseID: "call_bg", AgentID: "child", StartedAt: dayAgo, CompletedAt: justPast}}
 	for _, tt := range []struct {
 		name     string
 		sessions map[string]sess
 		want     []string
 	}{
-		{name: "idle for a day", sessions: map[string]sess{"stale": {session.PhaseIdle, &dayAgo}}},
-		{name: "idle just past the window", sessions: map[string]sess{"stale": {session.PhaseIdle, &justPast}}},
-		{name: "recent", sessions: map[string]sess{"recent": {session.PhaseIdle, &recent}}, want: []string{"recent"}},
-		{name: "no recorded interaction", sessions: map[string]sess{"undated": {session.PhaseIdle, nil}}, want: []string{"undated"}},
-		{name: "mid-turn past the window", sessions: map[string]sess{"long-turn": {session.PhaseActive, &justPast}}, want: []string{"long-turn"}},
-		{name: "left active for two days", sessions: map[string]sess{"abandoned": {session.PhaseActive, &twoDaysAgo}}},
+		{name: "idle for a day", sessions: map[string]sess{"stale": {session.PhaseIdle, &dayAgo, nil}}},
+		{name: "idle just past the window", sessions: map[string]sess{"stale": {session.PhaseIdle, &justPast, nil}}},
+		{name: "recent", sessions: map[string]sess{"recent": {session.PhaseIdle, &recent, nil}}, want: []string{"recent"}},
+		{name: "no recorded interaction", sessions: map[string]sess{"undated": {session.PhaseIdle, nil, nil}}, want: []string{"undated"}},
+		{name: "mid-turn past the window", sessions: map[string]sess{"long-turn": {session.PhaseActive, &justPast, nil}}, want: []string{"long-turn"}},
+		{name: "left active for two days", sessions: map[string]sess{"abandoned": {session.PhaseActive, &twoDaysAgo, nil}}},
+		{name: "idle with a subagent in flight", sessions: map[string]sess{"bg": {session.PhaseIdle, &dayAgo, inFlight}}, want: []string{"bg"}},
+		{name: "idle with a finished subagent", sessions: map[string]sess{"bg": {session.PhaseIdle, &dayAgo, finished}}},
 		{
 			name: "stale beside recent and undated",
 			sessions: map[string]sess{
-				"stale":   {session.PhaseIdle, &dayAgo},
-				"recent":  {session.PhaseIdle, &recent},
-				"undated": {session.PhaseIdle, nil},
+				"stale":   {session.PhaseIdle, &dayAgo, nil},
+				"recent":  {session.PhaseIdle, &recent, nil},
+				"undated": {session.PhaseIdle, nil, nil},
 			},
 			want: []string{"recent", "undated"},
 		},
@@ -67,7 +73,7 @@ func TestCommitLinking_FallbackSkipsSiblingSessionsIdleBeyondTheWindow(t *testin
 			mainDir, linkedDir := twoWorktrees(t)
 			s := &ManualCommitStrategy{}
 			for id, st := range tt.sessions {
-				saveSiblingSession(t, s, mainDir, id, st.phase, st.last)
+				saveSiblingSession(t, s, mainDir, id, st.phase, st.last, st.tasks...)
 			}
 			assert.ElementsMatch(t, tt.want, linkingIDs(t, linkedDir))
 		})
