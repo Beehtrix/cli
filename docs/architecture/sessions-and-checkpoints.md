@@ -324,7 +324,13 @@ commit.
   records the sessions prepare linked for each stamped ID, and post-commit
   keeps them when it matches sessions again (`withLinkedSessions`): one that
   looks idle by then, after a long prompt or editor wait, is still condensed
-  into the trailer prepare wrote. The trailer an amend restores names an
+  into the trailer prepare wrote. The entry also names the sessions prepare
+  stamped on their shape alone, ACTIVE mid-turn or IDLE with a running
+  subagent (`trustedSessionIDs`). In a commit no session's tracked files
+  claim, post-commit condenses those without overlap evidence
+  (`trustedByPrepare`) even once the subagent has finished or the turn has
+  ended, so a session with no tracked files still writes the checkpoint the
+  trailer names. A claimed commit is the claimant's, as before. The trailer an amend restores names an
   existing checkpoint and is not recorded: post-commit condenses into it for
   its owner without a stamp, keeping that owner however idle it looks
   (`withAmendedCheckpoint`: HEAD's reflog shows it replaced, not advanced, and
@@ -657,7 +663,10 @@ forever. A completed record confers no trust: its subagent can no longer be
 the committer, and completion merged its files into `FilesTouched`, so the
 ordinary overlap check links a commit that carries them. Trusting completed
 records let a read-only reviewer's session condense into other sessions'
-commits. The same predicate feeds `shouldCondenseWithOverlapCheck`'s
+commits. The exception is the commit prepare stamped while the record was
+live: post-commit keeps prepare's trust for that trailer (`trustedByPrepare`),
+so a reviewer that finishes while the editor is open does not leave it
+dangling, and the read-only gate below still applies. The same predicate feeds `shouldCondenseWithOverlapCheck`'s
 overlap-check bypass, so the trigger and the condensation trust share one
 rule. The trailer's content guarantee is the materializer itself: the
 commit's condensation stores each record's transcript-so-far under the
