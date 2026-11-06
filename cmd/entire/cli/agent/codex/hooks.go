@@ -671,6 +671,9 @@ func hookFileStateForReadError(err error) HookFileState {
 	return HookFileUnavailable
 }
 
+// managedHookIsCurrent reports whether the event has exactly one Entire hook,
+// it is want, and it is in an unfiltered group, which is the state
+// syncHookCommand leaves; anything else is what `entire enable` would rewrite.
 func managedHookIsCurrent(groups []MatcherGroup, want HookEntry) bool {
 	count := 0
 	for _, group := range groups {
@@ -678,7 +681,7 @@ func managedHookIsCurrent(groups []MatcherGroup, want HookEntry) bool {
 			if !isEntireHook(hook.Command) {
 				continue
 			}
-			if !sameManagedSettings(hook, want) {
+			if group.Matcher != nil || !sameManagedSettings(hook, want) {
 				return false
 			}
 			count++
@@ -736,10 +739,12 @@ func hookEntryExists(groups []MatcherGroup, want HookEntry) bool {
 // syncHookCommand makes want the event's one Entire hook. The Entire hook
 // already there (an exact match first, else the first one an older release
 // wrote) is updated in place, so fields the user added to it, such as
-// statusMessage or async, survive the upgrade; one being updated out of a group
-// with a matcher moves, fields and all, to the unfiltered group Entire installs
-// into, so it fires for every tool again. Any other Entire hook for the event is
-// removed, and want is added when there is none. It applies
+// statusMessage or async, survive the upgrade. If it sits in a group with a
+// matcher, current or not, it moves, fields and all, to the unfiltered group
+// Entire installs into, so it fires for every tool again; the group's own
+// fields stay with the group and its remaining hooks, and a group left with no
+// hooks is dropped. Any other Entire hook for the event is removed, and want is
+// added when there is none. It applies
 // agent.DropStaleManagedHooks' rule (every install drops Entire hooks an older
 // release left behind) through the same IsManagedHookCommand recognition, but
 // rewrites the one it keeps instead of re-adding it.
@@ -757,11 +762,10 @@ func syncHookCommand(groups []MatcherGroup, want HookEntry) ([]MatcherGroup, boo
 			switch {
 			case !kept && keep(hook):
 				kept = true
-				if sameManagedSettings(hook, want) && hook.Type == want.Type {
-					break
+				if !sameManagedSettings(hook, want) || hook.Type != want.Type {
+					hook = hook.withManagedSettings(want)
+					changed = true
 				}
-				hook = hook.withManagedSettings(want)
-				changed = true
 				if group.Matcher != nil {
 					moved = &hook
 					continue

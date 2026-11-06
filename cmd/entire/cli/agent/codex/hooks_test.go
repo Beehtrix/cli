@@ -218,44 +218,66 @@ func TestInstallHooks_MigratesConfigsWrittenBeforeCommandWindows(t *testing.T) {
 	}
 }
 
-// An outdated Entire hook found under a matcher moves to the unfiltered group
-// when it is upgraded, keeping its fields: left under the matcher it would fire
-// only for that tool. The user's own hook in that group stays where it is.
+// An Entire hook found under a matcher moves to the unfiltered group on
+// install, keeping its fields, whether it is outdated or already current: left
+// under the matcher it would fire only for that tool. The user's own hook in
+// that group stays where it is, and doctor then reports the file current.
 func TestInstallHooks_UpgradeMovesEntireHookOutOfMatcherGroup(t *testing.T) {
-	tempDir := setupTestEnv(t)
 	var post managedHook
 	for _, h := range managedHooks {
 		if h.event == "PostToolUse" {
 			post = h
 		}
 	}
-	posix, _ := post.commands()
-	seed := `{"hooks":{"PostToolUse":[{"matcher":"apply_patch","hooks":[` +
-		`{"type":"command","command":"./audit.sh"},` +
-		`{"type":"command","command":` + strconv.Quote(posix) + `,"timeout":30,"statusMessage":"Saving"}` +
-		`]}]}}`
-	hooksPath := filepath.Join(tempDir, ".codex", HooksFileName)
-	require.NoError(t, os.MkdirAll(filepath.Dir(hooksPath), 0o750))
-	require.NoError(t, os.WriteFile(hooksPath, []byte(seed), 0o600))
-
-	_, err := (&CodexAgent{}).InstallHooks(context.Background(), false)
-	require.NoError(t, err)
-	_, data := readHooksFile(t, tempDir)
-	assertCodexEntries(t, data)
-	var doc struct {
-		Hooks map[string][]struct {
-			Matcher *string          `json:"matcher"`
-			Hooks   []map[string]any `json:"hooks"`
-		} `json:"hooks"`
+	posix, windows := post.commands()
+	outdated := `{"type":"command","command":` + strconv.Quote(posix) + `,"timeout":30,"statusMessage":"Saving"}`
+	current := `{"type":"command","command":` + strconv.Quote(posix) + `,"commandWindows":` + strconv.Quote(windows) +
+		`,"timeout":` + strconv.Itoa(post.timeout) + `,"statusMessage":"Saving"}`
+	matched := func(entire string) string {
+		return `{"matcher":"apply_patch","hooks":[{"type":"command","command":"./audit.sh"},` + entire + `]}`
 	}
-	require.NoError(t, json.Unmarshal(data, &doc))
-	groups := doc.Hooks["PostToolUse"]
-	require.Len(t, groups, 2)
-	require.NotNil(t, groups[0].Matcher)
-	require.Equal(t, []map[string]any{{"type": "command", "command": "./audit.sh"}}, groups[0].Hooks)
-	require.Nil(t, groups[1].Matcher)
-	require.Len(t, groups[1].Hooks, 1)
-	require.Equal(t, "Saving", groups[1].Hooks[0]["statusMessage"])
+	for _, tc := range []struct{ name, seed string }{
+		{"outdated", `{"hooks":{"PostToolUse":[` + matched(outdated) + `]}}`},
+		{"current, beside an unfiltered outdated one", `{"hooks":{"PostToolUse":[` + matched(current) +
+			`,{"hooks":[{"type":"command","command":` + strconv.Quote(posix) + `,"timeout":30}]}]}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := setupTestEnv(t)
+			hooksPath := filepath.Join(tempDir, ".codex", HooksFileName)
+			require.NoError(t, os.MkdirAll(filepath.Dir(hooksPath), 0o750))
+			require.NoError(t, os.WriteFile(hooksPath, []byte(tc.seed), 0o600))
+
+			_, err := (&CodexAgent{}).InstallHooks(context.Background(), false)
+			require.NoError(t, err)
+			_, data := readHooksFile(t, tempDir)
+			assertCodexEntries(t, data)
+			var doc struct {
+				Hooks map[string][]struct {
+					Matcher *string          `json:"matcher"`
+					Hooks   []map[string]any `json:"hooks"`
+				} `json:"hooks"`
+			}
+			require.NoError(t, json.Unmarshal(data, &doc))
+			groups := doc.Hooks["PostToolUse"]
+			require.Len(t, groups, 2)
+			require.NotNil(t, groups[0].Matcher)
+			require.Equal(t, []map[string]any{{"type": "command", "command": "./audit.sh"}}, groups[0].Hooks)
+			require.Nil(t, groups[1].Matcher)
+			require.Len(t, groups[1].Hooks, 1)
+			require.Equal(t, "Saving", groups[1].Hooks[0]["statusMessage"])
+			require.Equal(t, agentpkg.HooksCurrent, (&CodexAgent{}).CheckHookConfig(context.Background()))
+		})
+	}
+}
+
+// Doctor counts Entire's hook as current only in an unfiltered group, the
+// place install leaves it, so the two agree.
+func TestManagedHookIsCurrent_RequiresUnfilteredGroup(t *testing.T) {
+	t.Parallel()
+	want := managedEntry(managedHooks[0])
+	matcher := "apply_patch"
+	require.True(t, managedHookIsCurrent([]MatcherGroup{{Hooks: []HookEntry{want}}}, want))
+	require.False(t, managedHookIsCurrent([]MatcherGroup{{Matcher: &matcher, Hooks: []HookEntry{want}}}, want))
 }
 
 // Reported on #2884: `entire doctor` flagged hooks.json as out of date
