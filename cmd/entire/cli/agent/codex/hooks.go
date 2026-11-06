@@ -57,19 +57,35 @@ func HookEventSpecs() []HookEventSpec {
 	return append([]HookEventSpec(nil), hookEventSpecs...)
 }
 
-// managedHook adds the platform-specific command wrapper to one canonical
-// event specification.
+// managedHook adds the command wrappers to one canonical event specification.
 type managedHook struct {
 	event   string // hooks.json key
 	label   string // Codex trust-state key
 	verb    string // `entire hooks codex <verb>`
 	timeout int
-	wrap    func(cmd string, windows bool) string
+
+	// posix wraps the hook for `command`, which Codex runs through sh on macOS
+	// and Linux. windows wraps it for `commandWindows`, which Codex runs in its
+	// place on native Windows. Both are always written: Codex chooses between
+	// them by the platform it runs on, so Entire never has to guess that shell
+	// from the one `entire enable` happened to run in.
+	posix   func(cmd string) string
+	windows func(cmd string) string
+	// legacyWindows is what releases before commandWindows wrote into
+	// `command` on a Windows host whose sh probe failed. Recognized, never
+	// written.
+	legacyWindows func(cmd string) string
 
 	// core marks the events whose absence means Codex was never enabled in this
 	// repo, as opposed to enabled against an older release that installed fewer
 	// events. Only these gate AreHooksInstalled — see the comment there.
 	core bool
+}
+
+// commands returns the command and commandWindows Entire installs for h.
+func (h managedHook) commands() (posix, windows string) {
+	const cmdPrefix = "entire hooks codex "
+	return h.posix(cmdPrefix + h.verb), h.windows(cmdPrefix + h.verb)
 }
 
 func buildManagedHooks() []managedHook {
@@ -78,15 +94,24 @@ func buildManagedHooks() []managedHook {
 		if !spec.Managed {
 			continue
 		}
-		wrap := agent.WrapProductionSilentHookCommandForOS
+		posix := agent.WrapProductionSilentHookCommand
+		windows := agent.WrapWindowsProductionSilentHookCommand
+		legacyWindows := agent.WrapWindowsProductionSilentHookCommand
 		if spec.JSONWarning {
-			wrap = func(cmd string, windows bool) string {
-				return agent.WrapProductionJSONWarningHookCommandForOS(cmd, agent.WarningFormatSingleLine, windows)
+			posix = func(cmd string) string {
+				return agent.WrapProductionJSONWarningHookCommand(cmd, agent.WarningFormatSingleLine)
+			}
+			windows = func(cmd string) string {
+				return agent.WrapWindowsProductionNestedPlainTextWarningHookCommand(cmd, agent.WarningFormatSingleLine)
+			}
+			legacyWindows = func(cmd string) string {
+				return agent.WrapWindowsProductionJSONWarningHookCommand(cmd, agent.WarningFormatSingleLine)
 			}
 		}
 		managed = append(managed, managedHook{
 			event: spec.Event, label: spec.Label, verb: spec.Verb,
-			timeout: spec.Timeout, core: spec.Core, wrap: wrap,
+			timeout: spec.Timeout, core: spec.Core,
+			posix: posix, windows: windows, legacyWindows: legacyWindows,
 		})
 	}
 	return managed
@@ -127,8 +152,6 @@ func (c *CodexAgent) InstallHooks(ctx context.Context, force bool) (int, error) 
 		rawHooks = make(map[string]json.RawMessage)
 	}
 
-	const cmdPrefix = "entire hooks codex "
-	useWindowsProductionHooks := agent.UseWindowsProductionHooks(ctx)
 	count := 0
 	updated := make([][]MatcherGroup, len(managedHooks))
 	for i, h := range managedHooks {
@@ -139,8 +162,7 @@ func (c *CodexAgent) InstallHooks(ctx context.Context, force bool) (int, error) 
 		if force {
 			groups = removeEntireHooks(groups)
 		}
-		hookCmd := h.wrap(cmdPrefix+h.verb, useWindowsProductionHooks)
-		if synced, changed := syncHookCommand(groups, hookCmd, h.timeout); changed {
+		if synced, changed := syncHookCommand(groups, managedEntry(h)); changed {
 			groups = synced
 			count++
 		}
@@ -334,11 +356,10 @@ func (c *CodexAgent) CheckHookConfig(ctx context.Context) agent.HookConfigState 
 }
 
 type managedHookSpec struct {
-	event   string
-	label   string
-	command string
-	timeout int
-	core    bool
+	event string
+	label string
+	entry HookEntry
+	core  bool
 }
 
 // HookFileState distinguishes Entire's installation from unrelated user
@@ -370,21 +391,31 @@ type hooksDocument struct {
 	exists   bool
 }
 
-func managedHookSpecs(ctx context.Context) []managedHookSpec {
-	const cmdPrefix = "entire hooks codex "
-	useWindowsProductionHooks := agent.UseWindowsProductionHooks(ctx)
+// managedHookSpecs is the same on every host: the config Entire writes no
+// longer depends on the shell `entire enable` or `entire doctor` runs in, so a
+// file written from PowerShell reads as current from Git Bash and back.
+func managedHookSpecs() []managedHookSpec {
 	specs := make([]managedHookSpec, 0, len(managedHooks))
 	for _, hook := range managedHooks {
-		command := hook.wrap(cmdPrefix+hook.verb, useWindowsProductionHooks)
 		specs = append(specs, managedHookSpec{
-			event:   hook.event,
-			label:   hook.label,
-			command: command,
-			timeout: hook.timeout,
-			core:    hook.core,
+			event: hook.event,
+			label: hook.label,
+			entry: managedEntry(hook),
+			core:  hook.core,
 		})
 	}
 	return specs
+}
+
+// managedEntry is the hooks.json entry Entire installs for h.
+func managedEntry(h managedHook) HookEntry {
+	posix, windows := h.commands()
+	return HookEntry{
+		Type:           "command",
+		Command:        posix,
+		CommandWindows: windows,
+		Timeout:        h.timeout,
+	}
 }
 
 func inspectWorktreeHookConfig(ctx context.Context, hooks WorktreeHooksPath) HookConfigInspection {
@@ -466,7 +497,7 @@ func inspectHookConfigLightweightAt(path string) HookConfigInspection {
 	return inspection
 }
 
-func inspectHookConfigAt(ctx context.Context, path string) HookConfigInspection {
+func inspectHookConfigAt(_ context.Context, path string) HookConfigInspection {
 	document, err := readHooksDocument(path)
 	if err != nil {
 		return HookConfigInspection{State: hookFileStateForReadError(err), Err: err}
@@ -484,7 +515,7 @@ func inspectHookConfigAt(ctx context.Context, path string) HookConfigInspection 
 	if err != nil {
 		return HookConfigInspection{State: HookFileMalformed, Err: err}
 	}
-	for _, spec := range managedHookSpecs(ctx) {
+	for _, spec := range managedHookSpecs() {
 		var groups []MatcherGroup
 		if err := parseHookType(document.rawHooks, spec.event, &groups); err != nil {
 			return HookConfigInspection{State: HookFileMalformed, Err: err}
@@ -498,7 +529,7 @@ func inspectHookConfigAt(ctx context.Context, path string) HookConfigInspection 
 				inspection.CoreInstalled = false
 			}
 		}
-		if !managedHookIsCurrent(groups, spec.command, spec.timeout) {
+		if !managedHookIsCurrent(groups, spec.entry) {
 			inspection.Current = false
 		}
 	}
@@ -641,20 +672,31 @@ func hookFileStateForReadError(err error) HookFileState {
 	return HookFileUnavailable
 }
 
-func managedHookIsCurrent(groups []MatcherGroup, command string, timeoutSec int) bool {
+func managedHookIsCurrent(groups []MatcherGroup, want HookEntry) bool {
 	count := 0
 	for _, group := range groups {
 		for _, hook := range group.Hooks {
 			if !isEntireHook(hook.Command) {
 				continue
 			}
-			if hook.Command != command || hook.Timeout != timeoutSec {
+			if !sameManagedSettings(hook, want) {
 				return false
 			}
 			count++
 		}
 	}
 	return count == 1
+}
+
+// sameManagedSettings reports whether hook is want: both commands and the
+// timeout. The timeout is part of the match so an upgrade rewrites a hook
+// installed by an older Entire with a different budget — notably SessionEnd,
+// where a leftover 30s makes Codex print a clamping warning at every startup.
+// commandWindows is part of it so a hook written before Entire set one, or
+// with a Windows command from an older release, is replaced rather than left
+// to run the wrong command on Windows.
+func sameManagedSettings(hook, want HookEntry) bool {
+	return hook.Command == want.Command && hook.CommandWindows == want.CommandWindows && hook.Timeout == want.Timeout
 }
 
 // --- Helpers ---
@@ -680,15 +722,11 @@ func marshalHookType(rawHooks map[string]json.RawMessage, hookType string, group
 	rawHooks[hookType] = data
 }
 
-// hookCommandExists reports whether the exact command is already configured
-// with the timeout we want. The timeout is part of the match so an upgrade
-// rewrites a hook installed by an older Entire with a different budget —
-// notably SessionEnd, where a leftover 30s makes Codex print a clamping warning
-// at every startup.
-func hookCommandExists(groups []MatcherGroup, command string, timeoutSec int) bool {
+// hookEntryExists reports whether want is already configured exactly.
+func hookEntryExists(groups []MatcherGroup, want HookEntry) bool {
 	for _, group := range groups {
 		for _, hook := range group.Hooks {
-			if hook.Command == command && hook.Timeout == timeoutSec {
+			if sameManagedSettings(hook, want) {
 				return true
 			}
 		}
@@ -698,23 +736,23 @@ func hookCommandExists(groups []MatcherGroup, command string, timeoutSec int) bo
 
 // syncHookCommand ensures groups contains exactly the requested Entire hook and
 // removes stale commands left by an older install.
-func syncHookCommand(groups []MatcherGroup, command string, timeoutSec int) ([]MatcherGroup, bool) {
-	groups, dropped := dropStaleEntireHooks(groups, command, timeoutSec)
-	if hookCommandExists(groups, command, timeoutSec) {
+func syncHookCommand(groups []MatcherGroup, want HookEntry) ([]MatcherGroup, bool) {
+	groups, dropped := dropStaleEntireHooks(groups, want)
+	if hookEntryExists(groups, want) {
 		return groups, dropped
 	}
-	return addHook(groups, command, timeoutSec), true
+	return addHook(groups, want), true
 }
 
-func dropStaleEntireHooks(groups []MatcherGroup, command string, timeoutSec int) ([]MatcherGroup, bool) {
-	staleTimeout := func(e HookEntry) bool { return e.Command == command && e.Timeout != timeoutSec }
+func dropStaleEntireHooks(groups []MatcherGroup, want HookEntry) ([]MatcherGroup, bool) {
+	staleSettings := func(e HookEntry) bool { return e.Command == want.Command && !sameManagedSettings(e, want) }
 	result := make([]MatcherGroup, 0, len(groups))
 	dropped := false
 	for _, group := range groups {
-		kept, removed := agent.DropStaleManagedHooks(group.Hooks, hookEntryCommand, []string{command})
+		kept, removed := agent.DropStaleManagedHooks(group.Hooks, hookEntryCommand, []string{want.Command})
 		dropped = dropped || removed
-		if slices.ContainsFunc(kept, staleTimeout) {
-			kept = slices.DeleteFunc(slices.Clone(kept), staleTimeout)
+		if slices.ContainsFunc(kept, staleSettings) {
+			kept = slices.DeleteFunc(slices.Clone(kept), staleSettings)
 			dropped = true
 		}
 		if len(kept) > 0 {
@@ -730,13 +768,7 @@ func dropStaleEntireHooks(groups []MatcherGroup, command string, timeoutSec int)
 
 func hookEntryCommand(e HookEntry) string { return e.Command }
 
-func addHook(groups []MatcherGroup, command string, timeoutSec int) []MatcherGroup {
-	entry := HookEntry{
-		Type:    "command",
-		Command: command,
-		Timeout: timeoutSec,
-	}
-
+func addHook(groups []MatcherGroup, entry HookEntry) []MatcherGroup {
 	// Add to an existing group with null matcher, or create a new one
 	for i, group := range groups {
 		if group.Matcher == nil {
@@ -785,15 +817,26 @@ func removeEntireHooks(groups []MatcherGroup) []MatcherGroup {
 // HookConfigRelPath implements agent.HookConfigLocator.
 func (c *CodexAgent) HookConfigRelPath() string { return ".codex/" + HooksFileName }
 
-// EntireHookCommands returns the exact commands Entire installs, by event, in
-// both the sh and Windows wrappers. Callers must match whole commands.
+// EntireHookCommands returns, by event, every command Entire installs or has
+// installed for that event: today's `command` and `commandWindows`, plus the
+// Windows wrapper older releases wrote into `command` on hosts where sh did not
+// run. Callers must match whole commands, and must check a hook's Windows
+// command as well as its `command`, since Codex on Windows runs the former.
 func EntireHookCommands() map[string][]string {
 	const cmdPrefix = "entire hooks codex "
 	out := make(map[string][]string)
 	for _, hook := range managedHooks {
-		for _, windows := range []bool{false, true} {
-			out[hook.event] = append(out[hook.event], hook.wrap(cmdPrefix+hook.verb, windows))
+		posix, windows := hook.commands()
+		out[hook.event] = append(out[hook.event], posix, windows)
+		if legacy := hook.legacyWindows(cmdPrefix + hook.verb); legacy != windows {
+			out[hook.event] = append(out[hook.event], legacy)
 		}
 	}
 	return out
+}
+
+// WindowsCommandKeys returns the hook fields Codex runs in place of `command`
+// on Windows: commandWindows, and the command_windows spelling it also accepts.
+func WindowsCommandKeys() []string {
+	return []string{"commandWindows", "command_windows"}
 }

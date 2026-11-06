@@ -226,9 +226,11 @@ func WrapWindowsProductionSilentHookCommandDirect(command string) string {
 
 // WrapWindowsProductionJSONWarningHookCommand emits a JSON hook response with a
 // systemMessage field on stdout when the Entire CLI is missing from PATH. It
-// avoids sh so Codex hooks still work from native Windows shells. Codex already
-// runs hook commands through cmd.exe /C, so this JSON-bearing command uses that
-// shell directly instead of adding a second quote-parsing layer.
+// avoids sh, and is for a host that runs every hook command through cmd.exe
+// itself: the command is that shell's own syntax, with no cmd.exe prefix, so
+// the JSON's quotes need only one quote-parsing layer. A host that may run the
+// command through PowerShell instead needs
+// WrapWindowsProductionNestedPlainTextWarningHookCommand.
 func WrapWindowsProductionJSONWarningHookCommand(command string, format WarningFormat) string {
 	payload, err := jsonutil.MarshalWithNoHTMLEscape(struct {
 		SystemMessage string `json:"systemMessage,omitempty"`
@@ -242,6 +244,31 @@ func WrapWindowsProductionJSONWarningHookCommand(command string, format WarningF
 	return fmt.Sprintf(
 		`where.exe entire >nul 2>nul & if errorlevel 1 (echo %s) else (%s)`,
 		escapeWindowsCMD(string(payload)),
+		command,
+	)
+}
+
+// WrapWindowsProductionNestedPlainTextWarningHookCommand prints the missing-CLI
+// warning as plain text when the Entire CLI is missing from PATH, and otherwise
+// runs command. It is the warning counterpart of
+// WrapWindowsProductionSilentHookCommand, for a host whose Windows hook shell
+// is not fixed: Codex runs a hook's commandWindows through PowerShell
+// (`-NoProfile -Command`) when its session has a shell, which is the default,
+// and through %COMSPEC% /C otherwise.
+//
+// Both read the command the same way only because everything after `/c` is
+// one double-quoted string with no `"`, `$`, backtick or `%` inside it:
+// PowerShell passes it to cmd.exe as a single literal argument, and the outer
+// cmd.exe leaves it alone because its metacharacters are all quoted. The inner
+// cmd.exe's /s then strips the two quotes and runs the line. A JSON warning
+// cannot meet that: its quotes would end PowerShell's string, and the escape
+// PowerShell needs for them is a different one from cmd.exe's. Codex treats
+// plain stdout from a start hook as context it shows and passes to the model,
+// so the warning still surfaces.
+func WrapWindowsProductionNestedPlainTextWarningHookCommand(command string, format WarningFormat) string {
+	return fmt.Sprintf(
+		`cmd.exe /d /s /c "where.exe entire >nul 2>nul & if errorlevel 1 (echo %s) else (%s)"`,
+		escapeWindowsCMD(windowsPlainTextWarning(format)),
 		command,
 	)
 }
@@ -402,8 +429,8 @@ var (
 // is true only on Windows when the sh-based wrapper does not actually run on
 // this host. This lives in the shared agent layer so every agent that wraps
 // hooks for production inherits the same Windows fallback decision rather than
-// re-implementing the probe and selection (codex is the first adopter; the
-// other agents can switch to these helpers without new logic).
+// re-implementing the probe and selection (cursor uses it; codex did until it
+// moved to Codex's own commandWindows, see HookHostIsWindows).
 //
 // The probe runs once per InstallHooks call (not memoized): InstallHooks is
 // invoked once per `entire enable`, and not caching is what lets a host that
@@ -441,16 +468,22 @@ func defaultSHHookWrapperWorks(ctx context.Context, command string) bool {
 // wrapper, which is full of `>` and `&`, is still cut apart by cmd.exe before
 // any sh sees it.
 //
-// Codex and Cursor keep UseWindowsProductionHooks, but do NOT read that as
-// "their runners are different". WrapWindowsProductionSilentHookCommand's own
-// doc, runWindowsWrapper in hook_command_exec_windows_test.go, and cursor's
-// InstallHooks all describe those runners as going through cmd.exe too. What
-// separates them is only evidence: Codex demonstrably passes the Windows
-// nightly with the sh wrapper installed, so whatever its composition does, the
-// wrapper survives it. Cursor has no such evidence — it is excluded from the
-// Windows matrix (no tmux) — so it may well have this same defect. Establish
-// that the way it was established here, by reading the runner, before changing
-// its gate.
+// Cursor keeps UseWindowsProductionHooks, but do NOT read that as "its runner
+// is different". cursor's InstallHooks describes it as going through cmd.exe
+// too, and it has no evidence either way — it is excluded from the Windows
+// matrix (no tmux) — so it may well have this same defect. Establish that by
+// reading the runner before changing its gate.
+//
+// Codex needs neither gate. Its hooks.json takes a commandWindows beside
+// command, and Codex itself runs the one for the platform it is on, so Entire
+// writes both and decides nothing at install time. Reading its runner
+// (codex-rs/hooks/src/engine/command_runner.rs) also showed why the probe was
+// the wrong question there: on Windows Codex runs a hook through PowerShell
+// whenever the session has a shell, and through %COMSPEC% /C only otherwise.
+// That is the likeliest reason the Windows nightly passed with the sh wrapper
+// installed (the runner has Git's sh on PATH, and PowerShell hands the wrapper
+// to it as one argument), and it means the direct cmd.exe form a failed probe
+// chose for SessionStart could not even parse there.
 func HookHostIsWindows() bool {
 	return hookCommandOS == hookWrapperOSWindows
 }

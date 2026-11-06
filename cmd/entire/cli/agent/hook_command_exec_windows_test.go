@@ -43,6 +43,29 @@ func runDroidWrapper(t *testing.T, wrapper string, entirePresent bool) (string, 
 
 func runWrapperCmdLine(t *testing.T, buildCmdLine func(cmdPath string) string, entirePresent bool) (string, string, int) {
 	t.Helper()
+	stub := ""
+	if entirePresent {
+		stub = "@exit /b 0\r\n"
+	}
+	return runWrapperProcess(t, stub, "", func() *exec.Cmd {
+		cmdPath, err := exec.LookPath("cmd.exe")
+		if err != nil {
+			t.Fatalf("find cmd.exe: %v", err)
+		}
+		cmd := exec.CommandContext(t.Context(), cmdPath)
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			CmdLine: buildCmdLine(cmdPath),
+		}
+		return cmd
+	})
+}
+
+// runWrapperProcess runs the command newCmd builds with a PATH holding only
+// System32 and, when entireStub is not empty, an entire.bat with that content,
+// feeding it stdin. newCmd is called after PATH is narrowed, so anything it
+// looks up there resolves against that PATH.
+func runWrapperProcess(t *testing.T, entireStub, stdin string, newCmd func() *exec.Cmd) (string, string, int) {
+	t.Helper()
 
 	sysRoot := os.Getenv("SystemRoot")
 	if sysRoot == "" {
@@ -51,30 +74,22 @@ func runWrapperCmdLine(t *testing.T, buildCmdLine func(cmdPath string) string, e
 	// System32 supplies cmd.exe and where.exe; nothing else is on PATH so an
 	// `entire` installed on the host machine can't leak into the "absent" case.
 	pathEntries := []string{filepath.Join(sysRoot, "System32")}
-	if entirePresent {
+	if entireStub != "" {
 		stubDir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(stubDir, "entire.bat"), []byte("@exit /b 0\r\n"), 0o700); err != nil {
+		if err := os.WriteFile(filepath.Join(stubDir, "entire.bat"), []byte(entireStub), 0o700); err != nil {
 			t.Fatalf("write entire stub: %v", err)
 		}
 		pathEntries = append([]string{stubDir}, pathEntries...)
 	}
 	t.Setenv("PATH", strings.Join(pathEntries, ";"))
 
-	runDir := t.TempDir()
-	cmdPath, err := exec.LookPath("cmd.exe")
-	if err != nil {
-		t.Fatalf("find cmd.exe: %v", err)
-	}
-
-	cmd := exec.CommandContext(t.Context(), cmdPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CmdLine: buildCmdLine(cmdPath),
-	}
-	cmd.Dir = runDir // clean CWD so `where` can't find a stray entire next to us
+	cmd := newCmd()
+	cmd.Dir = t.TempDir() // clean CWD so `where` can't find a stray entire next to us
+	cmd.Stdin = strings.NewReader(stdin)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err = cmd.Run()
+	err := cmd.Run()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -234,4 +249,138 @@ func TestWindowsWrappers_DroidComposition(t *testing.T) {
 			t.Fatalf("expected exit 0, got %d; stderr=%q", code, stderr)
 		}
 	})
+}
+
+// codexWindowsShell is one way Codex on Windows runs a hook's commandWindows
+// (codex-rs/hooks/src/engine/command_runner.rs, build_command).
+type codexWindowsShell struct {
+	name string
+	run  func(t *testing.T, hook, entireStub, stdin string) (string, string, int)
+}
+
+// codexWindowsShells lists the runners Codex uses on Windows that this host
+// can provide: PowerShell, which Codex runs hooks through whenever the session
+// has a shell (its default Windows shell is PowerShell, pwsh first), and
+// %COMSPEC% /C with the hook quoted raw, its fallback.
+func codexWindowsShells(t *testing.T) []codexWindowsShell {
+	t.Helper()
+	shells := []codexWindowsShell{{
+		name: "cmd /C",
+		run: func(t *testing.T, hook, entireStub, stdin string) (string, string, int) {
+			t.Helper()
+			return runWrapperProcess(t, entireStub, stdin, func() *exec.Cmd {
+				cmdPath, err := exec.LookPath("cmd.exe")
+				if err != nil {
+					t.Fatalf("find cmd.exe: %v", err)
+				}
+				cmd := exec.CommandContext(t.Context(), cmdPath)
+				cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: `"` + cmdPath + `" /C "` + hook + `"`}
+				return cmd
+			})
+		},
+	}}
+	// Resolved before runWrapperProcess narrows PATH to System32, which holds
+	// neither. The hook is one ordinary argument after -Command: Codex passes it
+	// with Rust's std quoting, which follows the same rules as Go's.
+	for _, exe := range []string{"powershell.exe", "pwsh.exe"} {
+		path, err := exec.LookPath(exe)
+		if err != nil {
+			if exe == "powershell.exe" {
+				t.Fatalf("find %s: %v", exe, err)
+			}
+			t.Logf("%s not installed; not covered on this host", exe)
+			continue
+		}
+		shells = append(shells, codexWindowsShell{
+			name: exe,
+			run: func(t *testing.T, hook, entireStub, stdin string) (string, string, int) {
+				t.Helper()
+				return runWrapperProcess(t, entireStub, stdin, func() *exec.Cmd {
+					return exec.CommandContext(t.Context(), path, "-NoProfile", "-Command", hook)
+				})
+			},
+		})
+	}
+	return shells
+}
+
+// TestWindowsNestedWrappers_CodexShells runs the wrappers Entire writes into
+// Codex's commandWindows through every shell Codex may hand them to on
+// Windows. The direct cmd.exe forms do not survive PowerShell, which reads `&`
+// and `if errorlevel` as its own syntax, and the sh wrapper needs an sh on PATH
+// and Codex to pass its quotes through intact (#2884). The stub reads the hook
+// payload from stdin, so this also checks the payload reaches entire through
+// both layers of shell.
+func TestWindowsNestedWrappers_CodexShells(t *testing.T) {
+	// No t.Parallel(): t.Setenv("PATH") forbids it.
+
+	const (
+		ranMarker = "ENTIRE_HOOK_RAN"
+		payload   = `{"session_id":"s-2884","hook_event_name":"Stop"}`
+	)
+	stub := "@echo off\r\necho " + ranMarker + " %*\r\nfindstr /c:s-2884\r\nexit /b 0\r\n"
+	warning := windowsPlainTextWarning(WarningFormatSingleLine)
+	silent := WrapWindowsProductionSilentHookCommand("entire hooks codex stop")
+	warn := WrapWindowsProductionNestedPlainTextWarningHookCommand("entire hooks codex session-start", WarningFormatSingleLine)
+
+	for _, shell := range codexWindowsShells(t) {
+		t.Run(shell.name+"/silent/present runs entire with the payload", func(t *testing.T) {
+			out, stderr, code := shell.run(t, silent, stub, payload)
+			if !strings.Contains(out, ranMarker+" hooks codex stop") {
+				t.Fatalf("expected entire to run; stdout=%q stderr=%q", out, stderr)
+			}
+			if !strings.Contains(out, payload) {
+				t.Fatalf("expected the hook payload to reach entire on stdin; stdout=%q stderr=%q", out, stderr)
+			}
+			if code != 0 {
+				t.Fatalf("expected exit 0, got %d; stderr=%q", code, stderr)
+			}
+		})
+
+		t.Run(shell.name+"/silent/absent exits 0 without output", func(t *testing.T) {
+			out, stderr, code := shell.run(t, silent, "", payload)
+			if strings.TrimSpace(out) != "" {
+				t.Fatalf("expected no stdout when entire is absent; stdout=%q stderr=%q", out, stderr)
+			}
+			if code != 0 {
+				t.Fatalf("expected exit 0 when entire absent, got %d; stderr=%q", code, stderr)
+			}
+		})
+
+		t.Run(shell.name+"/warning/present runs entire without a warning", func(t *testing.T) {
+			out, stderr, code := shell.run(t, warn, stub, payload)
+			if !strings.Contains(out, ranMarker+" hooks codex session-start") {
+				t.Fatalf("expected entire to run; stdout=%q stderr=%q", out, stderr)
+			}
+			if !strings.Contains(out, payload) {
+				t.Fatalf("expected the hook payload to reach entire on stdin; stdout=%q stderr=%q", out, stderr)
+			}
+			if strings.Contains(out, "Entire CLI") {
+				t.Fatalf("warning must NOT be emitted when entire present; stdout=%q stderr=%q", out, stderr)
+			}
+			if code != 0 {
+				t.Fatalf("expected exit 0, got %d; stderr=%q", code, stderr)
+			}
+		})
+
+		t.Run(shell.name+"/warning/absent prints the warning and exits 0", func(t *testing.T) {
+			out, stderr, code := shell.run(t, warn, "", payload)
+			if strings.TrimSpace(out) != warning {
+				t.Fatalf("expected exactly the warning on stdout; got %q, want %q; stderr=%q", strings.TrimSpace(out), warning, stderr)
+			}
+			if code != 0 {
+				t.Fatalf("expected exit 0, got %d; stderr=%q", code, stderr)
+			}
+		})
+
+		t.Run(shell.name+"/silent/present passes a failure through", func(t *testing.T) {
+			_, stderr, code := shell.run(t, WrapWindowsProductionSilentHookCommand("cmd /c exit 7"), stub, payload)
+			// cmd.exe hands the exit code back unchanged; Windows PowerShell 5.1
+			// reports any failing last command as 1. Codex only tells zero from
+			// non-zero for these events.
+			if code == 0 {
+				t.Fatalf("expected a non-zero exit to pass through, got 0; stderr=%q", stderr)
+			}
+		})
+	}
 }

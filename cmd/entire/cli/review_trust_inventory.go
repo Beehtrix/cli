@@ -306,7 +306,11 @@ func claudePermissionEntries(source string, raw json.RawMessage) ([]cliReview.Tr
 
 // hookTrustEntries reads the hooks object shared by Claude Code and Codex. A
 // hook is Entire's only when its whole command equals one Entire installs.
-func hookTrustEntries(agentName, source string, raw json.RawMessage, canonical map[string][]string) ([]cliReview.TrustEntry, bool) {
+// windowsKeys names the fields that replace command when the agent runs on
+// Windows (Codex's commandWindows, under both of its spellings): a hook is
+// Entire's only if those are Entire's too, and any other hook shows its Windows
+// command beside command, since that is what runs there.
+func hookTrustEntries(agentName, source string, raw json.RawMessage, canonical map[string][]string, windowsKeys ...string) ([]cliReview.TrustEntry, bool) {
 	// Exact-key maps, as the agents read them: Go structs match keys
 	// case-insensitively, so a "Hooks": [] decoy could hide "hooks".
 	events, ok := jsonObject(raw)
@@ -333,11 +337,44 @@ func hookTrustEntries(agentName, source string, raw json.RawMessage, canonical m
 				}
 				entire := typeOK && commandOK && (hookType == "" || hookType == "command") &&
 					command != "" && slices.Contains(canonical[event], command)
+				windowsCanonical, windowsShown := windowsHookCommands(hook, command, canonical[event], windowsKeys)
+				entire = entire && windowsCanonical
+				if !entire && commandOK && command != "" && len(windowsShown) > 0 {
+					shown += " (Windows: " + strings.Join(windowsShown, "; ") + ")"
+				}
 				out = append(out, cliReview.TrustEntry{Agent: agentName, Kind: cliReview.TrustKindHook, Name: event, Command: shown, Source: source, Entire: entire})
 			}
 		}
 	}
 	return out, true
+}
+
+// windowsHookCommands reads the windowsKeys fields of hook: whether each one
+// present is a canonical command (or empty, which runs nothing), and the ones
+// that differ from command, for display.
+func windowsHookCommands(hook map[string]json.RawMessage, command string, canonical, windowsKeys []string) (allCanonical bool, differing []string) {
+	allCanonical = true
+	for _, key := range windowsKeys {
+		raw, present := hook[key]
+		if !present {
+			continue
+		}
+		windows, ok := jsonString(raw)
+		if !ok {
+			allCanonical = false
+			continue
+		}
+		if windows == "" {
+			continue
+		}
+		if !slices.Contains(canonical, windows) {
+			allCanonical = false
+		}
+		if windows != command {
+			differing = append(differing, windows)
+		}
+	}
+	return allCanonical, differing
 }
 
 func mcpServerCommand(raw json.RawMessage) string {
@@ -420,7 +457,7 @@ func codexTrustEntries(files trustFiles) ([]cliReview.TrustEntry, error) {
 		if !docOK {
 			out = append(out, unknownTrustEntry(agentName, ".codex/hooks.json", "could not parse"))
 		} else if raw := doc[trustHooksKey]; len(raw) > 0 && !isJSONNull(raw) {
-			hooks, ok := hookTrustEntries(agentName, ".codex/hooks.json", raw, codex.EntireHookCommands())
+			hooks, ok := hookTrustEntries(agentName, ".codex/hooks.json", raw, codex.EntireHookCommands(), codex.WindowsCommandKeys()...)
 			if !ok {
 				out = append(out, unknownTrustEntry(agentName, ".codex/hooks.json", "could not parse hooks"))
 			}
