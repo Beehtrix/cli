@@ -2097,11 +2097,12 @@ func TestInstallHooks_RewrapSymlinkLeadingBehindBrainWrapper(t *testing.T) {
 			back := filepath.Join(scripts, "back")
 			return map[string]string{back: filepath.Join(dir, brainBehind), "pre-push" + backupSuffix: back}
 		}},
-		// The kernel follows alias before "..", so this is brainBehind.
+		// The kernel follows alias before "..", so this is brainBehind. Not
+		// filepath.Join: that would clean the link to "../" + brainBehind.
 		"through .. after a linked directory": {dirs: []string{filepath.Join("sub", "deeper")}, links: func(string, string) map[string]string {
 			return map[string]string{
 				"alias":                   filepath.Join("sub", "deeper"),
-				"pre-push" + backupSuffix: filepath.Join("alias", "..", "..", brainBehind),
+				"pre-push" + backupSuffix: "alias/../../" + brainBehind,
 			}
 		}},
 		"to a script elsewhere with that name": {moved: true, links: func(_, scripts string) map[string]string {
@@ -2157,43 +2158,69 @@ func TestInstallHooks_RewrapSymlinkLeadingBehindBrainWrapper(t *testing.T) {
 	}
 }
 
-// A symlinked backup whose chain only shares a link with the file behind the
-// wrapper still moves there: a hard link to one relative symlink resolves
-// against the directory it is in, so sub/alias runs sub/user while the file
-// behind the wrapper runs user.
-func TestInstallHooks_RewrapSymlinkThroughHardLinkedSymlink(t *testing.T) {
+// A symlinked backup moves behind the wrapper, past another hook already
+// there, when the kernel resolves it to the user's hook in sub/user, though
+// following its links by name would land on that other hook: a hard link to
+// one relative symlink resolves against the directory it is in, and a ".."
+// applies after the link before it.
+func TestInstallHooks_RewrapSymlinkResolvedAsTheKernelDoes(t *testing.T) {
 	t.Parallel()
 	if runtime.GOOS != "linux" {
 		t.Skip("needs a hard link to a symlink")
 	}
 	spec := specFor(t, prePushHook)
-	f := newHooksFixture(t)
-	f.brainLayoutOverUserHook(spec)
-	f.chmod("pre-push", 0o644)
-	if err := os.Mkdir(filepath.Join(f.dir, "sub"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	backup := filepath.Join(f.dir, "pre-push"+backupSuffix)
-	if err := os.Rename(backup, filepath.Join(f.dir, "sub", "user")); err != nil {
-		t.Fatal(err)
-	}
-	f.write("user", userHookV2)
-	alias := filepath.Join(f.dir, "sub", "alias")
-	if err := os.Symlink("user", alias); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Link(alias, filepath.Join(f.dir, brainBehind)); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join("sub", "alias"), backup); err != nil {
-		t.Fatal(err)
-	}
+	for name, setup := range map[string]func(f *hooksFixture) string{
+		// sub/alias and brainBehind are one symlink to "user".
+		"a hard link to a relative symlink": func(f *hooksFixture) string {
+			f.write("user", userHookV2)
+			alias := filepath.Join(f.dir, "sub", "alias")
+			mustSymlink(t, "user", alias)
+			if err := os.Link(alias, filepath.Join(f.dir, brainBehind)); err != nil {
+				t.Fatal(err)
+			}
+			return "sub/alias"
+		},
+		// alias/../user is sub/user; cleaned by name it is user, which is brainBehind.
+		".. after a linked directory": func(f *hooksFixture) string {
+			f.write(brainBehind, userHookV2)
+			if err := os.Link(filepath.Join(f.dir, brainBehind), filepath.Join(f.dir, "user")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(f.dir, "sub", "deeper"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			mustSymlink(t, "sub/deeper", filepath.Join(f.dir, "alias"))
+			return "alias/../user"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newHooksFixture(t)
+			f.brainLayoutOverUserHook(spec)
+			f.chmod("pre-push", 0o644)
+			if err := os.Mkdir(filepath.Join(f.dir, "sub"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			backup := filepath.Join(f.dir, "pre-push"+backupSuffix)
+			if err := os.Rename(backup, filepath.Join(f.dir, "sub", "user")); err != nil {
+				t.Fatal(err)
+			}
+			mustSymlink(t, setup(f), backup)
 
-	f.install(spec)
+			f.install(spec)
 
-	assertHooks(t, f, map[string]string{"pre-push" + backupSuffix: brainWrapper, brainBehind: userHookV1})
-	if got, want := f.contents(f.olderCopies()...), []string{userHookV2}; !slices.Equal(got, want) {
-		t.Errorf("older copies hold %q, want %q", got, want)
+			assertHooks(t, f, map[string]string{"pre-push" + backupSuffix: brainWrapper, brainBehind: userHookV1})
+			if got, want := f.contents(f.olderCopies()...), []string{userHookV2}; !slices.Equal(got, want) {
+				t.Errorf("older copies hold %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func mustSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
 	}
 }
 
