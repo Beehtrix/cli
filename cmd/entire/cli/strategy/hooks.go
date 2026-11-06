@@ -1477,20 +1477,21 @@ func removeHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string, 
 // restoreHookBackup puts hook's .pre-entire backup back at hook for
 // removeHooks, recording it in res, unless foreign: a non-Entire hook is
 // there, which the backup must not overwrite. Once entire-brain's wrapper is
-// back, the user's hook a re-wrap kept behind it has only its new name left.
+// back at hook, put back here or installed again by Brain (removeHooks has
+// then dropped its redundant backup), the user's hook a re-wrap kept behind
+// it has only its new name left.
 func restoreHookBackup(root *os.Root, hook string, foreign bool, res *GitHookRemoval) error {
 	backupName := hook + backupSuffix
-	if !hookFileExists(root, backupName) {
-		return nil
+	if hookFileExists(root, backupName) {
+		if foreign {
+			fmt.Fprintf(stderrWriter, "[entire] Warning: %s was modified since install; backup %s%s left in place\n", hook, hook, backupSuffix)
+			return nil
+		}
+		if err := root.Rename(backupName, hook); err != nil {
+			return fmt.Errorf("restore %s%s: %w", hook, backupSuffix, err)
+		}
+		res.Restored = append(res.Restored, hook)
 	}
-	if foreign {
-		fmt.Fprintf(stderrWriter, "[entire] Warning: %s was modified since install; backup %s%s left in place\n", hook, hook, backupSuffix)
-		return nil
-	}
-	if err := root.Rename(backupName, hook); err != nil {
-		return fmt.Errorf("restore %s%s: %w", hook, backupSuffix, err)
-	}
-	res.Restored = append(res.Restored, hook)
 	if err := dropUserHookBehindBrainWrapper(root, hook); err != nil {
 		return fmt.Errorf("%s%s%s: %w", hook, backupSuffix, brainMovedSuffix, err)
 	}

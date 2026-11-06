@@ -1474,6 +1474,21 @@ func TestRemoveHooks_AfterBrainWrapperLeavesNoEntireHook(t *testing.T) {
 			},
 			copyIsUser: true, want: "user",
 		},
+		// Brain finds Entire's hook at pre-push after the re-wrap and installs
+		// its wrapper again, so the chain runs Brain, Entire, Brain's backed-up
+		// wrapper, then the user's hook behind it.
+		"Brain installed again after Entire re-wrapped it": {
+			userHook: true,
+			setup: func(f *hooksFixture) {
+				f.install(spec)
+				f.brainInstall()
+				f.chmod("pre-push", 0o644)
+				f.install(spec)
+				f.chmod("pre-push"+backupSuffix, 0o755)
+				f.brainInstall()
+			},
+			copyIsUser: true, want: "user",
+		},
 		"Entire re-wrapped a non-executable brain, no user hook": {
 			setup: func(f *hooksFixture) {
 				f.install(spec)
@@ -2226,18 +2241,21 @@ func mustSymlink(t *testing.T, target, link string) {
 
 // The user's hook behind Brain's backed-up wrapper is an older copy once the
 // hook at pre-push no longer runs that wrapper, as when another tool replaced
-// Entire's hook, and uninstall reports it; a hook that names the wrapper's
-// file still runs it.
+// Entire's hook, and uninstall reports it. A hook that names the wrapper's
+// file still runs it, and so does Brain's wrapper installed again in front
+// of Entire's hook.
 func TestOlderHookCopies_UserHookBehindBrainWrapperNothingRuns(t *testing.T) {
 	t.Parallel()
 	spec := specFor(t, prePushHook)
 	for name, tc := range map[string]struct {
 		hook     string // replaces Entire's hook at pre-push, if set
+		brain    bool   // Brain installs its wrapper again, in front of Entire's hook
 		reported bool
 	}{
-		"Entire's hook":                {},
-		"a hook naming the backup":     {hook: "#!/bin/sh\nexec \"$(dirname \"$0\")/pre-push" + backupSuffix + "\" \"$@\"\n"},
-		"a hook not naming the backup": {hook: userHookV2, reported: true},
+		"Entire's hook":                   {},
+		"Brain's wrapper installed again": {brain: true},
+		"a hook naming the backup":        {hook: "#!/bin/sh\nexec \"$(dirname \"$0\")/pre-push" + backupSuffix + "\" \"$@\"\n"},
+		"a hook not naming the backup":    {hook: userHookV2, reported: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -2247,6 +2265,9 @@ func TestOlderHookCopies_UserHookBehindBrainWrapperNothingRuns(t *testing.T) {
 			f.install(spec)
 			if tc.hook != "" {
 				f.write("pre-push", tc.hook)
+			}
+			if tc.brain {
+				f.brainInstall()
 			}
 
 			if got := slices.Contains(f.olderCopies(), brainBehind); got != tc.reported {

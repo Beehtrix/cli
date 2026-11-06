@@ -180,9 +180,14 @@ func backupRunsBehindBrainWrapper(root *os.Root, name string) bool {
 	}
 	backup := name + backupSuffix
 	behind := backup + brainBackupSuffix
-	copied, err := osroot.ReadFileNoFollow(root, name+brainBackupSuffix)
-	return err == nil && bytes.Contains(copied, []byte(entireHookMarker)) && namesFile(copied, backup) &&
+	return entireHookChainsTo(root, name+brainBackupSuffix, backup) &&
 		!runsByName(root, backup, behind) && !linkMayReach(root, backup, behind)
+}
+
+// entireHookChainsTo: name is Entire's hook, chaining to backup.
+func entireHookChainsTo(root *os.Root, name, backup string) bool {
+	data, err := osroot.ReadFileNoFollow(root, name)
+	return err == nil && bytes.Contains(data, []byte(entireHookMarker)) && namesFile(data, backup)
 }
 
 // linkMayReach: name is a symlink that may lead to target, so moved there it
@@ -376,6 +381,15 @@ func keepOlderCopy(root *os.Root, backup string, now time.Time) (string, error) 
 	return "", fmt.Errorf("no free name for an older copy of %s", backup)
 }
 
+// prePushRunsBrainBackup: the hook at pre-push runs entire-brain's wrapper
+// backed up in backup. Entire's hook chains to it, any other hook must name
+// it, and Brain's wrapper, installed again after the re-wrap, runs Entire's
+// hook from its copy, which chains to it.
+func prePushRunsBrainBackup(root *os.Root, backup string) bool {
+	return carriesEntireMarker(root, prePushHook) || runsByName(root, prePushHook, backup) ||
+		isBrainWrapperFile(root, prePushHook) && entireHookChainsTo(root, prePushHook+brainBackupSuffix, backup)
+}
+
 func identicalOlderCopy(root *os.Root, backup string) string {
 	copies, err := olderHookCopies(root)
 	if err != nil {
@@ -392,7 +406,7 @@ func identicalOlderCopy(root *os.Root, backup string) string {
 // olderHookCopies lists <hook>.pre-entire.<timestamp> files in root, sorted.
 // The user's hook moveBehindBrainWrapper moved is not one while it runs:
 // entire-brain's wrapper in .pre-entire runs it, and the hook at pre-push runs
-// that wrapper (Entire's hook chains to it; any other must name it).
+// that wrapper (see prePushRunsBrainBackup).
 func olderHookCopies(root *os.Root) ([]string, error) {
 	names, err := hookDirNames(root)
 	if err != nil {
@@ -402,8 +416,7 @@ func olderHookCopies(root *os.Root) ([]string, error) {
 	behindBrain := backup + brainBackupSuffix
 	var copies []string
 	for _, n := range names {
-		if n == behindBrain && isBrainWrapperFile(root, backup) &&
-			(carriesEntireMarker(root, prePushHook) || runsByName(root, prePushHook, backup)) {
+		if n == behindBrain && isBrainWrapperFile(root, backup) && prePushRunsBrainBackup(root, backup) {
 			continue
 		}
 		if slices.ContainsFunc(gitHookNames, func(hook string) bool {
@@ -937,14 +950,16 @@ func restoreBrainChain(root *os.Root, hook, m string) (bool, error) {
 		return false, nil
 	case isBrainChain(root, hook, hook) && userBackup:
 		return true, root.Rename(backup, m) //nolint:wrapcheck // caller adds the file name
-	case isBrainChain(root, hook, hook):
+	case isBrainChain(root, hook, hook) && !isBrainChain(root, backup, hook):
 		return true, root.Remove(m) //nolint:wrapcheck // caller adds the file name
-	case carriesEntireMarker(root, hook) && isBrainChain(root, backup, hook):
+	case isBrainChain(root, backup, hook) && (carriesEntireMarker(root, hook) || isBrainChain(root, hook, hook)):
+		// Entire re-wrapped Brain, and Brain may since have installed its
+		// wrapper again at hook, moving Entire's hook into m.
 		if behind, ok := userHookBehindBrainBackup(root, backup, m); ok {
 			// The re-wrap moved the user's hook to where the wrapper in
 			// .pre-entire runs it; from the hook path the wrapper runs m. It is
-			// linked, not moved, so the chain runs it until the caller has put
-			// the wrapper back, and removeHooks drops the old name after that
+			// linked, not moved, so the chain runs it until the wrapper is back
+			// at the hook path, and removeHooks drops the old name after that
 			// (see dropUserHookBehindBrainWrapper).
 			return true, replaceWithCopyKeepingMode(root, behind, m)
 		}
