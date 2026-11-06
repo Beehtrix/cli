@@ -151,7 +151,7 @@ those not yet on the default branch (local or origin), without imported
 checkpoints unless it is the current branch. Branches that were merged and
 deleted cannot be listed yet; HEAD is rejected (omit --branch instead).
 
-None of --session, --author or --branch applies with --pending.`,
+None of --session, --author or --branch applies with --pending or --outgoing.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if checkDisabledGuard(cmd.Context(), cmd.OutOrStdout()) {
 				return nil
@@ -177,6 +177,12 @@ None of --session, --author or --branch applies with --pending.`,
 			}
 			if pendingFlag && branchFlag != "" {
 				return errors.New("--branch cannot be combined with --pending")
+			}
+			if outgoingFlag && authorFlag != "" {
+				return errors.New("--author cannot be combined with --outgoing")
+			}
+			if outgoingFlag && branchFlag != "" {
+				return errors.New("--branch cannot be combined with --outgoing")
 			}
 
 			filters := checkpointListFilters{session: sessionFlag, author: authorFlag, branch: branchFlag}
