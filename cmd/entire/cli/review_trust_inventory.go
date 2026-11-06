@@ -308,8 +308,8 @@ func claudePermissionEntries(source string, raw json.RawMessage) ([]cliReview.Tr
 // hook is Entire's only when its whole command equals one Entire installs.
 // windowsKeys names the fields that replace command when the agent runs on
 // Windows (Codex's commandWindows, under both of its spellings): a hook is
-// Entire's only if those are Entire's too, and any other hook shows its Windows
-// command beside command, since that is what runs there.
+// Entire's only if those are Entire's too, and any other hook lists its
+// Windows command as a second entry, since that is what runs there.
 func hookTrustEntries(agentName, source string, raw json.RawMessage, canonical map[string][]string, windowsKeys ...string) ([]cliReview.TrustEntry, bool) {
 	// Exact-key maps, as the agents read them: Go structs match keys
 	// case-insensitively, so a "Hooks": [] decoy could hide "hooks".
@@ -339,10 +339,14 @@ func hookTrustEntries(agentName, source string, raw json.RawMessage, canonical m
 					command != "" && slices.Contains(canonical[event], command)
 				windowsCanonical, windowsShown := windowsHookCommands(hook, command, canonical[event], windowsKeys)
 				entire = entire && windowsCanonical
-				if !entire && commandOK && command != "" && len(windowsShown) > 0 {
-					shown += " (Windows: " + strings.Join(windowsShown, "; ") + ")"
-				}
 				out = append(out, cliReview.TrustEntry{Agent: agentName, Kind: cliReview.TrustKindHook, Name: event, Command: shown, Source: source, Entire: entire})
+				if !entire && commandOK && command != "" {
+					// Its own entry, so the confirm truncates it separately
+					// and the head of a long POSIX command can't push it out.
+					for _, windows := range windowsShown {
+						out = append(out, cliReview.TrustEntry{Agent: agentName, Kind: cliReview.TrustKindHook, Name: event + " (Windows)", Command: windows, Source: source})
+					}
+				}
 			}
 		}
 	}

@@ -227,7 +227,7 @@ func TestTrustInventory_CodexHooksAndConfig(t *testing.T) {
 // Codex on Windows runs commandWindows instead of command, so a branch could
 // pair Entire's own command with a Windows command of its own and have the hook
 // pass as Entire's. The Windows command, under either spelling, is part of what
-// makes a hook Entire's, and a different one is shown to the reviewer.
+// makes a hook Entire's, and a different one is listed to the reviewer.
 func TestTrustInventory_CodexWindowsCommandIsPartOfTheHook(t *testing.T) {
 	t.Parallel()
 	stop := codex.EntireHookCommands()["Stop"]
@@ -260,18 +260,23 @@ func TestTrustInventory_CodexWindowsCommandIsPartOfTheHook(t *testing.T) {
 			continue
 		}
 		if e.Entire {
-			entire = append(entire, e.Command)
+			entire = append(entire, e.Name+": "+e.Command)
 		} else {
-			branch = append(branch, e.Command)
+			branch = append(branch, e.Name+": "+e.Command)
 		}
 	}
-	if !slices.Equal(entire, []string{posix}) {
+	if !slices.Equal(entire, []string{"Stop: " + posix}) {
 		t.Errorf("Entire hooks = %q, want only the installed pair", entire)
 	}
+	// Each Windows command is its own entry, so the confirm truncates it
+	// separately from a long POSIX command.
 	wantBranch := []string{
-		posix + " (Windows: powershell -c evil)",
-		posix + " (Windows: evil.cmd)",
-		"make lint (Windows: lint.cmd)",
+		"Stop: " + posix,
+		"Stop (Windows): powershell -c evil",
+		"Stop: " + posix,
+		"Stop (Windows): evil.cmd",
+		"Stop: make lint",
+		"Stop (Windows): lint.cmd",
 	}
 	if !slices.Equal(branch, wantBranch) {
 		t.Errorf("branch hooks = %q, want %q", branch, wantBranch)

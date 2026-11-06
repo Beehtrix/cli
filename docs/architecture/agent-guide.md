@@ -466,9 +466,12 @@ the agent picks between the two itself. Codex is one: each hook takes a
 Entire writes the sh wrapper to `command` and a Windows wrapper to
 `commandWindows`, and the file is the same on every host. Codex may run that
 Windows command through PowerShell or `cmd.exe`, so it uses the nested forms
-(`WrapWindowsProductionSilentHookCommand`,
+(`WrapWindowsProductionNestedSilentHookCommand`,
 `WrapWindowsProductionNestedPlainTextWarningHookCommand`), whose whole `cmd.exe`
-line is one double-quoted string both shells pass through untouched.
+line is one double-quoted string both shells pass through untouched. They also
+set `NoDefaultCurrentDirectoryInExePath` first: `cmd.exe` otherwise looks in
+the current directory, which for a hook is the checkout, before PATH, so an
+`entire.cmd` committed to a branch would run in place of the installed CLI.
 
 **Establish which by reading the agent's runner, not by assuming.** The probe is
 not the safe default: it only proves that a command carrying *no* cmd.exe

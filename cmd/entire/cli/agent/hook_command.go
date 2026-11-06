@@ -197,8 +197,9 @@ func warningHookCommand(command, missing, failed string) string {
 //     (silently via `ver>nul`, or echoing the warning) and the line exits 0.
 
 // WrapWindowsProductionSilentHookCommand exits successfully without output when
-// the Entire CLI is missing from PATH. It avoids sh so Codex hooks still work
-// from native Windows shells.
+// the Entire CLI is missing from PATH. It avoids sh so hooks still work from
+// native Windows shells. cmd.exe resolves entire from the current directory
+// before PATH here; WrapWindowsProductionNestedSilentHookCommand does not.
 func WrapWindowsProductionSilentHookCommand(command string) string {
 	return fmt.Sprintf(
 		`cmd.exe /d /s /c "where.exe entire >nul 2>nul & if errorlevel 1 (ver>nul) else (%s)"`,
@@ -248,27 +249,56 @@ func WrapWindowsProductionJSONWarningHookCommand(command string, format WarningF
 	)
 }
 
-// WrapWindowsProductionNestedPlainTextWarningHookCommand prints the missing-CLI
-// warning as plain text when the Entire CLI is missing from PATH, and otherwise
-// runs command. It is the warning counterpart of
-// WrapWindowsProductionSilentHookCommand, for a host whose Windows hook shell
-// is not fixed: Codex runs a hook's commandWindows through PowerShell
-// (`-NoProfile -Command`) when its session has a shell, which is the default,
-// and through %COMSPEC% /C otherwise.
+// windowsPathOnlyLookup starts the nested Windows wrappers. cmd.exe looks for
+// a command in the current directory before PATH, and a hook runs in the
+// checkout, so without it an entire.cmd (or where.exe) committed to the
+// repository would run in place of the installed one, including in a review
+// run that trusts Entire's hooks but not the branch. cmd.exe skips the current
+// directory while NoDefaultCurrentDirectoryInExePath is set, and the entire it
+// starts inherits the setting.
+const windowsPathOnlyLookup = `set NoDefaultCurrentDirectoryInExePath=1& `
+
+// WrapWindowsProductionNestedSilentHookCommand exits successfully without
+// output when the Entire CLI is missing from PATH, and otherwise runs command.
+// It is WrapWindowsProductionSilentHookCommand for a host that runs hooks in
+// the checkout and whose Windows hook shell is not fixed: Codex runs a hook's
+// commandWindows through PowerShell (`-NoProfile -Command`) when its session
+// has a shell, which is the default, and through %COMSPEC% /C otherwise.
 //
-// Both read the command the same way only because everything after `/c` is
-// one double-quoted string with no `"`, `$`, backtick or `%` inside it:
+// Both shells read the command the same way only because everything after
+// `/c` is one double-quoted string with no `"`, `$`, backtick or `%` inside it:
 // PowerShell passes it to cmd.exe as a single literal argument, and the outer
 // cmd.exe leaves it alone because its metacharacters are all quoted. The inner
-// cmd.exe's /s then strips the two quotes and runs the line. A JSON warning
-// cannot meet that: its quotes would end PowerShell's string, and the escape
-// PowerShell needs for them is a different one from cmd.exe's. Codex treats
-// plain stdout from a start hook as context it shows and passes to the model,
-// so the warning still surfaces.
+// cmd.exe's /s then strips the two quotes and runs the line, resolving
+// where.exe and entire from PATH only (windowsPathOnlyLookup).
+func WrapWindowsProductionNestedSilentHookCommand(command string) string {
+	return fmt.Sprintf(
+		`cmd.exe /d /s /c "%swhere.exe entire >nul 2>nul & if errorlevel 1 (ver>nul) else (%s)"`,
+		windowsPathOnlyLookup,
+		command,
+	)
+}
+
+// WrapWindowsProductionNestedPlainTextWarningHookCommand is the warning
+// counterpart of WrapWindowsProductionNestedSilentHookCommand, with the same
+// quoting and PATH-only lookup. Like the POSIX warningHookCommand it prints
+// the missing-CLI warning when entire is not on PATH, the failed-CLI warning
+// when `entire --version` fails (a version-manager shim with no version
+// selected passes where.exe), and otherwise runs command; it exits 0 in both
+// warning cases. The probe reads nul so the hook payload on stdin reaches
+// command.
+//
+// The warnings are plain text. A JSON warning cannot be written this way: its
+// quotes would end PowerShell's string, and the escape PowerShell needs for
+// them is a different one from cmd.exe's. Codex treats plain stdout from a
+// start hook as context it shows and passes to the model, so the warning still
+// surfaces.
 func WrapWindowsProductionNestedPlainTextWarningHookCommand(command string, format WarningFormat) string {
 	return fmt.Sprintf(
-		`cmd.exe /d /s /c "where.exe entire >nul 2>nul & if errorlevel 1 (echo %s) else (%s)"`,
-		escapeWindowsCMD(windowsPlainTextWarning(format)),
+		`cmd.exe /d /s /c "%swhere.exe entire >nul 2>nul & if errorlevel 1 (echo %s) else (entire --version <nul >nul 2>nul & if errorlevel 1 (echo %s) else (%s))"`,
+		windowsPathOnlyLookup,
+		escapeWindowsCMD(windowsPlainText(MissingEntireWarning(format))),
+		escapeWindowsCMD(windowsPlainText(FailedEntireWarning(format))),
 		command,
 	)
 }
@@ -292,6 +322,7 @@ func WrapProductionPlainTextWarningHookCommand(command string, format WarningFor
 const productionHookWrapperPrefix = `sh -c 'if ! command -v entire >/dev/null 2>&1; then `
 const windowsProductionHookWrapperPrefix = `where.exe entire >nul 2>nul & if errorlevel 1 `
 const nestedWindowsProductionHookWrapperPrefix = `cmd.exe /d /s /c "where.exe entire >nul 2>nul & if errorlevel 1 `
+const pathOnlyNestedWindowsProductionHookWrapperPrefix = `cmd.exe /d /s /c "` + windowsPathOnlyLookup + `where.exe entire >nul 2>nul & if errorlevel 1 `
 
 // DropStaleManagedHooks removes Entire-owned entries whose command is not one of
 // want, leaving foreign entries and the wanted commands untouched. commandOf
@@ -350,7 +381,8 @@ func IsManagedHookCommand(command string) bool {
 		return hasManagedHookPrefix(wrappedCommand)
 	}
 	if strings.HasPrefix(command, windowsProductionHookWrapperPrefix) ||
-		strings.HasPrefix(command, nestedWindowsProductionHookWrapperPrefix) {
+		strings.HasPrefix(command, nestedWindowsProductionHookWrapperPrefix) ||
+		strings.HasPrefix(command, pathOnlyNestedWindowsProductionHookWrapperPrefix) {
 		// The wrapped command lives in the `else (<command>)` branch. Take the
 		// last ` else (` so a warning string containing the marker can't fool us.
 		const elseMarker = " else ("
@@ -406,7 +438,12 @@ func escapeWindowsCMD(s string) string {
 }
 
 func windowsPlainTextWarning(format WarningFormat) string {
-	return strings.Join(strings.Fields(MissingEntireWarning(format)), " ")
+	return windowsPlainText(MissingEntireWarning(format))
+}
+
+// windowsPlainText puts a warning on one line for cmd.exe's echo.
+func windowsPlainText(warning string) string {
+	return strings.Join(strings.Fields(warning), " ")
 }
 
 const hookWrapperOSWindows = "windows"

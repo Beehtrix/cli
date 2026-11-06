@@ -67,7 +67,7 @@ func wantCodexEntries() map[string]HookEntry {
 		return HookEntry{
 			Type:           "command",
 			Command:        agentpkg.WrapProductionSilentHookCommand(cmd),
-			CommandWindows: agentpkg.WrapWindowsProductionSilentHookCommand(cmd),
+			CommandWindows: agentpkg.WrapWindowsProductionNestedSilentHookCommand(cmd),
 			Timeout:        timeout,
 		}
 	}
@@ -149,24 +149,38 @@ func TestInstallHooks_WritesTheSameConfigOnEveryHost(t *testing.T) {
 	}
 }
 
-// A hooks.json written by an older release is replaced in one install: one
-// from a Windows host whose sh probe failed holds cmd.exe syntax in `command`
-// (which Codex runs through sh on macOS and Linux), and one from anywhere else
-// has no commandWindows (so Codex runs the sh wrapper on Windows too).
+// A hooks.json written by an older release is brought up to date in one
+// install: one from a Windows host whose sh probe failed holds cmd.exe syntax in
+// `command` (which Codex runs through sh on macOS and Linux), and one from
+// anywhere else has no commandWindows (so Codex runs the sh wrapper on Windows
+// too). The Entire hook is rewritten in place, so fields the user added to it
+// survive; a command_windows it carried is dropped, since Codex refuses a
+// handler with both spellings. A second Entire hook for the event is removed.
 func TestInstallHooks_MigratesConfigsWrittenBeforeCommandWindows(t *testing.T) {
 	cases := []struct {
-		name    string
-		command func(h managedHook) string
+		name     string
+		commands func(h managedHook) []string
 	}{
-		{"windows probe failed", func(h managedHook) string { return h.legacyWindows("entire hooks codex " + h.verb) }},
-		{"posix only", func(h managedHook) string { posix, _ := h.commands(); return posix }},
+		{"windows probe failed", func(h managedHook) []string { return []string{h.legacyWindows("entire hooks codex " + h.verb)} }},
+		{"posix only", func(h managedHook) []string { posix, _ := h.commands(); return []string{posix} }},
+		{"both", func(h managedHook) []string {
+			posix, _ := h.commands()
+			return []string{h.legacyWindows("entire hooks codex " + h.verb), posix}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tempDir := setupTestEnv(t)
-			events := map[string][]MatcherGroup{}
+			events := map[string]any{}
 			for _, h := range managedHooks {
-				events[h.event] = []MatcherGroup{{Hooks: []HookEntry{{Type: "command", Command: tc.command(h), Timeout: h.timeout}}}}
+				var hooks []any
+				for _, command := range tc.commands(h) {
+					hooks = append(hooks, map[string]any{
+						"type": "command", "command": command, "timeout": h.timeout,
+						"statusMessage": "Saving session", "futureField": 1, "command_windows": "old.cmd",
+					})
+				}
+				events[h.event] = []any{map[string]any{"hooks": hooks}}
 			}
 			seed, err := jsonutil.MarshalIndentWithNewline(map[string]any{"hooks": events}, "", "  ")
 			require.NoError(t, err)
@@ -179,6 +193,22 @@ func TestInstallHooks_MigratesConfigsWrittenBeforeCommandWindows(t *testing.T) {
 			require.Equal(t, len(managedHooks), count)
 			_, data := readHooksFile(t, tempDir)
 			assertCodexEntries(t, data)
+
+			var doc struct {
+				Hooks map[string][]struct {
+					Hooks []map[string]any `json:"hooks"`
+				} `json:"hooks"`
+			}
+			require.NoError(t, json.Unmarshal(data, &doc))
+			for _, h := range managedHooks {
+				for _, group := range doc.Hooks[h.event] {
+					for _, hook := range group.Hooks {
+						require.Equal(t, "Saving session", hook["statusMessage"], "%s: user fields survive the upgrade", h.event)
+						require.InDelta(t, 1, hook["futureField"], 0, "%s: unknown fields survive the upgrade", h.event)
+						require.NotContains(t, hook, "command_windows", "%s: only one spelling of commandWindows", h.event)
+					}
+				}
+			}
 
 			count, err = (&CodexAgent{}).InstallHooks(context.Background(), false)
 			require.NoError(t, err)
@@ -210,9 +240,10 @@ func TestCheckHookConfig_CurrentRegardlessOfShProbe(t *testing.T) {
 // Every commandWindows Entire writes must parse the same under both shells
 // Codex can run it in on Windows. That holds only while the whole cmd.exe line
 // sits in one double-quoted string with nothing inside it that PowerShell
-// (`"`, `$`, backtick) or the outer cmd.exe (`%`) would act on; see
-// agent.WrapWindowsProductionNestedPlainTextWarningHookCommand. Execution under
-// both shells is covered on Windows by TestWindowsNestedWrappers_CodexShells.
+// (`"`, `$`, backtick) or the outer cmd.exe (`%`) would act on, and it must
+// look entire up on PATH only, never in the checkout; see
+// agent.WrapWindowsProductionNestedSilentHookCommand. Execution under both
+// shells is covered on Windows by TestWindowsNestedWrappers_CodexShells.
 func TestManagedHooks_WindowsCommandsAreShellNeutral(t *testing.T) {
 	t.Parallel()
 	const prefix = `cmd.exe /d /s /c "`
@@ -225,6 +256,7 @@ func TestManagedHooks_WindowsCommandsAreShellNeutral(t *testing.T) {
 		require.NotContainsf(t, body, `$`, "%s: PowerShell expands $ inside double quotes: %s", h.event, windows)
 		require.NotContainsf(t, body, "`", "%s: backtick is PowerShell's escape: %s", h.event, windows)
 		require.NotContainsf(t, body, `%`, "%s: the outer cmd.exe expands %%: %s", h.event, windows)
+		require.Truef(t, strings.HasPrefix(body, "set NoDefaultCurrentDirectoryInExePath=1& "), "%s: cmd.exe must not look for entire in the checkout: %s", h.event, windows)
 		require.True(t, agentpkg.IsManagedHookCommand(windows), "%s: Entire must recognize its own Windows command", h.event)
 	}
 }

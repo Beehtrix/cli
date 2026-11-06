@@ -62,9 +62,15 @@ func runWrapperCmdLine(t *testing.T, buildCmdLine func(cmdPath string) string, e
 
 // runWrapperProcess runs the command newCmd builds with a PATH holding only
 // System32 and, when entireStub is not empty, an entire.bat with that content,
-// feeding it stdin. newCmd is called after PATH is narrowed, so anything it
-// looks up there resolves against that PATH.
+// feeding it stdin, in an empty working directory. newCmd is called after PATH
+// is narrowed, so anything it looks up there resolves against that PATH.
 func runWrapperProcess(t *testing.T, entireStub, stdin string, newCmd func() *exec.Cmd) (string, string, int) {
+	t.Helper()
+	return runWrapperProcessIn(t, t.TempDir(), entireStub, stdin, newCmd)
+}
+
+// runWrapperProcessIn is runWrapperProcess with dir as the working directory.
+func runWrapperProcessIn(t *testing.T, dir, entireStub, stdin string, newCmd func() *exec.Cmd) (string, string, int) {
 	t.Helper()
 
 	sysRoot := os.Getenv("SystemRoot")
@@ -84,7 +90,7 @@ func runWrapperProcess(t *testing.T, entireStub, stdin string, newCmd func() *ex
 	t.Setenv("PATH", strings.Join(pathEntries, ";"))
 
 	cmd := newCmd()
-	cmd.Dir = t.TempDir() // clean CWD so `where` can't find a stray entire next to us
+	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(stdin)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -255,7 +261,9 @@ func TestWindowsWrappers_DroidComposition(t *testing.T) {
 // (codex-rs/hooks/src/engine/command_runner.rs, build_command).
 type codexWindowsShell struct {
 	name string
-	run  func(t *testing.T, hook, entireStub, stdin string) (string, string, int)
+	// run runs hook in dir, with an entire.bat holding entireStub on PATH
+	// unless it is empty.
+	run func(t *testing.T, dir, hook, entireStub, stdin string) (string, string, int)
 }
 
 // codexWindowsShells lists the runners Codex uses on Windows that this host
@@ -266,9 +274,9 @@ func codexWindowsShells(t *testing.T) []codexWindowsShell {
 	t.Helper()
 	shells := []codexWindowsShell{{
 		name: "cmd /C",
-		run: func(t *testing.T, hook, entireStub, stdin string) (string, string, int) {
+		run: func(t *testing.T, dir, hook, entireStub, stdin string) (string, string, int) {
 			t.Helper()
-			return runWrapperProcess(t, entireStub, stdin, func() *exec.Cmd {
+			return runWrapperProcessIn(t, dir, entireStub, stdin, func() *exec.Cmd {
 				cmdPath, err := exec.LookPath("cmd.exe")
 				if err != nil {
 					t.Fatalf("find cmd.exe: %v", err)
@@ -293,9 +301,9 @@ func codexWindowsShells(t *testing.T) []codexWindowsShell {
 		}
 		shells = append(shells, codexWindowsShell{
 			name: exe,
-			run: func(t *testing.T, hook, entireStub, stdin string) (string, string, int) {
+			run: func(t *testing.T, dir, hook, entireStub, stdin string) (string, string, int) {
 				t.Helper()
-				return runWrapperProcess(t, entireStub, stdin, func() *exec.Cmd {
+				return runWrapperProcessIn(t, dir, entireStub, stdin, func() *exec.Cmd {
 					return exec.CommandContext(t.Context(), path, "-NoProfile", "-Command", hook)
 				})
 			},
@@ -315,17 +323,33 @@ func TestWindowsNestedWrappers_CodexShells(t *testing.T) {
 	// No t.Parallel(): t.Setenv("PATH") forbids it.
 
 	const (
-		ranMarker = "ENTIRE_HOOK_RAN"
-		payload   = `{"session_id":"s-2884","hook_event_name":"Stop"}`
+		ranMarker    = "ENTIRE_HOOK_RAN"
+		hijackMarker = "CHECKOUT_ENTIRE_RAN"
+		payload      = `{"session_id":"s-2884","hook_event_name":"Stop"}`
 	)
 	stub := "@echo off\r\necho " + ranMarker + " %*\r\nfindstr /c:s-2884\r\nexit /b 0\r\n"
-	warning := windowsPlainTextWarning(WarningFormatSingleLine)
-	silent := WrapWindowsProductionSilentHookCommand("entire hooks codex stop")
+	// A version-manager shim with no version selected: on PATH, but fails.
+	brokenStub := "@echo off\r\nif \"%1\"==\"--version\" exit /b 3\r\necho " + ranMarker + " %*\r\nexit /b 0\r\n"
+	missing := windowsPlainText(MissingEntireWarning(WarningFormatSingleLine))
+	failed := windowsPlainText(FailedEntireWarning(WarningFormatSingleLine))
+	silent := WrapWindowsProductionNestedSilentHookCommand("entire hooks codex stop")
 	warn := WrapWindowsProductionNestedPlainTextWarningHookCommand("entire hooks codex session-start", WarningFormatSingleLine)
+	// checkout is a working directory holding an entire.cmd and entire.bat of
+	// its own, the way a branch under review could.
+	checkout := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		for _, name := range []string{"entire.cmd", "entire.bat"} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("@echo "+hijackMarker+"\r\n"), 0o700); err != nil {
+				t.Fatalf("write %s: %v", name, err)
+			}
+		}
+		return dir
+	}
 
 	for _, shell := range codexWindowsShells(t) {
 		t.Run(shell.name+"/silent/present runs entire with the payload", func(t *testing.T) {
-			out, stderr, code := shell.run(t, silent, stub, payload)
+			out, stderr, code := shell.run(t, t.TempDir(), silent, stub, payload)
 			if !strings.Contains(out, ranMarker+" hooks codex stop") {
 				t.Fatalf("expected entire to run; stdout=%q stderr=%q", out, stderr)
 			}
@@ -338,7 +362,7 @@ func TestWindowsNestedWrappers_CodexShells(t *testing.T) {
 		})
 
 		t.Run(shell.name+"/silent/absent exits 0 without output", func(t *testing.T) {
-			out, stderr, code := shell.run(t, silent, "", payload)
+			out, stderr, code := shell.run(t, t.TempDir(), silent, "", payload)
 			if strings.TrimSpace(out) != "" {
 				t.Fatalf("expected no stdout when entire is absent; stdout=%q stderr=%q", out, stderr)
 			}
@@ -347,8 +371,25 @@ func TestWindowsNestedWrappers_CodexShells(t *testing.T) {
 			}
 		})
 
+		t.Run(shell.name+"/silent/runs the entire on PATH, not the checkout's", func(t *testing.T) {
+			out, stderr, _ := shell.run(t, checkout(t), silent, stub, payload)
+			if strings.Contains(out, hijackMarker) || !strings.Contains(out, ranMarker+" hooks codex stop") {
+				t.Fatalf("expected the entire on PATH to run; stdout=%q stderr=%q", out, stderr)
+			}
+		})
+
+		t.Run(shell.name+"/silent/never runs the checkout's entire", func(t *testing.T) {
+			// where.exe may still list the checkout's entire.cmd, in which case
+			// cmd.exe, looking on PATH only, reports entire missing and the hook
+			// fails; either way the checkout's file must not run.
+			out, stderr, _ := shell.run(t, checkout(t), silent, "", payload)
+			if strings.Contains(out, hijackMarker) {
+				t.Fatalf("the checkout's entire ran; stdout=%q stderr=%q", out, stderr)
+			}
+		})
+
 		t.Run(shell.name+"/warning/present runs entire without a warning", func(t *testing.T) {
-			out, stderr, code := shell.run(t, warn, stub, payload)
+			out, stderr, code := shell.run(t, t.TempDir(), warn, stub, payload)
 			if !strings.Contains(out, ranMarker+" hooks codex session-start") {
 				t.Fatalf("expected entire to run; stdout=%q stderr=%q", out, stderr)
 			}
@@ -364,9 +405,32 @@ func TestWindowsNestedWrappers_CodexShells(t *testing.T) {
 		})
 
 		t.Run(shell.name+"/warning/absent prints the warning and exits 0", func(t *testing.T) {
-			out, stderr, code := shell.run(t, warn, "", payload)
-			if strings.TrimSpace(out) != warning {
-				t.Fatalf("expected exactly the warning on stdout; got %q, want %q; stderr=%q", strings.TrimSpace(out), warning, stderr)
+			out, stderr, code := shell.run(t, t.TempDir(), warn, "", payload)
+			if strings.TrimSpace(out) != missing {
+				t.Fatalf("expected exactly the warning on stdout; got %q, want %q; stderr=%q", strings.TrimSpace(out), missing, stderr)
+			}
+			if code != 0 {
+				t.Fatalf("expected exit 0, got %d; stderr=%q", code, stderr)
+			}
+		})
+
+		t.Run(shell.name+"/warning/failing entire prints the failed warning and exits 0", func(t *testing.T) {
+			out, stderr, code := shell.run(t, t.TempDir(), warn, brokenStub, payload)
+			if strings.TrimSpace(out) != failed {
+				t.Fatalf("expected exactly the failed warning on stdout; got %q, want %q; stderr=%q", strings.TrimSpace(out), failed, stderr)
+			}
+			if code != 0 {
+				t.Fatalf("expected exit 0, got %d; stderr=%q", code, stderr)
+			}
+		})
+
+		t.Run(shell.name+"/warning/never runs the checkout's entire", func(t *testing.T) {
+			out, stderr, code := shell.run(t, checkout(t), warn, "", payload)
+			if strings.Contains(out, hijackMarker) {
+				t.Fatalf("the checkout's entire ran; stdout=%q stderr=%q", out, stderr)
+			}
+			if got := strings.TrimSpace(out); got != missing && got != failed {
+				t.Fatalf("expected a warning; got %q; stderr=%q", got, stderr)
 			}
 			if code != 0 {
 				t.Fatalf("expected exit 0, got %d; stderr=%q", code, stderr)
@@ -374,7 +438,7 @@ func TestWindowsNestedWrappers_CodexShells(t *testing.T) {
 		})
 
 		t.Run(shell.name+"/silent/present passes a failure through", func(t *testing.T) {
-			_, stderr, code := shell.run(t, WrapWindowsProductionSilentHookCommand("cmd /c exit 7"), stub, payload)
+			_, stderr, code := shell.run(t, t.TempDir(), WrapWindowsProductionNestedSilentHookCommand("cmd /c exit 7"), stub, payload)
 			// cmd.exe hands the exit code back unchanged; Windows PowerShell 5.1
 			// reports any failing last command as 1. Codex only tells zero from
 			// non-zero for these events.
@@ -383,4 +447,15 @@ func TestWindowsNestedWrappers_CodexShells(t *testing.T) {
 			}
 		})
 	}
+
+	// The control: without the PATH-only lookup, cmd.exe runs the checkout's
+	// entire, which is what the cases above rule out. If this stops finding
+	// it, the checkout fixture no longer tests anything.
+	t.Run("control/plain cmd.exe lookup runs the checkout's entire", func(t *testing.T) {
+		plain := `cmd.exe /d /s /c "where.exe entire >nul 2>nul & if errorlevel 1 (ver>nul) else (entire hooks codex stop)"`
+		out, stderr, _ := codexWindowsShells(t)[0].run(t, checkout(t), plain, "", payload)
+		if !strings.Contains(out, hijackMarker) {
+			t.Fatalf("expected the checkout's entire to run without the PATH-only lookup; stdout=%q stderr=%q", out, stderr)
+		}
+	})
 }

@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
@@ -95,7 +94,7 @@ func buildManagedHooks() []managedHook {
 			continue
 		}
 		posix := agent.WrapProductionSilentHookCommand
-		windows := agent.WrapWindowsProductionSilentHookCommand
+		windows := agent.WrapWindowsProductionNestedSilentHookCommand
 		legacyWindows := agent.WrapWindowsProductionSilentHookCommand
 		if spec.JSONWarning {
 			posix = func(cmd string) string {
@@ -734,39 +733,50 @@ func hookEntryExists(groups []MatcherGroup, want HookEntry) bool {
 	return false
 }
 
-// syncHookCommand ensures groups contains exactly the requested Entire hook and
-// removes stale commands left by an older install.
+// syncHookCommand makes want the event's one Entire hook. The Entire hook
+// already there (an exact match first, else the first one an older release
+// wrote) is updated in place, so fields the user added to it, such as
+// statusMessage or async, survive the upgrade; any other Entire hook for the
+// event is removed, and want is added when there is none. It applies
+// agent.DropStaleManagedHooks' rule (every install drops Entire hooks an older
+// release left behind) through the same IsManagedHookCommand recognition, but
+// rewrites the one it keeps instead of re-adding it.
 func syncHookCommand(groups []MatcherGroup, want HookEntry) ([]MatcherGroup, bool) {
-	groups, dropped := dropStaleEntireHooks(groups, want)
-	if hookEntryExists(groups, want) {
-		return groups, dropped
+	keep := func(hook HookEntry) bool { return sameManagedSettings(hook, want) }
+	if !hookEntryExists(groups, want) {
+		keep = func(hook HookEntry) bool { return isEntireHook(hook.Command) }
 	}
-	return addHook(groups, want), true
-}
-
-func dropStaleEntireHooks(groups []MatcherGroup, want HookEntry) ([]MatcherGroup, bool) {
-	staleSettings := func(e HookEntry) bool { return e.Command == want.Command && !sameManagedSettings(e, want) }
+	kept, changed := false, false
 	result := make([]MatcherGroup, 0, len(groups))
-	dropped := false
 	for _, group := range groups {
-		kept, removed := agent.DropStaleManagedHooks(group.Hooks, hookEntryCommand, []string{want.Command})
-		dropped = dropped || removed
-		if slices.ContainsFunc(kept, staleSettings) {
-			kept = slices.DeleteFunc(slices.Clone(kept), staleSettings)
-			dropped = true
+		hooks := make([]HookEntry, 0, len(group.Hooks))
+		for _, hook := range group.Hooks {
+			switch {
+			case !kept && keep(hook):
+				kept = true
+				if !sameManagedSettings(hook, want) || hook.Type != want.Type {
+					hook = hook.withManagedSettings(want)
+					changed = true
+				}
+			case isEntireHook(hook.Command):
+				changed = true
+				continue
+			}
+			hooks = append(hooks, hook)
 		}
-		if len(kept) > 0 {
-			group.Hooks = kept
+		if len(hooks) > 0 {
+			group.Hooks = hooks
 			result = append(result, group)
 		}
 	}
-	if !dropped {
+	if !kept {
+		return addHook(result, want), true
+	}
+	if !changed {
 		return groups, false
 	}
 	return result, true
 }
-
-func hookEntryCommand(e HookEntry) string { return e.Command }
 
 func addHook(groups []MatcherGroup, entry HookEntry) []MatcherGroup {
 	// Add to an existing group with null matcher, or create a new one

@@ -2,6 +2,7 @@ package codex
 
 import (
 	"encoding/json"
+	"maps"
 	"slices"
 
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
@@ -84,6 +85,20 @@ func (e *HookEntry) UnmarshalJSON(data []byte) error {
 		e.raw = slices.Clone(data)
 	}
 	return err //nolint:wrapcheck // returned from UnmarshalJSON; encoding/json adds context
+}
+
+// withManagedSettings returns e running want's commands with want's type and
+// timeout, keeping every other field e carries. command_windows is dropped:
+// Codex rejects a handler that sets both spellings, and commandWindows is
+// written.
+func (e HookEntry) withManagedSettings(want HookEntry) HookEntry {
+	e.Type, e.Command, e.CommandWindows, e.Timeout = want.Type, want.Command, want.CommandWindows, want.Timeout
+	e.raw = nil
+	if _, ok := e.extra["command_windows"]; ok {
+		e.extra = maps.Clone(e.extra)
+		delete(e.extra, "command_windows")
+	}
+	return e
 }
 
 // setsZeroValue reports whether one of the present modeled keys of e decoded to
