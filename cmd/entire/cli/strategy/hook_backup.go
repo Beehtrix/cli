@@ -103,6 +103,7 @@ const (
 	backupCreated      backupAction = iota // <hook>.pre-entire now holds it
 	backupReplacedSame                     // identical to <hook>.pre-entire
 	backupRotated                          // a different backup was kept as an older copy
+	backupBehindBrain                      // the old backup moved behind entire-brain's wrapper; see moveBehindBrainWrapper
 )
 
 const (
@@ -123,8 +124,11 @@ const (
 // until the caller's atomic write replaces it, and a process that dies at any
 // step leaves every version on disk. Nothing is fsynced, so that holds for a
 // killed or crashed process, not for power loss or a kernel crash. A different existing backup is kept as
-// <name>.pre-entire.<timestamp> unless an identical older copy exists. The
-// caller holds the hooks lock.
+// <name>.pre-entire.<timestamp> unless an identical older copy exists, or,
+// when it runs behind entire-brain's wrapper at name, moved to where the
+// wrapper runs it from its new name (backupBehindBrain; older then names the
+// copy of a different hook that was already there, if any). The caller holds
+// the hooks lock.
 func prepareHookBackup(root *os.Root, name string, now time.Time) (backupAction, string, error) {
 	backup := name + backupSuffix
 	if hookFileExists(root, backup) && sameHookFile(root, name, backup) {
@@ -132,18 +136,72 @@ func prepareHookBackup(root *os.Root, name string, now time.Time) (backupAction,
 	}
 	action, older := backupCreated, ""
 	if hookFileExists(root, backup) && !carriesEntireMarker(root, backup) {
-		action = backupRotated
-		if older = identicalOlderCopy(root, backup); older == "" {
-			var err error
-			if older, err = keepOlderCopy(root, backup, now); err != nil {
-				return 0, "", err
+		var err error
+		switch {
+		case backupRunsBehindBrainWrapper(root, name):
+			action = backupBehindBrain
+			older, err = moveBehindBrainWrapper(root, backup, now)
+		default:
+			action = backupRotated
+			if older = identicalOlderCopy(root, backup); older == "" {
+				older, err = keepOlderCopy(root, backup, now)
 			}
+		}
+		if err != nil {
+			return 0, "", err
 		}
 	}
 	if err := replaceWithCopy(root, name, backup); err != nil {
 		return 0, "", err
 	}
 	return action, older, nil
+}
+
+// backupRunsBehindBrainWrapper reports whether the user's hook in
+// <name>.pre-entire runs behind entire-brain's pre-push wrapper at name: the
+// wrapper is exactly Brain's (see isBrainWrapper), and the copy it runs,
+// <name>.pre-entire-brain, is Entire's hook chaining to that backup. The
+// modes are not checked. The install only backs the wrapper up when it or the
+// copy cannot run, since installBehindBrainWrapper takes the layout otherwise,
+// and then the chain only needs its execute bits back to run the user's hook.
+//
+// A backup that names the file it would move to is left to the usual
+// rotation: moved there, it would run itself.
+func backupRunsBehindBrainWrapper(root *os.Root, name string) bool {
+	if name != prePushHook || !isBrainWrapperFile(root, name) {
+		return false
+	}
+	backup := name + backupSuffix
+	copied, err := osroot.ReadFileNoFollow(root, name+brainBackupSuffix)
+	return err == nil && bytes.Contains(copied, []byte(entireHookMarker)) && namesFile(copied, backup) &&
+		!runsByName(root, backup, backup+brainBackupSuffix)
+}
+
+// moveBehindBrainWrapper puts the user's hook in backup where entire-brain's
+// wrapper runs it once the caller backs the wrapper up to backup. The wrapper
+// runs "$0.pre-entire-brain", relative to its own name, so from backup it runs
+// <backup>.pre-entire-brain; rotating the user's hook to an older copy instead
+// would leave it out of the chain, and the wrapper with nothing to run. Like
+// prepareHookBackup it links or copies, so backup keeps the user's hook until
+// the caller replaces it. A different hook already in that file is kept as an
+// older copy first, whose name it returns.
+//
+// The wrapper's own copy of Entire's hook at <hook>.pre-entire-brain stays,
+// as on main: no wrapper runs it any more, and uninstall replaces it with the
+// user's hook (see restoreBrainChain).
+func moveBehindBrainWrapper(root *os.Root, backup string, now time.Time) (string, error) {
+	behind := backup + brainBackupSuffix
+	var older string
+	if hookFileExists(root, behind) && !sameHookFile(root, behind, backup) {
+		var err error
+		if older, err = keepOlderCopy(root, behind, now); err != nil {
+			return "", err
+		}
+	}
+	if err := replaceWithCopy(root, backup, behind); err != nil {
+		return "", fmt.Errorf("move %s behind entire-brain's wrapper: %w", backup, err)
+	}
+	return older, nil
 }
 
 // replaceWithCopy atomically replaces dst with a link to (or copy of) src.
@@ -258,13 +316,19 @@ func identicalOlderCopy(root *os.Root, backup string) string {
 }
 
 // olderHookCopies lists <hook>.pre-entire.<timestamp> files in root, sorted.
+// The user's hook moveBehindBrainWrapper moved is not one while
+// entire-brain's wrapper in .pre-entire runs it.
 func olderHookCopies(root *os.Root) ([]string, error) {
 	names, err := hookDirNames(root)
 	if err != nil {
 		return nil, err
 	}
+	behindBrain := prePushHook + backupSuffix + brainBackupSuffix
 	var copies []string
 	for _, n := range names {
+		if n == behindBrain && isBrainWrapperFile(root, prePushHook+backupSuffix) {
+			continue
+		}
 		if slices.ContainsFunc(gitHookNames, func(hook string) bool {
 			return strings.HasPrefix(n, hook+backupSuffix+".")
 		}) {
@@ -778,8 +842,10 @@ func mentionsOwnPath(root *os.Root, name string) bool {
 // layout is left as on main. With
 // Entire's hook at hook and the wrapper backed up (Entire re-wrapped Brain),
 // the copy was dormant, and the caller is about to put the wrapper back
-// where it would run it, so the copy goes. A keep copy beside m is left to
-// restoreWrapped's usual path. Reports whether it handled m.
+// where it would run it, so the copy goes, or gets the user's hook the
+// re-wrap kept behind the wrapper (see userHookBehindBrainBackup). A keep
+// copy beside m is left to restoreWrapped's usual path. Reports whether it
+// handled m.
 func restoreBrainChain(root *os.Root, hook, m string) (bool, error) {
 	if m != hook+brainMovedSuffix || !carriesEntireMarker(root, m) || hookFileExists(root, m+backupSuffix) {
 		return false, nil // a keep copy holds the user's hook: restore it as for any wrapper
@@ -797,9 +863,27 @@ func restoreBrainChain(root *os.Root, hook, m string) (bool, error) {
 	case isBrainChain(root, hook, hook):
 		return true, root.Remove(m) //nolint:wrapcheck // caller adds the file name
 	case carriesEntireMarker(root, hook) && isBrainChain(root, backup, hook):
+		if behind, ok := userHookBehindBrainBackup(root, backup, m); ok {
+			// The re-wrap moved the user's hook to where the wrapper in
+			// .pre-entire ran it; from the hook path the wrapper runs m.
+			return true, root.Rename(behind, m) //nolint:wrapcheck // caller adds the file name
+		}
 		return true, root.Remove(m) //nolint:wrapcheck // caller adds the file name
 	}
 	return false, nil
+}
+
+// userHookBehindBrainBackup returns the user's hook moveBehindBrainWrapper
+// put behind entire-brain's wrapper in backup, for restoreBrainChain to move
+// into m, the copy that wrapper runs once it is back at the hook path. It is
+// moved even when it refers to its own path: left where it is, nothing would
+// run it. One that names m is not, since in m it would run itself.
+func userHookBehindBrainBackup(root *os.Root, backup, m string) (string, bool) {
+	behind := backup + brainMovedSuffix
+	if !hookFileExists(root, behind) || carriesEntireMarker(root, behind) || isBrainChain(root, behind, prePushHook) || runsByName(root, behind, m) {
+		return "", false
+	}
+	return behind, true
 }
 
 // restoreWrapped undoes reclaimFromWrappers on uninstall: each file a hook

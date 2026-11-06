@@ -643,6 +643,13 @@ func isBrainWrapper(content string) bool {
 	return m != nil && m[1] == m[2]
 }
 
+// isBrainWrapperFile reports whether name in root is a regular file (read
+// NoFollow) holding exactly Brain's wrapper, whatever its mode.
+func isBrainWrapperFile(root *os.Root, name string) bool {
+	data, err := osroot.ReadFileNoFollow(root, name)
+	return err == nil && isBrainWrapper(string(data))
+}
+
 // brainChainedEntireHook returns the content of pre-push.pre-entire-brain when
 // hook is pre-push (the only hook Brain wraps), content is Brain's wrapper and
 // git can run it, and the copy it runs is Entire's hook that the wrapper's
@@ -1117,6 +1124,9 @@ func installHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string,
 			case backupRotated:
 				fmt.Fprintf(stderrWriter, "[entire] %s changed since Entire backed it up. The current version now runs after Entire's; the older copy was kept as %s and no longer runs.\n", spec.name, older)
 				logging.Warn(ctx, "git hook backup rotated; the older copy no longer runs", slog.String("hook", spec.name), slog.String("older_copy", older))
+			case backupBehindBrain:
+				fmt.Fprint(stderrWriter, behindBrainNotice(root, hooksDir, spec.name, older))
+				logging.Info(ctx, "git hook backup moved behind entire-brain's wrapper", slog.String("hook", spec.name), slog.String("older_copy", older))
 			case backupReplacedSame:
 			}
 		}
@@ -1272,6 +1282,31 @@ func updateEditedBrainCopy(ctx context.Context, root *os.Root, hooksDir string, 
 	fmt.Fprintf(stderrWriter, "[entire] Updated the line that runs Entire in %s; the lines you added there are kept.\n", filepath.Join(hooksDir, brainCopy))
 	logging.Info(ctx, "updated Entire's line in an edited copy of its git hook behind entire-brain's wrapper", slog.String("hook", spec.name), slog.String("copy", brainCopy))
 	return 1, true, nil
+}
+
+// behindBrainNotice tells the user that Entire's hook runs in front of
+// entire-brain's wrapper again, and where their own hook went (see
+// moveBehindBrainWrapper). A wrapper that cannot run skips the user's hook
+// too, as it did while it was at the hook path, so the notice says how to
+// make it run. older names the copy of what was already where the user's hook
+// went, if anything.
+func behindBrainNotice(root *os.Root, hooksDir, hook, older string) string {
+	backup := hook + backupSuffix
+	wrapper := filepath.Join(hooksDir, backup)
+	behind := filepath.Join(hooksDir, backup+brainBackupSuffix)
+	var b strings.Builder
+	if isRunnableHookFile(root, backup) {
+		fmt.Fprintf(&b, "[entire] Entire's %s hook could not run behind entire-brain's, so it runs first again, then entire-brain's (moved to %s). "+
+			"Your own %s hook still runs after both: it moved to %s, where entire-brain's hook runs it.\n", hook, wrapper, hook, behind)
+	} else {
+		fmt.Fprintf(&b, "[entire] entire-brain's %s hook is not executable, so git skipped it and the hooks it runs. "+
+			"Entire's hook runs first again; entire-brain's moved to %s, and your own %s hook to %s, where entire-brain's hook runs it. "+
+			"Both run again once entire-brain's hook can: chmod +x %s\n", hook, wrapper, hook, behind, wrapper)
+	}
+	if older != "" {
+		fmt.Fprintf(&b, "[entire] The hook that was already at %s was kept as %s and no longer runs.\n", behind, filepath.Join(hooksDir, older))
+	}
+	return b.String()
 }
 
 // brainCopyUnchanged reports an error when the copy Brain runs is no longer
