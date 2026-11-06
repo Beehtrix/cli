@@ -1526,8 +1526,10 @@ func TestRemoveHooks_AfterBrainWrapperLeavesNoEntireHook(t *testing.T) {
 			case f.exists(brainCopy):
 				t.Errorf("%s left behind: %q", brainCopy, f.read(brainCopy))
 			}
-			if f.exists("pre-push" + backupSuffix) {
-				t.Errorf("pre-push%s left behind", backupSuffix)
+			for _, n := range []string{"pre-push" + backupSuffix, brainBehind} {
+				if f.exists(n) {
+					t.Errorf("%s left behind: %q", n, f.read(n))
+				}
 			}
 			if tc.userHook && !tc.copyIsUser && !slices.ContainsFunc(res.Older, func(n string) bool {
 				return strings.HasPrefix(n, "pre-push"+backupSuffix+".") && f.read(n) == user
@@ -1707,12 +1709,12 @@ const brainBehind = "pre-push" + backupSuffix + ".pre-entire-brain"
 
 // brainLayoutOverUserHook writes what `entire enable` over the user's hook and
 // then entire-brain's connect leave: Brain's wrapper, the copy of Entire's
-// hook it runs, chained to the user's hook in pre-push.pre-entire.
-func (f *hooksFixture) brainLayoutOverUserHook(spec hookSpec, wrapper, user string) {
+// hook it runs, chained to the user's hook (userHookV1) in pre-push.pre-entire.
+func (f *hooksFixture) brainLayoutOverUserHook(spec hookSpec) {
 	f.t.Helper()
-	f.write("pre-push", wrapper)
+	f.write("pre-push", brainWrapper)
 	f.write("pre-push.pre-entire-brain", generateChainedContent(spec.content, prePushHook))
-	f.write("pre-push"+backupSuffix, user)
+	f.write("pre-push"+backupSuffix, userHookV1)
 }
 
 // #2960: an install re-wraps entire-brain's wrapper when the wrapper or the
@@ -1860,7 +1862,7 @@ func TestInstallHooks_RewrapKeepsWhatWasBehindBrainWrapper(t *testing.T) {
 	t.Parallel()
 	spec := specFor(t, prePushHook)
 	f := newHooksFixture(t)
-	f.brainLayoutOverUserHook(spec, brainWrapper, userHookV1)
+	f.brainLayoutOverUserHook(spec)
 	f.chmod("pre-push", 0o644)
 	f.write(brainBehind, userHookV2)
 
@@ -1880,45 +1882,105 @@ func TestInstallHooks_RewrapKeepsWhatWasBehindBrainWrapper(t *testing.T) {
 }
 
 // The re-wrap tells the user where their hook went instead of saying it no
-// longer runs, and, when Brain's wrapper still cannot run, how to make both
-// run. Not parallel: it swaps the package's stderr writer.
+// longer runs, and what stays skipped: Brain's wrapper that still cannot run
+// (with the chmod that fixes it), or a user hook that could not run before.
+// Not parallel: it swaps the package's stderr writer.
 func TestInstallHooks_RewrapBehindBrainWrapperNotice(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("needs execute bits")
 	}
 	spec := specFor(t, prePushHook)
+	const wrapperSkipped = "entire-brain's hook is not executable"
+	const userSkipped = "Your own pre-push hook is not executable, so it is skipped too, as it was before."
 	for name, tc := range map[string]struct {
-		notExecutable string
-		want          func(dir string) string
+		notExecutable []string
+		want, not     []string
 	}{
 		"wrapper not executable": {
-			notExecutable: "pre-push",
-			want: func(dir string) string {
-				return "Both run again once entire-brain's hook can: chmod +x " + filepath.Join(dir, "pre-push"+backupSuffix) + "\n"
-			},
+			notExecutable: []string{"pre-push"},
+			want:          []string{"so it is skipped, and so is the hook behind it. To run it again: chmod +x "},
+			not:           []string{userSkipped},
 		},
 		"Entire's copy not executable": {
-			notExecutable: "pre-push.pre-entire-brain",
-			want: func(dir string) string {
-				return "Your own pre-push hook still runs after both: it moved to " + filepath.Join(dir, brainBehind) + ", where entire-brain's hook runs it.\n"
-			},
+			notExecutable: []string{"pre-push.pre-entire-brain"},
+			not:           []string{wrapperSkipped, userSkipped},
+		},
+		"user hook not executable either": {
+			notExecutable: []string{"pre-push.pre-entire-brain", "pre-push" + backupSuffix},
+			want:          []string{userSkipped},
+			not:           []string{wrapperSkipped},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newHooksFixture(t)
-			f.brainLayoutOverUserHook(spec, brainWrapper, userHookV1)
-			f.chmod(tc.notExecutable, 0o644)
+			f.brainLayoutOverUserHook(spec)
+			for _, n := range tc.notExecutable {
+				f.chmod(n, 0o644)
+			}
 			stderr := captureStderrWriter(t)
 
 			f.install(spec)
 
-			if want := tc.want(f.dir); !strings.Contains(stderr.String(), want) {
-				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), want)
+			want := append([]string{"then your own pre-push hook (moved to " + filepath.Join(f.dir, brainBehind) + ", where entire-brain's hook runs it).\n"}, tc.want...)
+			for _, w := range want {
+				if !strings.Contains(stderr.String(), w) {
+					t.Errorf("stderr = %q, want it to contain %q", stderr.String(), w)
+				}
 			}
-			if strings.Contains(stderr.String(), "no longer runs") {
-				t.Errorf("stderr = %q says a hook no longer runs", stderr.String())
+			for _, n := range append([]string{"no longer runs"}, tc.not...) {
+				if strings.Contains(stderr.String(), n) {
+					t.Errorf("stderr = %q, want it not to contain %q", stderr.String(), n)
+				}
 			}
 		})
+	}
+}
+
+// The chmod the notice suggests is quoted for a hooks directory with a space.
+func TestBehindBrainNotice_QuotesChmodPath(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs execute bits; Windows quotes with double quotes")
+	}
+	spec := specFor(t, prePushHook)
+	f := newHooksFixture(t)
+	f.brainLayoutOverUserHook(spec)
+	f.chmod("pre-push"+backupSuffix, 0o644) // as the wrapper is once backed up
+
+	got := behindBrainNotice(f.root, "/my repo/.git/hooks", prePushHook, "")
+
+	if want := "chmod +x '/my repo/.git/hooks/pre-push" + backupSuffix + "'\n"; !strings.Contains(got, want) {
+		t.Errorf("notice = %q, want it to contain %q", got, want)
+	}
+}
+
+// Without hard links the moves copy, and a copy keeps its mode, so a wrapper
+// or user hook switched off with chmod -x is not switched back on where it
+// runs. Not parallel: it swaps the package's link function.
+func TestInstallHooks_RewrapCopyKeepsModes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs execute bits")
+	}
+	spec := specFor(t, prePushHook)
+	old := linkHookFile
+	linkHookFile = func(*os.Root, string, string) error { return errors.ErrUnsupported }
+	t.Cleanup(func() { linkHookFile = old })
+	f := newHooksFixture(t)
+	f.brainLayoutOverUserHook(spec)
+	f.chmod("pre-push", 0o644)
+	f.chmod("pre-push"+backupSuffix, 0o600)
+
+	f.install(spec)
+
+	assertHooks(t, f, map[string]string{"pre-push" + backupSuffix: brainWrapper, brainBehind: userHookV1})
+	for name, want := range map[string]os.FileMode{"pre-push" + backupSuffix: 0o644, brainBehind: 0o600} {
+		info, err := os.Lstat(filepath.Join(f.dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Errorf("%s mode = %v, want %v", name, got, want)
+		}
 	}
 }
 
@@ -1929,7 +1991,7 @@ func TestRemoveHooks_ReportsUserHookLeftBehindBrainWrapper(t *testing.T) {
 	t.Parallel()
 	spec := specFor(t, prePushHook)
 	f := newHooksFixture(t)
-	f.brainLayoutOverUserHook(spec, brainWrapper, userHookV1)
+	f.brainLayoutOverUserHook(spec)
 	f.chmod("pre-push", 0o644)
 	f.install(spec)
 	if older := f.olderCopies(); len(older) > 0 {
@@ -1974,5 +2036,127 @@ func TestRemoveHooks_UserHookBehindBrainNamingTheCopy(t *testing.T) {
 	}
 	if !slices.Equal(res.Older, []string{brainBehind}) {
 		t.Errorf("older copies %v, want %v", res.Older, []string{brainBehind})
+	}
+}
+
+// A symlink in the backup that leads where the re-wrap would move it keeps
+// the usual rotation: moved there, it would point at itself, and Brain's
+// wrapper, once backed up, already runs the hook it leads to.
+func TestInstallHooks_RewrapSymlinkLeadingBehindBrainWrapper(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs symlinks")
+	}
+	spec := specFor(t, prePushHook)
+	for name, target := range map[string]func(dir string) string{
+		"relative": func(string) string { return brainBehind },
+		"absolute": func(dir string) string { return filepath.Join(dir, brainBehind) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newHooksFixture(t)
+			f.brainLayoutOverUserHook(spec)
+			f.chmod("pre-push", 0o644)
+			backup := filepath.Join(f.dir, "pre-push"+backupSuffix)
+			if err := os.Rename(backup, filepath.Join(f.dir, brainBehind)); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target(f.dir), backup); err != nil {
+				t.Fatal(err)
+			}
+
+			f.install(spec)
+
+			assertHooks(t, f, map[string]string{"pre-push" + backupSuffix: brainWrapper, brainBehind: userHookV1})
+			if info, err := os.Lstat(filepath.Join(f.dir, brainBehind)); err != nil || !info.Mode().IsRegular() {
+				t.Errorf("%s is no longer the user's hook file: %v %v", brainBehind, info, err)
+			}
+		})
+	}
+}
+
+// The user's hook behind Brain's backed-up wrapper is an older copy once the
+// hook at pre-push no longer runs that wrapper, as when another tool replaced
+// Entire's hook, and uninstall reports it; a hook that names the wrapper's
+// file still runs it.
+func TestOlderHookCopies_UserHookBehindBrainWrapperNothingRuns(t *testing.T) {
+	t.Parallel()
+	spec := specFor(t, prePushHook)
+	for name, tc := range map[string]struct {
+		hook     string // replaces Entire's hook at pre-push, if set
+		reported bool
+	}{
+		"Entire's hook":                {},
+		"a hook naming the backup":     {hook: "#!/bin/sh\nexec \"$(dirname \"$0\")/pre-push" + backupSuffix + "\" \"$@\"\n"},
+		"a hook not naming the backup": {hook: userHookV2, reported: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newHooksFixture(t)
+			f.brainLayoutOverUserHook(spec)
+			f.chmod("pre-push", 0o644)
+			f.install(spec)
+			if tc.hook != "" {
+				f.write("pre-push", tc.hook)
+			}
+
+			if got := slices.Contains(f.olderCopies(), brainBehind); got != tc.reported {
+				t.Errorf("%s among the older copies = %v, want %v", brainBehind, got, tc.reported)
+			}
+			if !tc.reported {
+				return
+			}
+			res, err := removeHooks(context.Background(), f.lockRoot, f.root, f.dir, restoreMovedHooks)
+			if err != nil {
+				t.Fatalf("removeHooks: %v", err)
+			}
+			if !slices.Contains(res.Older, brainBehind) {
+				t.Errorf("older copies %v, want them to include %s", res.Older, brainBehind)
+			}
+		})
+	}
+}
+
+// Uninstall links the user's hook into the copy Brain's wrapper runs from the
+// hook path, so until the wrapper is back there the chain still runs it from
+// behind the wrapper's backup: an interrupted uninstall and a reinstall after
+// it leave it running, and a retry finishes the job.
+func TestRemoveHooks_InterruptedKeepsUserHookBehindBrainWrapper(t *testing.T) {
+	t.Parallel()
+	spec := specFor(t, prePushHook)
+	const brainCopy = "pre-push.pre-entire-brain"
+	f := newHooksFixture(t)
+	f.brainLayoutOverUserHook(spec)
+	f.chmod("pre-push", 0o644)
+	f.install(spec)
+	interrupted := func(root *os.Root, hook string) error {
+		if err := restoreMovedHooks(root, hook); err != nil {
+			return err
+		}
+		return errors.New("injected")
+	}
+	chain := map[string]string{
+		"pre-push":                generateChainedContent(spec.content, prePushHook),
+		"pre-push" + backupSuffix: brainWrapper,
+		brainBehind:               userHookV1,
+	}
+
+	if _, err := removeHooks(context.Background(), f.lockRoot, f.root, f.dir, interrupted); err == nil {
+		t.Fatal("removeHooks succeeded despite the injected failure")
+	}
+	assertHooks(t, f, chain)
+	f.install(spec)
+	assertHooks(t, f, chain)
+
+	res, err := removeHooks(context.Background(), f.lockRoot, f.root, f.dir, restoreMovedHooks)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	assertHooks(t, f, map[string]string{"pre-push": brainWrapper, brainCopy: userHookV1})
+	if f.exists(brainBehind) {
+		t.Errorf("%s left behind: %q", brainBehind, f.read(brainBehind))
+	}
+	if len(res.Older) > 0 {
+		t.Errorf("older copies %v, want none", res.Older)
 	}
 }

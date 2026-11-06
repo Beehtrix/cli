@@ -1288,20 +1288,21 @@ func updateEditedBrainCopy(ctx context.Context, root *os.Root, hooksDir string, 
 // entire-brain's wrapper again, and where their own hook went (see
 // moveBehindBrainWrapper). A wrapper that cannot run skips the user's hook
 // too, as it did while it was at the hook path, so the notice says how to
-// make it run. older names the copy of what was already where the user's hook
-// went, if anything.
+// make it run; a user hook that cannot run stays skipped, as it was. older
+// names the copy of what was already where the user's hook went, if anything.
 func behindBrainNotice(root *os.Root, hooksDir, hook, older string) string {
 	backup := hook + backupSuffix
 	wrapper := filepath.Join(hooksDir, backup)
 	behind := filepath.Join(hooksDir, backup+brainBackupSuffix)
 	var b strings.Builder
-	if isRunnableHookFile(root, backup) {
-		fmt.Fprintf(&b, "[entire] Entire's %s hook could not run behind entire-brain's, so it runs first again, then entire-brain's (moved to %s). "+
-			"Your own %s hook still runs after both: it moved to %s, where entire-brain's hook runs it.\n", hook, wrapper, hook, behind)
-	} else {
-		fmt.Fprintf(&b, "[entire] entire-brain's %s hook is not executable, so git skipped it and the hooks it runs. "+
-			"Entire's hook runs first again; entire-brain's moved to %s, and your own %s hook to %s, where entire-brain's hook runs it. "+
-			"Both run again once entire-brain's hook can: chmod +x %s\n", hook, wrapper, hook, behind, wrapper)
+	fmt.Fprintf(&b, "[entire] Entire's %s hook could not run behind entire-brain's, so it runs first again, then entire-brain's (moved to %s), "+
+		"then your own %s hook (moved to %s, where entire-brain's hook runs it).\n", hook, wrapper, hook, behind)
+	if !isRunnableHookFile(root, backup) {
+		fmt.Fprintf(&b, "[entire] entire-brain's hook is not executable, so it is skipped, and so is the hook behind it. To run it again: chmod +x %s\n",
+			ShellQuoteForDisplay(wrapper))
+	}
+	if !isRunnableHookFile(root, backup+brainBackupSuffix) {
+		fmt.Fprintf(&b, "[entire] Your own %s hook is not executable, so it is skipped too, as it was before.\n", hook)
 	}
 	if older != "" {
 		fmt.Fprintf(&b, "[entire] The hook that was already at %s was kept as %s and no longer runs.\n", behind, filepath.Join(hooksDir, older))
@@ -1459,18 +1460,8 @@ func removeHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string, 
 			res.Removed++
 		}
 
-		// Restore .pre-entire backup if it exists
-		if hookFileExists(root, backupName) {
-			if hookExists && !hookIsOurs {
-				// A non-Entire hook is present — don't overwrite it with the backup
-				fmt.Fprintf(stderrWriter, "[entire] Warning: %s was modified since install; backup %s%s left in place\n", hook, hook, backupSuffix)
-			} else {
-				if err := root.Rename(backupName, hook); err != nil {
-					removeErrors = append(removeErrors, fmt.Sprintf("restore %s%s: %v", hook, backupSuffix, err))
-				} else {
-					res.Restored = append(res.Restored, hook)
-				}
-			}
+		if err := restoreHookBackup(root, hook, hookExists && !hookIsOurs, &res); err != nil {
+			removeErrors = append(removeErrors, err.Error())
 		}
 	}
 
@@ -1481,6 +1472,29 @@ func removeHooks(ctx context.Context, lockRoot, root *os.Root, hooksDir string, 
 		return res, fmt.Errorf("failed to remove hooks: %s", strings.Join(removeErrors, "; "))
 	}
 	return res, nil
+}
+
+// restoreHookBackup puts hook's .pre-entire backup back at hook for
+// removeHooks, recording it in res, unless foreign: a non-Entire hook is
+// there, which the backup must not overwrite. Once entire-brain's wrapper is
+// back, the user's hook a re-wrap kept behind it has only its new name left.
+func restoreHookBackup(root *os.Root, hook string, foreign bool, res *GitHookRemoval) error {
+	backupName := hook + backupSuffix
+	if !hookFileExists(root, backupName) {
+		return nil
+	}
+	if foreign {
+		fmt.Fprintf(stderrWriter, "[entire] Warning: %s was modified since install; backup %s%s left in place\n", hook, hook, backupSuffix)
+		return nil
+	}
+	if err := root.Rename(backupName, hook); err != nil {
+		return fmt.Errorf("restore %s%s: %w", hook, backupSuffix, err)
+	}
+	res.Restored = append(res.Restored, hook)
+	if err := dropUserHookBehindBrainWrapper(root, hook); err != nil {
+		return fmt.Errorf("%s%s%s: %w", hook, backupSuffix, brainMovedSuffix, err)
+	}
+	return nil
 }
 
 // generateChainedContent appends a chain call to the base hook content,
