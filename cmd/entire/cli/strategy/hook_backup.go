@@ -186,20 +186,57 @@ func backupRunsBehindBrainWrapper(root *os.Root, name string) bool {
 		!runsByName(root, backup, behind) && !symlinkLeadsTo(root, backup, behind)
 }
 
-// symlinkLeadsTo: name is a symlink whose target ends in a file called target,
-// or that resolves to the same file as target does. root cannot follow a link
-// that leaves it, so for one of those only the file name counts.
+// symlinkLeadsTo: name is a symlink whose chain of links reaches target. The
+// chain is followed one link at a time inside root, so a link written as an
+// absolute path, or with "..", counts when it names a file in root (compared
+// by path, lexically). A link to a file outside root ends the chain there, so
+// a script elsewhere that happens to share target's name does not count. A
+// chain that does not end within maxHookLinkHops counts, so a loop is left
+// alone.
 func symlinkLeadsTo(root *os.Root, name, target string) bool {
-	info, err := root.Lstat(name)
-	if err != nil || info.Mode()&fs.ModeSymlink == 0 {
-		return false
+	targetInfo, targetErr := root.Lstat(target)
+	cur := name
+	for range maxHookLinkHops {
+		info, err := root.Lstat(cur)
+		if err != nil {
+			// A dangling link to target would point at itself once moved there.
+			return cur == target
+		}
+		if cur != name && (cur == target || targetErr == nil && os.SameFile(info, targetInfo)) {
+			return true
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			return false
+		}
+		link, err := root.Readlink(cur)
+		if err != nil {
+			return false
+		}
+		next, ok := linkInRoot(root, filepath.Dir(cur), link)
+		if !ok {
+			return false
+		}
+		cur = next
 	}
-	if link, err := root.Readlink(name); err == nil && filepath.Base(link) == target {
-		return true
+	return true
+}
+
+// maxHookLinkHops bounds symlinkLeadsTo's walk, as the kernel bounds its own.
+const maxHookLinkHops = 40
+
+// linkInRoot returns the name in root that link, read from a symlink in dir
+// (a name in root), points to, or false when it points outside root. root's
+// name is absolute (see osroot.Shared), so an absolute link is compared with it.
+func linkInRoot(root *os.Root, dir, link string) (string, bool) {
+	abs := link
+	if !filepath.IsAbs(link) {
+		abs = filepath.Join(root.Name(), dir, link)
 	}
-	a, errA := root.Stat(name)
-	b, errB := root.Stat(target)
-	return errA == nil && errB == nil && os.SameFile(a, b)
+	rel, err := filepath.Rel(root.Name(), abs)
+	if err != nil || !filepath.IsLocal(rel) {
+		return "", false
+	}
+	return rel, true
 }
 
 // moveBehindBrainWrapper puts the user's hook in backup where entire-brain's
@@ -241,23 +278,25 @@ func replaceWithCopy(root *os.Root, src, dst string) error {
 // runnable by the move. A link already shares src's mode, and a symlink has
 // none of its own.
 func replaceWithCopyKeepingMode(root *os.Root, src, dst string) error {
-	return replaceWith(root, src, dst, func(root *os.Root, src, tmp string) error {
-		if err := linkOrCopy(root, src, tmp); err != nil {
-			return err
-		}
-		from, errFrom := root.Lstat(src)
-		to, errTo := root.Lstat(tmp)
-		if err := errors.Join(errFrom, errTo); err != nil {
-			return errors.Join(fmt.Errorf("keep the mode of %s: %w", src, err), root.Remove(tmp))
-		}
-		if !from.Mode().IsRegular() || os.SameFile(from, to) {
-			return nil
-		}
-		if err := root.Chmod(tmp, from.Mode().Perm()); err != nil {
-			return errors.Join(fmt.Errorf("keep the mode of %s: %w", src, err), root.Remove(tmp))
-		}
-		return nil
-	})
+	return replaceWith(root, src, dst, linkOrCopyKeepingMode)
+}
+
+// linkOrCopyKeepingMode is linkOrCopy whose byte copy is created with src's
+// permission bits from the start, so not even a temporary file left by an
+// interrupted install is more open than src.
+func linkOrCopyKeepingMode(root *os.Root, src, dst string) error {
+	err := linkHookFile(root, src, dst)
+	if err == nil || errors.Is(err, fs.ErrExist) {
+		return err // unwrapped: callers check fs.ErrExist
+	}
+	info, err := root.Lstat(src)
+	if err != nil {
+		return fmt.Errorf("copy %s: %w", src, err)
+	}
+	if !info.Mode().IsRegular() {
+		return copyOrRelink(root, src, dst)
+	}
+	return copyHookFileWithMode(root, src, dst, info.Mode().Perm())
 }
 
 // replaceWithOwnCopy is replaceWithCopy without the hard link: dst gets its
@@ -322,17 +361,23 @@ var writeHookCopy = func(f *os.File, data []byte) error {
 // copyHookFile creates dst as a byte copy of src. A failed write removes dst,
 // so no partial hook is left under a name that reads as a complete version.
 func copyHookFile(root *os.Root, src, dst string) error {
+	return copyHookFileWithMode(root, src, dst, 0o755)
+}
+
+// copyHookFileWithMode is copyHookFile creating dst with mode, then setting
+// exactly mode whatever the umask removed.
+func copyHookFileWithMode(root *os.Root, src, dst string, mode fs.FileMode) error {
 	data, err := osroot.ReadFileNoFollow(root, src)
 	if err != nil {
 		return fmt.Errorf("copy %s: %w", src, err)
 	}
-	f, err := root.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755)
+	f, err := root.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err //nolint:wrapcheck // callers check fs.ErrExist
 	}
 	werr := writeHookCopy(f, data)
 	cerr := f.Close()
-	if err := errors.Join(werr, cerr, root.Chmod(dst, 0o755)); err != nil {
+	if err := errors.Join(werr, cerr, root.Chmod(dst, mode)); err != nil {
 		return errors.Join(fmt.Errorf("copy %s to %s: %w", src, dst, err), root.Remove(dst))
 	}
 	return nil
@@ -954,15 +999,31 @@ func userHookBehindBrainBackup(root *os.Root, backup, m string) (string, bool) {
 // entire-brain's wrapper back at hook, the old name of the user's hook that
 // restoreBrainChain linked into the copy the wrapper runs. With .pre-entire
 // gone nothing runs that name, and left there it would be reported as an older
-// copy. A file there that is not the same hook as the copy stays.
+// copy. It goes only when the copy is that hook (see isRestoredCopy), so
+// removing it loses nothing; any other file there stays.
 func dropUserHookBehindBrainWrapper(root *os.Root, hook string) error {
 	backup := hook + backupSuffix
 	behind, m := backup+brainMovedSuffix, hook+brainMovedSuffix
 	if hook != prePushHook || hookFileExists(root, backup) || !isBrainChain(root, hook, hook) ||
-		!hookFileExists(root, behind) || !sameHookFile(root, behind, m) {
+		!isRestoredCopy(root, behind, m) {
 		return nil
 	}
 	return root.Remove(behind) //nolint:wrapcheck // caller adds the file name
+}
+
+// isRestoredCopy: copied is what replaceWithCopyKeepingMode made of src, the
+// same file (a hard link), or, where links are unavailable, a regular file
+// with src's bytes and permission bits; a symlink counts with the same target.
+func isRestoredCopy(root *os.Root, src, copied string) bool {
+	from, errFrom := root.Lstat(src)
+	to, errTo := root.Lstat(copied)
+	if errFrom != nil || errTo != nil {
+		return false
+	}
+	if os.SameFile(from, to) {
+		return true
+	}
+	return from.Mode() == to.Mode() && sameHookFile(root, src, copied)
 }
 
 // restoreWrapped undoes reclaimFromWrappers on uninstall: each file a hook

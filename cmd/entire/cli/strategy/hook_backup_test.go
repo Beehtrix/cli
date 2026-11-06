@@ -1962,9 +1962,16 @@ func TestInstallHooks_RewrapCopyKeepsModes(t *testing.T) {
 		t.Skip("needs execute bits")
 	}
 	spec := specFor(t, prePushHook)
-	old := linkHookFile
+	oldLink, oldWrite := linkHookFile, writeHookCopy
 	linkHookFile = func(*os.Root, string, string) error { return errors.ErrUnsupported }
-	t.Cleanup(func() { linkHookFile = old })
+	written := map[string]os.FileMode{} // each copy's mode while its bytes are written
+	writeHookCopy = func(f *os.File, data []byte) error {
+		if info, err := f.Stat(); err == nil {
+			written[filepath.Base(f.Name())] = info.Mode().Perm()
+		}
+		return oldWrite(f, data)
+	}
+	t.Cleanup(func() { linkHookFile, writeHookCopy = oldLink, oldWrite })
 	f := newHooksFixture(t)
 	f.brainLayoutOverUserHook(spec)
 	f.chmod("pre-push", 0o644)
@@ -1973,6 +1980,16 @@ func TestInstallHooks_RewrapCopyKeepsModes(t *testing.T) {
 	f.install(spec)
 
 	assertHooks(t, f, map[string]string{"pre-push" + backupSuffix: brainWrapper, brainBehind: userHookV1})
+	for name, mode := range written {
+		if strings.HasSuffix(name, "pre-push"+backupSuffix) || strings.HasSuffix(name, brainBehind) {
+			if mode&^0o644 != 0 {
+				t.Errorf("%s was written with mode %v, more open than its source", name, mode)
+			}
+		}
+	}
+	if len(written) == 0 {
+		t.Error("no copy was written: the link fallback was not taken")
+	}
 	for name, want := range map[string]os.FileMode{"pre-push" + backupSuffix: 0o644, brainBehind: 0o600} {
 		info, err := os.Lstat(filepath.Join(f.dir, name))
 		if err != nil {
@@ -2041,35 +2058,74 @@ func TestRemoveHooks_UserHookBehindBrainNamingTheCopy(t *testing.T) {
 
 // A symlink in the backup that leads where the re-wrap would move it keeps
 // the usual rotation: moved there, it would point at itself, and Brain's
-// wrapper, once backed up, already runs the hook it leads to.
+// wrapper, once backed up, already runs the hook it leads to. The chain is
+// followed link by link, also through absolute links into the hooks dir. A
+// link to a script outside the hooks dir that only shares that file's name is
+// moved behind the wrapper like any other hook.
 func TestInstallHooks_RewrapSymlinkLeadingBehindBrainWrapper(t *testing.T) {
 	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("needs symlinks")
 	}
 	spec := specFor(t, prePushHook)
-	for name, target := range map[string]func(dir string) string{
-		"relative": func(string) string { return brainBehind },
-		"absolute": func(dir string) string { return filepath.Join(dir, brainBehind) },
+	for name, tc := range map[string]struct {
+		// links returns the symlinks to make, name -> target, given the hooks
+		// dir and a scripts dir outside it holding the user's hook as brainBehind.
+		links func(dir, scripts string) map[string]string
+		moved bool // the backup was moved behind the wrapper, not rotated
+	}{
+		"relative": {links: func(string, string) map[string]string {
+			return map[string]string{"pre-push" + backupSuffix: brainBehind}
+		}},
+		"absolute": {links: func(dir, _ string) map[string]string {
+			return map[string]string{"pre-push" + backupSuffix: filepath.Join(dir, brainBehind)}
+		}},
+		"absolute, through an alias": {links: func(dir, _ string) map[string]string {
+			return map[string]string{"pre-push" + backupSuffix: filepath.Join(dir, "alias"), "alias": brainBehind}
+		}},
+		"through .. back into the hooks dir": {links: func(dir, _ string) map[string]string {
+			return map[string]string{"pre-push" + backupSuffix: filepath.Join("..", filepath.Base(dir), brainBehind)}
+		}},
+		"to a script elsewhere with that name": {moved: true, links: func(_, scripts string) map[string]string {
+			return map[string]string{"pre-push" + backupSuffix: filepath.Join(scripts, brainBehind)}
+		}},
+		"relative, to a script elsewhere with that name": {moved: true, links: func(dir, scripts string) map[string]string {
+			rel, err := filepath.Rel(dir, filepath.Join(scripts, brainBehind))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return map[string]string{"pre-push" + backupSuffix: rel}
+		}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			f := newHooksFixture(t)
+			scripts := t.TempDir()
 			f.brainLayoutOverUserHook(spec)
 			f.chmod("pre-push", 0o644)
 			backup := filepath.Join(f.dir, "pre-push"+backupSuffix)
-			if err := os.Rename(backup, filepath.Join(f.dir, brainBehind)); err != nil {
+			userHook := filepath.Join(f.dir, brainBehind)
+			if tc.moved {
+				userHook = filepath.Join(scripts, brainBehind)
+			}
+			if err := os.Rename(backup, userHook); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.Symlink(target(f.dir), backup); err != nil {
-				t.Fatal(err)
+			for link, target := range tc.links(f.dir, scripts) {
+				if err := os.Symlink(target, filepath.Join(f.dir, link)); err != nil {
+					t.Fatal(err)
+				}
 			}
 
 			f.install(spec)
 
 			assertHooks(t, f, map[string]string{"pre-push" + backupSuffix: brainWrapper, brainBehind: userHookV1})
-			if info, err := os.Lstat(filepath.Join(f.dir, brainBehind)); err != nil || !info.Mode().IsRegular() {
-				t.Errorf("%s is no longer the user's hook file: %v %v", brainBehind, info, err)
+			info, err := os.Lstat(filepath.Join(f.dir, brainBehind))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if moved := info.Mode()&os.ModeSymlink != 0; moved != tc.moved {
+				t.Errorf("%s is a symlink = %v, want %v", brainBehind, moved, tc.moved)
 			}
 		})
 	}
@@ -2158,5 +2214,32 @@ func TestRemoveHooks_InterruptedKeepsUserHookBehindBrainWrapper(t *testing.T) {
 	}
 	if len(res.Older) > 0 {
 		t.Errorf("older copies %v, want none", res.Older)
+	}
+}
+
+// Uninstall drops the old name of the user's hook only when the copy Brain's
+// wrapper runs is that hook. A file there with the same bytes but another
+// mode was not made by the restore, so it stays and is reported.
+func TestRemoveHooks_KeepsOtherFileBehindBrainWrapper(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs execute bits")
+	}
+	spec := specFor(t, prePushHook)
+	const brainCopy = "pre-push.pre-entire-brain"
+	f := newHooksFixture(t)
+	f.write("pre-push", generateChainedContent(spec.content, prePushHook))
+	f.write("pre-push"+backupSuffix, brainWrapper)
+	f.write(brainCopy, userHookV1)
+	f.write(brainBehind, userHookV1)
+	f.chmod(brainBehind, 0o644)
+
+	res, err := removeHooks(context.Background(), f.lockRoot, f.root, f.dir, restoreMovedHooks)
+	if err != nil {
+		t.Fatalf("removeHooks: %v", err)
+	}
+	assertHooks(t, f, map[string]string{"pre-push": brainWrapper, brainCopy: userHookV1, brainBehind: userHookV1})
+	if !slices.Equal(res.Older, []string{brainBehind}) {
+		t.Errorf("older copies %v, want %v", res.Older, []string{brainBehind})
 	}
 }
