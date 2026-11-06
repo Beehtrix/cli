@@ -172,9 +172,8 @@ func prepareHookBackup(root *os.Root, name string, now time.Time) (backupAction,
 // and then the chain only needs its execute bits back to run the user's hook.
 //
 // A backup that names the file it would move to is left to the usual
-// rotation: moved there, it would run itself. So is a symlink that leads to
-// that file: moved there, it would point at itself, and the wrapper already
-// runs the hook it leads to.
+// rotation: moved there, it would run itself. So is a symlinked backup once
+// something is at that file (see linkMayReach).
 func backupRunsBehindBrainWrapper(root *os.Root, name string) bool {
 	if name != prePushHook || !isBrainWrapperFile(root, name) {
 		return false
@@ -183,60 +182,34 @@ func backupRunsBehindBrainWrapper(root *os.Root, name string) bool {
 	behind := backup + brainBackupSuffix
 	copied, err := osroot.ReadFileNoFollow(root, name+brainBackupSuffix)
 	return err == nil && bytes.Contains(copied, []byte(entireHookMarker)) && namesFile(copied, backup) &&
-		!runsByName(root, backup, behind) && !symlinkLeadsTo(root, backup, behind)
+		!runsByName(root, backup, behind) && !linkMayReach(root, backup, behind)
 }
 
-// symlinkLeadsTo: name is a symlink whose chain of links reaches target. The
-// chain is followed one link at a time inside root, so a link written as an
-// absolute path, or with "..", counts when it names a file in root (compared
-// by path, lexically). A link to a file outside root ends the chain there, so
-// a script elsewhere that happens to share target's name does not count. A
-// chain that does not end within maxHookLinkHops counts, so a loop is left
-// alone.
-func symlinkLeadsTo(root *os.Root, name, target string) bool {
-	targetInfo, targetErr := root.Lstat(target)
-	cur := name
-	for range maxHookLinkHops {
-		info, err := root.Lstat(cur)
-		if err != nil {
-			// A dangling link to target would point at itself once moved there.
-			return cur == target
-		}
-		if cur != name && (cur == target || targetErr == nil && os.SameFile(info, targetInfo)) {
-			return true
-		}
-		if info.Mode()&fs.ModeSymlink == 0 {
-			return false
-		}
-		link, err := root.Readlink(cur)
-		if err != nil {
-			return false
-		}
-		next, ok := linkInRoot(root, filepath.Dir(cur), link)
-		if !ok {
-			return false
-		}
-		cur = next
+// linkMayReach: name is a symlink that may lead to target, so moved there it
+// would point at itself, while the usual rotation leaves Brain's wrapper
+// running target, as on main. With nothing at target, a link that led there
+// would be dangling already, so moving it cannot stop a hook that runs.
+// Otherwise the link is resolved as the kernel would within root (os.Root
+// follows each link before a "..", unlike filepath.Clean), and it clears
+// target only when it resolves there to another file than target does. A link
+// that leaves root, written as an absolute path or climbing out with "..",
+// may come back through a directory alias or a link outside, so it counts.
+func linkMayReach(root *os.Root, name, target string) bool {
+	info, err := root.Lstat(name)
+	if err != nil || info.Mode()&fs.ModeSymlink == 0 {
+		return false
 	}
-	return true
-}
-
-// maxHookLinkHops bounds symlinkLeadsTo's walk, as the kernel bounds its own.
-const maxHookLinkHops = 40
-
-// linkInRoot returns the name in root that link, read from a symlink in dir
-// (a name in root), points to, or false when it points outside root. root's
-// name is absolute (see osroot.Shared), so an absolute link is compared with it.
-func linkInRoot(root *os.Root, dir, link string) (string, bool) {
-	abs := link
-	if !filepath.IsAbs(link) {
-		abs = filepath.Join(root.Name(), dir, link)
+	if _, err := root.Lstat(target); errors.Is(err, fs.ErrNotExist) {
+		return false
 	}
-	rel, err := filepath.Rel(root.Name(), abs)
-	if err != nil || !filepath.IsLocal(rel) {
-		return "", false
+	resolved, err := root.Stat(name)
+	if err != nil {
+		return true
 	}
-	return rel, true
+	// A chain through target resolves as target does; target failing to
+	// resolve while name does means the chain does not pass through it.
+	there, err := root.Stat(target)
+	return err == nil && os.SameFile(resolved, there)
 }
 
 // moveBehindBrainWrapper puts the user's hook in backup where entire-brain's
