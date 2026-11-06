@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -215,6 +216,46 @@ func TestInstallHooks_MigratesConfigsWrittenBeforeCommandWindows(t *testing.T) {
 			require.Zero(t, count, "a migrated config must be current")
 		})
 	}
+}
+
+// An outdated Entire hook found under a matcher moves to the unfiltered group
+// when it is upgraded, keeping its fields: left under the matcher it would fire
+// only for that tool. The user's own hook in that group stays where it is.
+func TestInstallHooks_UpgradeMovesEntireHookOutOfMatcherGroup(t *testing.T) {
+	tempDir := setupTestEnv(t)
+	var post managedHook
+	for _, h := range managedHooks {
+		if h.event == "PostToolUse" {
+			post = h
+		}
+	}
+	posix, _ := post.commands()
+	seed := `{"hooks":{"PostToolUse":[{"matcher":"apply_patch","hooks":[` +
+		`{"type":"command","command":"./audit.sh"},` +
+		`{"type":"command","command":` + strconv.Quote(posix) + `,"timeout":30,"statusMessage":"Saving"}` +
+		`]}]}}`
+	hooksPath := filepath.Join(tempDir, ".codex", HooksFileName)
+	require.NoError(t, os.MkdirAll(filepath.Dir(hooksPath), 0o750))
+	require.NoError(t, os.WriteFile(hooksPath, []byte(seed), 0o600))
+
+	_, err := (&CodexAgent{}).InstallHooks(context.Background(), false)
+	require.NoError(t, err)
+	_, data := readHooksFile(t, tempDir)
+	assertCodexEntries(t, data)
+	var doc struct {
+		Hooks map[string][]struct {
+			Matcher *string          `json:"matcher"`
+			Hooks   []map[string]any `json:"hooks"`
+		} `json:"hooks"`
+	}
+	require.NoError(t, json.Unmarshal(data, &doc))
+	groups := doc.Hooks["PostToolUse"]
+	require.Len(t, groups, 2)
+	require.NotNil(t, groups[0].Matcher)
+	require.Equal(t, []map[string]any{{"type": "command", "command": "./audit.sh"}}, groups[0].Hooks)
+	require.Nil(t, groups[1].Matcher)
+	require.Len(t, groups[1].Hooks, 1)
+	require.Equal(t, "Saving", groups[1].Hooks[0]["statusMessage"])
 }
 
 // Reported on #2884: `entire doctor` flagged hooks.json as out of date

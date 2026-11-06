@@ -736,8 +736,10 @@ func hookEntryExists(groups []MatcherGroup, want HookEntry) bool {
 // syncHookCommand makes want the event's one Entire hook. The Entire hook
 // already there (an exact match first, else the first one an older release
 // wrote) is updated in place, so fields the user added to it, such as
-// statusMessage or async, survive the upgrade; any other Entire hook for the
-// event is removed, and want is added when there is none. It applies
+// statusMessage or async, survive the upgrade; one being updated out of a group
+// with a matcher moves, fields and all, to the unfiltered group Entire installs
+// into, so it fires for every tool again. Any other Entire hook for the event is
+// removed, and want is added when there is none. It applies
 // agent.DropStaleManagedHooks' rule (every install drops Entire hooks an older
 // release left behind) through the same IsManagedHookCommand recognition, but
 // rewrites the one it keeps instead of re-adding it.
@@ -747,6 +749,7 @@ func syncHookCommand(groups []MatcherGroup, want HookEntry) ([]MatcherGroup, boo
 		keep = func(hook HookEntry) bool { return isEntireHook(hook.Command) }
 	}
 	kept, changed := false, false
+	var moved *HookEntry
 	result := make([]MatcherGroup, 0, len(groups))
 	for _, group := range groups {
 		hooks := make([]HookEntry, 0, len(group.Hooks))
@@ -754,9 +757,14 @@ func syncHookCommand(groups []MatcherGroup, want HookEntry) ([]MatcherGroup, boo
 			switch {
 			case !kept && keep(hook):
 				kept = true
-				if !sameManagedSettings(hook, want) || hook.Type != want.Type {
-					hook = hook.withManagedSettings(want)
-					changed = true
+				if sameManagedSettings(hook, want) && hook.Type == want.Type {
+					break
+				}
+				hook = hook.withManagedSettings(want)
+				changed = true
+				if group.Matcher != nil {
+					moved = &hook
+					continue
 				}
 			case isEntireHook(hook.Command):
 				changed = true
@@ -769,10 +777,12 @@ func syncHookCommand(groups []MatcherGroup, want HookEntry) ([]MatcherGroup, boo
 			result = append(result, group)
 		}
 	}
-	if !kept {
+	switch {
+	case !kept:
 		return addHook(result, want), true
-	}
-	if !changed {
+	case moved != nil:
+		return addHook(result, *moved), true
+	case !changed:
 		return groups, false
 	}
 	return result, true

@@ -260,23 +260,21 @@ func TestTrustInventory_CodexWindowsCommandIsPartOfTheHook(t *testing.T) {
 			continue
 		}
 		if e.Entire {
-			entire = append(entire, e.Name+": "+e.Command)
+			if e.CommandWindows != "" {
+				t.Errorf("Entire hook %q has CommandWindows %q; its Windows command is canonical", e.Command, e.CommandWindows)
+			}
+			entire = append(entire, e.Command)
 		} else {
-			branch = append(branch, e.Name+": "+e.Command)
+			branch = append(branch, e.Command+" | "+e.CommandWindows)
 		}
 	}
-	if !slices.Equal(entire, []string{"Stop: " + posix}) {
+	if !slices.Equal(entire, []string{posix}) {
 		t.Errorf("Entire hooks = %q, want only the installed pair", entire)
 	}
-	// Each Windows command is its own entry, so the confirm truncates it
-	// separately from a long POSIX command.
 	wantBranch := []string{
-		"Stop: " + posix,
-		"Stop (Windows): powershell -c evil",
-		"Stop: " + posix,
-		"Stop (Windows): evil.cmd",
-		"Stop: make lint",
-		"Stop (Windows): lint.cmd",
+		posix + " | powershell -c evil",
+		posix + " | evil.cmd",
+		"make lint | lint.cmd",
 	}
 	if !slices.Equal(branch, wantBranch) {
 		t.Errorf("branch hooks = %q, want %q", branch, wantBranch)
