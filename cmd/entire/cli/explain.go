@@ -2504,7 +2504,7 @@ func shortBranchName(name string) string {
 // default branch. Whether the target is the default branch is decided by its
 // short name, the same way strategy.IsOnDefaultBranch decides it for HEAD.
 func resolveBranchListTarget(repo *git.Repository, value string) (*branchListTarget, error) {
-	if shortBranchName(value) == "HEAD" {
+	if shortBranchName(value) == plumbing.HEAD.String() {
 		return nil, fmt.Errorf("--branch %q is not supported: use a branch name, or omit --branch to list the current branch", value)
 	}
 	candidates := branchListCandidates(value)
@@ -2548,6 +2548,70 @@ func checkpointMatchesAuthorFilter(p strategy.PendingCheckpoint, authorFilter st
 	}
 	ident := p.AuthorName + " <" + p.AuthorEmail + ">"
 	return strings.Contains(strings.ToLower(ident), strings.ToLower(authorFilter))
+}
+
+// branchListStart returns the commit a branch listing walks from and whether
+// that branch is the default one (which decides how history is walked): the
+// named branch's tip when target is set, else HEAD. born is false for an
+// unborn HEAD (no commits yet), which has nothing to list.
+func branchListStart(repo *git.Repository, target *branchListTarget) (plumbing.Hash, bool, bool, error) {
+	if target != nil {
+		return target.tip, target.isDefault, true, nil
+	}
+	head, err := repo.Head()
+	if err != nil {
+		if errors.Is(err, plumbing.ErrReferenceNotFound) {
+			return plumbing.ZeroHash, false, false, nil
+		}
+		return plumbing.ZeroHash, false, false, fmt.Errorf("failed to get HEAD: %w", err)
+	}
+	isOnDefault, _ := strategy.IsOnDefaultBranch(repo)
+	return head.Hash(), isOnDefault, true, nil
+}
+
+// walkBranchCommits visits the commits a branch listing scans from start, at
+// most commitScanLimit of them. On the default branch it walks the full DAG
+// so checkpoint commits on merged feature branches (second parents of merge
+// commits) are found. On any other branch it walks first parents only and
+// stops at the first commit on the default branch's first-parent chain,
+// which avoids walking into main's full history through merge commit parents.
+func walkBranchCommits(ctx context.Context, repo *git.Repository, start plumbing.Hash, isOnDefault bool, visit func(*object.Commit)) error {
+	if isOnDefault {
+		iter, err := repo.Log(&git.LogOptions{
+			From:  start,
+			Order: git.LogOrderCommitterTime,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to get commit log: %w", err)
+		}
+		defer iter.Close()
+
+		count := 0
+		return iter.ForEach(func(c *object.Commit) error { //nolint:wrapcheck // the caller wraps iteration errors
+			if err := ctx.Err(); err != nil {
+				return err //nolint:wrapcheck // Propagating context cancellation
+			}
+			if count >= commitScanLimit {
+				return storer.ErrStop
+			}
+			count++
+			visit(c)
+			return nil
+		})
+	}
+
+	// isOnDefault is false here (for HEAD or the named branch), so build the
+	// default branch's first-parent set unconditionally.
+	reachableFromMain := computeDefaultBranchFirstParents(ctx, repo)
+	return walkFirstParentCommits(ctx, repo, start, commitScanLimit, func(c *object.Commit) error {
+		// Once we hit a commit reachable from main on the first-parent chain,
+		// all earlier ancestors are also shared-with-main, so stop scanning.
+		if reachableFromMain[c.Hash] {
+			return errStopIteration
+		}
+		visit(c)
+		return nil
+	})
 }
 
 // getBranchCheckpointsWithOptions is getBranchCheckpoints narrowed by opts.
@@ -2599,24 +2663,13 @@ func getBranchCheckpointsWithOptions(ctx context.Context, repo *git.Repository, 
 		}
 	}
 
-	// Start hash and default-branch status (which decides how history is
-	// walked) come from the named branch when given, else from HEAD.
-	var startHash plumbing.Hash
-	var isOnDefault bool
-	if opts.target != nil {
-		startHash = opts.target.tip
-		isOnDefault = opts.target.isDefault
-	} else {
-		head, headErr := repo.Head()
-		if headErr != nil {
-			// Unborn HEAD (no commits yet) - return empty list instead of erroring
-			if errors.Is(headErr, plumbing.ErrReferenceNotFound) {
-				return []strategy.PendingCheckpoint{}, false, nil
-			}
-			return nil, false, fmt.Errorf("failed to get HEAD: %w", headErr)
-		}
-		startHash = head.Hash()
-		isOnDefault, _ = strategy.IsOnDefaultBranch(repo)
+	startHash, isOnDefault, born, err := branchListStart(repo, opts.target)
+	if err != nil {
+		return nil, false, err
+	}
+	if !born {
+		// Unborn HEAD (no commits yet) - return empty list instead of erroring
+		return []strategy.PendingCheckpoint{}, false, nil
 	}
 
 	var points []strategy.PendingCheckpoint
@@ -2662,48 +2715,7 @@ func getBranchCheckpointsWithOptions(ctx context.Context, repo *git.Repository, 
 		points = append(points, point)
 	}
 
-	if isOnDefault {
-		// On the default branch, use full DAG walk to find checkpoint commits
-		// on merged feature branches (second parents of merge commits).
-		iter, iterErr := repo.Log(&git.LogOptions{
-			From:  startHash,
-			Order: git.LogOrderCommitterTime,
-		})
-		if iterErr != nil {
-			return nil, false, fmt.Errorf("failed to get commit log: %w", iterErr)
-		}
-		defer iter.Close()
-
-		count := 0
-		err = iter.ForEach(func(c *object.Commit) error {
-			if err := ctx.Err(); err != nil {
-				return err //nolint:wrapcheck // Propagating context cancellation
-			}
-			if count >= commitScanLimit {
-				return storer.ErrStop
-			}
-			count++
-			collectCheckpoint(c)
-			return nil
-		})
-	} else {
-		// On feature branches, use first-parent walk with branch filtering.
-		// This avoids walking into main's full history through merge commit parents.
-		// isOnDefault is already false here (for HEAD or the named branch), so
-		// build the default branch's first-parent set unconditionally.
-		reachableFromMain := computeDefaultBranchFirstParents(ctx, repo)
-
-		err = walkFirstParentCommits(ctx, repo, startHash, commitScanLimit, func(c *object.Commit) error {
-			// Once we hit a commit reachable from main on the first-parent chain,
-			// all earlier ancestors are also shared-with-main, so stop scanning.
-			if reachableFromMain[c.Hash] {
-				return errStopIteration
-			}
-			collectCheckpoint(c)
-			return nil
-		})
-	}
-
+	err = walkBranchCommits(ctx, repo, startHash, isOnDefault, collectCheckpoint)
 	if err != nil {
 		return nil, false, fmt.Errorf("error iterating commits: %w", err)
 	}
