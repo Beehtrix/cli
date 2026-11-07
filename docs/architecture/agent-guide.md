@@ -450,23 +450,36 @@ The sh-based wrappers carry `>` and `&`. On Windows, an agent that hands the
 stored command to `cmd.exe` has those read as its own redirection and separator,
 so the command is cut apart and `entire` never runs — at **exit code 0**, so
 nothing reports a problem. Never install an unconditional
-`WrapProductionSilentHookCommand`; choose per host with the `*ForOS` selectors
-(`WrapProductionSilentHookCommandForOS`,
+`WrapProductionSilentHookCommand` as a hook's only command; choose per host
+with the `*ForOS` selectors (`WrapProductionSilentHookCommandForOS`,
 `WrapProductionJSONWarningHookCommandForOS`,
 `WrapProductionPlainTextWarningHookCommandForOS`), passing one of two gates:
 
 | Gate | Use it when | Adopters |
 | --- | --- | --- |
-| `agent.UseWindowsProductionHooks(ctx)` | The agent may genuinely reach a POSIX sh on Windows. Probes whether `sh -c 'exit 0'` runs and keeps the sh wrapper if it does. | codex, cursor |
+| `agent.UseWindowsProductionHooks(ctx)` | The agent may genuinely reach a POSIX sh on Windows. Probes whether `sh -c 'exit 0'` runs and keeps the sh wrapper if it does. | cursor |
 | `agent.HookHostIsWindows()` | The agent hands every hook to `cmd.exe` on Windows whatever else is installed. No probe. | factoryai-droid |
+
+Prefer neither when the agent's config can hold a separate Windows command and
+the agent picks between the two itself. Codex is one: each hook takes a
+`commandWindows` that Codex runs instead of `command` on native Windows, so
+Entire writes the sh wrapper to `command` and a Windows wrapper to
+`commandWindows`, and the file is the same on every host. Codex may run that
+Windows command through PowerShell or `cmd.exe`, so it uses the nested forms
+(`WrapWindowsProductionNestedSilentHookCommand`,
+`WrapWindowsProductionNestedPlainTextWarningHookCommand`), whose whole `cmd.exe`
+line is one double-quoted string both shells pass through untouched. They also
+set `NoDefaultCurrentDirectoryInExePath` first: `cmd.exe` otherwise looks in
+the current directory, which for a hook is the checkout, before PATH, so an
+`entire.cmd` committed to a branch would run in place of the installed CLI.
 
 **Establish which by reading the agent's runner, not by assuming.** The probe is
 not the safe default: it only proves that a command carrying *no* cmd.exe
 metacharacters runs, so a Windows host with Git Bash reports success while the
 real wrapper is still cut apart. That is exactly how droid shipped broken on
 Windows — see `agent.HookHostIsWindows`'s doc comment for how its runner was
-read out of the shipped binaries, and for why codex and cursor are on the other
-gate for reasons of evidence rather than mechanism.
+read out of the shipped binaries, and for why cursor is on the other gate for
+reasons of evidence rather than mechanism.
 
 Put a warning wrapper on one hook that fires every session (usually session
 start) so a broken install is visible. The sh-based warning wrappers warn both
