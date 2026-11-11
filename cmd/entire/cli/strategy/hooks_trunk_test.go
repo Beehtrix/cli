@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
@@ -234,6 +235,71 @@ func TestInstallHooks_ChainedTrunkLauncherNeedsNoBashOnPath(t *testing.T) {
 	}
 }
 
+// A PATH that lacks grep must still source Trunk's launcher under the hook's
+// own name. The chain used to identify the launcher with grep -qxF, so a
+// missing grep fell through to executing it as <hook>.pre-entire, and Trunk
+// exited 2.
+func TestInstallHooks_ChainedTrunkLauncherNeedsNoGrepOnPath(t *testing.T) {
+	t.Parallel()
+	tf := newTrunkFixture(t, false, 0)
+	tf.installExecutable(buildHookSpecs(bareEntireHookCmd)...)
+	for _, tool := range []string{"cat", "dirname", "mkdir", "mktemp", "rm"} {
+		target, err := exec.LookPath(tool)
+		if err != nil {
+			t.Skipf("hooks need %s", tool)
+		}
+		if err := os.Symlink(target, filepath.Join(tf.bin, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tf.path = tf.bin
+	if code, got := tf.run("pre-push", "\n", "origin", "url"); code != 0 || !strings.Contains(got, "trunk pre-push origin url") {
+		t.Errorf("pre-push exited %d after running:\n%s\nwant Trunk's pre-push to run without grep on PATH", code, got)
+	}
+}
+
+// A large compiled-like backup must still run promptly. The chain used to
+// identify Trunk's launcher by reading the backup to EOF, which took several
+// seconds on a 15MB executable; the scan is now capped at 64KiB.
+func TestInstallHooks_ChainedLargeBackupRunsPromptly(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("runs POSIX shell hooks")
+	}
+	f := newHooksFixture(t)
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "log")
+	writeExec(t, filepath.Join(bin, "entire"), "#!/bin/sh\n")
+	hook := filepath.Join(f.dir, "post-commit")
+	writeExec(t, hook, "#!/bin/sh\necho ran >> "+log+"\nexit 0\n")
+	pad, err := os.OpenFile(hook, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := strings.Repeat("A", 1<<20)
+	for range 8 {
+		if _, err := pad.WriteString(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := pad.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.installExecutable(specFor(t, "post-commit"))
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if out, err := runHook(ctx, bin, filepath.Join(f.dir, "post-commit")); err != nil {
+		t.Fatalf("post-commit: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "ran" {
+		t.Errorf("backup ran %q, want ran", got)
+	}
+}
+
 // Every other saved hook is still run as its own program, under its own path.
 func TestInstallHooks_ChainedHookKeepsItsOwnPath(t *testing.T) {
 	t.Parallel()
@@ -315,6 +381,81 @@ func plantPre3051TrunkChain(t *testing.T, tf *trunkFixture) {
 	}
 }
 
+// grepTrunkChainCall is the chain Entire wrote when it identified Trunk's
+// launcher with grep -qxF. Frozen so this test still plants that text if
+// chainCall changes again.
+func grepTrunkChainCall(hookName, redirect string) string {
+	backup := hookName + backupSuffix
+	keep := hookName + keepSuffix
+	guard := "ENTIRE_CHAINING_" + strings.ToUpper(strings.ReplaceAll(hookName, "-", "_"))
+	return fmt.Sprintf(`%s
+_entire_hook_dir="$(dirname "$0")"
+if [ -z "${%s:-}" ]; then
+    %s=1
+    export %s
+    if [ -n "${PRE_COMMIT_RUNNING_LEGACY:-}" ] && grep -q '^%s' "$_entire_hook_dir/%s" 2>/dev/null; then
+        if [ -x "$_entire_hook_dir/%s" ]; then
+            "$_entire_hook_dir/%s" "$@"%s
+        fi
+    elif [ -x "$_entire_hook_dir/%s" ]; then
+        if grep -qxF %s "$_entire_hook_dir/%s" 2>/dev/null; then
+            /bin/bash --norc -c '_entire_saved_hook=$1; shift; . "$_entire_saved_hook"' "$_entire_hook_dir/%s" "$_entire_hook_dir/%s" "$@"%s
+        else
+            "$_entire_hook_dir/%s" "$@"%s
+        fi
+    fi
+fi
+`, chainComment, guard, guard, guard, preCommitSignatures[0], backup, keep, keep, redirect,
+		backup, shellQuote(trunkHookCallback), backup, hookName, backup, redirect, backup, redirect)
+}
+
+func grepTrunkChainedContent(baseContent, hookName string) string {
+	if hookName == postRewriteHook {
+		const original = `hooks git post-rewrite "$1" 2>/dev/null || true`
+		const replacement = `hooks git post-rewrite "$1" < "$_entire_stdin" 2>/dev/null || true`
+		replayPrefix := `#!/bin/sh
+_entire_stdin="$(mktemp "${TMPDIR:-/tmp}/entire-post-rewrite.XXXXXX")"
+cat > "$_entire_stdin"
+trap 'rm -f "$_entire_stdin"' EXIT
+`
+		body := strings.TrimPrefix(baseContent, "#!/bin/sh\n")
+		body = strings.Replace(body, original, replacement, 1)
+		return replayPrefix + body + "\n" + grepTrunkChainCall(postRewriteHook, ` < "$_entire_stdin"`)
+	}
+	if hookName == prePushHook {
+		baseContent += "_entire_status=$?\nif [ \"$_entire_status\" -ne 0 ]; then exit \"$_entire_status\"; fi\n"
+	}
+	return baseContent + grepTrunkChainCall(hookName, "")
+}
+
+func plantGrepTrunkChain(t *testing.T, tf *trunkFixture) {
+	t.Helper()
+	for _, spec := range buildHookSpecs(bareEntireHookCmd) {
+		src := filepath.Join(tf.dir, spec.name)
+		dst := filepath.Join(tf.dir, spec.name+backupSuffix)
+		if err := os.Rename(src, dst); err != nil {
+			t.Fatal(err)
+		}
+		tf.write(spec.name, grepTrunkChainedContent(spec.content, spec.name))
+	}
+}
+
+func writeGrepChain(t *testing.T, dir, hook, backup string) {
+	t.Helper()
+	for _, spec := range buildHookSpecs(bareEntireHookCmd) {
+		content := spec.content
+		if spec.name == hook {
+			content = grepTrunkChainedContent(spec.content, spec.name)
+		}
+		if err := os.WriteFile(filepath.Join(dir, spec.name), []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, hook+backupSuffix), []byte(backup), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (tf *trunkFixture) useAsGitHooks(t *testing.T) {
 	t.Helper()
 	testutil.RunGit(t, tf.worktree, "init")
@@ -344,6 +485,39 @@ func TestReinstallGitHooks_Pre3051TrunkChainIsOutdated(t *testing.T) {
 	const refs = "refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222"
 	if code, got := tf.run("pre-push", refs+"\n", "origin", "url"); code != 0 || !strings.Contains(got, "trunk pre-push origin url") {
 		t.Errorf("pre-push exited %d after running:\n%s\nwant Trunk to run as pre-push", code, got)
+	}
+}
+
+// An existing install that still identifies Trunk's launcher with grep -qxF
+// must read Outdated so ReinstallGitHooks rewrites it. After the rewrite,
+// pre-push reaches Trunk as pre-push even when grep is not on PATH.
+func TestReinstallGitHooks_GrepTrunkChainIsOutdated(t *testing.T) {
+	tf := newTrunkFixture(t, false, 0)
+	plantGrepTrunkChain(t, tf)
+	tf.useAsGitHooks(t)
+
+	if got := CheckGitHookState(t.Context()); got != GitHooksOutdated {
+		t.Fatalf("CheckGitHookState = %v, want GitHooksOutdated", got)
+	}
+	if _, err := ReinstallGitHooks(t.Context()); err != nil {
+		t.Fatalf("ReinstallGitHooks: %v", err)
+	}
+	if got := CheckGitHookState(t.Context()); got != GitHooksCurrent {
+		t.Fatalf("after ReinstallGitHooks, CheckGitHookState = %v, want GitHooksCurrent", got)
+	}
+	for _, tool := range []string{"cat", "dirname", "mkdir", "mktemp", "rm"} {
+		target, err := exec.LookPath(tool)
+		if err != nil {
+			t.Skipf("hooks need %s", tool)
+		}
+		if err := os.Symlink(target, filepath.Join(tf.bin, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tf.path = tf.bin
+	const refs = "refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 2222222222222222222222222222222222222222"
+	if code, got := tf.run("pre-push", refs+"\n", "origin", "url"); code != 0 || !strings.Contains(got, "trunk pre-push origin url") {
+		t.Errorf("pre-push exited %d after running:\n%s\nwant Trunk to run as pre-push without grep on PATH", code, got)
 	}
 }
 
@@ -404,6 +578,24 @@ func TestCheckGitHookState_TrunkChainOutdatedIsSpecific(t *testing.T) {
 		}
 		if got := gitHookStateInHooksDir(dir); got != GitHooksCurrent {
 			t.Errorf("current chain with a Trunk backup = %v, want GitHooksCurrent", got)
+		}
+	})
+
+	t.Run("grep chain with Trunk backup", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		writeGrepChain(t, dir, prePushHook, trunkHookLauncher)
+		if got := gitHookStateInHooksDir(dir); got != GitHooksOutdated {
+			t.Errorf("grep chain to a Trunk backup = %v, want GitHooksOutdated", got)
+		}
+	})
+
+	t.Run("grep chain with ordinary backup", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		writeGrepChain(t, dir, prePushHook, "#!/bin/sh\necho user hook\n")
+		if got := gitHookStateInHooksDir(dir); got != GitHooksCurrent {
+			t.Errorf("grep chain to a non-Trunk backup = %v, want GitHooksCurrent", got)
 		}
 	})
 
