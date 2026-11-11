@@ -646,6 +646,9 @@ type stampRecords struct {
 	// the committed paths a redo's inherited checkpoints hold.
 	inherited map[id.CheckpointID]bool
 	redone    map[string]bool
+	// takenAt is when the take ran, the time it marks the sessions entries it
+	// takes with (awaitEarlierCondensations).
+	takenAt time.Time
 }
 
 // takeStampRecords returns, for post-commit, what prepare-commit-msg recorded
@@ -681,9 +684,9 @@ func takeStampRecords(ctx context.Context, commit *object.Commit) stampRecords {
 	// Read HEAD under the lock: a prepare whose records are here read HEAD
 	// before writing them, so the commit it stamped on has landed by now.
 	pending := commitsUpToHead(ctx, head)
-	var out stampRecords
+	out := stampRecords{takenAt: time.Now()}
 	out.inherited, out.redone = takeInheritedMarkerIn(ctx, root, parent, pending)
-	out.stamped, out.sessions = takeStampsIn(ctx, root, commit, carried, pending)
+	out.stamped, out.sessions = takeStampsIn(ctx, root, commit, carried, pending, out.takenAt)
 	return out
 }
 
@@ -696,7 +699,7 @@ func takeStampRecords(ctx context.Context, commit *object.Commit) stampRecords {
 // does; it is kept for that commit's post-commit. It leaves the entries it
 // takes in place, without their stamps and marked as this post-commit's, for
 // releaseStampedSessions. Callers hold the stamp-records lock.
-func takeStampsIn(ctx context.Context, root *os.Root, commit *object.Commit, carried map[id.CheckpointID]bool, pending inFlight) (map[id.CheckpointID]bool, map[id.CheckpointID]stampedSessions) {
+func takeStampsIn(ctx context.Context, root *os.Root, commit *object.Commit, carried map[id.CheckpointID]bool, pending inFlight, now time.Time) (map[id.CheckpointID]bool, map[id.CheckpointID]stampedSessions) {
 	entries := readStampedSessionsIn(root)
 	stampedOn := make(map[id.CheckpointID]string, len(entries))
 	for _, e := range entries {
@@ -712,7 +715,6 @@ func takeStampsIn(ctx context.Context, root *os.Root, commit *object.Commit, car
 			kept = append(kept, cpID)
 		}
 	}
-	now := time.Now()
 	taker := currentStampTaker(now)
 	sessions := make(map[id.CheckpointID]stampedSessions)
 	var keptEntries []stampedSessions
