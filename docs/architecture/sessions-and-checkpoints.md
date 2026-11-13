@@ -326,10 +326,7 @@ commit.
   records the sessions prepare linked for each stamped ID, and post-commit
   keeps them when it matches sessions again (`withLinkedSessions`): one that
   looks idle by then, after a long prompt or editor wait, is still condensed
-  into the trailer prepare wrote. The recency filter the fallback applies when
-  its candidates span several worktrees counts a linked session as recent,
-  and when the recent ones still span several worktrees, it takes the linked
-  ones if they share one. The entry also names the sessions prepare
+  into the trailer prepare wrote. The entry also names the sessions prepare
   stamped on their shape alone, ACTIVE mid-turn or IDLE with a running
   subagent (`trustedSessionIDs`). In a commit no session's tracked files
   claim, post-commit condenses those without overlap evidence
