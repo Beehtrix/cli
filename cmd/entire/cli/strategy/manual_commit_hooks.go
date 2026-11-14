@@ -1514,6 +1514,23 @@ func (h *postCommitActionHandler) HandleWarnStaleSession(_ *session.State) error
 // it did, and PostCommit then reads the sessions again. See SetBeforeCondense.
 var beforeCondense func(ctx context.Context, sessions []*SessionState) bool
 
+// settledSessions runs, for the sessions PostCommit is about to condense into
+// cpID, the commit's checkpoint, what may change their state outside every
+// session lock: the beforeCondense hook, and the wait for a post-commit that
+// took its stamps before this one's take (at tookAt) to condense them
+// (awaitEarlierCondensations). When either did, it reads the set again so
+// commit claims see the change.
+func (s *ManualCommitStrategy) settledSessions(ctx context.Context, worktreePath string, sessions []*SessionState, tookAt time.Time, cpID id.CheckpointID) []*SessionState {
+	changed := beforeCondense != nil && beforeCondense(ctx, sessions)
+	if !awaitEarlierCondensations(ctx, sessions, cpID, tookAt) && !changed {
+		return sessions
+	}
+	if reloaded, err := s.findSessionsForCommitLinking(ctx, worktreePath); err == nil && len(reloaded) > 0 {
+		return reloaded
+	}
+	return sessions
+}
+
 // SetBeforeCondense registers the hook PostCommit runs for the sessions it is
 // about to condense (nil clears it). The cli registers the Codex child-ledger
 // refresh here, so child task records are reconciled in exactly the set
@@ -1551,10 +1568,10 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 	}
 
 	// Condense into the trailer prepare stamped, never into an inherited one.
-	// The records are taken in one step under their lock, so a later commit's
-	// prepare or post-commit racing this hook cannot split them, and this hook
-	// leaves that commit's own records in place.
+	// Only this commit's records are taken, in one step under their lock
+	// (takeStampRecords), and their sessions entries released on return.
 	records := takeStampRecords(ctx, commit)
+	defer releaseStampedSessions(ctx, records.sessions)
 	ids, moved := linkedTrailersOf(ctx, commit, records)
 	checkpointID, targetPreexisting, found := s.condensationTarget(ctx, repo, ids, records.stamped)
 	openRepoSpan.End()
@@ -1603,14 +1620,7 @@ func (s *ManualCommitStrategy) PostCommit(ctx context.Context) error {
 		)
 		return nil
 	}
-	if beforeCondense != nil && beforeCondense(ctx, sessions) {
-		// The hook changed session state (it runs outside every session
-		// lock); read the set again so commit claims see the change.
-		if reloaded, reloadErr := s.findSessionsForCommitLinking(ctx, worktreePath); reloadErr == nil && len(reloaded) > 0 {
-			sessions = reloaded
-		}
-	}
-
+	sessions = s.settledSessions(ctx, worktreePath, sessions, records.takenAt, checkpointID)
 	provenance := newCommitProvenance(ctx, sessions)
 
 	// Build transition context
@@ -3212,9 +3222,15 @@ func (s *ManualCommitStrategy) addTrailerForAgentCommit(logCtx context.Context, 
 	return nil
 }
 
+// checkpointIDForSessions returns the checkpoint ID for a commit linking
+// states: the first reserved ID among them that this commit may take
+// (freeReservation), or a fresh one. A reserved ID goes to one commit.
+// Another commit prepared before that commit's post-commit has condensed the
+// session gets an ID of its own, and the session joins it once that
+// post-commit has condensed the reservation.
 func checkpointIDForSessions(ctx context.Context, states []*SessionState) (id.CheckpointID, error) {
 	for _, state := range states {
-		if checkpointID := state.PendingCondensationID(); checkpointID != id.EmptyCheckpointID {
+		if checkpointID := freeReservation(ctx, state); !checkpointID.IsEmpty() {
 			return checkpointID, nil
 		}
 	}

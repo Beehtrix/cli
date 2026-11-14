@@ -33,14 +33,22 @@ import (
 // `commit -C`, inherited from squashed commits) names a checkpoint this commit
 // did not stamp, and would otherwise suppress the fresh trailer new work
 // needs; so does an ID anywhere else in the message. A checkpoint deleted from
-// this clone never counts either. rules is messageCommentRules' answer for
-// message.
+// this clone never counts either, nor does a stamp a commit made since carries
+// (stampCarriedInFlight), which a message saved from that commit can name
+// before its post-commit takes the stamp. rules is messageCommentRules' answer
+// for message.
 func stampedTrailer(ctx context.Context, message string, rules commentRules, inherited []id.CheckpointID) (id.CheckpointID, bool) {
 	ids := withoutInherited(withoutDeletedCheckpoints(ctx, preparedFinalTrailers(message, rules)), checkpointSet(inherited))
 	if len(ids) == 0 {
 		return id.EmptyCheckpointID, false
 	}
-	return lastStamped(ids, readStampedTrailers(ctx))
+	stamped := readStampedTrailers(ctx)
+	for _, cpID := range ids {
+		if stamped[cpID] && stampCarriedInFlight(ctx, cpID) {
+			delete(stamped, cpID)
+		}
+	}
+	return lastStamped(ids, stamped)
 }
 
 // preparedFinalTrailers returns the checkpoint IDs in the final trailer block
@@ -496,7 +504,12 @@ func recordStampedTrailer(ctx context.Context, cpID id.CheckpointID) bool {
 // its trailer (a stamp an older binary wrote), post-commit matches afresh, as
 // before. The entry also names the linked sessions prepare stamped on their
 // shape alone (withTrustedSessions), which post-commit condenses without
-// overlap evidence however they have settled since.
+// overlap evidence however they have settled since. Post-commit leaves the
+// entries of the stamps it takes, marked as its own, until it is done
+// (releaseStampedSessions), which is how a racing prepare knows a reserved ID
+// is already another commit's (stampCarriedInFlight), and a racing
+// post-commit that the session is still to be condensed into it
+// (awaitEarlierCondensations).
 const stampedSessionsFile = "entire-stamped-sessions.json"
 
 type stampedSessions struct {
@@ -508,6 +521,9 @@ type stampedSessions struct {
 	// post-commit keeps the stamps prepared on its own commit or on one made on
 	// top of it since (takeStampRecords).
 	Head string `json:"head,omitempty"`
+	// Taken is the post-commit that took the stamp, set on the entry it
+	// leaves in place until it is done (releaseStampedSessions).
+	Taken *stampTaker `json:"taken,omitempty"`
 }
 
 // writeStampRecords records entry's trailer as stamped, and entry with it,
@@ -672,12 +688,18 @@ type stampRecords struct {
 	// the committed paths a redo's inherited checkpoints hold.
 	inherited map[id.CheckpointID]bool
 	redone    map[string]bool
+	// takenAt is when the take ran, the time it marks the sessions entries it
+	// takes with (awaitEarlierCondensations).
+	takenAt time.Time
 }
 
 // takeStampRecords returns, for post-commit, what prepare-commit-msg recorded
 // for commit, and consumes it. It holds the stamp-records lock throughout, so
 // it takes every record in one step that a racing prepare or post-commit
-// cannot split.
+// cannot split. The sessions entries of the stamps it takes stay in place,
+// without their stamps, until post-commit is done with them
+// (releaseStampedSessions), so a prepare racing it can tell that its commit
+// carries a session's reserved ID (stampCarriedInFlight).
 //
 // It consumes only what is the commit's. git lets the next commit start once
 // this one is made, before its post-commit runs, so later commits' prepares
@@ -704,17 +726,22 @@ func takeStampRecords(ctx context.Context, commit *object.Commit) stampRecords {
 	// Read HEAD under the lock: a prepare whose records are here read HEAD
 	// before writing them, so the commit it stamped on has landed by now.
 	pending := commitsUpToHead(ctx, head)
-	var out stampRecords
+	out := stampRecords{takenAt: time.Now()}
 	out.inherited, out.redone = takeInheritedMarkerIn(ctx, root, parent, pending)
-	out.stamped, out.sessions = takeStampsIn(ctx, root, carried, pending)
+	out.stamped, out.sessions = takeStampsIn(ctx, root, commit, carried, pending, out.takenAt)
 	return out
 }
 
-// takeStampsIn takes the stamps and sessions entries of the trailers carried,
-// keeps the ones that may be stamped on a commit in pending, and drops the
-// rest. Callers
-// hold the stamp-records lock.
-func takeStampsIn(ctx context.Context, root *os.Root, carried map[id.CheckpointID]bool, pending inFlight) (map[id.CheckpointID]bool, map[id.CheckpointID]stampedSessions) {
+// takeStampsIn takes the stamps and sessions entries of the trailers commit
+// carries, keeps the ones that may be stamped on a commit in pending, and
+// drops the rest, including an entry an earlier take left without its stamp
+// once the post-commit that took it has stopped running. A stamp commit
+// carries is an earlier commit's when a commit before it, made since the
+// stamp, carries it too (carriedBefore), as a message saved from that commit
+// does; it is kept for that commit's post-commit. It leaves the entries it
+// takes in place, without their stamps and marked as this post-commit's, for
+// releaseStampedSessions. Callers hold the stamp-records lock.
+func takeStampsIn(ctx context.Context, root *os.Root, commit *object.Commit, carried map[id.CheckpointID]bool, pending inFlight, now time.Time) (map[id.CheckpointID]bool, map[id.CheckpointID]stampedSessions) {
 	entries := readStampedSessionsIn(root)
 	stampedOn := make(map[id.CheckpointID]string, len(entries))
 	for _, e := range entries {
@@ -724,19 +751,22 @@ func takeStampsIn(ctx context.Context, root *os.Root, carried map[id.CheckpointI
 	var kept []id.CheckpointID
 	for _, cpID := range readStampedTrailersIn(root) {
 		switch {
-		case carried[cpID]:
+		case carried[cpID] && !carriedBefore(ctx, commit, stampedOn[cpID], cpID):
 			stamped[cpID] = true
-		case pending.mayBePending(stampedOn[cpID]):
+		case carried[cpID], pending.mayBePending(stampedOn[cpID]):
 			kept = append(kept, cpID)
 		}
 	}
+	taker := currentStampTaker(now)
 	sessions := make(map[id.CheckpointID]stampedSessions)
 	var keptEntries []stampedSessions
 	for _, e := range entries {
 		switch {
-		case carried[e.CheckpointID]:
+		case stamped[e.CheckpointID]:
 			sessions[e.CheckpointID] = e
-		case slices.Contains(kept, e.CheckpointID):
+			e.Taken = taker
+			keptEntries = append(keptEntries, e)
+		case slices.Contains(kept, e.CheckpointID), e.Taken.running(now):
 			keptEntries = append(keptEntries, e)
 		}
 	}
@@ -749,6 +779,36 @@ func takeStampsIn(ctx context.Context, root *os.Root, carried map[id.CheckpointI
 		logging.Debug(logCtx, "post-commit: could not rewrite the stamped trailers", slog.String("error", err.Error()))
 	}
 	return stamped, sessions
+}
+
+// releaseStampedSessions removes the sessions entries takeStampRecords left
+// in place for the stamps post-commit took (taken), once post-commit is done
+// with them. An entry whose trailer has been stamped again since is a later
+// prepare's, and stays. If post-commit never gets here, a later post-commit's
+// take drops the entries once this one has stopped running.
+func releaseStampedSessions(ctx context.Context, taken map[id.CheckpointID]stampedSessions) {
+	if len(taken) == 0 {
+		return
+	}
+	root, err := perWorktreeGitRoot(ctx)
+	if err != nil {
+		return
+	}
+	release := lockStampRecords(ctx, root)
+	defer release()
+	restamped := checkpointSet(readStampedTrailersIn(root))
+	entries := readStampedSessionsIn(root)
+	left := slices.DeleteFunc(entries, func(e stampedSessions) bool {
+		_, took := taken[e.CheckpointID]
+		return took && !restamped[e.CheckpointID]
+	})
+	if len(left) == len(entries) {
+		return
+	}
+	if err := writeStampedSessionsIn(root, left); err != nil {
+		logging.Debug(logging.WithComponent(ctx, "checkpoint"), "post-commit: could not release the stamped sessions",
+			slog.String("error", err.Error()))
+	}
 }
 
 // takeInheritedMarkerIn returns the trailers prepare-commit-msg recorded as
