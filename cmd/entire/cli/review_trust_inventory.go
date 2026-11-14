@@ -341,7 +341,10 @@ func hookTrustEntries(agentName, source string, raw json.RawMessage, canonical m
 				windowsCanonical, windowsShown := windowsHookCommands(hook, command, canonical[event], windowsKeys)
 				entire = entire && windowsCanonical
 				entry := cliReview.TrustEntry{Agent: agentName, Kind: cliReview.TrustKindHook, Name: event, Command: shown, Source: source, Entire: entire}
-				if !entire && commandOK && command != "" {
+				// Even when Command is the whole hook as JSON (no string
+				// command), the Windows command gets its own line: the
+				// shortened JSON could cut it out.
+				if !entire {
 					entry.CommandWindows = strings.Join(windowsShown, "; ")
 				}
 				out = append(out, entry)

@@ -247,6 +247,10 @@ func TestTrustInventory_CodexWindowsCommandIsPartOfTheHook(t *testing.T) {
 		hook(map[string]string{"command": posix, "commandWindows": "powershell -c evil"}),
 		hook(map[string]string{"command": posix, "command_windows": "evil.cmd"}),
 		hook(map[string]string{"command": "make lint", "commandWindows": "lint.cmd"}),
+		// No command to show: Command falls back to the hook's JSON, which
+		// the confirm shortens, so the Windows command needs its own line.
+		hook(map[string]string{"command": "", "commandWindows": "empty.cmd", "statusMessage": strings.Repeat("x", 200)}),
+		hook(map[string]string{"command_windows": "missing.cmd"}),
 	}
 	data, err := json.Marshal(map[string]any{"hooks": map[string]any{"Stop": []any{map[string]any{"hooks": hooks}}}})
 	if err != nil {
@@ -265,7 +269,11 @@ func TestTrustInventory_CodexWindowsCommandIsPartOfTheHook(t *testing.T) {
 			}
 			entire = append(entire, e.Command)
 		} else {
-			branch = append(branch, e.Command+" | "+e.CommandWindows)
+			command := e.Command
+			if strings.HasPrefix(command, "{") {
+				command = "(json)"
+			}
+			branch = append(branch, command+" | "+e.CommandWindows)
 		}
 	}
 	if !slices.Equal(entire, []string{posix}) {
@@ -275,6 +283,8 @@ func TestTrustInventory_CodexWindowsCommandIsPartOfTheHook(t *testing.T) {
 		posix + " | powershell -c evil",
 		posix + " | evil.cmd",
 		"make lint | lint.cmd",
+		"(json) | empty.cmd",
+		"(json) | missing.cmd",
 	}
 	if !slices.Equal(branch, wantBranch) {
 		t.Errorf("branch hooks = %q, want %q", branch, wantBranch)
