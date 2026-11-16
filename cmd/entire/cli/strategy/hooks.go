@@ -465,8 +465,8 @@ const (
 	GitHooksCurrent
 	// GitHooksOutdated means the hooks are ours but at least one is a shape we no
 	// longer write: a hook that still runs Entire from the working tree, an old
-	// pre-push that does not pass git's ref list, or a chain that still executes
-	// Trunk's launcher under the backup's name.
+	// pre-push that does not pass git's ref list, or a chain to Trunk's launcher
+	// that still executes it under the backup's name or needs grep to avoid that.
 	GitHooksOutdated
 )
 
@@ -550,8 +550,9 @@ const bareEntireHookCmd = "entire"
 
 // gitHookStateInHooksDir classifies the hooks in the given directory. A hook that
 // is present but in a shape we no longer write — a removed local-dev launcher,
-// an old pre-push, or a Trunk chain from before sourcing — reads Outdated, not
-// Current, so EnsureSetup reinstalls it rather than leaving a broken hook in place.
+// an old pre-push, or a Trunk chain that would still misroute the launcher —
+// reads Outdated, not Current, so EnsureSetup reinstalls it rather than leaving
+// a broken hook in place.
 func gitHookStateInHooksDir(hooksDir string) GitHookState {
 	// ForRemoval: this is a read, and reporting GitHooksAbsent for a symlinked
 	// hooks directory is what sent EnsureSetup to InstallGitHook on every agent
@@ -619,15 +620,15 @@ func classifyEntireHookContent(root *os.Root, hook, content string) (GitHookStat
 
 // outdatedTrunkChain returns the chain block in content that an earlier
 // version wrote and that runs Trunk's launcher wrongly, when <hook>.pre-entire
-// is Trunk's launcher; otherwise "". That chain executes the launcher as
-// <hook>.pre-entire, which Trunk refuses with exit 2, aborting the commit or
-// push.
+// is Trunk's launcher; otherwise "". Those chains either execute the launcher
+// as <hook>.pre-entire, which Trunk refuses with exit 2, aborting the commit
+// or push, or need grep on PATH to avoid that.
 //
 // The check is Trunk-specific and only reads the backup for a hook that holds
-// that block exactly as generated, once. A chain that is not Trunk's, or one
-// the user changed by hand (say, to source the backup themselves), stays
-// Current. Lines the user added outside the block are kept: ReinstallGitHooks
-// replaces only the block (see trunkChainUpgrade).
+// one of those blocks exactly as generated, once. A chain that is not Trunk's,
+// or one the user changed by hand (say, to source the backup themselves),
+// stays Current. Lines the user added outside the block are kept:
+// ReinstallGitHooks replaces only the block (see trunkChainUpgrade).
 func outdatedTrunkChain(root *os.Root, hook, content string) string {
 	for _, block := range legacyTrunkChainCalls(hook) {
 		if strings.Count(content, block) != 1 {
@@ -643,12 +644,14 @@ func outdatedTrunkChain(root *os.Root, hook, content string) string {
 
 // legacyTrunkChainCalls are the chain blocks earlier versions wrote for hook.
 // They differ from chainCall only in the branch that runs the backup outside
-// pre-commit's legacy pass: the one here executes the backup directly.
+// pre-commit's legacy pass: the first executes the backup directly, the
+// second identifies Trunk's launcher with grep -qxF.
 func legacyTrunkChainCalls(hook string) []string {
 	redirect := chainRedirect(hook)
 	backup := hook + backupSuffix
 	return []string{
 		chainCallWith(hook, redirect, preSourcingBackupCall(backup)+redirect+"\n"),
+		chainCallWith(hook, redirect, regularExecutableBackup(backup)+grepTrunkProbe(backup)+"\n"+sourceOrRunBackup(hook, redirect)),
 	}
 }
 
@@ -659,7 +662,8 @@ func preSourcingBackupCall(backup string) string {
 	return fmt.Sprintf("    elif [ -x \"$_entire_hook_dir/%[1]s\" ]; then\n        \"$_entire_hook_dir/%[1]s\" \"$@\"", backup)
 }
 
-// grepTrunkProbe is the line the chain uses to identify Trunk's launcher.
+// grepTrunkProbe is the line the grep-based chain used to identify Trunk's
+// launcher, exactly as generated.
 func grepTrunkProbe(backup string) string {
 	return "        if grep -qxF " + shellQuote(trunkHookCallback) + ` "$_entire_hook_dir/` + backup + `" 2>/dev/null; then`
 }
@@ -692,9 +696,9 @@ func trunkChainUpgrade(root *os.Root, hook string) (string, bool) {
 const maxTrunkCallbackBackup = 1 << 20
 
 // backupHasTrunkCallback reports whether <hook>.pre-entire contains
-// trunkHookCallback as a whole line, the same match the chain's grep -qxF
-// uses. Only a regular file in the hooks directory is read, through the root
-// and no-follow. A symlinked backup is not followed, since git hooks are not a
+// trunkHookCallback as a whole line, the same match the chain uses. Only a
+// regular file in the hooks directory is read, through the root and
+// no-follow. A symlinked backup is not followed, since git hooks are not a
 // symlink exception; that install keeps the old chain until entire enable
 // rewrites every hook. A FIFO or device is not read either, so it cannot hang
 // an agent-turn setup check.
@@ -1352,10 +1356,30 @@ func generateChainedContent(baseContent, hookName string) string {
 // trunkHookCallback. The chain only runs a regular executable (or a link to
 // one): an executable FIFO passes [ -x ], and on macOS exec of that FIFO
 // blocks waiting for a writer, hanging the commit or push. The same [ -f ]
-// check also keeps grep from opening the FIFO.
+// check keeps the launcher probe from opening the FIFO. The launcher is
+// identified by a whole-line comparison in /bin/bash, not grep, so a PATH
+// that lacks grep cannot fall through to executing it as <hook>.pre-entire.
+// The scan reads at most 64KiB (Trunk's launcher is under 2KiB) so a compiled
+// or otherwise large backup is not read to EOF before it runs.
 func chainCall(hookName, redirect string) string {
 	backup := hookName + backupSuffix
-	return chainCallWith(hookName, redirect, regularExecutableBackup(backup)+grepTrunkProbe(backup)+"\n"+sourceOrRunBackup(hookName, redirect))
+	return chainCallWith(hookName, redirect, regularExecutableBackup(backup)+`        if /bin/bash --norc -c 'LC_ALL=C IFS= read -r -d "" -n 65536 _entire_data < "$1" || true
+            _entire_nl="
+"
+            if [ "${#_entire_data}" -eq 65536 ]; then
+                case "$_entire_data" in
+                *"$_entire_nl") ;;
+                *"$_entire_nl"*) _entire_data="${_entire_data%"$_entire_nl"*}" ;;
+                *) exit 1 ;;
+                esac
+            fi
+            while IFS= read -r _entire_line || [ -n "$_entire_line" ]; do
+                if [ "$_entire_line" = "$2" ]; then
+                    exit 0
+                fi
+            done <<< "$_entire_data"
+            exit 1' bash "$_entire_hook_dir/`+backup+`" `+shellQuote(trunkHookCallback)+`; then
+`+sourceOrRunBackup(hookName, redirect))
 }
 
 // chainCallWith is the chain block with branch as the elif that runs the
