@@ -129,6 +129,7 @@ func (lx *cmdLexer) lex(from, to, depth int, dqContent bool) {
 		case sepEnd:
 			lx.check(words)
 			words = words[:0]
+			skipTarget = false // a closing redirection (2>&-) has no target
 		case sepRedirect:
 			skipTarget = true
 		case sepBlank:

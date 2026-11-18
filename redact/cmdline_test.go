@@ -35,6 +35,8 @@ func TestString_CommandLinePasswords(t *testing.T) {
 		{"docker run -l is a label", "docker run -l app=db mysql:8 mysql -pSummer2026Release", "docker run -l app=db mysql:8 mysql -pREDACTED"},
 		{"container option with its value attached", "docker exec -w/tmp box redis-cli -a Summer2026Release", "docker exec -w/tmp box redis-cli -a REDACTED"},
 		{"sshpass option cluster", "sshpass -vp Summer2026Release ssh host redis-cli -a swordfish", "sshpass -vp REDACTED ssh host redis-cli -a REDACTED"},
+		{"after a closed descriptor", "exec 2>&-; redis-cli -a Summer2026Release", "exec 2>&-; redis-cli -a REDACTED"},
+		{"after a closed descriptor and &&", "make >&- && mysql -pSummer2026Release db", "make >&- && mysql -pREDACTED db"},
 		{"in sh -c", `sh -c "mysql -pSummer2026Release"; echo " done"`, `sh -c "mysql -pREDACTED"; echo " done"`},
 		{"over ssh", `ssh db 'redis-cli -a Summer2026Release ping'`, `ssh db 'redis-cli -a REDACTED ping'`},
 		{"in a substitution", "out=$(mysql -u root -pSummer2026Release)", "out=$(mysql -u root -pREDACTED)"},
