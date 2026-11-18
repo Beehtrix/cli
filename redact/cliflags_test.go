@@ -768,6 +768,8 @@ func TestString_CommandLinePasswordsShellGrammarCases(t *testing.T) {
 		{name: "netrc password given twice in a default entry", input: "default password oldpass password " + p + " login me", want: "default password REDACTED password REDACTED login me"},
 		{name: "netrc password given twice written by printf", input: `printf "machine h\nlogin me\npassword oldpass\npassword ` + p + `\n" > ~/.netrc`, want: `printf "machine h\nlogin me\npassword REDACTED\npassword REDACTED\n" > ~/.netrc`},
 		{name: "netrc password field again followed by prose", input: "machine h login me password " + p + " password is in the vault", want: "machine h login me password REDACTED password is in the vault"},
+		{name: "netrc password given again after an account named like a prose word", input: "machine h login me password old account and password " + p, want: "machine h login me password REDACTED account and password REDACTED"},
+		{name: "netrc password given again as a comment token", input: "machine h login me password old password #rotated\n" + p + "\n", want: "machine h login me password REDACTED password REDACTED\nREDACTED\n"},
 		{name: "openssl source after an extended glob", input: "openssl enc -aes-128-cbc -pbkdf2 -in /dev/@(null|nonexistent) -pass pass:" + p, want: "openssl enc -aes-128-cbc -pbkdf2 -in /dev/@(null|nonexistent) -pass pass:REDACTED"},
 		{name: "mysql password after a negated extended glob", input: "mysql --defaults-file=!(a|b).cnf -p" + p, want: "mysql --defaults-file=!(a|b).cnf -pREDACTED"},
 		{name: "openssl source after a here-document with an ANSI-C quoted delimiter", input: "openssl enc -in $(cat <<$'EOF'\n/dev/null\nEOF\n) -pass pass:" + p, want: "openssl enc -in $(cat <<$'EOF'\n/dev/null\nEOF\n) -pass pass:REDACTED"},
