@@ -5229,8 +5229,15 @@ func (p netrcPattern) appendPassword(regions []taggedRegion, s, written string, 
 		// in the vault).
 		return regions, loc[1]
 	}
+	regions = appendNetrcPasswordToken(regions, s, written, lines, start, end)
+	return appendMoreNetrcPasswords(regions, s, written, lines, end)
+}
+
+// appendNetrcPasswordToken appends the region of the .netrc password token
+// s[start:end], and of the token after it when it is a comment. written is
+// as for appendNetrcEntries.
+func appendNetrcPasswordToken(regions []taggedRegion, s, written string, lines *quoteScan, start, end int) []taggedRegion {
 	regions = appendNetrcValue(regions, s, lines, start, netrcTokenEnd(s, written, start, end))
-	regions, fieldsEnd = appendMoreNetrcPasswords(regions, s, written, lines, end)
 	if s[start] == '#' {
 		// curl reads a token that starts with # as a comment that runs to
 		// the end of its line, and the next token as the password
@@ -5240,7 +5247,7 @@ func (p netrcPattern) appendPassword(regions []taggedRegion, s, written string, 
 			regions = appendNetrcValue(regions, s, lines, end+next[2], end+next[3])
 		}
 	}
-	return regions, fieldsEnd
+	return regions
 }
 
 // netrcNextField matches the .netrc field right after a token: group 1 is
@@ -5252,24 +5259,27 @@ var netrcNextField = regexp.MustCompile(`^` + netrcSep + `((?i:account|login|pas
 // or another login and password, more than once (machine h password old
 // password x login me, machine h login a password x login b password y).
 // A client reads the last, or the one that matches its login, so each is
-// hidden. The fields stop at any other token, and at a login or password
-// that is a prose word (see isNetrcProse). It returns where they end.
+// hidden, with the token after one that is a comment. The fields stop at any
+// other token, and at a login or password that is a prose word (see
+// isNetrcProse). It returns where they end.
 func appendMoreNetrcPasswords(regions []taggedRegion, s, written string, lines *quoteScan, end int) ([]taggedRegion, int) {
 	for {
 		m := netrcNextField.FindStringSubmatchIndex(s[end:])
 		if m == nil {
 			return regions, end
 		}
+		keyword := s[end+m[2] : end+m[3]]
 		start, next := end+m[4], end+m[5]
-		if !strings.EqualFold(s[end+m[2]:end+m[3]], "password") {
+		switch {
+		case strings.EqualFold(keyword, "login"):
 			if slices.Contains(netrcLoginProseWords, strings.ToLower(s[start:next])) {
 				return regions, end
 			}
-		} else {
+		case strings.EqualFold(keyword, "password"):
 			if isNetrcProse(s, "", "", start, next) {
 				return regions, end
 			}
-			regions = appendNetrcValue(regions, s, lines, start, netrcTokenEnd(s, written, start, next))
+			regions = appendNetrcPasswordToken(regions, s, written, lines, start, next)
 		}
 		end = next
 	}
