@@ -27,10 +27,13 @@ import "strings"
 
 const cmdMaxDepth = 3
 
+// cmdPodman is podman, whose exec --latest names no container.
+const cmdPodman = "podman"
+
 // cmdPrefilterNames are the client names one of which a text must hold, as
 // a word or the start of one (mysqldump, mongosh), before the lexer reads it.
 // A long password flag is enough on its own.
-var cmdPrefilterNames = []string{"mysql", "mariadb", "docker", "podman", "nerdctl", "buildah", "skopeo",
+var cmdPrefilterNames = []string{"mysql", "mariadb", "docker", cmdPodman, "nerdctl", "buildah", "skopeo",
 	"oras", "helm", "az", "mongo", "sshpass", "redis-cli", "openssl", "psql", "pg_", "wget"}
 
 // cmdWord is one shell word: its raw bytes in the text and its text with

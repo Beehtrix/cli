@@ -46,7 +46,7 @@ var (
 
 var cmdClients = map[string]cmdClient{
 	"mysql": mysqlClient, "mariadb": mysqlClient, "mysqldump": mysqldumpClient, "mariadb-dump": mysqldumpClient,
-	"docker": loginClient, "podman": loginClient, "nerdctl": loginClient, "buildah": loginClient,
+	"docker": loginClient, cmdPodman: loginClient, "nerdctl": loginClient, "buildah": loginClient,
 	"skopeo": loginClient, "oras": loginClient, "helm": loginClient, "az": loginClient,
 	"mongo": mongoClient, "mongosh": mongoClient, "mongodump": mongoClient, "mongorestore": mongoClient,
 	"mongoexport": mongoClient, "mongoimport": mongoClient, "mongostat": mongoClient, "mongotop": mongoClient,
@@ -164,15 +164,15 @@ func subCommandStart(words []cmdWord, prog int, name string) int {
 	case "ssh", "autossh":
 		// ssh reads options after its host too.
 		const values = "BbcDEeFIiJLlmOoPpQRSWw"
-		start := afterOperand(words, skipOptions(words, prog+1, values, false))
+		start := afterOperand(words, skipOptions(words, prog+1, values, false, nil))
 		if start < 0 {
 			return -1
 		}
-		return skipOptions(words, start, values, false)
-	case "docker", "podman", "nerdctl":
+		return skipOptions(words, start, values, false, nil)
+	case "docker", cmdPodman, "nerdctl":
 		for i := prog + 1; i < len(words); i++ {
 			if t := words[i].text; t == "exec" || t == "run" {
-				return afterOperand(words, skipOptions(words, i+1, "", true))
+				return containerCommandStart(words, i+1, name == cmdPodman && t == "exec")
 			}
 		}
 	case "kubectl", "oc":
@@ -189,17 +189,37 @@ func subCommandStart(words []cmdWord, prog int, name string) int {
 			}
 		}
 	case "sshpass":
-		return skipOptions(words, prog+1, "fdPp", false)
+		return skipOptions(words, prog+1, "fdPp", false, nil)
 	case "eval":
 		return afterOperand(words, prog)
 	}
 	return -1
 }
 
+// containerCommandStart returns where the command run in a container starts,
+// after the options from words[i] and the container. podman exec --latest
+// (-l) names no container, so there the command follows the options.
+func containerCommandStart(words []cmdWord, i int, latestOK bool) int {
+	var latest bool
+	seen := &latest
+	if !latestOK {
+		seen = nil
+	}
+	end := skipOptions(words, i, "", true, seen)
+	if latest {
+		if end < len(words) {
+			return end
+		}
+		return -1
+	}
+	return afterOperand(words, end)
+}
+
 // skipOptions skips the options from words[i]: the short options listed in
 // values take the next word, and with longValues every option without "="
-// does, except a few common switches (docker run -it --rm).
-func skipOptions(words []cmdWord, i int, values string, longValues bool) int {
+// does, except a few common switches (docker run -it --rm). With latest set,
+// -l and --latest are switches too, and seeing one sets *latest.
+func skipOptions(words []cmdWord, i int, values string, longValues bool, latest *bool) int {
 	for i < len(words) {
 		t := words[i].text
 		if t == "--" {
@@ -210,6 +230,8 @@ func skipOptions(words []cmdWord, i int, values string, longValues bool) int {
 		}
 		i++
 		switch {
+		case latest != nil && (t == "-l" || t == "--latest"):
+			*latest = true
 		case strings.Contains(t, "="):
 		case longValues:
 			if !isContainerSwitch(t) {

@@ -27,6 +27,8 @@ func TestString_CommandLinePasswords(t *testing.T) {
 		{"option cluster", "mysql -fpSummer2026Release", "mysql -fpREDACTED"},
 		{"through a wrapper", "sudo -u mysql mysql -pSummer2026Release", "sudo -u mysql mysql -pREDACTED"},
 		{"in a container", "docker exec -it mongo mongosh -u root -p Summer2026Release", "docker exec -it mongo mongosh -u root -p REDACTED"},
+		{"podman exec --latest names no container", "podman exec -it -l mysql -pSummer2026Release", "podman exec -it -l mysql -pREDACTED"},
+		{"docker run -l is a label", "docker run -l app=db mysql:8 mysql -pSummer2026Release", "docker run -l app=db mysql:8 mysql -pREDACTED"},
 		{"in sh -c", `sh -c "mysql -pSummer2026Release"; echo " done"`, `sh -c "mysql -pREDACTED"; echo " done"`},
 		{"over ssh", `ssh db 'redis-cli -a Summer2026Release ping'`, `ssh db 'redis-cli -a REDACTED ping'`},
 		{"in a substitution", "out=$(mysql -u root -pSummer2026Release)", "out=$(mysql -u root -pREDACTED)"},
@@ -149,4 +151,26 @@ func TestCommandLinePasswordsStayLinear(t *testing.T) {
 	}
 	in := strings.Repeat("mysql -pSecret1; ", n/17)
 	require.Equal(t, n/17, strings.Count(String(in), "-pREDACTED"))
+}
+
+// Every region either reader returns lies inside the text, whatever the text.
+func FuzzCommandLinePasswords(f *testing.F) {
+	for _, seed := range []string{
+		"mysql -u root -pSecret1 db", `sh -c "mysql -p'x' && echo \"$(redis-cli -a y)\""`,
+		"machine h login u password p", "printf \"machine h\\npassword p\" > ~/.netrc",
+		`exec.Command("docker", "login", "-p", "x")`, "podman exec -l mysql -px",
+		"mysql -p$( ", ")'sshpass ", "psql${ \"", "mysql -e $(echo `x`",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		for _, regions := range [][]taggedRegion{detectCommandLinePasswords(s), commandRegions(s)} {
+			for _, r := range regions {
+				if r.start < 0 || r.end > len(s) || r.start >= r.end {
+					t.Fatalf("region [%d,%d) outside %q", r.start, r.end, s)
+				}
+			}
+		}
+		_ = String(s)
+	})
 }
