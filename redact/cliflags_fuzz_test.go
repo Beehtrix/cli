@@ -43,7 +43,8 @@ const (
 // repetitions were read in quadratic time once: commands after the closing
 // quotes of strings, expansions that never close inside quoted strings or
 // before client names, substitutions that never close before code spans,
-// and substitutions nested in the arguments of a client.
+// substitutions nested in the arguments of a client, and .netrc password
+// tokens that start a comment, each of which read the rest of its line.
 func FuzzString_CommandLinePasswordsLinear(f *testing.F) {
 	for _, words := range [][]string{
 		{"- ", ")", "'", "sshpass", " "},
@@ -58,6 +59,8 @@ func FuzzString_CommandLinePasswordsLinear(f *testing.F) {
 		{"x", "find", " ", "mysql", " ", "-exec", " ", "mysql", " ", "-pX", " "},
 		{"x", "${PW:-", ")", "login", " ", "mysql", " "},
 		{"x", "`", "${PW:-", ")", "mysql", " "},
+		{"default", " ", "password", " ", "#", "x"},
+		{"x", "machine", " ", "x", " ", "login", " ", "x", " ", "password", " ", "#", "x", " "},
 	} {
 		f.Add(fuzzPicks(f, words))
 	}

@@ -5183,10 +5183,10 @@ func netrcEscapesAsBlanks(s string) (string, bool) {
 // only those (see netrcTokenEnd).
 func appendNetrcEntries(regions []taggedRegion, s, written string) []taggedRegion {
 	for _, p := range netrcPasswordPatterns {
-		lines := quoteScan{s: s, prose: true}
+		scan := netrcScan{lines: quoteScan{s: s, prose: true}}
 		for _, loc := range p.pattern.FindAllStringSubmatchIndex(s, -1) {
 			var fieldsEnd int
-			regions, fieldsEnd = p.appendPassword(regions, s, written, &lines, loc)
+			regions, fieldsEnd = p.appendPassword(regions, s, written, &scan, loc)
 			// A default entry may follow on the same line, after the
 			// fields the entry gave again.
 			after := max(loc[1], fieldsEnd)
@@ -5197,7 +5197,7 @@ func appendNetrcEntries(regions []taggedRegion, s, written string) []taggedRegio
 							dloc[k] += after
 						}
 					}
-					regions, _ = d.appendPassword(regions, s, written, &lines, dloc)
+					regions, _ = d.appendPassword(regions, s, written, &scan, dloc)
 					break
 				}
 			}
@@ -5206,11 +5206,52 @@ func appendNetrcEntries(regions []taggedRegion, s, written string) []taggedRegio
 	return regions
 }
 
+// netrcScan is what the reads of one .netrc pattern over a string share:
+// its quoted strings, and the token after the last comment token read.
+type netrcScan struct {
+	lines    quoteScan
+	comments netrcAfterComment
+}
+
+// netrcAfterComment finds the .netrc token after a comment token that ends
+// at a position of a string (see netrcTokenAfterComment), and keeps its
+// answer for the other positions that share it: those up to the last line
+// break before that token, or up to the next line break when there is no
+// token. The comment tokens of one line, and of the comment lines it skips,
+// thus read them once, however many an entry gives (password #a password
+// #b ...).
+type netrcAfterComment struct {
+	set        bool
+	from, to   int // the positions that share the answer, to included
+	start, end int // the token, or -1 for none
+}
+
+// token returns the token after the comment token that ends at pos in s,
+// as netrcTokenAfterComment matches it at pos, or -1, -1 for none. s is the
+// same string for every call.
+func (c *netrcAfterComment) token(s string, pos int) (start, end int) {
+	if c.set && pos >= c.from && pos <= c.to {
+		return c.start, c.end
+	}
+	c.set, c.from, c.start, c.end = true, pos, -1, -1
+	if m := netrcTokenAfterComment.FindStringSubmatchIndex(s[pos:]); m != nil {
+		// From any position up to the last line break before the token, the
+		// rest of its line and the lines after are those the match read.
+		c.start, c.end = pos+m[2], pos+m[3]
+		c.to = pos + strings.LastIndexByte(s[pos:c.start], '\n')
+	} else if i := strings.IndexAny(s[pos:], "\r\n"); i >= 0 {
+		c.to = pos + i
+	} else {
+		c.to = len(s)
+	}
+	return c.start, c.end
+}
+
 // appendPassword adds the password of the .netrc entry that loc, a match of
 // p in s, found, and every password the entry gives again in the fields
 // after it (see appendMoreNetrcPasswords), which end at fieldsEnd. written
 // is as for appendNetrcEntries.
-func (p netrcPattern) appendPassword(regions []taggedRegion, s, written string, lines *quoteScan, loc []int) (_ []taggedRegion, fieldsEnd int) {
+func (p netrcPattern) appendPassword(regions []taggedRegion, s, written string, scan *netrcScan, loc []int) (_ []taggedRegion, fieldsEnd int) {
 	machine := ""
 	if loc[2] >= 0 {
 		machine = s[loc[2]:loc[3]]
@@ -5229,22 +5270,22 @@ func (p netrcPattern) appendPassword(regions []taggedRegion, s, written string, 
 		// in the vault).
 		return regions, loc[1]
 	}
-	regions = appendNetrcPasswordToken(regions, s, written, lines, start, end)
-	return appendMoreNetrcPasswords(regions, s, written, lines, end)
+	regions = appendNetrcPasswordToken(regions, s, written, scan, start, end)
+	return appendMoreNetrcPasswords(regions, s, written, scan, end)
 }
 
 // appendNetrcPasswordToken appends the region of the .netrc password token
 // s[start:end], and of the token after it when it is a comment. written is
 // as for appendNetrcEntries.
-func appendNetrcPasswordToken(regions []taggedRegion, s, written string, lines *quoteScan, start, end int) []taggedRegion {
-	regions = appendNetrcValue(regions, s, lines, start, netrcTokenEnd(s, written, start, end))
+func appendNetrcPasswordToken(regions []taggedRegion, s, written string, scan *netrcScan, start, end int) []taggedRegion {
+	regions = appendNetrcValue(regions, s, &scan.lines, start, netrcTokenEnd(s, written, start, end))
 	if s[start] == '#' {
 		// curl reads a token that starts with # as a comment that runs to
 		// the end of its line, and the next token as the password
 		// (password #rotated<newline>hunter2), even a keyword. Both are
 		// redacted, as other readers may take the first.
-		if next := netrcTokenAfterComment.FindStringSubmatchIndex(s[end:]); next != nil && s[end+next[2]] != '#' {
-			regions = appendNetrcValue(regions, s, lines, end+next[2], end+next[3])
+		if next, nextEnd := scan.comments.token(s, end); next >= 0 && s[next] != '#' {
+			regions = appendNetrcValue(regions, s, &scan.lines, next, nextEnd)
 		}
 	}
 	return regions
@@ -5262,7 +5303,7 @@ var netrcNextField = regexp.MustCompile(`^` + netrcSep + `((?i:account|login|pas
 // hidden, with the token after one that is a comment. The fields stop at any
 // other token, and at a login or password that is a prose word (see
 // isNetrcProse). It returns where they end.
-func appendMoreNetrcPasswords(regions []taggedRegion, s, written string, lines *quoteScan, end int) ([]taggedRegion, int) {
+func appendMoreNetrcPasswords(regions []taggedRegion, s, written string, scan *netrcScan, end int) ([]taggedRegion, int) {
 	for {
 		m := netrcNextField.FindStringSubmatchIndex(s[end:])
 		if m == nil {
@@ -5279,7 +5320,7 @@ func appendMoreNetrcPasswords(regions []taggedRegion, s, written string, lines *
 			if isNetrcProse(s, "", "", start, next) {
 				return regions, end
 			}
-			regions = appendNetrcPasswordToken(regions, s, written, lines, start, next)
+			regions = appendNetrcPasswordToken(regions, s, written, scan, start, next)
 		}
 		end = next
 	}

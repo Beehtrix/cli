@@ -830,6 +830,52 @@ func TestString_CommandLinePasswordsDeepExpansionNesting(t *testing.T) { //nolin
 	}
 }
 
+// netrcAfterComment keeps the token after a comment for the positions that
+// share it, which must be the token netrcTokenAfterComment matches at each
+// of them: across blank and comment lines, both kinds of line break, lone
+// carriage returns and the end of the text, whichever order the positions
+// come in.
+func TestNetrcAfterCommentMatchesRegexp(t *testing.T) {
+	t.Parallel()
+
+	for _, s := range []string{
+		"password #a password #b\nhunter2",
+		"password #a\r\n  \r\n# note\r\n\thunter2 x",
+		"password #a\n\n#c\n#d\n",
+		"password #a\n \n\t\n",
+		"password #a\r# b\nx",
+		"password #a\n#c\r\nx\ry\n z",
+		"password #a password #b",
+		"# machine h login me password #x\n# machine h login me password #x\nhunter2\n",
+		"password #a \"q r\" #b\n'x y'z\n\"open\n",
+	} {
+		n := len(s) + 1
+		orders := map[string]func(i int) int{
+			"forwards":  func(i int) int { return i },
+			"backwards": func(i int) int { return n - 1 - i },
+			"from both ends": func(i int) int {
+				if i%2 == 0 {
+					return i / 2
+				}
+				return n - 1 - i/2
+			},
+		}
+		for name, order := range orders {
+			var c netrcAfterComment
+			for i := range n {
+				pos := order(i)
+				wantStart, wantEnd := -1, -1
+				if m := netrcTokenAfterComment.FindStringSubmatchIndex(s[pos:]); m != nil {
+					wantStart, wantEnd = pos+m[2], pos+m[3]
+				}
+				if start, end := c.token(s, pos); start != wantStart || end != wantEnd {
+					t.Errorf("read %s, token(%q, %d) = %d, %d, want %d, %d", name, s, pos, start, end, wantStart, wantEnd)
+				}
+			}
+		}
+	}
+}
+
 // The layer reads every flag on its own, so a flag whose value is no
 // password does not hide the next one, which other layers may not catch.
 func TestCommandLinePasswordsReadFlagAfterRejectedValue(t *testing.T) {
