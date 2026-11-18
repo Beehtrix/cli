@@ -346,6 +346,10 @@ type jsonReplacement struct {
 	// placeholders is how many placeholders redacting original wrote, when
 	// the walk counts.
 	placeholders int
+	// keepKeys leaves a copy written as an object key: a password that only
+	// its argument list gives away ("-a","type") is no reason to rename a
+	// "type" key.
+	keepKeys bool
 }
 
 type connectionStringRule struct {
@@ -473,8 +477,10 @@ func detectAllLayers(s string) []taggedRegion {
 	regions = append(regions, detectDatabaseURIPasswords(s)...)
 	next = tagFrom(regions, next, layerCredentialedURI)
 
-	// 5. Database and connection-string detection (secrets — always on).
+	// 5. Database and connection-string detection (secrets — always on),
+	// with passwords given on command lines and in .netrc entries.
 	regions = append(regions, detectConnectionStrings(s)...)
+	regions = append(regions, detectCommandLinePasswords(s)...)
 	next = tagFrom(regions, next, layerConnectionString)
 
 	// 6. User-defined custom rules (secrets — only runs when configured).
@@ -1983,6 +1989,12 @@ func applyJSONReplacements(s string, repls []jsonReplacement) (result string, wr
 		if err != nil {
 			return "", 0, err
 		}
+		if r.key == "" && r.keepKeys {
+			var replaced int
+			s, replaced = replaceUnkeyedJSONValue(s, origJSON, replJSON)
+			written += replaced * r.placeholders
+			continue
+		}
 		if r.key == "" {
 			written += strings.Count(s, origJSON) * r.placeholders
 			s = strings.ReplaceAll(s, origJSON, replJSON)
@@ -2044,6 +2056,38 @@ func replaceKeyedJSONValue(s, keyJSON, origJSON, replJSON string) (string, int) 
 	return b.String(), replaced
 }
 
+// replaceUnkeyedJSONValue replaces every copy of origJSON except one written
+// as an object key, and reports how many it replaced.
+func replaceUnkeyedJSONValue(s, origJSON, replJSON string) (string, int) {
+	replaced := 0
+	var b strings.Builder
+	i := 0
+	for {
+		j := strings.Index(s[i:], origJSON)
+		if j < 0 {
+			break
+		}
+		end := i + j + len(origJSON)
+		p := end
+		for p < len(s) && isJSONWhitespace(s[p]) {
+			p++
+		}
+		b.WriteString(s[i : i+j])
+		if p < len(s) && s[p] == ':' {
+			b.WriteString(origJSON)
+		} else {
+			b.WriteString(replJSON)
+			replaced++
+		}
+		i = end
+	}
+	if replaced == 0 {
+		return s, 0
+	}
+	b.WriteString(s[i:])
+	return b.String(), replaced
+}
+
 func isJSONWhitespace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
@@ -2082,9 +2126,9 @@ func isSingleJSONValue(dec *json.Decoder) bool {
 // collection pass, the post-splice verification, and the structural re-encode
 // fallback must all agree on which leaves are redactable, and a second copy of
 // the rules is how they would drift apart.
-func walkRedactableStrings(v any, transform func(key, spliceKey string, credentialContext bool, val string) string) (any, bool) {
-	var walk func(key, spliceKey string, credentialContext, skipStrings bool, v any) (any, bool)
-	walk = func(key, spliceKey string, credentialContext, skipStrings bool, v any) (any, bool) {
+func walkRedactableStrings(v any, transform func(key, spliceKey string, credentialContext bool, val string, argv []taggedRegion) string) (any, bool) {
+	var walk func(key, spliceKey string, credentialContext, skipStrings bool, v any, argv []taggedRegion) (any, bool)
+	walk = func(key, spliceKey string, credentialContext, skipStrings bool, v any, argv []taggedRegion) (any, bool) {
 		switch val := v.(type) {
 		case map[string]any:
 			if shouldSkipJSONLObject(val) {
@@ -2093,7 +2137,7 @@ func walkRedactableStrings(v any, transform func(key, spliceKey string, credenti
 			childCredentialContext := credentialContext || isCredentialJSONObject(val)
 			var out map[string]any
 			for k, child := range val {
-				newChild, childChanged := walk(k, k, childCredentialContext, shouldSkipJSONLField(k), child)
+				newChild, childChanged := walk(k, k, childCredentialContext, shouldSkipJSONLField(k), child, nil)
 				if !childChanged {
 					continue
 				}
@@ -2108,8 +2152,9 @@ func walkRedactableStrings(v any, transform func(key, spliceKey string, credenti
 			return out, true
 		case []any:
 			var out []any
+			argvByElem := commandArgvRegions(key, skipStrings, val)
 			for i, child := range val {
-				newChild, childChanged := walk(key, "", credentialContext, skipStrings, child)
+				newChild, childChanged := walk(key, "", credentialContext, skipStrings, child, elemRegions(argvByElem, i))
 				if !childChanged {
 					continue
 				}
@@ -2127,7 +2172,7 @@ func walkRedactableStrings(v any, transform func(key, spliceKey string, credenti
 			if skipLeaf(skipStrings, key, credentialContext, val) {
 				return v, false
 			}
-			redacted := transform(key, spliceKey, credentialContext, val)
+			redacted := transform(key, spliceKey, credentialContext, val, argv)
 			if redacted == val {
 				return v, false
 			}
@@ -2136,7 +2181,7 @@ func walkRedactableStrings(v any, transform func(key, spliceKey string, credenti
 			return v, false
 		}
 	}
-	return walk("", "", false, false, v)
+	return walk("", "", false, false, v, nil)
 }
 
 // redactLeafValue is the per-leaf redaction rule shared by the splice
@@ -2148,13 +2193,22 @@ func walkRedactableStrings(v any, transform func(key, spliceKey string, credenti
 // The redactor always sees the unchanged value. Rewriting part of it first
 // would stop a rule that needs the whole value, such as an anchored custom
 // rule, from matching, and expose text it used to redact.
-func redactLeafValue(key string, credentialContext bool, val string, redactor leafRedactor) string {
+//
+// onlyArgv reports that nothing but the leaf's argument list (argv) found
+// anything in it.
+func redactLeafValue(key string, credentialContext bool, val string, argv []taggedRegion, redactor leafRedactor) (redacted string, onlyArgv bool) {
 	if keyContextFindsMore(key, val) {
 		redactor.counts.addPlaceholder(layerKeyContext)
-		return RedactedPlaceholder
+		return RedactedPlaceholder, false
 	}
 	version := isVersionValue(key, val)
 	regions := redactor.detect(val)
+	// A command an agent ran is read as one, and an argument list's
+	// password elements arrive from the list around them.
+	if extra := commandFieldRegions(key, val); len(extra) > 0 || len(argv) > 0 {
+		onlyArgv = len(regions) == 0 && len(extra) == 0
+		regions = slices.Concat(regions, extra, argv)
+	}
 	if version {
 		regions = slices.DeleteFunc(slices.Clone(regions), func(r taggedRegion) bool { return r.builtinIP })
 	}
@@ -2163,13 +2217,13 @@ func redactLeafValue(key string, credentialContext bool, val string, redactor le
 	if onlyPIIRegions(regions) && isCredentialJSONSecretKey(key, credentialContext) &&
 		hasNonPlaceholderKeyValue(key, val, false) && !isNonPasswordCodeLiteral(key, val) {
 		redactor.counts.addPlaceholder(layerCredentialKey)
-		return RedactedPlaceholder
+		return RedactedPlaceholder, false
 	}
-	redacted := redactRegions(val, regions, redactor.counts)
+	redacted = redactRegions(val, regions, redactor.counts)
 	if version {
-		return redacted
+		return redacted, onlyArgv
 	}
-	return redactIPsUnderNetworkKey(key, redacted, redactor.counts)
+	return redactIPsUnderNetworkKey(key, redacted, redactor.counts), onlyArgv
 }
 
 // onlyPIIRegions reports whether every non-empty region is a PII match, true
@@ -2252,14 +2306,15 @@ type replKey struct {
 func collectJSONLReplacements(v any, redactor leafRedactor) []jsonReplacement {
 	seen := make(map[replKey]int)
 	var repls []jsonReplacement
-	walkRedactableStrings(v, func(key, spliceKey string, credentialContext bool, val string) string {
+	walkRedactableStrings(v, func(key, spliceKey string, credentialContext bool, val string, argv []taggedRegion) string {
 		before := redactor.replacements()
-		redacted := redactLeafValue(key, credentialContext, val, redactor)
+		redacted, onlyArgv := redactLeafValue(key, credentialContext, val, argv, redactor)
 		if redacted != val {
 			k := replKey{key: spliceKey, original: val}
 			repl := jsonReplacement{
 				key: spliceKey, original: val, redacted: redacted,
 				placeholders: redactor.replacements() - before,
+				keepKeys:     onlyArgv,
 			}
 			if i, ok := seen[k]; !ok {
 				seen[k] = len(repls)
@@ -2430,7 +2485,7 @@ func spliceMissed(spliced string, repls []jsonReplacement) bool {
 	}
 
 	missed := false
-	walkRedactableStrings(parsed, func(_, spliceKey string, _ bool, val string) string {
+	walkRedactableStrings(parsed, func(_, spliceKey string, _ bool, val string, _ []taggedRegion) string {
 		if missed {
 			return val
 		}
@@ -2474,8 +2529,9 @@ func reencodeRedacted(content string, redactor leafRedactor) (string, error) {
 	if err := dec.Decode(&parsed); err != nil {
 		return "", fmt.Errorf("%w: re-parse content for structural redaction: %w", ErrRedactionIncomplete, err)
 	}
-	redactedTree, _ := walkRedactableStrings(parsed, func(key, _ string, credentialContext bool, val string) string {
-		return redactLeafValue(key, credentialContext, val, redactor)
+	redactedTree, _ := walkRedactableStrings(parsed, func(key, _ string, credentialContext bool, val string, argv []taggedRegion) string {
+		redacted, _ := redactLeafValue(key, credentialContext, val, argv, redactor)
+		return redacted
 	})
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
