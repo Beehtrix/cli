@@ -215,8 +215,8 @@ func containerCommandStart(words []cmdWord, i int, latestOK bool) int {
 	return afterOperand(words, end)
 }
 
-// skipOptions skips the options from words[i]: the short options listed in
-// values take the next word, and with longValues every option without "="
+// skipOptions skips the options from words[i]: a short option listed in
+// values takes the next word, and with longValues every option without "="
 // does, except a few common switches (docker run -it --rm). With latest set,
 // -l and --latest are switches too, and seeing one sets *latest.
 func skipOptions(words []cmdWord, i int, values string, longValues bool, latest *bool) int {
@@ -230,18 +230,38 @@ func skipOptions(words []cmdWord, i int, values string, longValues bool, latest 
 		}
 		i++
 		switch {
-		case latest != nil && (t == "-l" || t == "--latest"):
-			*latest = true
 		case strings.Contains(t, "="):
-		case longValues:
-			if !isContainerSwitch(t) {
+		case t[1] != '-':
+			if shortTakesNext(t, values, longValues, latest) {
 				i++
 			}
-		case len(t) == 2 && strings.IndexByte(values, t[1]) >= 0:
+		case latest != nil && t == "--latest":
+			*latest = true
+		case longValues && !isContainerSwitch(t):
 			i++
 		}
 	}
 	return i
+}
+
+// containerSwitches are the short container options that take no value.
+const containerSwitches = "ditqP"
+
+// shortTakesNext reports whether the short option cluster t takes the next
+// word as its value: the first of its letters that takes a value is its last
+// (-vp takes it; -p2222 and -w/tmp hold their own).
+func shortTakesNext(t, values string, longValues bool, latest *bool) bool {
+	for j := 1; j < len(t); j++ {
+		c := t[j]
+		if latest != nil && c == 'l' {
+			*latest = true
+			continue
+		}
+		if strings.IndexByte(values, c) >= 0 || longValues && strings.IndexByte(containerSwitches, c) < 0 {
+			return j == len(t)-1
+		}
+	}
+	return false
 }
 
 func isContainerSwitch(t string) bool {
@@ -250,7 +270,7 @@ func isContainerSwitch(t string) bool {
 		"--publish-all", "--no-healthcheck", "--sig-proxy", "--oom-kill-disable":
 		return true
 	}
-	return len(t) > 1 && t[1] != '-' && strings.Trim(t[1:], "ditqP") == ""
+	return false
 }
 
 // afterOperand returns the index after the operand at i, or -1.

@@ -170,7 +170,7 @@ func (n *netrcScanner) next(value bool) (start, stop int, lineStart, ok bool) {
 			}
 			// A value starts and ends with no blank: in `password " + pw + "`
 			// the quotes belong to code.
-			if end := strings.IndexByte(window, c); end > 0 && !isCmdBlank(window[0]) && !isCmdBlank(window[end-1]) &&
+			if end := netrcQuoteEnd(window, c); end > 0 && !isCmdBlank(window[0]) && !isCmdBlank(window[end-1]) &&
 				(n.p+end+1 >= len(s) || isNetrcBreak(s, n.p+end+1)) {
 				start, stop = n.p, n.p+end
 				n.p = stop + 1
@@ -178,8 +178,11 @@ func (n *netrcScanner) next(value bool) (start, stop int, lineStart, ok bool) {
 			}
 		}
 	}
+	// An unquoted value ends at a blank, or at the quote that closes the
+	// shell string an entry is written in. Shell operators are part of it:
+	// an entry is file text, never a command.
 	start = n.p
-	for n.p < len(s) && !isNetrcBreak(s, n.p) && strings.IndexByte("\"';&|<>)`", s[n.p]) < 0 {
+	for n.p < len(s) && !isNetrcBreak(s, n.p) && strings.IndexByte("\"'`", s[n.p]) < 0 {
 		n.p++
 	}
 	stop = n.p
@@ -187,6 +190,20 @@ func (n *netrcScanner) next(value bool) (start, stop int, lineStart, ok bool) {
 		n.p++ // a lone stop byte
 	}
 	return start, stop, lineStart, true
+}
+
+// netrcQuoteEnd returns the quote q that closes a quoted value in window,
+// past backslash escapes, or -1.
+func netrcQuoteEnd(window string, q byte) int {
+	for i := 0; i < len(window); i++ {
+		switch window[i] {
+		case '\\':
+			i++
+		case q:
+			return i
+		}
+	}
+	return -1
 }
 
 func isNetrcBreak(s string, i int) bool {

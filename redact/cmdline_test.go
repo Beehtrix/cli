@@ -22,13 +22,19 @@ func TestString_CommandLinePasswords(t *testing.T) {
 		{"netrc entry", "machine host login me password Summer2026Release", "machine host login me password REDACTED"},
 		{"netrc written by printf", `printf "machine h\nlogin me\npassword Summer2026Release\n" > ~/.netrc`, `printf "machine h\nlogin me\npassword REDACTED\n" > ~/.netrc`},
 		{"netrc file without login", "machine db.example.com\n  password Summer2026Release\n", "machine db.example.com\n  password REDACTED\n"},
+		{"netrc password with shell operators", "machine h login me password rainy;summer&x\n", "machine h login me password REDACTED\n"},
+		{"netrc quoted password with an escaped quote", `machine h login me password "Summer\"2026"`, `machine h login me password "REDACTED"`},
 		{"single-quoted value", "mysql -u root -p'Summer 2026' mydb", "mysql -u root -p'REDACTED' mydb"},
 		{"single-quoted reference is literal", "mysql -u root -p'$PASSWORD' mydb", "mysql -u root -p'REDACTED' mydb"},
+		{"escaped dollar is literal", `mysql -p\$ecret1 db`, `mysql -p\REDACTED db`},
+		{"escaped dollar in double quotes is literal", `mysql -p"\$ecret1" db`, `mysql -p"\REDACTED" db`},
 		{"option cluster", "mysql -fpSummer2026Release", "mysql -fpREDACTED"},
 		{"through a wrapper", "sudo -u mysql mysql -pSummer2026Release", "sudo -u mysql mysql -pREDACTED"},
 		{"in a container", "docker exec -it mongo mongosh -u root -p Summer2026Release", "docker exec -it mongo mongosh -u root -p REDACTED"},
 		{"podman exec --latest names no container", "podman exec -it -l mysql -pSummer2026Release", "podman exec -it -l mysql -pREDACTED"},
 		{"docker run -l is a label", "docker run -l app=db mysql:8 mysql -pSummer2026Release", "docker run -l app=db mysql:8 mysql -pREDACTED"},
+		{"container option with its value attached", "docker exec -w/tmp box redis-cli -a Summer2026Release", "docker exec -w/tmp box redis-cli -a REDACTED"},
+		{"sshpass option cluster", "sshpass -vp Summer2026Release ssh host redis-cli -a swordfish", "sshpass -vp REDACTED ssh host redis-cli -a REDACTED"},
 		{"in sh -c", `sh -c "mysql -pSummer2026Release"; echo " done"`, `sh -c "mysql -pREDACTED"; echo " done"`},
 		{"over ssh", `ssh db 'redis-cli -a Summer2026Release ping'`, `ssh db 'redis-cli -a REDACTED ping'`},
 		{"in a substitution", "out=$(mysql -u root -pSummer2026Release)", "out=$(mysql -u root -pREDACTED)"},
@@ -80,6 +86,8 @@ func TestString_CommandLinePasswordsStayVisible(t *testing.T) {
 		`parser.add_argument("--password", "-p", help="database password")`,
 		`flags := []string{"--password", "--help"}`,
 		`subprocess.run(["redis-cli", "-a", "$PASSWORD"])`,
+		`sh -c "mysql -p\$PASSWORD"`,
+		`mysql -p"$PASSWORD" db`,
 	} {
 		require.Equal(t, in, String(in), in)
 	}
@@ -144,6 +152,7 @@ func TestCommandLinePasswordsStayLinear(t *testing.T) {
 		`["mysql", "-pX"], `, `"--password", `, `exec.Command("mysql", x(`,
 		"machine h login u password p ", "machine \"h login\" password '",
 		"ssh db \"nice mysql\" ", "docker run --entrypoint x ", "sudo -u ",
+		"mysql -p '\\", "mysql -p \\\"", `"mysql", 'x, `,
 	} {
 		in := strings.Repeat(unit, n/len(unit))
 		_ = detectCommandLinePasswords(in)

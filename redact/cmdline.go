@@ -269,6 +269,9 @@ type wordBuilder struct {
 	// marks a single-quoted piece.
 	pieceStart int
 	literal    bool
+	// expands is set when the piece holds a $ or a backquote the shell
+	// expands.
+	expands bool
 }
 
 func (b *wordBuilder) emit(at int) {
@@ -284,13 +287,23 @@ func (b *wordBuilder) emitRange(from, to int) {
 	}
 }
 
-// endPiece ends a piece. Text a shell expands after single quotes makes
-// the value no literal any more.
+// endPiece ends a piece. Text a shell expands after literal text makes the
+// value no literal any more.
 func (b *wordBuilder) endPiece() {
-	if !b.literal && b.text.Len() > b.pieceStart {
+	if !b.literal && b.expands && b.text.Len() > b.pieceStart {
 		b.w.sqFrom = -1
 	}
-	b.pieceStart, b.literal = b.text.Len(), false
+	b.pieceStart, b.literal, b.expands = b.text.Len(), false, false
+}
+
+// markLiteral marks the piece about to be emitted as literal text without
+// making the word a quoted one: an escaped $ or the inside of a double-quoted
+// string that expands nothing.
+func (b *wordBuilder) markLiteral(at int) {
+	if b.w.sqFrom < 0 {
+		b.w.sqFrom = at
+	}
+	b.literal = true
 }
 
 func (b *wordBuilder) startLiteral() {
@@ -317,6 +330,9 @@ func (b *wordBuilder) piece(p, to int, dqContent bool) int {
 		b.emit(p + 1)
 		return p + 2
 	case c == '\\' && p+1 < to:
+		if !dqContent && (s[p+1] == '$' || s[p+1] == '`') {
+			b.markLiteral(b.text.Len())
+		}
 		b.emit(p + 1)
 		return p + 2
 	case c == '\'':
@@ -335,13 +351,14 @@ func (b *wordBuilder) piece(p, to int, dqContent bool) int {
 		}
 	case c == '"':
 		if end := b.lx.closingQuote(p+1, to, '"', true); end >= 0 {
-			b.doubleQuoted(p+1, end)
+			b.doubleQuoted(p+1, end, !dqContent)
 			return end + 1
 		}
 	case c == '`':
 		// A backquoted substitution is part of the word, and is read again
 		// as a command.
 		if end := b.lx.closingQuote(p+1, to, '`', true); end >= 0 {
+			b.expands = true
 			b.emitRange(p, end+1)
 			b.inner = append(b.inner, cmdQuoted{start: p + 1, end: end})
 			return end + 1
@@ -350,25 +367,34 @@ func (b *wordBuilder) piece(p, to int, dqContent bool) int {
 		// A substitution or expansion is part of the word, and a
 		// substitution is read again as a command.
 		end, _ := b.lx.closingBracket(p+1, to)
+		b.expands = true
 		b.emitRange(p, end)
 		if s[p+1] == '(' {
 			b.inner = append(b.inner, cmdQuoted{start: p + 2, end: end - 1})
 		}
 		return end
 	}
+	b.expands = c == '$'
 	b.emit(p)
 	return p + 1
 }
 
 // doubleQuoted emits s[from:end], the inside of a double-quoted string,
-// without the backslashes of its escapes.
-func (b *wordBuilder) doubleQuoted(from, end int) {
+// without the backslashes of its escapes. With literalOK, a string that
+// expands nothing is literal text.
+func (b *wordBuilder) doubleQuoted(from, end int, literalOK bool) {
 	s := b.lx.s
+	start := b.text.Len()
 	for i := from; i < end; i++ {
 		if s[i] == '\\' && i+1 < end && strings.IndexByte("\"\\$`", s[i+1]) >= 0 {
 			i++
+		} else if s[i] == '$' || s[i] == '`' {
+			b.expands = true
 		}
 		b.emit(i)
+	}
+	if literalOK && !b.expands {
+		b.markLiteral(start)
 	}
 	b.inner = append(b.inner, cmdQuoted{start: from, end: end, dq: true})
 	b.w.quoted = true
