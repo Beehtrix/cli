@@ -110,6 +110,18 @@ type Deps struct {
 // it, or found nothing to report.
 type explicitTrailRun struct {
 	settled bool
+	// errOut receives the notices of a report that was not posted, since
+	// they explain the run's failure.
+	errOut io.Writer
+}
+
+// trailNotices is where maybePostReviewToTrail says a report was not posted:
+// stderr when --trail requires the post, else out beside the review.
+func (d Deps) trailNotices(out io.Writer) io.Writer {
+	if d.trail != nil && d.trail.errOut != nil {
+		return d.trail.errOut
+	}
+	return out
 }
 
 // settleTrail records that a --trail run's report needs nothing more.
@@ -126,7 +138,7 @@ func trackExplicitTrail(cmd *cobra.Command, required bool, deps Deps) (Deps, fun
 	if !required {
 		return deps, func(err error) error { return err }
 	}
-	run := &explicitTrailRun{}
+	run := &explicitTrailRun{errOut: cmd.ErrOrStderr()}
 	deps.trail = run
 	return deps, func(err error) error { return trailRunResult(cmd, run, err) }
 }
@@ -1160,7 +1172,7 @@ func unverifiedReviewerConfig(unverified []string, profileName string, profile s
 
 // reviewModesWithoutARun are the flags that select a mode which runs no
 // review, so it has nothing to post to a --trail.
-var reviewModesWithoutARun = []string{"configure", "edit", "findings", "list", "agents", "models"}
+var reviewModesWithoutARun = []string{"configure", "edit", "findings", "list", "agents", "models", "show-config"}
 
 // registerTrailFlag adds --trail and checks it before any mode runs, after
 // the checks already registered.
@@ -1190,7 +1202,7 @@ func checkTrailFlag(cmd *cobra.Command, selector *string) error {
 	}
 	for _, mode := range reviewModesWithoutARun {
 		if f := cmd.Flags().Lookup(mode); f != nil && f.Value.String() == "true" {
-			return errors.New("--trail applies to a review run; it cannot be combined with --configure, --edit, --findings, --list, --agents, or --models")
+			return errors.New("--trail applies to a review run; it cannot be combined with --configure, --edit, --findings, --list, --agents, --models, or --show-config")
 		}
 	}
 	return nil
@@ -1942,9 +1954,10 @@ func maybePostReviewToTrail(
 	if summary.Cancelled {
 		return trailNotPosted(deps, errReviewCancelled)
 	}
+	notices := deps.trailNotices(out)
 	report, post := trailReportFor(summary, aggregateOutput)
 	if !post && deps.trail != nil && strings.TrimSpace(aggregateOutput) == "" && len(usableAgentRuns(summary)) == 0 {
-		fmt.Fprintln(out, "The review produced no output, so nothing was posted to the trail.")
+		fmt.Fprintln(notices, "The review produced no output, so nothing was posted to the trail.")
 		return trailNotPosted(deps, errors.New("the review produced no output"))
 	}
 	if !post {
@@ -1953,11 +1966,11 @@ func maybePostReviewToTrail(
 		return nil
 	}
 	if len(report.Comments) == 0 && strings.TrimSpace(report.Prose) == "" {
-		fmt.Fprintln(out, "The review produced no readable report, so nothing was posted to the trail.")
+		fmt.Fprintln(notices, "The review produced no readable report, so nothing was posted to the trail.")
 		return trailNotPosted(deps, errors.New("the review produced no readable report"))
 	}
 	if deps.PostReviewToTrail == nil {
-		fmt.Fprintln(out, "Trail output is not available here; the review was kept local.")
+		fmt.Fprintln(notices, "Trail output is not available here; the review was kept local.")
 		return trailNotPosted(deps, errors.New("trail output is not available"))
 	}
 	report.Scope = scope
@@ -1965,7 +1978,7 @@ func maybePostReviewToTrail(
 	// On success the hook prints its own confirmation and trail link.
 	if err := deps.PostReviewToTrail(ctx, out, profileName, report); err != nil {
 		if !userMessageAlreadyPrinted(err) {
-			fmt.Fprintf(out, "Could not post the review to the trail: %v\n", err)
+			fmt.Fprintf(notices, "Could not post the review to the trail: %v\n", err)
 		}
 		return trailNotPosted(deps, err)
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -24,7 +25,8 @@ type trailFlagRun struct {
 	resolved  []string
 	posted    *review.TrailReport
 	started   bool
-	out       string
+	out       string // stdout
+	errOut    string // stderr
 	err       error
 	reviewCfg reviewtypes.RunConfig
 }
@@ -89,13 +91,13 @@ func runTrailFlagReviewWith(t *testing.T, run *trailFlagRun, resolveErr, postErr
 			}, nil
 		},
 	}
-	out := &bytes.Buffer{}
+	out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
 	cmd := review.NewCommand(deps)
 	cmd.SetOut(out)
-	cmd.SetErr(out)
+	cmd.SetErr(errOut)
 	cmd.SetArgs(args)
 	run.err = cmd.Execute()
-	run.out = out.String()
+	run.out, run.errOut = out.String(), errOut.String()
 	return run
 }
 
@@ -123,6 +125,9 @@ func TestRunReview_TrailFlagPostsToNamedTrail(t *testing.T) {
 	if run.posted.HeadSHA != head {
 		t.Errorf("posted HeadSHA = %q, want the reviewed commit %q", run.posted.HeadSHA, head)
 	}
+	if posted := run.posted.Prose + fmt.Sprint(run.posted.Comments); !strings.Contains(posted, "a real bug") {
+		t.Errorf("posted report %+v does not carry the reviewer's finding", *run.posted)
+	}
 	if !run.reviewCfg.TrailFindingsJSON {
 		t.Error("the reviewer was not asked for the trail findings line, though --trail posts its output")
 	}
@@ -141,8 +146,9 @@ func TestRunReview_TrailFlagFailsWhenNotPosted(t *testing.T) {
 	if run.err == nil {
 		t.Fatalf("a --trail review whose post failed exited zero:\n%s", run.out)
 	}
-	if !strings.Contains(run.out, "Could not post the review to the trail: the trail's head is abc") {
-		t.Errorf("output does not say why nothing was posted:\n%s", run.out)
+	// The run's error is silent, so its explanation must reach stderr.
+	if !strings.Contains(run.errOut, "Could not post the review to the trail: the trail's head is abc") {
+		t.Errorf("stderr does not say why nothing was posted:\n%s", run.errOut)
 	}
 
 	run = runTrailFlagReview(t, errors.New("no trail #999"), nil, "general", "--trail", "999")
@@ -165,6 +171,7 @@ func TestRunReview_TrailFlagRejectsModesWithoutAReview(t *testing.T) {
 		{[]string{"--trail", "", "general"}, "--trail cannot be empty"},
 		{[]string{"--trail", "42", "--findings"}, "--trail applies to a review run"},
 		{[]string{"--trail", "42", "--list"}, "--trail applies to a review run"},
+		{[]string{"--trail", "42", "--show-config"}, "--trail applies to a review run"},
 	} {
 		run := runTrailFlagReview(t, nil, nil, tt.args...)
 		if run.err == nil || !strings.Contains(run.err.Error(), tt.want) {

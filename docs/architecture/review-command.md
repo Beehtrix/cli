@@ -62,9 +62,10 @@ at the reviewed commit; otherwise none are posted. Unlike a profile's `output:
 trail`, which never fails the run, a `--trail` run exits non-zero when its
 findings were not posted (a cancelled or declined run, a review that produced
 no output or no readable report, a resolution or network error, or a head
-mismatch); the findings stay available locally through `entire review
---findings`. A run with nothing to report posts nothing and succeeds. `--trail` is rejected with the modes that run no review
-(`--configure`, `--edit`, `--findings`, `--list`, `--agents`, `--models`). With
+mismatch), and says why on stderr; the findings stay available locally
+through `entire review --findings`. A run with nothing to report posts nothing and succeeds. `--trail` is rejected with the modes that run no review
+(`--configure`, `--edit`, `--findings`, `--list`, `--agents`, `--models`,
+`--show-config`). With
 `--target`, the flag is passed on to the re-run in the worktree.
 
 ## Profiles
