@@ -942,6 +942,35 @@ type reviewProfileSelection struct {
 }
 
 // resolveReviewProfile selects the profile, running setup or the chooser if needed.
+// guidedFirstRun reports whether a first run with no review profile walks the
+// user through setup. A --trail run does not: it reviews the committed
+// checkout and must leave it so, so it uses the default profile unsaved.
+func guidedFirstRun(cmd *cobra.Command, interactiveTTY bool) bool {
+	return interactiveTTY && !cmd.Flags().Changed("trail")
+}
+
+// announceDefaultProfile tells the user which default profile a first run
+// uses, and whether it was saved.
+func announceDefaultProfile(cmd *cobra.Command, name string, profile settings.ReviewProfileConfig) {
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "No review profiles found; using default %q profile with %s.\n", name, strings.Join(sortedMapKeys(profile.Agents), ", "))
+	if cmd.Flags().Changed("trail") {
+		fmt.Fprintln(out, "It is not saved: --trail leaves the checkout as committed. Save a profile with `entire review --configure`.")
+	} else {
+		fmt.Fprintln(out, "Configure later with `entire review --configure`.")
+	}
+	fmt.Fprintln(out)
+}
+
+// saveFirstRunProfile saves the profile a first run set up, except for a
+// --trail run, which writes nothing to the checkout it reviews.
+func saveFirstRunProfile(ctx context.Context, cmd *cobra.Command, name string, profile settings.ReviewProfileConfig, scope reviewSettingsScope) error {
+	if cmd.Flags().Changed("trail") {
+		return nil
+	}
+	return saveReviewProfile(reviewSettingsContext(ctx), name, profile, false, scope)
+}
+
 func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverride, agentOverride string, deps Deps) (reviewProfileSelection, error) {
 	out := cmd.OutOrStdout()
 	silentErr := deps.NewSilentError
@@ -1002,7 +1031,7 @@ func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverri
 		// Non-interactive first run writes the shared project settings; interactive
 		// setup asks the user where to save below.
 		saveScope := reviewScopeProject
-		guidedSetup := interactiveTTY
+		guidedSetup := guidedFirstRun(cmd, interactiveTTY)
 		if guidedSetup {
 			var setupErr error
 			profileForSetup, profile, setupErr = RunReviewGuidedSetup(ctx, out, installed, deps.ReviewerFor, profileForSetup, true, s)
@@ -1025,11 +1054,9 @@ func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverri
 				return reviewProfileSelection{}, silentErr(defaultErr)
 			}
 			profile = defaultProfile
-			fmt.Fprintf(out, "No review profiles found; using default %q profile with %s.\n", profileForSetup, strings.Join(sortedMapKeys(profile.Agents), ", "))
-			fmt.Fprintln(out, "Configure later with `entire review --configure`.")
-			fmt.Fprintln(out)
+			announceDefaultProfile(cmd, profileForSetup, profile)
 		}
-		if saveErr := saveReviewProfile(reviewSettingsContext(ctx), profileForSetup, profile, false, saveScope); saveErr != nil {
+		if saveErr := saveFirstRunProfile(ctx, cmd, profileForSetup, profile, saveScope); saveErr != nil {
 			return reviewProfileSelection{}, saveErr
 		}
 		s.ReviewProfiles = map[string]settings.ReviewProfileConfig{profileForSetup: profile}

@@ -290,10 +290,10 @@ func checkWorktreeRefusal(t *testing.T, run *trailFlagRun, want string) {
 	}
 }
 
-// A first --trail run with no review profile saves the default one to the
-// checkout's tracked settings. That write is Entire's own, so it does not
-// make the worktree count as dirty. Not parallel: changes CWD.
-func TestRunReview_TrailFlagFirstRunSavesTheDefaultProfile(t *testing.T) {
+// A first --trail run with no review profile uses the default one without
+// saving it, so the checkout the reviewers read stays as committed, tracked
+// settings included. Not parallel: changes CWD.
+func TestRunReview_TrailFlagFirstRunLeavesTheSettingsAlone(t *testing.T) {
 	setupCmdTestRepo(t)
 	testutil.WriteFile(t, ".", ".entire/settings.json", "{}\n")
 	testutil.GitAdd(t, ".", ".entire/settings.json")
@@ -303,8 +303,11 @@ func TestRunReview_TrailFlagFirstRunSavesTheDefaultProfile(t *testing.T) {
 	if run.err != nil || run.posted == nil {
 		t.Fatalf("err = %v, posted %v; want a posted review\n%s\n%s", run.err, run.posted != nil, run.out, run.errOut)
 	}
-	if !strings.Contains(run.out, "No review profiles found; using default") {
-		t.Errorf("the run did not set up the default profile:\n%s", run.out)
+	if !strings.Contains(run.out, "No review profiles found; using default") || !strings.Contains(run.out, "It is not saved") {
+		t.Errorf("the run did not say it uses the default profile unsaved:\n%s", run.out)
+	}
+	if status := testutil.RunGit(t, ".", "--no-optional-locks", "status", "--porcelain", "--untracked-files=all"); status != "" {
+		t.Errorf("the run changed the checkout:\n%s", status)
 	}
 }
 

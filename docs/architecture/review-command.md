@@ -57,9 +57,11 @@ count whatever `status.showUntrackedFiles` says, and so do edits, deletions and
 type changes of files marked assume-unchanged or skip-worktree (copied without
 those flags into a temporary index and compared there by git, so line-ending
 conversion applies as it does for `git status`; a skip-worktree path missing
-from a sparse checkout is no change). This is checked before the profile is
-resolved, so a first run's save of the default profile to
-`.entire/settings.json` does not trip it; that save is not checked again.
+from a sparse checkout is no change, and the index read is the one the
+caller's exported `GIT_INDEX_FILE` selects, as for `git status`). This is
+checked before the profile is resolved. A `--trail` run that finds no review
+profile uses the default one for that run without guided setup and without
+saving it, so the checkout stays as committed.
 The trust gate's `--show-config` hints leave `--trail` out. The trail is
 resolved before any reviewer runs, so a selector that names no trail fails
 without starting the agents, and the findings are posted only to the change
