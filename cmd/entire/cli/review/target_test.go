@@ -32,7 +32,7 @@ func TestReviewTargetChildArgsUsesParsedCommandFlags(t *testing.T) {
 		t.Fatalf("reviewTargetChildArgs() = %q, want %q", got, want)
 	}
 	wantEnv := []string{envReviewFindingsWorktree + "=/caller", envReviewTargetPrompt + "=focus here"}
-	if got := reviewTargetChildEnv(cmd, "/caller"); !reflect.DeepEqual(got, wantEnv) {
+	if got := reviewTargetChildEnv(cmd, "/caller", reviewProfileSelection{}); !reflect.DeepEqual(got, wantEnv) {
 		t.Fatalf("reviewTargetChildEnv() = %q, want %q", got, wantEnv)
 	}
 }
@@ -43,7 +43,7 @@ func TestReviewTargetChildEnvOmitsUnsetPrompt(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.Flags().String("prompt", "", "")
 	want := []string{envReviewFindingsWorktree + "=/caller"}
-	if got := reviewTargetChildEnv(cmd, "/caller"); !reflect.DeepEqual(got, want) {
+	if got := reviewTargetChildEnv(cmd, "/caller", reviewProfileSelection{}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("reviewTargetChildEnv() = %q, want %q", got, want)
 	}
 }
