@@ -941,12 +941,20 @@ type reviewProfileSelection struct {
 	done      bool
 }
 
-// resolveReviewProfile selects the profile, running setup or the chooser if needed.
+// trailReviewsThisCheckout reports whether this run posts with --trail what
+// it finds in the checkout it runs in, which must stay as committed. A
+// --target parent does not review its own checkout: the target worktree is
+// reviewed, and the re-run there reads its profile from this checkout's
+// settings, so a first run saves the profile here as usual.
+func trailReviewsThisCheckout(cmd *cobra.Command) bool {
+	return cmd.Flags().Changed("trail") && !cmd.Flags().Changed("target")
+}
+
 // guidedFirstRun reports whether a first run with no review profile walks the
-// user through setup. A --trail run does not: it reviews the committed
-// checkout and must leave it so, so it uses the default profile unsaved.
+// user through setup. A --trail run of this checkout does not: it uses the
+// default profile unsaved.
 func guidedFirstRun(cmd *cobra.Command, interactiveTTY bool) bool {
-	return interactiveTTY && !cmd.Flags().Changed("trail")
+	return interactiveTTY && !trailReviewsThisCheckout(cmd)
 }
 
 // announceDefaultProfile tells the user which default profile a first run
@@ -954,7 +962,7 @@ func guidedFirstRun(cmd *cobra.Command, interactiveTTY bool) bool {
 func announceDefaultProfile(cmd *cobra.Command, name string, profile settings.ReviewProfileConfig) {
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "No review profiles found; using default %q profile with %s.\n", name, strings.Join(sortedMapKeys(profile.Agents), ", "))
-	if cmd.Flags().Changed("trail") {
+	if trailReviewsThisCheckout(cmd) {
 		fmt.Fprintln(out, "It is not saved: --trail leaves the checkout as committed. Save a profile with `entire review --configure`.")
 	} else {
 		fmt.Fprintln(out, "Configure later with `entire review --configure`.")
@@ -963,14 +971,16 @@ func announceDefaultProfile(cmd *cobra.Command, name string, profile settings.Re
 }
 
 // saveFirstRunProfile saves the profile a first run set up, except for a
-// --trail run, which writes nothing to the checkout it reviews.
+// --trail run of this checkout, which writes nothing to the checkout it
+// reviews.
 func saveFirstRunProfile(ctx context.Context, cmd *cobra.Command, name string, profile settings.ReviewProfileConfig, scope reviewSettingsScope) error {
-	if cmd.Flags().Changed("trail") {
+	if trailReviewsThisCheckout(cmd) {
 		return nil
 	}
 	return saveReviewProfile(reviewSettingsContext(ctx), name, profile, false, scope)
 }
 
+// resolveReviewProfile selects the profile, running setup or the chooser if needed.
 func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverride, agentOverride string, deps Deps) (reviewProfileSelection, error) {
 	out := cmd.OutOrStdout()
 	silentErr := deps.NewSilentError
@@ -1268,8 +1278,7 @@ func withExplicitTrail(cmd *cobra.Command, deps Deps, selector string) (Deps, er
 // requireCommittedWorktree refuses a --trail run in a worktree with
 // uncommitted changes: the reviewers read them, but the findings are posted
 // against the reviewed commit, which does not contain them. It runs before
-// the review resolves its profile, since a first run saves the default
-// profile to the settings.
+// the review resolves its profile, so a refused run asks nothing.
 func requireCommittedWorktree(cmd *cobra.Command, trailSelector string) error {
 	if trailSelector == "" {
 		return nil

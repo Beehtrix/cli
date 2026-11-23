@@ -30,6 +30,7 @@ type trailFlagRun struct {
 	errOut    string // stderr
 	err       error
 	reviewCfg reviewtypes.RunConfig
+	withDeps  func(*review.Deps) // adjusts the deps before the run, if set
 }
 
 type trailFlagReviewer struct {
@@ -91,6 +92,9 @@ func runTrailFlagReviewWith(t *testing.T, run *trailFlagRun, resolveErr, postErr
 				return err
 			}, nil
 		},
+	}
+	if run.withDeps != nil {
+		run.withDeps(&deps)
 	}
 	out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
 	cmd := review.NewCommand(deps)
@@ -308,6 +312,49 @@ func TestRunReview_TrailFlagFirstRunLeavesTheSettingsAlone(t *testing.T) {
 	}
 	if status := testutil.RunGit(t, ".", "--no-optional-locks", "status", "--porcelain", "--untracked-files=all"); status != "" {
 		t.Errorf("the run changed the checkout:\n%s", status)
+	}
+}
+
+// A --target parent reviews the target worktree, not its own checkout, and
+// its re-run there reads the profile from this checkout's settings. So a first
+// --target --trail run saves the default profile here as any first run does,
+// and the re-run uses the reviewers the parent inspected instead of building
+// a default from the branch's own hooks. Not parallel: changes CWD.
+func TestRunReview_TrailFlagFirstTargetRunSavesTheProfileForTheReRun(t *testing.T) {
+	setupCmdTestRepo(t)
+	root, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := strings.TrimSpace(testutil.RunGit(t, root, "rev-parse", "HEAD"))
+	var childArgs []string
+	run := runTrailFlagReviewWith(t, &trailFlagRun{withDeps: func(deps *review.Deps) {
+		deps.ResolveTarget = func(context.Context, io.Writer, io.Writer, string) (review.ResolvedTarget, error) {
+			return review.ResolvedTarget{Branch: "feature", HeadSHA: head}, nil
+		}
+		deps.InspectTrust = func(context.Context, review.TrustSource, []review.TrustAgent) (review.TrustInventory, error) {
+			return review.TrustInventory{}, nil
+		}
+		deps.CheckoutTarget = func(context.Context, io.Writer, io.Writer, review.ResolvedTarget, bool) (review.TargetWorktree, error) {
+			return review.TargetWorktree{Path: root}, nil
+		}
+		deps.RunInWorktree = func(_ context.Context, _ string, args, _ []string, _ io.Reader, _, _ io.Writer) error {
+			childArgs = args
+			return nil
+		}
+	}}, nil, nil, "general", "--target", "feature", "--trail", "42", "--trust-target", head)
+	if run.err != nil || childArgs == nil {
+		t.Fatalf("err = %v, re-run args %q; want the re-run started\n%s\n%s", run.err, childArgs, run.out, run.errOut)
+	}
+	s, err := settings.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved := s.ReviewProfiles["general"]; len(saved.Agents) == 0 {
+		t.Errorf("the default profile was not saved for the re-run to read; profiles = %v\n%s", s.ReviewProfiles, run.out)
+	}
+	if strings.Contains(run.out, "It is not saved") {
+		t.Errorf("a --target run said the profile is not saved:\n%s", run.out)
 	}
 }
 

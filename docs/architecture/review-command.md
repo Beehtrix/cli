@@ -59,9 +59,13 @@ those flags into a temporary index and compared there by git, so line-ending
 conversion applies as it does for `git status`; a skip-worktree path missing
 from a sparse checkout is no change, and the index read is the one the
 caller's exported `GIT_INDEX_FILE` selects, as for `git status`). This is
-checked before the profile is resolved. A `--trail` run that finds no review
-profile uses the default one for that run without guided setup and without
-saving it, so the checkout stays as committed.
+checked before the profile is resolved. When no review profile exists, a
+`--trail` run that would use the default one (in a terminal, or with a profile
+named; outside a terminal a bare run still asks for a profile) uses it for that
+run without guided setup and without saving it, so the checkout stays as
+committed. With `--target` the reviewed checkout is the target worktree, so a
+first run saves the profile in the caller's checkout as usual, and the re-run
+in the worktree reads that saved profile.
 The trust gate's `--show-config` hints leave `--trail` out. The trail is
 resolved before any reviewer runs, so a selector that names no trail fails
 without starting the agents, and the findings are posted only to the change
