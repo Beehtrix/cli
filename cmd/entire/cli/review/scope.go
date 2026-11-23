@@ -299,9 +299,9 @@ func listTracked(ctx context.Context, repoRoot string) (tracked, hidden map[stri
 }
 
 // countWorktreeChanges returns how many paths differ between the worktree and
-// HEAD: staged, unstaged and untracked files, whatever
-// status.showUntrackedFiles says, submodules with changes, whatever their
-// ignore setting says, plus the files marked assume-unchanged or
+// HEAD: staged, unstaged and untracked files, even when
+// status.showUntrackedFiles hides them, submodules with changes, even when
+// their ignore setting hides them, plus the files marked assume-unchanged or
 // skip-worktree that git status does not report, which are also counted in
 // hidden.
 func countWorktreeChanges(ctx context.Context, repoRoot string) (paths, hidden int, err error) {
