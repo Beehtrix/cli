@@ -30,8 +30,13 @@ func HiddenFromStatus(tag string) bool {
 // its own rules: clean filters and the index-aware line-ending conversion
 // apply as they do for git status (see PathStatuses), which hashing the files
 // would not do. The repository's own index is only read.
+//
+// This is for commands the user runs: unlike the package's hook-path reads,
+// it keeps the repository selectors the caller exported (GIT_DIR,
+// GIT_WORK_TREE, GIT_INDEX_FILE), so it reads the same index git status does
+// in that environment.
 func HiddenWorktreeChanges(ctx context.Context, worktreeRoot string) ([]string, error) {
-	out, err := worktreeGitCommand(ctx, worktreeRoot, "ls-files", "-z", "-v", "--stage").Output()
+	out, err := callerGitCommand(ctx, worktreeRoot, nil, "ls-files", "-z", "-v", "--stage").Output()
 	if err != nil {
 		return nil, gitCommandError("ls-files", err)
 	}
@@ -65,6 +70,14 @@ func HiddenWorktreeChanges(ctx context.Context, worktreeRoot string) ([]string, 
 	return changed, nil
 }
 
+// callerGitCommand is worktreeGitCommand with the caller's own environment,
+// selectors included, plus env, whose entries win over the inherited ones.
+func callerGitCommand(ctx context.Context, worktreeRoot string, env []string, args ...string) *exec.Cmd {
+	cmd := worktreeGitCommand(ctx, worktreeRoot, args...)
+	cmd.Env = append(os.Environ(), env...)
+	return cmd
+}
+
 // worktreeEntryMode reports whether an index mode is a regular file or a
 // symlink, the entries this repository's worktree holds (not a gitlink).
 func worktreeEntryMode(mode string) bool {
@@ -89,8 +102,8 @@ func diffFilesWithoutFlags(ctx context.Context, worktreeRoot, entries string) (m
 		// again, a split index would leave a shared index file in the
 		// repository, and fsmonitor could start its daemon for a throwaway
 		// index.
-		cmd := worktreeGitCommand(ctx, worktreeRoot, append([]string{"-c", "core.ignoreStat=false", "-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"}, args...)...)
-		cmd.Env = append(cmd.Env, "GIT_INDEX_FILE="+index)
+		cmd := callerGitCommand(ctx, worktreeRoot, []string{"GIT_INDEX_FILE=" + index},
+			append([]string{"-c", "core.ignoreStat=false", "-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"}, args...)...)
 		cmd.Stdin = strings.NewReader(stdin)
 		out, err := cmd.Output()
 		if err != nil {

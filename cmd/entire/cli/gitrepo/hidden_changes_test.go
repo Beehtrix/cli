@@ -9,8 +9,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
+	"github.com/entireio/cli/cmd/entire/cli/testutil/gitenv"
 )
 
 // HiddenWorktreeChanges reports what git status hides behind assume-unchanged
@@ -90,6 +92,34 @@ func TestHiddenWorktreeChanges_IgnoreStat(t *testing.T) {
 	got, err := gitrepo.HiddenWorktreeChanges(context.Background(), dir)
 	if err != nil || !slices.Equal(got, []string{"f.txt"}) {
 		t.Fatalf("HiddenWorktreeChanges = %q, %v; want the edited f.txt", got, err)
+	}
+}
+
+// An index the caller selected with GIT_INDEX_FILE is the one read, as git
+// status reads it. Not parallel: sets the environment.
+func TestHiddenWorktreeChanges_CallerSelectedIndex(t *testing.T) {
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	testutil.WriteFile(t, dir, "f.txt", "x")
+	testutil.GitAdd(t, dir, "f.txt")
+	testutil.GitCommit(t, dir, "init")
+	// f.txt is assume-unchanged only in the alternate index, so reading the
+	// repository's default index would find nothing hidden.
+	alternate := filepath.Join(t.TempDir(), "index")
+	for _, args := range [][]string{{"read-tree", "HEAD"}, {"update-index", "--assume-unchanged", "f.txt"}} {
+		cmd := execx.NonInteractive(context.Background(), "git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(gitenv.Isolated(), "GIT_INDEX_FILE="+alternate)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	testutil.WriteFile(t, dir, "f.txt", "edited")
+	t.Setenv("GIT_INDEX_FILE", alternate)
+
+	got, err := gitrepo.HiddenWorktreeChanges(context.Background(), dir)
+	if err != nil || !slices.Equal(got, []string{"f.txt"}) {
+		t.Fatalf("HiddenWorktreeChanges = %q, %v; want f.txt, hidden in the selected index", got, err)
 	}
 }
 
