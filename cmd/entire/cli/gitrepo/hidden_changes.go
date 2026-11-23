@@ -85,9 +85,11 @@ func diffFilesWithoutFlags(ctx context.Context, worktreeRoot, entries string) (m
 		return nil, fmt.Errorf("create a temporary index: %w", err)
 	}
 	git := func(stdin string, args ...string) ([]byte, error) {
-		// A split index would leave a shared index file in the repository,
-		// and fsmonitor could start its daemon for a throwaway index.
-		cmd := worktreeGitCommand(ctx, worktreeRoot, append([]string{"-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"}, args...)...)
+		// core.ignoreStat would mark every imported entry assume-unchanged
+		// again, a split index would leave a shared index file in the
+		// repository, and fsmonitor could start its daemon for a throwaway
+		// index.
+		cmd := worktreeGitCommand(ctx, worktreeRoot, append([]string{"-c", "core.ignoreStat=false", "-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"}, args...)...)
 		cmd.Env = append(cmd.Env, "GIT_INDEX_FILE="+index)
 		cmd.Stdin = strings.NewReader(stdin)
 		out, err := cmd.Output()

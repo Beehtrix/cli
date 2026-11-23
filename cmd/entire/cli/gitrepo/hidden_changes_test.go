@@ -74,6 +74,25 @@ func TestHiddenWorktreeChanges(t *testing.T) {
 	}
 }
 
+// core.ignoreStat marks entries assume-unchanged as they enter an index, which
+// must not happen to the copies compared in the temporary one.
+func TestHiddenWorktreeChanges_IgnoreStat(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	testutil.WriteFile(t, dir, "f.txt", "x")
+	testutil.GitAdd(t, dir, "f.txt")
+	testutil.GitCommit(t, dir, "init")
+	testutil.RunGit(t, dir, "config", "core.ignoreStat", "true")
+	testutil.RunGit(t, dir, "update-index", "--assume-unchanged", "f.txt")
+	testutil.WriteFile(t, dir, "f.txt", "edited")
+
+	got, err := gitrepo.HiddenWorktreeChanges(context.Background(), dir)
+	if err != nil || !slices.Equal(got, []string{"f.txt"}) {
+		t.Fatalf("HiddenWorktreeChanges = %q, %v; want the edited f.txt", got, err)
+	}
+}
+
 // A repository with nothing marked hidden needs no temporary index.
 func TestHiddenWorktreeChanges_NoneHidden(t *testing.T) {
 	t.Parallel()
