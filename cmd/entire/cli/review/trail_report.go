@@ -149,11 +149,12 @@ func readLocalReport(summary reviewtypes.RunSummary, aggregateOutput string) (Tr
 }
 
 // finalReportText is a reviewer's report in a run without the trail JSON
-// line: the text after its last tool call, which leaves out exploration
-// narration such as "I'll check:\n- retry.go" written before it. When the
-// earlier text has a severity marker or a feedback verdict, which narration
-// does not, all of the text is the report, so findings written before a last
-// tool call are kept.
+// line. The output format asks a report to open with a verdict line, so
+// when the text after the last tool call does, that text is the report, and
+// exploration narration such as "I'll check:\n- retry.go" written before it
+// is left out. Otherwise, or when the earlier text has a severity marker or
+// a feedback verdict, which narration does not, all of the text is the
+// report, so findings written before a last tool call are kept.
 func finalReportText(buf []reviewtypes.Event) string {
 	for i := len(buf) - 1; i >= 0; i-- {
 		if !isTextBoundary(buf, i) {
@@ -163,29 +164,51 @@ func finalReportText(buf []reviewtypes.Event) string {
 		if final == "" {
 			continue
 		}
-		if reportsFindings(joinAssistantText(buf[:i]), false) {
-			break
+		if opensWithVerdict(final) && !reportsFindings(joinAssistantText(buf[:i]), false) {
+			return final
 		}
-		return final
+		break
 	}
 	return joinAssistantText(buf)
 }
 
+// opensWithVerdict reports whether report's first line is a verdict the
+// output format asks for: approve, approve with nits, or request changes.
+func opensWithVerdict(report string) bool {
+	first, _, _ := strings.Cut(strings.TrimSpace(report), "\n")
+	verdict := verdictText(first)
+	return strings.HasPrefix(verdict, "approve") || strings.HasPrefix(verdict, "request changes") ||
+		strings.HasPrefix(verdict, "request_changes")
+}
+
 // cleanVerdict reports whether a report without the trail JSON line says
-// the change is clean: it opens with an approve verdict, the shape the
-// output format asks a clean review for, and has none of the finding shapes
-// proseReportsFindings looks for ("approve with nits" is one). Anything
-// else, such as a finding written as a plain paragraph, is a finding.
+// the change is clean: it is only an approve verdict line, which is what the
+// output format asks a clean review to write, and the verdict is not
+// "approve with nits" or another one that says there is feedback. Anything
+// else, such as an approval followed by a finding written as a plain
+// paragraph, is a finding.
 func cleanVerdict(report string) bool {
-	if proseReportsFindings(report) {
+	first, rest, _ := strings.Cut(strings.TrimSpace(report), "\n")
+	if strings.TrimSpace(rest) != "" {
 		return false
 	}
-	first, _, _ := strings.Cut(strings.TrimSpace(report), "\n")
-	lower := strings.ToLower(trimMarkdownEmphasis(first))
-	if after, found := strings.CutPrefix(lower, "verdict"); found {
-		lower = trimMarkdownEmphasis(strings.TrimLeft(after, ":-—– "))
+	verdict := verdictText(first)
+	return strings.HasPrefix(verdict, "approve") && !proseReportsFindings(verdict)
+}
+
+// verdictEmphasis removes the Markdown emphasis a verdict line may carry
+// anywhere in it, as in "Verdict: **approve** with nits".
+var verdictEmphasis = strings.NewReplacer("**", "", "__", "", "*", "", "`", "")
+
+// verdictText is line in lower case without Markdown emphasis, a heading or
+// quote marker, or a "Verdict:" label.
+func verdictText(line string) string {
+	text := strings.ToLower(verdictEmphasis.Replace(line))
+	text = strings.TrimLeft(text, "#>_ ")
+	if after, found := strings.CutPrefix(text, "verdict"); found {
+		text = strings.TrimLeft(after, ":-—– ")
 	}
-	return strings.HasPrefix(lower, "approve")
+	return text
 }
 
 // contractCoversProse reports whether a valid contract can be posted in place

@@ -95,6 +95,24 @@ func TestBuildLocalReviewManifestFromSummary_KeepsTrailReport(t *testing.T) {
 			want:    ManifestReport{Comments: []TrailComment{}, Prose: "## codex\n\n" + finding + "\nDone."},
 		},
 		{
+			name:    "local plain-paragraph finding before a last tool call",
+			summary: narrated(reviewtypes.AssistantText{Text: "The retry loop ignores ctx cancel."}, tool, reviewtypes.AssistantText{Text: "Done."}),
+			local:   true,
+			want:    ManifestReport{Comments: []TrailComment{}, Prose: "## codex\n\nThe retry loop ignores ctx cancel.\nDone."},
+		},
+		{
+			name:    "local approval followed by a plain-paragraph finding",
+			summary: trailRunsSummary(textRun(manifestTestCodexAgent, "approve\n\nThe retry loop in retry.go:42 can hang shutdown.")),
+			local:   true,
+			want:    ManifestReport{Comments: []TrailComment{}, Prose: "## codex\n\napprove\n\nThe retry loop in retry.go:42 can hang shutdown."},
+		},
+		{
+			name:    "local approval with nits inside emphasis",
+			summary: trailRunsSummary(textRun(manifestTestCodexAgent, "Verdict: **approve** with nits — rename the flag")),
+			local:   true,
+			want:    ManifestReport{Comments: []TrailComment{}, Prose: "## codex\n\nVerdict: **approve** with nits — rename the flag"},
+		},
+		{
 			name:    "local finding as a plain paragraph",
 			summary: trailRunsSummary(textRun(manifestTestCodexAgent, "The retry loop ignores ctx cancel.")),
 			local:   true,

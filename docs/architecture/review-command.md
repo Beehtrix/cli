@@ -107,13 +107,14 @@ is in that commit. The run records what a post would read from it (the
 manifest's `report`). A run that did not ask for the JSON line, such as a
 `local` profile's, records its report as prose instead, without reading a
 trailing JSON block as the line: the judge's verdict when one ran, otherwise
-each reviewer's text after its last tool call (all of its text when earlier
-text has a severity marker or feedback verdict), leaving out exploration
-narration. Such a report, or one reviewer's part of it, that opens with an
-approve verdict and has none of the finding shapes the output format asks
-for (a list item, a severity marker, a feedback label or verdict) is
-nothing to report; a trail-mode run without its line still counts its prose
-as findings, as posting treats it. A run with nothing to report prints an
+each reviewer's text after its last tool call when that text opens with a
+verdict line, as the output format asks, leaving out exploration narration.
+All of a reviewer's text is its report when the last text does not open with
+a verdict, or when earlier text has a severity marker or feedback verdict.
+A report, or one reviewer's part of it, that is only an approving verdict
+line (`approve`, not `approve with nits`) is nothing to report; anything
+more, such as a paragraph after the approval, is a finding. A trail-mode run
+without its line still counts its prose as findings, as posting treats it. A run with nothing to report prints an
 empty list; one that produced no output or no readable report, or that was
 saved before runs kept their report, prints nothing to stdout and exits
 non-zero, saying why on stderr. A handle is required; `entire review
