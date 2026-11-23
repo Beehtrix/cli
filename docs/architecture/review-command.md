@@ -63,9 +63,12 @@ checked before the profile is resolved. When no review profile exists, a
 `--trail` run that would use the default one (in a terminal, or with a profile
 named; outside a terminal a bare run still asks for a profile) uses it for that
 run without guided setup and without saving it, so the checkout stays as
-committed. With `--target` the reviewed checkout is the target worktree, so a
-first run saves the profile in the caller's checkout as usual, and the re-run
-in the worktree reads that saved profile.
+committed. With `--target`, which can target the caller's own checkout, the
+parent saves nothing either and passes that profile to the re-run in the
+worktree (in `ENTIRE_REVIEW_TARGET_PROFILE`), so the re-run runs the reviewers
+the trust gate inspected. A `--trail` re-run that finds no saved profile and
+was passed none refuses to run rather than build one from the branch's own
+hooks.
 The trust gate's `--show-config` hints leave `--trail` out. The trail is
 resolved before any reviewer runs, so a selector that names no trail fails
 without starting the agents, and the findings are posted only to the change

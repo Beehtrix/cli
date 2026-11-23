@@ -939,22 +939,17 @@ type reviewProfileSelection struct {
 	profile   settings.ReviewProfileConfig
 	installed []types.AgentName
 	done      bool
-}
-
-// trailReviewsThisCheckout reports whether this run posts with --trail what
-// it finds in the checkout it runs in, which must stay as committed. A
-// --target parent does not review its own checkout: the target worktree is
-// reviewed, and the re-run there reads its profile from this checkout's
-// settings, so a first run saves the profile here as usual.
-func trailReviewsThisCheckout(cmd *cobra.Command) bool {
-	return cmd.Flags().Changed("trail") && !cmd.Flags().Changed("target")
+	// unsaved is the default profile a first --trail run used without saving
+	// it, which a --target parent passes to its re-run.
+	unsaved *settings.ReviewProfileConfig
 }
 
 // guidedFirstRun reports whether a first run with no review profile walks the
-// user through setup. A --trail run of this checkout does not: it uses the
-// default profile unsaved.
+// user through setup. A --trail run does not: it reviews a committed checkout
+// and must leave it so, so it uses the default profile unsaved. That includes
+// a --target parent, whose target can be this very checkout.
 func guidedFirstRun(cmd *cobra.Command, interactiveTTY bool) bool {
-	return interactiveTTY && !trailReviewsThisCheckout(cmd)
+	return interactiveTTY && !cmd.Flags().Changed("trail")
 }
 
 // announceDefaultProfile tells the user which default profile a first run
@@ -962,7 +957,7 @@ func guidedFirstRun(cmd *cobra.Command, interactiveTTY bool) bool {
 func announceDefaultProfile(cmd *cobra.Command, name string, profile settings.ReviewProfileConfig) {
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "No review profiles found; using default %q profile with %s.\n", name, strings.Join(sortedMapKeys(profile.Agents), ", "))
-	if trailReviewsThisCheckout(cmd) {
+	if cmd.Flags().Changed("trail") {
 		fmt.Fprintln(out, "It is not saved: --trail leaves the checkout as committed. Save a profile with `entire review --configure`.")
 	} else {
 		fmt.Fprintln(out, "Configure later with `entire review --configure`.")
@@ -971,13 +966,24 @@ func announceDefaultProfile(cmd *cobra.Command, name string, profile settings.Re
 }
 
 // saveFirstRunProfile saves the profile a first run set up, except for a
-// --trail run of this checkout, which writes nothing to the checkout it
-// reviews.
-func saveFirstRunProfile(ctx context.Context, cmd *cobra.Command, name string, profile settings.ReviewProfileConfig, scope reviewSettingsScope) error {
-	if trailReviewsThisCheckout(cmd) {
-		return nil
+// --trail run, which writes nothing to the checkout it reviews and returns the
+// profile unsaved instead.
+func saveFirstRunProfile(ctx context.Context, cmd *cobra.Command, name string, profile settings.ReviewProfileConfig, scope reviewSettingsScope) (*settings.ReviewProfileConfig, error) {
+	if cmd.Flags().Changed("trail") {
+		return &profile, nil
 	}
-	return saveReviewProfile(reviewSettingsContext(ctx), name, profile, false, scope)
+	return nil, saveReviewProfile(reviewSettingsContext(ctx), name, profile, false, scope)
+}
+
+// firstRunDefaultProfile builds the default profile from the agents with
+// hooks installed here. The --trail re-run of a --target review never does:
+// its worktree's hooks are the branch's, while the parent's trust gate
+// inspected the reviewers of the profile the parent passed on.
+func firstRunDefaultProfile(ctx context.Context, cmd *cobra.Command, name string, installed []types.AgentName, reviewerFor func(string) reviewtypes.AgentReviewer) (settings.ReviewProfileConfig, error) {
+	if cmd.Flags().Changed("trail") && os.Getenv(envReviewFindingsWorktree) != "" {
+		return settings.ReviewProfileConfig{}, errors.New("this --target re-run was given no review profile; save one with `entire review --configure` and run the review again")
+	}
+	return defaultReviewProfileForInstalledAgents(ctx, name, installed, reviewerFor)
 }
 
 // resolveReviewProfile selects the profile, running setup or the chooser if needed.
@@ -1010,6 +1016,7 @@ func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverri
 		s = &settings.EntireSettings{}
 	}
 	applyLegacyReviewProfileFallback(s)
+	useTargetChildProfile(s)
 
 	profileOverride = strings.TrimSpace(profileOverride)
 	interactiveTTY := reviewCommandIsInteractive(cmd)
@@ -1035,6 +1042,7 @@ func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverri
 	// `general` profile in a hand-edited preferences file) still routes through
 	// guided setup / the non-interactive default instead of dead-ending later in
 	// selectReviewProfile with "every profile is empty".
+	var unsaved *settings.ReviewProfileConfig
 	if len(nonZeroProfiles(s.ReviewProfiles)) == 0 {
 		profileForSetup := profileOverride
 		var profile settings.ReviewProfileConfig
@@ -1057,7 +1065,7 @@ func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverri
 			if profileForSetup == "" {
 				profileForSetup = DefaultProfileName
 			}
-			defaultProfile, defaultErr := defaultReviewProfileForInstalledAgents(ctx, profileForSetup, installed, deps.ReviewerFor)
+			defaultProfile, defaultErr := firstRunDefaultProfile(ctx, cmd, profileForSetup, installed, deps.ReviewerFor)
 			if defaultErr != nil {
 				cmd.SilenceUsage = true
 				fmt.Fprintln(cmd.ErrOrStderr(), defaultErr.Error())
@@ -1066,9 +1074,11 @@ func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverri
 			profile = defaultProfile
 			announceDefaultProfile(cmd, profileForSetup, profile)
 		}
-		if saveErr := saveFirstRunProfile(ctx, cmd, profileForSetup, profile, saveScope); saveErr != nil {
+		kept, saveErr := saveFirstRunProfile(ctx, cmd, profileForSetup, profile, saveScope)
+		if saveErr != nil {
 			return reviewProfileSelection{}, saveErr
 		}
+		unsaved = kept
 		s.ReviewProfiles = map[string]settings.ReviewProfileConfig{profileForSetup: profile}
 		s.ReviewDefaultProfile = profileForSetup
 		// The user just chose this profile in setup; treat it as the selection so
@@ -1120,7 +1130,7 @@ func resolveReviewProfile(ctx context.Context, cmd *cobra.Command, profileOverri
 	}
 	profile.Task = profileTask(profileName, profile)
 	profile.Agents = nonZeroAgentConfigs(profile.Agents)
-	return reviewProfileSelection{name: profileName, profile: profile, installed: installed}, nil
+	return reviewProfileSelection{name: profileName, profile: profile, installed: installed, unsaved: unsaved}, nil
 }
 
 // printBlockedTools reports tools a reviewer tried to call but its permission

@@ -3,6 +3,7 @@ package review_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -315,46 +316,103 @@ func TestRunReview_TrailFlagFirstRunLeavesTheSettingsAlone(t *testing.T) {
 	}
 }
 
-// A --target parent reviews the target worktree, not its own checkout, and
-// its re-run there reads the profile from this checkout's settings. So a first
-// --target --trail run saves the default profile here as any first run does,
-// and the re-run uses the reviewers the parent inspected instead of building
-// a default from the branch's own hooks. Not parallel: changes CWD.
-func TestRunReview_TrailFlagFirstTargetRunSavesTheProfileForTheReRun(t *testing.T) {
+// A first --target --trail run writes nothing either: its target can be this
+// very checkout. It passes the default profile it used to the re-run in the
+// worktree instead, so the re-run runs the reviewers the trust gate
+// inspected. Not parallel: changes CWD.
+func TestRunReview_TrailFlagFirstTargetRunPassesTheProfileToTheReRun(t *testing.T) {
 	setupCmdTestRepo(t)
 	root, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
 	head := strings.TrimSpace(testutil.RunGit(t, root, "rev-parse", "HEAD"))
-	var childArgs []string
+	var childEnv []string
+	started := false
 	run := runTrailFlagReviewWith(t, &trailFlagRun{withDeps: func(deps *review.Deps) {
 		deps.ResolveTarget = func(context.Context, io.Writer, io.Writer, string) (review.ResolvedTarget, error) {
-			return review.ResolvedTarget{Branch: "feature", HeadSHA: head}, nil
-		}
-		deps.InspectTrust = func(context.Context, review.TrustSource, []review.TrustAgent) (review.TrustInventory, error) {
-			return review.TrustInventory{}, nil
+			return review.ResolvedTarget{Branch: "feature", HeadSHA: head, ExistingWorktree: root}, nil
 		}
 		deps.CheckoutTarget = func(context.Context, io.Writer, io.Writer, review.ResolvedTarget, bool) (review.TargetWorktree, error) {
 			return review.TargetWorktree{Path: root}, nil
 		}
-		deps.RunInWorktree = func(_ context.Context, _ string, args, _ []string, _ io.Reader, _, _ io.Writer) error {
-			childArgs = args
+		deps.InspectTrust = func(context.Context, review.TrustSource, []review.TrustAgent) (review.TrustInventory, error) {
+			return review.TrustInventory{}, nil
+		}
+		deps.RunInWorktree = func(_ context.Context, _ string, _, env []string, _ io.Reader, _, _ io.Writer) error {
+			started, childEnv = true, env
 			return nil
 		}
 	}}, nil, nil, "general", "--target", "feature", "--trail", "42", "--trust-target", head)
-	if run.err != nil || childArgs == nil {
-		t.Fatalf("err = %v, re-run args %q; want the re-run started\n%s\n%s", run.err, childArgs, run.out, run.errOut)
+	if run.err != nil || !started {
+		t.Fatalf("err = %v, re-run started = %v; want the re-run started\n%s\n%s", run.err, started, run.out, run.errOut)
 	}
-	s, err := settings.Load(context.Background())
+	var passed struct {
+		Name    string                       `json:"name"`
+		Profile settings.ReviewProfileConfig `json:"profile"`
+	}
+	for _, entry := range childEnv {
+		if raw, ok := strings.CutPrefix(entry, "ENTIRE_REVIEW_TARGET_PROFILE="); ok {
+			if err := json.Unmarshal([]byte(raw), &passed); err != nil {
+				t.Fatalf("the passed profile does not decode: %v\n%s", err, raw)
+			}
+		}
+	}
+	if _, ok := passed.Profile.Agents["claude-code"]; passed.Name != "general" || !ok {
+		t.Errorf("the re-run was not passed the default profile; env = %q", childEnv)
+	}
+	if status := testutil.RunGit(t, root, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all"); status != "" {
+		t.Errorf("the run changed the checkout it targets:\n%s", status)
+	}
+}
+
+// The re-run in the target worktree uses the profile its parent passed when
+// none is saved. Not parallel: changes CWD and the environment.
+func TestRunReview_TrailFlagTargetReRunUsesThePassedProfile(t *testing.T) {
+	setupCmdTestRepo(t)
+	root, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved := s.ReviewProfiles["general"]; len(saved.Agents) == 0 {
-		t.Errorf("the default profile was not saved for the re-run to read; profiles = %v\n%s", s.ReviewProfiles, run.out)
+	raw, err := json.Marshal(map[string]any{"name": "general", "profile": settings.ReviewProfileConfig{
+		Agents: map[string]settings.ReviewConfig{"claude-code": {Prompt: "review"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(run.out, "It is not saved") {
-		t.Errorf("a --target run said the profile is not saved:\n%s", run.out)
+	t.Setenv("ENTIRE_REVIEW_FINDINGS_WORKTREE", root)
+	t.Setenv("ENTIRE_REVIEW_TARGET_PROFILE", string(raw))
+
+	run := runTrailFlagReview(t, nil, nil, "general", "--trail", "42")
+	if run.err != nil || run.posted == nil {
+		t.Fatalf("err = %v, posted %v; want a posted review\n%s\n%s", run.err, run.posted != nil, run.out, run.errOut)
+	}
+	if strings.Contains(run.out, "No review profiles found") {
+		t.Errorf("the re-run built its own default profile:\n%s", run.out)
+	}
+	if _, set := os.LookupEnv("ENTIRE_REVIEW_TARGET_PROFILE"); set {
+		t.Error("the passed profile was left in the environment for the reviewers")
+	}
+}
+
+// A re-run in a target worktree that was passed no profile and finds none
+// refuses, rather than build a default from the branch's own hooks, which the
+// parent's trust gate never inspected. Not parallel: changes CWD and the
+// environment.
+func TestRunReview_TrailFlagTargetReRunWithoutAProfileRefuses(t *testing.T) {
+	setupCmdTestRepo(t)
+	root, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ENTIRE_REVIEW_FINDINGS_WORKTREE", root)
+
+	run := runTrailFlagReview(t, nil, nil, "general", "--trail", "42")
+	if run.err == nil || !strings.Contains(run.errOut, "was given no review profile") {
+		t.Fatalf("err = %v, want the refusal\n%s\n%s", run.err, run.out, run.errOut)
+	}
+	if run.started || run.posted != nil {
+		t.Error("a reviewer ran without a profile from the parent")
 	}
 }
 
