@@ -18,11 +18,14 @@ func ExposedComposeSynthesisPrompt(summary reviewtypes.RunSummary, perRunPrompt 
 // ExposedSaveReviewRun saves summary as a finished run's manifest, one
 // source per agent run (session "<name>-session"), so package-external
 // tests can read it back through `entire review --findings`.
-func ExposedSaveReviewRun(ctx context.Context, createdAt time.Time, headSHA string, summary reviewtypes.RunSummary, aggregateOutput string) error {
+// askedForTrailJSON is whether the run asked for the trail JSON line, as a
+// trail-mode run does.
+func ExposedSaveReviewRun(ctx context.Context, createdAt time.Time, headSHA string, summary reviewtypes.RunSummary, aggregateOutput string, askedForTrailJSON bool) error {
 	manifest := LocalReviewManifest{
-		CreatedAt:   createdAt,
-		StartingSHA: headSHA,
-		Report:      manifestReportFor(summary, aggregateOutput),
+		CreatedAt:         createdAt,
+		StartingSHA:       headSHA,
+		TrailFindingsJSON: askedForTrailJSON,
+		Report:            manifestReportFor(summary, aggregateOutput),
 	}
 	for _, run := range summary.AgentRuns {
 		manifest.Sources = append(manifest.Sources, ManifestSource{

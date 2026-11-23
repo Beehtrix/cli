@@ -72,8 +72,9 @@ func TestBuildLocalReviewManifestFromSummary_KeepsTrailReport(t *testing.T) {
 }
 
 // writeFindingsJSONTestManifest saves one review run with report in a new
-// repository and changes into it.
-func writeFindingsJSONTestManifest(t *testing.T, report *ManifestReport) {
+// repository and changes into it. askedForTrailJSON is whether the run asked
+// for the trail JSON line, as a trail-mode run does.
+func writeFindingsJSONTestManifest(t *testing.T, report *ManifestReport, askedForTrailJSON bool) {
 	t.Helper()
 	tmp := t.TempDir()
 	testutil.InitRepo(t, tmp)
@@ -82,10 +83,11 @@ func writeFindingsJSONTestManifest(t *testing.T, report *ManifestReport) {
 	testutil.GitCommit(t, tmp, "init")
 	t.Chdir(tmp)
 	if err := writeLocalReviewManifest(context.Background(), LocalReviewManifest{
-		CreatedAt:   time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC),
-		StartingSHA: "abc123",
-		Sources:     []ManifestSource{{SessionID: findingsJSONTestHandle, Label: "Claude Code", Output: manifestTestFinding}},
-		Report:      report,
+		CreatedAt:         time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC),
+		StartingSHA:       "abc123",
+		Sources:           []ManifestSource{{SessionID: findingsJSONTestHandle, Label: "Claude Code", Output: manifestTestFinding}},
+		Report:            report,
+		TrailFindingsJSON: askedForTrailJSON,
 	}); err != nil {
 		t.Fatalf("writeLocalReviewManifest: %v", err)
 	}
@@ -106,7 +108,7 @@ func TestReviewFindingsCommand_JSONPrintsTheSavedReportsFindings(t *testing.T) {
 		Comments: []TrailComment{{Severity: "high", Body: "Loop ignores ctx cancel.", Location: TrailLocation{Granularity: "line", FilePath: "retry.go", StartLine: 42}}},
 		Prose:    "- nit: rename n",
 	}
-	writeFindingsJSONTestManifest(t, saved)
+	writeFindingsJSONTestManifest(t, saved, true)
 	confidence := 0.9
 	want := []Finding{{Severity: "high", Confidence: &confidence, File: "retry.go", Line: 42, Body: "Loop ignores ctx cancel."}}
 	var split TrailReport
@@ -140,7 +142,7 @@ func TestReviewFindingsCommand_JSONPrintsTheSavedReportsFindings(t *testing.T) {
 // A run with nothing to report prints an empty list, not null, so a script
 // can range over it.
 func TestReviewFindingsCommand_JSONPrintsAnEmptyListForACleanReview(t *testing.T) {
-	writeFindingsJSONTestManifest(t, &ManifestReport{Comments: []TrailComment{}})
+	writeFindingsJSONTestManifest(t, &ManifestReport{Comments: []TrailComment{}}, true)
 	deps := Deps{TrailFindings: func(TrailReport) []Finding { return nil }}
 
 	stdout, stderr, err := runReviewCommand(deps, manifestFindingsFlag, findingsJSONTestHandle, "--json")
@@ -149,6 +151,46 @@ func TestReviewFindingsCommand_JSONPrintsAnEmptyListForACleanReview(t *testing.T
 	}
 	if !strings.Contains(stdout, `"findings": []`) {
 		t.Fatalf("stdout should hold an empty findings list:\n%s", stdout)
+	}
+}
+
+// A run that did not ask for the trail JSON line, such as a local profile's,
+// has no line to say it is clean: prose with none of the finding shapes the
+// output format asks for prints an empty list, and any shape still prints
+// as findings. A trail-mode run's prose is a finding, as posting treats it.
+func TestReviewFindingsCommand_JSONReadsACleanVerdictWithoutTheTrailLine(t *testing.T) {
+	tests := []struct {
+		name              string
+		prose             string
+		askedForTrailJSON bool
+		wantSplit         bool
+	}{
+		{"local verdict only", "## codex\n\napprove — no actionable findings", false, false},
+		{"local judge verdict", "Verdict: approve. The change is small and tested.", false, false},
+		{"local finding", "## codex\n\nrequest changes\n\n- [high] retry.go:42 — loop ignores ctx cancel", false, true},
+		{"local feedback verdict without a bullet", "request changes: the retry loop ignores ctx cancel", false, true},
+		{"trail run without its line", "## codex\n\napprove — no actionable findings", true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writeFindingsJSONTestManifest(t, &ManifestReport{Comments: []TrailComment{}, Prose: tt.prose}, tt.askedForTrailJSON)
+			split := false
+			deps := Deps{TrailFindings: func(TrailReport) []Finding {
+				split = true
+				return []Finding{{Body: "split"}}
+			}}
+
+			stdout, stderr, err := runReviewCommand(deps, manifestFindingsFlag, findingsJSONTestHandle, "--json")
+			if err != nil {
+				t.Fatalf("review --findings --json: %v\nstderr:\n%s", err, stderr)
+			}
+			if split != tt.wantSplit {
+				t.Fatalf("report split = %v, want %v\nstdout:\n%s", split, tt.wantSplit, stdout)
+			}
+			if !tt.wantSplit && !strings.Contains(stdout, `"findings": []`) {
+				t.Fatalf("stdout should hold an empty findings list:\n%s", stdout)
+			}
+		})
 	}
 }
 
@@ -165,7 +207,7 @@ func TestReviewFindingsCommand_JSONRefusesARunWithoutAReport(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			writeFindingsJSONTestManifest(t, tt.report)
+			writeFindingsJSONTestManifest(t, tt.report, true)
 			called := false
 			deps := Deps{TrailFindings: func(TrailReport) []Finding {
 				called = true
@@ -198,6 +240,8 @@ func TestReviewJSONFlagNeedsShowConfigOrAFindingsHandle(t *testing.T) {
 	}{
 		{"alone", []string{"--json"}, "--json requires --show-config or --findings <handle>"},
 		{"findings without a handle", []string{manifestFindingsFlag, "--json"}, "--findings --json needs a handle"},
+		{"findings with an empty handle", []string{manifestFindingsFlag, "", "--json"}, "--findings --json needs a handle"},
+		{"findings with a blank handle", []string{manifestFindingsFlag, "  ", "--json"}, "--findings --json needs a handle"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

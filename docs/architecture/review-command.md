@@ -100,7 +100,12 @@ item, with the severity and location its text gives. The post's cap, the
 profile line it puts before a finding split from prose, and its check of
 each location against the reviewed change are left out: that check reads
 the worktree as the review found it. The run records what a post would read
-from it (the manifest's `report`). A run with nothing to report prints an
+from it (the manifest's `report`). A run that did not ask for the JSON line,
+such as a `local` profile's, has no line to say it is clean, so its report
+counts as clean when it has none of the finding shapes the output format asks
+for (a list item, a severity marker, a feedback label or verdict), the rule a
+JSON line with no comments is held to; a trail-mode run's prose counts as
+findings, as posting treats it. A run with nothing to report prints an
 empty list; one that produced no output or no readable report, or that was
 saved before runs kept their report, prints nothing to stdout and exits
 non-zero, saying why on stderr. A handle is required; `entire review

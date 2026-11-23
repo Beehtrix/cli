@@ -41,7 +41,7 @@ func findingsJSONRequested(cmd *cobra.Command, args []string, jsonFlag bool) (bo
 	if f := cmd.Flags().Lookup("findings"); !jsonFlag || f == nil || f.Value.String() != "true" {
 		return false, nil
 	}
-	if len(args) == 0 {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
 		return false, errors.New("--findings --json needs a handle; run 'entire review --findings' to list saved reviews")
 	}
 	return true, nil

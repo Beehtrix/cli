@@ -126,12 +126,24 @@ func savedReviewFindings(manifest LocalReviewManifest, split func(TrailReport) [
 		return nil, fmt.Errorf("no findings to print: %s", report.Unreadable)
 	case split == nil:
 		return nil, errors.New("--findings --json is not available here")
+	case cleanWithoutTrailJSON(manifest.TrailFindingsJSON, *report):
+		return []Finding{}, nil
 	}
 	findings := split(TrailReport{Comments: report.Comments, Prose: report.Prose})
 	if findings == nil {
 		findings = []Finding{}
 	}
 	return findings, nil
+}
+
+// cleanWithoutTrailJSON reports whether a run that did not ask for the trail
+// JSON line, such as a local profile's, found nothing: its prose has none of
+// the finding shapes the output format asks for, the rule a JSON line with
+// no comments is held to. Without the line, a clean review is only its
+// verdict, such as "approve". A run that asked for the line had it to say it
+// was clean, so its prose is posted, and printed, as findings.
+func cleanWithoutTrailJSON(askedForTrailJSON bool, report ManifestReport) bool {
+	return !askedForTrailJSON && len(report.Comments) == 0 && !proseReportsFindings(report.Prose)
 }
 
 func findReviewManifestByHandle(manifests []LocalReviewManifest, handle string) (LocalReviewManifest, error) {
