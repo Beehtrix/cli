@@ -116,53 +116,90 @@ func TestResolveReviewTrailPostsOnlyOnTheReviewedHead(t *testing.T) {
 	}
 }
 
-// The findings go to the change announced before the review, even when the
-// selector resolves to another one by the time they are posted: a trail with
-// several changes here prefers the checked-out branch, which the user may
-// have switched while the reviewers ran.
+// twoChangeReviewTrail serves trail #42 to a clone of acme/widget checked out
+// on feature/work. Before the review the trail's changes in this repository
+// are before; afterwards, after.
 // Not parallel: changes CWD and replaces client constructors.
-func TestResolveReviewTrailPostsOnlyToTheAnnouncedChange(t *testing.T) {
+func twoChangeReviewTrail(t *testing.T, before, after []api.ChangeSummary) (posting *bool) {
+	t.Helper()
 	dir := t.TempDir()
 	testutil.InitRepo(t, dir)
 	testutil.RunGit(t, dir, "remote", "add", "origin", "git@github.com:acme/widget.git")
 	testutil.WriteFile(t, dir, "README.md", "widget")
 	testutil.GitAdd(t, dir, "README.md")
 	testutil.GitCommit(t, dir, "initial")
-	testutil.RunGit(t, dir, "branch", "feature/other")
 	testutil.RunGit(t, dir, "checkout", "-b", "feature/work")
 	t.Chdir(dir)
-	const otherChange = "01ARZ3NDEKTSV4RRFFQ69G5FAY"
-	parent := projectTrailTestResource()
-	parent.Changes = []api.ChangeSummary{
-		{ID: projectTrailTestChange, RepositoryID: "repo-id", Repository: "widget", Number: 7, Title: "Work", Branch: "feature/work"},
-		{ID: otherChange, RepositoryID: "repo-id", Repository: "widget", Number: 8, Title: "Other", Branch: "feature/other"},
-	}
+	posting = new(bool)
 	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/gh/acme/trails/42", projectTrailTestPath:
-			assert.NoError(t, json.NewEncoder(w).Encode(parent))
-		case projectTrailTestPath + "/changes/" + projectTrailTestChange:
-			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": projectTrailTestChange, "number": 7, "trailId": projectTrailTestID, "repositoryId": "repo-id", "branch": "feature/work", "status": "open"}))
-		case projectTrailTestPath + "/changes/" + otherChange:
-			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": otherChange, "number": 8, "trailId": projectTrailTestID, "repositoryId": "repo-id", "branch": "feature/other", "status": "open"}))
-		default:
-			t.Errorf("unexpected project request: %s %s", r.Method, r.URL.Path)
-			http.NotFound(w, r)
+		parent := projectTrailTestResource()
+		parent.Changes = before
+		if *posting {
+			parent.Changes = after
 		}
-	})
-	setupWorkingRepoClient(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("must not post: %s %s", r.Method, r.URL.Path)
+		if r.URL.Path == "/api/v1/gh/acme/trails/42" || r.URL.Path == projectTrailTestPath {
+			assert.NoError(t, json.NewEncoder(w).Encode(parent))
+			return
+		}
+		for _, change := range parent.Changes {
+			if r.URL.Path == projectTrailTestPath+"/changes/"+change.ID {
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": change.ID, "number": change.Number, "trailId": projectTrailTestID, "repositoryId": "repo-id", "branch": change.Branch, "status": "open"}))
+				return
+			}
+		}
+		t.Errorf("unexpected project request: %s %s", r.Method, r.URL.Path)
 		http.NotFound(w, r)
 	})
+	setupWorkingRepoClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method != http.MethodGet:
+			t.Errorf("must not post: %s %s", r.Method, r.URL.Path)
+		case strings.HasSuffix(r.URL.Path, "/approvals"):
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"approvals": []any{}}))
+			return
+		}
+		// A failed lookup also re-probes trails enablement.
+		http.NotFound(w, r)
+	})
+	return posting
+}
+
+const reviewTrailOtherChange = "01ARZ3NDEKTSV4RRFFQ69G5FAY"
+
+// The findings go only to the change announced before the review, even when
+// the selector resolves to another one by the time they are posted.
+// Not parallel: changes CWD and replaces client constructors.
+func TestResolveReviewTrailPostsOnlyToTheAnnouncedChange(t *testing.T) {
+	posting := twoChangeReviewTrail(t,
+		[]api.ChangeSummary{{ID: projectTrailTestChange, RepositoryID: "repo-id", Repository: "widget", Number: 7, Title: "Work", Branch: "feature/work"}},
+		[]api.ChangeSummary{{ID: reviewTrailOtherChange, RepositoryID: "repo-id", Repository: "widget", Number: 8, Title: "Other", Branch: "feature/other"}})
 
 	var out bytes.Buffer
 	post, err := resolveReviewTrail(reviewTrailTestCommand(&out), "42")
 	require.NoError(t, err)
 	require.Contains(t, out.String(), "feature/work")
-	testutil.RunGit(t, dir, "checkout", "feature/other")
+	*posting = true
 	err = post(context.Background(), &out, "general", cliReview.TrailReport{Prose: "a finding", HeadSHA: reviewTrailTestHead})
 	require.ErrorContains(t, err, "--trail 42 now resolves to")
 	require.ErrorContains(t, err, "so the findings were not posted")
+}
+
+// What is checked out never picks the change a review posts to: a trail with
+// several changes in this repository is listed with the command to re-run.
+// Not parallel: changes CWD and replaces client constructors.
+func TestResolveReviewTrailListsSeveralLocalChanges(t *testing.T) {
+	changes := []api.ChangeSummary{
+		{ID: projectTrailTestChange, RepositoryID: "repo-id", Repository: "widget", Number: 7, Title: "Work", Branch: "feature/work"},
+		{ID: reviewTrailOtherChange, RepositoryID: "repo-id", Repository: "widget", Number: 8, Title: "Other", Branch: "feature/other"},
+	}
+	twoChangeReviewTrail(t, changes, changes)
+
+	var out bytes.Buffer
+	_, err := resolveReviewTrail(reviewTrailTestCommand(&out), "42")
+	require.ErrorContains(t, err, "widget/7 - Work")
+	require.ErrorContains(t, err, "widget/8 - Other")
+	require.ErrorContains(t, err, "review --trail=widget/")
+	require.NotContains(t, out.String(), "Findings will be posted")
 }
 
 // A branch with no trail fails at once, before any reviewer would run.

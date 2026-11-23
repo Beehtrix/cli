@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	reviewtypes "github.com/entireio/cli/cmd/entire/cli/review/types"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
 )
@@ -204,7 +206,7 @@ func TestMaybePostReviewToTrailRequiredByTrailFlag(t *testing.T) {
 			if err := maybePostReviewToTrail(context.Background(), &out, deps, ReviewOutputTrail, "general", TrailScope{}, "abc", tt.summary, ""); err != nil {
 				t.Fatalf("a profile's output: trail failed the run: %v", err)
 			}
-			deps.trailRequired = true
+			deps.trail = &explicitTrailRun{}
 			err := maybePostReviewToTrail(context.Background(), &out, deps, ReviewOutputTrail, "general", TrailScope{}, "abc", tt.summary, "")
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("err = %v, want %q", err, tt.wantErr)
@@ -213,6 +215,23 @@ func TestMaybePostReviewToTrailRequiredByTrailFlag(t *testing.T) {
 				t.Errorf("already printed = %v, want %v (%v)", got, tt.printed, err)
 			}
 		})
+	}
+}
+
+// A --trail run that ends before settling its report, as at a declined
+// prompt, fails; one that posted or had nothing to report keeps its result.
+func TestTrailRunResult(t *testing.T) {
+	t.Parallel()
+	cmd := &cobra.Command{}
+	failed := errors.New("review run failed")
+	if err := trailRunResult(cmd, &explicitTrailRun{}, nil); err == nil || !strings.Contains(err.Error(), "the review did not run") {
+		t.Errorf("unsettled run: err = %v", err)
+	}
+	if err := trailRunResult(cmd, &explicitTrailRun{settled: true}, nil); err != nil {
+		t.Errorf("settled run: err = %v", err)
+	}
+	if err := trailRunResult(cmd, &explicitTrailRun{}, failed); !errors.Is(err, failed) {
+		t.Errorf("failed run: err = %v, want its own error", err)
 	}
 }
 

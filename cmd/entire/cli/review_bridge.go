@@ -99,9 +99,8 @@ func resolveReviewTrail(cmd *cobra.Command, selector string) (cliReview.TrailPos
 			return errors.New("the reviewed commit is unknown, so it cannot be matched to the trail's head")
 		}
 		// Resolve again for a client whose credentials are fresh after a long
-		// review, but post only to the change announced before it: with
-		// several changes in this repository, the trail resolves through the
-		// checked-out branch, which may have changed meanwhile.
+		// review, but post only to the change announced before it: the
+		// trail's changes may have been linked or unlinked meanwhile.
 		client, current, err := resolveReviewTrailTarget(cmd, selector)
 		if err != nil {
 			return err

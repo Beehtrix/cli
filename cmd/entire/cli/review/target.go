@@ -60,7 +60,11 @@ type targetReviewRequest struct {
 	Gate         reviewGateOptions
 }
 
-func runTargetReview(ctx context.Context, cmd *cobra.Command, req targetReviewRequest, deps Deps) error {
+func runTargetReview(ctx context.Context, cmd *cobra.Command, req targetReviewRequest, deps Deps) (err error) {
+	// The re-run in the worktree posts and enforces --trail; this run fails
+	// when it ends before starting that re-run.
+	deps, result := trackExplicitTrail(cmd, cmd.Flags().Changed("trail"), deps)
+	defer func() { err = result(err) }()
 	if req.ModeSelected {
 		return errors.New("--target can only be used when running a review")
 	}
@@ -154,6 +158,7 @@ func runTargetReview(ctx context.Context, cmd *cobra.Command, req targetReviewRe
 	if err := runReviewInWorktree(ctx, deps.RunInWorktree, prepared.Path, childArgs, env, cmd.InOrStdin(), cmd.OutOrStdout(), errOut); err != nil {
 		return wrapReviewSilentError(deps.NewSilentError, err)
 	}
+	deps.settleTrail()
 	return finishTargetReview(ctx, cmd, prepared, req.CleanupWorktree, deps.RemoveTarget)
 }
 

@@ -20,6 +20,7 @@ import (
 // trailFlagRun is one `entire review --trail` invocation against a stub
 // reviewer that reports one finding.
 type trailFlagRun struct {
+	events    []reviewtypes.Event // nil reports one finding
 	resolved  []string
 	posted    *review.TrailReport
 	started   bool
@@ -36,11 +37,15 @@ func (r trailFlagReviewer) Name() string { return "claude-code" }
 func (r trailFlagReviewer) Start(_ context.Context, cfg reviewtypes.RunConfig) (reviewtypes.Process, error) {
 	r.run.started = true
 	r.run.reviewCfg = cfg
-	return &scriptedDispatchProcess{events: []reviewtypes.Event{
-		reviewtypes.Started{},
-		reviewtypes.AssistantText{Text: "- [high] f.txt:1 a real bug"},
-		reviewtypes.Finished{Success: true},
-	}}, nil
+	events := r.run.events
+	if events == nil {
+		events = []reviewtypes.Event{
+			reviewtypes.Started{},
+			reviewtypes.AssistantText{Text: "- [high] f.txt:1 a real bug"},
+			reviewtypes.Finished{Success: true},
+		}
+	}
+	return &scriptedDispatchProcess{events: events}, nil
 }
 
 // runTrailFlagReview runs `entire review <args>` in the current repository with
@@ -48,7 +53,11 @@ func (r trailFlagReviewer) Start(_ context.Context, cfg reviewtypes.RunConfig) (
 // fails posting.
 func runTrailFlagReview(t *testing.T, resolveErr, postErr error, args ...string) *trailFlagRun {
 	t.Helper()
-	run := &trailFlagRun{}
+	return runTrailFlagReviewWith(t, &trailFlagRun{}, resolveErr, postErr, args...)
+}
+
+func runTrailFlagReviewWith(t *testing.T, run *trailFlagRun, resolveErr, postErr error, args ...string) *trailFlagRun {
+	t.Helper()
 	deps := review.Deps{
 		GetAgentsWithHooksInstalled: func(context.Context) []types.AgentName {
 			return []types.AgentName{"claude-code"}
@@ -164,5 +173,42 @@ func TestRunReview_TrailFlagRejectsModesWithoutAReview(t *testing.T) {
 		if len(run.resolved) != 0 || run.started {
 			t.Errorf("%v: resolved %v, started %v; want neither", tt.args, run.resolved, run.started)
 		}
+	}
+}
+
+// A --trail review refuses a worktree with uncommitted changes, which the
+// reviewers would read but the reviewed commit does not contain, before it
+// resolves the trail or starts a reviewer. Not parallel: changes CWD.
+func TestRunReview_TrailFlagRefusesUncommittedChanges(t *testing.T) {
+	setupCmdTestRepo(t)
+	if err := seedReviewConfig(context.Background(), map[string]settings.ReviewConfig{"claude-code": {Prompt: "review"}}); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, ".", "scratch.txt", "not committed")
+
+	run := runTrailFlagReview(t, nil, nil, "general", "--trail", "42")
+	if run.err == nil || !strings.Contains(run.err.Error(), "uncommitted changes (1 paths)") {
+		t.Fatalf("err = %v, want the uncommitted-changes refusal", run.err)
+	}
+	if len(run.resolved) != 0 || run.started {
+		t.Errorf("resolved %v, started %v; want neither", run.resolved, run.started)
+	}
+}
+
+// A reviewer that says nothing at all is not a clean review: a --trail run
+// fails instead of reporting nothing to post. Not parallel: changes CWD.
+func TestRunReview_TrailFlagFailsOnAnEmptyReview(t *testing.T) {
+	setupCmdTestRepo(t)
+	if err := seedReviewConfig(context.Background(), map[string]settings.ReviewConfig{"claude-code": {Prompt: "review"}}); err != nil {
+		t.Fatal(err)
+	}
+	run := runTrailFlagReviewWith(t, &trailFlagRun{events: []reviewtypes.Event{
+		reviewtypes.Started{}, reviewtypes.Finished{Success: true},
+	}}, nil, nil, "general", "--trail", "42")
+	if run.err == nil || !strings.Contains(run.err.Error(), "the review produced no output") {
+		t.Fatalf("err = %v, want the empty-review failure\n%s", run.err, run.out)
+	}
+	if run.posted != nil {
+		t.Error("an empty review was posted")
 	}
 }

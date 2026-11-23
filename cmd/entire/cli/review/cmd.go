@@ -101,9 +101,45 @@ type Deps struct {
 	// target flags have been removed. nil uses the production subprocess runner.
 	RunInWorktree func(ctx context.Context, worktreeRoot string, args, env []string, stdin io.Reader, stdout, stderr io.Writer) error
 
-	// trailRequired is set for a run whose --trail names the trail: a report
-	// that is not posted fails the run instead of staying local with a notice.
-	trailRequired bool
+	// trail is set for a run whose --trail names the trail: a report that is
+	// not posted fails the run instead of staying local with a notice.
+	trail *explicitTrailRun
+}
+
+// explicitTrailRun records whether a --trail run settled its report: posted
+// it, or found nothing to report.
+type explicitTrailRun struct {
+	settled bool
+}
+
+// settleTrail records that a --trail run's report needs nothing more.
+func (d Deps) settleTrail() {
+	if d.trail != nil {
+		d.trail.settled = true
+	}
+}
+
+// trackExplicitTrail records whether a --trail run settles its report, when
+// required, and returns the function that turns the run's error into its
+// result.
+func trackExplicitTrail(cmd *cobra.Command, required bool, deps Deps) (Deps, func(error) error) {
+	if !required {
+		return deps, func(err error) error { return err }
+	}
+	run := &explicitTrailRun{}
+	deps.trail = run
+	return deps, func(err error) error { return trailRunResult(cmd, run, err) }
+}
+
+// trailRunResult is a --trail run's result: err, or an error when the run
+// ended without settling its report, such as at a declined prompt or a
+// cancelled picker, so a script never reads a skipped review as a posted one.
+func trailRunResult(cmd *cobra.Command, run *explicitTrailRun, err error) error {
+	if err != nil || run.settled {
+		return err
+	}
+	cmd.SilenceUsage = true
+	return errors.New("review not posted to the trail: the review did not run")
 }
 
 // TrailPoster posts a run's final report to a trail as findings and prints
@@ -1161,10 +1197,14 @@ func checkTrailFlag(cmd *cobra.Command, selector *string) error {
 }
 
 // withExplicitTrail resolves --trail before any reviewer runs and returns the
-// deps that post to that trail and fail the run when nothing is posted.
+// deps that post to that trail.
 func withExplicitTrail(cmd *cobra.Command, deps Deps, selector string) (Deps, error) {
 	if deps.ResolveTrail == nil {
 		return deps, errors.New("--trail is not available in this build")
+	}
+	if err := requireCommittedWorktree(cmd.Context()); err != nil {
+		cmd.SilenceUsage = true
+		return deps, err
 	}
 	post, err := deps.ResolveTrail(cmd, selector)
 	if err != nil {
@@ -1175,14 +1215,33 @@ func withExplicitTrail(cmd *cobra.Command, deps Deps, selector string) (Deps, er
 		return deps, fmt.Errorf("--trail %s: %w", sanitizeDisplay(selector), err)
 	}
 	deps.PostReviewToTrail = post
-	deps.trailRequired = true
 	return deps, nil
 }
 
+// requireCommittedWorktree refuses a --trail run in a worktree with
+// uncommitted changes: the reviewers read them, but the findings are posted
+// against the reviewed commit, which does not contain them.
+func requireCommittedWorktree(ctx context.Context) error {
+	root, err := paths.WorktreeRoot(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve worktree: %w", err)
+	}
+	uncommitted, err := countUncommitted(ctx, root)
+	if err != nil {
+		return fmt.Errorf("check for uncommitted changes: %w", err)
+	}
+	if uncommitted > 0 {
+		return fmt.Errorf("--trail posts the findings against the reviewed commit, but this worktree has uncommitted changes (%d paths) that the reviewers would read; commit or stash them, or review a branch with --target", uncommitted)
+	}
+	return nil
+}
+
 // runReview executes the main review flow.
-func runReview(ctx context.Context, cmd *cobra.Command, agentOverride, modelOverride, baseOverride, profileOverride, perRunPrompt, trailSelector string, timeout time.Duration, gateOpts reviewGateOptions, deps Deps) error {
+func runReview(ctx context.Context, cmd *cobra.Command, agentOverride, modelOverride, baseOverride, profileOverride, perRunPrompt, trailSelector string, timeout time.Duration, gateOpts reviewGateOptions, deps Deps) (err error) {
 	out := cmd.OutOrStdout()
 	silentErr := deps.NewSilentError
+	deps, result := trackExplicitTrail(cmd, trailSelector != "", deps)
+	defer func() { err = result(err) }()
 
 	if err := gateOpts.validate(); err != nil {
 		return err
@@ -1429,7 +1488,7 @@ func runSingleAgentPath(
 	// 7. Branch on launchability.
 	reviewer := deps.ReviewerFor(agentName)
 	if reviewer == nil {
-		if deps.trailRequired {
+		if deps.trail != nil {
 			// The manual fallback's output is never posted, so --trail could
 			// not keep its promise.
 			cmd.SilenceUsage = true
@@ -1863,9 +1922,10 @@ func reviewTrailScope(ctx context.Context, out io.Writer, outputMode, worktreeRo
 // when the profile selects the "trail" destination. By default it never fails
 // the run: the review already happened, so a posting error (or a missing hook)
 // is surfaced as a notice and the local output stands. When --trail named the
-// trail (deps.trailRequired), a report that is not posted also returns an
-// error, so a script can tell a posted review from one kept local. A run with
-// nothing to report posts nothing and succeeds either way.
+// trail (deps.trail), a report that is not posted also returns an error, so
+// a script can tell a posted review from one kept local, and so does a review
+// that produced no output at all. A run with nothing to report posts nothing
+// and succeeds either way.
 func maybePostReviewToTrail(
 	ctx context.Context,
 	out io.Writer,
@@ -1883,8 +1943,13 @@ func maybePostReviewToTrail(
 		return trailNotPosted(deps, errReviewCancelled)
 	}
 	report, post := trailReportFor(summary, aggregateOutput)
+	if !post && deps.trail != nil && strings.TrimSpace(aggregateOutput) == "" && len(usableAgentRuns(summary)) == 0 {
+		fmt.Fprintln(out, "The review produced no output, so nothing was posted to the trail.")
+		return trailNotPosted(deps, errors.New("the review produced no output"))
+	}
 	if !post {
 		fmt.Fprintln(out, "Nothing to report, so nothing was posted to the trail.")
+		deps.settleTrail()
 		return nil
 	}
 	if len(report.Comments) == 0 && strings.TrimSpace(report.Prose) == "" {
@@ -1904,6 +1969,7 @@ func maybePostReviewToTrail(
 		}
 		return trailNotPosted(deps, err)
 	}
+	deps.settleTrail()
 	return nil
 }
 
@@ -1914,7 +1980,7 @@ var errReviewCancelled = errors.New("the review was cancelled")
 // default, and an error when --trail required the post. The error is printed
 // by the caller; every reason but cancellation was already printed here.
 func trailNotPosted(deps Deps, err error) error {
-	if !deps.trailRequired {
+	if deps.trail == nil {
 		return nil
 	}
 	err = fmt.Errorf("review not posted to the trail: %w", err)

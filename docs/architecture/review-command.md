@@ -50,16 +50,20 @@ or ID or `<repo>/<number>`, or else a branch name, as `--branch` would; a
 positive integer is always a trail number. Only this clone's repository's
 changes are considered, since the findings quote this worktree, and a trail
 with several of them in this repository lists them with the `--trail
-<repo>/<number>` command to re-run. The trail is resolved before any reviewer
-runs, so a selector that names no trail fails without starting the agents. A
+<repo>/<number>` command to re-run; the checked-out branch never picks one.
+The worktree must have no uncommitted changes, since the reviewers would read
+them but the findings are posted against the reviewed commit. The trail is
+resolved before any reviewer runs, so a selector that names no trail fails
+without starting the agents, and the findings are posted only to the change
+announced then, even if the selector resolves to another one afterwards. A
 finding carries no commit, and the server attaches a review to the trail's
 head, so findings are posted only when the review session the server opens is
 at the reviewed commit; otherwise none are posted. Unlike a profile's `output:
 trail`, which never fails the run, a `--trail` run exits non-zero when its
-findings were not posted (a cancelled run, no readable report, a resolution
-or network error, or a head mismatch); the findings stay available locally
-through `entire review --findings`. A run with nothing to report posts nothing
-and succeeds. `--trail` is rejected with the modes that run no review
+findings were not posted (a cancelled or declined run, a review that produced
+no output or no readable report, a resolution or network error, or a head
+mismatch); the findings stay available locally through `entire review
+--findings`. A run with nothing to report posts nothing and succeeds. `--trail` is rejected with the modes that run no review
 (`--configure`, `--edit`, `--findings`, `--list`, `--agents`, `--models`). With
 `--target`, the flag is passed on to the re-run in the worktree.
 
