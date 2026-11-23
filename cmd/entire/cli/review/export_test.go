@@ -3,6 +3,7 @@ package review
 import (
 	"context"
 	"io"
+	"strings"
 	"time"
 
 	reviewtypes "github.com/entireio/cli/cmd/entire/cli/review/types"
@@ -25,6 +26,7 @@ func ExposedSaveReviewRun(ctx context.Context, createdAt time.Time, headSHA stri
 		CreatedAt:         createdAt,
 		StartingSHA:       headSHA,
 		TrailFindingsJSON: askedForTrailJSON,
+		AggregateOutput:   strings.TrimSpace(aggregateOutput),
 		Report:            manifestReportFor(summary, aggregateOutput, askedForTrailJSON),
 	}
 	for _, run := range summary.AgentRuns {

@@ -25,12 +25,27 @@ const reviewTrailTestHead = "0123456789abcdef0123456789abcdef01234567"
 // Not parallel: changes CWD and replaces client constructors.
 func setupReviewTrailFlag(t *testing.T, head *string) *int {
 	t.Helper()
+	return setupReviewTrailFlagMoving(t, head, new(bool))
+}
+
+// setupReviewTrailFlagMoving is setupReviewTrailFlag with the change served
+// under another project trail once *moved is set.
+func setupReviewTrailFlagMoving(t *testing.T, head *string, moved *bool) *int {
+	t.Helper()
 	dir := t.TempDir()
 	testutil.InitRepo(t, dir)
 	testutil.RunGit(t, dir, "remote", "add", "origin", "git@github.com:acme/widget.git")
 	t.Chdir(dir)
+	otherPath := "/api/v1/gh/acme/trails/" + reviewTrailOtherParent
 	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
-		if !serveWorkingProjectRead(t, w, r) {
+		switch {
+		case *moved && r.URL.Path == otherPath:
+			parent := workingProjectTestResource()
+			parent.ID, parent.Number = reviewTrailOtherParent, 43
+			assert.NoError(t, json.NewEncoder(w).Encode(parent))
+		case *moved && r.URL.Path == otherPath+"/changes/"+projectTrailTestChange:
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": projectTrailTestChange, "number": 7, "trailId": reviewTrailOtherParent, "repositoryId": "repo-id", "branch": "feature/work", "base": "main", "status": "open"}))
+		case !serveWorkingProjectRead(t, w, r):
 			t.Errorf("unexpected project request: %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)
 		}
@@ -39,12 +54,22 @@ func setupReviewTrailFlag(t *testing.T, head *string) *int {
 	work := api.TrailResource{ID: projectTrailTestChange, Number: 7, Branch: "feature/work",
 		Parent: &api.TrailParentReference{ID: projectTrailTestID, Number: 42, ProjectID: projectTrailTestProject,
 			Host: "gh", Project: "acme", Path: projectTrailTestPath, Jurisdiction: "eu", PrimaryProcessingCell: "project-cell"}}
+	served := func() api.TrailResource {
+		if !*moved {
+			return work
+		}
+		parent := *work.Parent
+		parent.ID, parent.Number, parent.Path = reviewTrailOtherParent, 43, otherPath
+		changed := work
+		changed.Parent = &parent
+		return changed
+	}
 	setupWorkingRepoClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
 		case "GET /api/v1/repos/repo-id/changes":
-			assert.NoError(t, json.NewEncoder(w).Encode(api.TrailListResponse{Trails: []api.TrailResource{work}}))
+			assert.NoError(t, json.NewEncoder(w).Encode(api.TrailListResponse{Trails: []api.TrailResource{served()}}))
 		case "GET /api/v1/repos/repo-id/changes/7":
-			assert.NoError(t, json.NewEncoder(w).Encode(work))
+			assert.NoError(t, json.NewEncoder(w).Encode(served()))
 		case "POST " + trailReviewTestStartPath:
 			assert.NoError(t, json.NewEncoder(w).Encode(api.TrailReviewStartResponse{ReviewID: "rvw_1", TrailID: projectTrailTestChange, HeadSHA: head}))
 		case "POST " + trailReviewTestCommentsPath:
@@ -164,7 +189,10 @@ func twoChangeReviewTrail(t *testing.T, before, after []api.ChangeSummary) (post
 	return posting
 }
 
-const reviewTrailOtherChange = "01ARZ3NDEKTSV4RRFFQ69G5FAY"
+const (
+	reviewTrailOtherChange = "01ARZ3NDEKTSV4RRFFQ69G5FAY"
+	reviewTrailOtherParent = "01ARZ3NDEKTSV4RRFFQ69G5FAZ"
+)
 
 // The findings go only to the change announced before the review, even when
 // the selector resolves to another one by the time they are posted.
@@ -182,6 +210,24 @@ func TestResolveReviewTrailPostsOnlyToTheAnnouncedChange(t *testing.T) {
 	err = post(context.Background(), &out, "general", cliReview.TrailReport{Prose: "a finding", HeadSHA: reviewTrailTestHead})
 	require.ErrorContains(t, err, "--trail 42 now resolves to")
 	require.ErrorContains(t, err, "so the findings were not posted")
+}
+
+// A change moved to another project trail during the review is not the
+// trail the run announced, so nothing is posted to it.
+// Not parallel: changes CWD and replaces client constructors.
+func TestResolveReviewTrailPostsOnlyToTheAnnouncedTrail(t *testing.T) {
+	head := reviewTrailTestHead
+	moved := new(bool)
+	batches := setupReviewTrailFlagMoving(t, &head, moved)
+	var out bytes.Buffer
+	post, err := resolveReviewTrail(reviewTrailTestCommand(&out), "feature/work")
+	require.NoError(t, err)
+	require.Contains(t, out.String(), "Findings will be posted to trail #42")
+	*moved = true
+	err = post(context.Background(), &out, "general", cliReview.TrailReport{Prose: "a finding", HeadSHA: head})
+	require.ErrorContains(t, err, "--trail feature/work now resolves to")
+	require.ErrorContains(t, err, "so the findings were not posted")
+	require.Zero(t, *batches)
 }
 
 // What is checked out never picks the change a review posts to: a trail with

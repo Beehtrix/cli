@@ -26,9 +26,11 @@ func HiddenFromStatus(tag string) bool {
 // entries are left out.
 //
 // A flagged submodule is returned when it has any change, committed, staged,
-// unstaged or untracked. Each checked-out submodule is also searched for the
-// paths its own index hides, recursively; those are returned below the
-// submodule's path ("sub/file.txt").
+// unstaged or untracked. Each checked-out submodule is also searched,
+// recursively, for the paths its own index hides and for the changes its own
+// settings keep from the superproject's git status (see
+// submoduleStatusHiddenChanges); those are returned below the submodule's path
+// ("sub/file.txt").
 //
 // The entries are copied, without those flags, into a temporary index, which
 // is refreshed and read with `git diff-files`. git therefore compares them by
@@ -41,7 +43,11 @@ func HiddenFromStatus(tag string) bool {
 // GIT_WORK_TREE, GIT_INDEX_FILE), so it reads the same index git status does
 // in that environment.
 func HiddenWorktreeChanges(ctx context.Context, worktreeRoot string) ([]string, error) {
-	return hiddenChanges(ctx, worktreeRoot, callerGitCommand)
+	gitDir, err := callerGitCommand(ctx, worktreeRoot, nil, "rev-parse", "--absolute-git-dir").Output()
+	if err != nil {
+		return nil, gitCommandError("rev-parse", err)
+	}
+	return hiddenChanges(ctx, worktreeRoot, callerGitCommand, map[string]bool{strings.TrimSpace(string(gitDir)): true})
 }
 
 // gitCommandFunc builds a git command run in worktreeRoot, with env's entries
@@ -49,8 +55,9 @@ func HiddenWorktreeChanges(ctx context.Context, worktreeRoot string) ([]string, 
 type gitCommandFunc func(ctx context.Context, worktreeRoot string, env []string, args ...string) *exec.Cmd
 
 // hiddenChanges is HiddenWorktreeChanges for one repository's worktree, with
-// git commands built by git.
-func hiddenChanges(ctx context.Context, worktreeRoot string, git gitCommandFunc) ([]string, error) {
+// git commands built by git. searched holds the git directories of the
+// repositories searched so far, this one's included.
+func hiddenChanges(ctx context.Context, worktreeRoot string, git gitCommandFunc, searched map[string]bool) ([]string, error) {
 	out, err := git(ctx, worktreeRoot, nil, "ls-files", "-z", "-v", "--stage").Output()
 	if err != nil {
 		return nil, gitCommandError("ls-files", err)
@@ -89,7 +96,7 @@ func hiddenChanges(ctx context.Context, worktreeRoot string, git gitCommandFunc)
 		}
 	}
 	for _, sub := range submodules {
-		nested, err := submoduleHiddenChanges(ctx, filepath.Join(worktreeRoot, filepath.FromSlash(sub)))
+		nested, err := submoduleHiddenChanges(ctx, filepath.Join(worktreeRoot, filepath.FromSlash(sub)), searched)
 		if err != nil {
 			return nil, fmt.Errorf("submodule %s: %w", sub, err)
 		}
@@ -104,14 +111,62 @@ func hiddenChanges(ctx context.Context, worktreeRoot string, git gitCommandFunc)
 // hides, relative to the submodule. A submodule that is not checked out (its
 // directory is missing, or holds no repository of its own) has none: git
 // status reports a missing one, and an empty directory has nothing to hide.
-func submoduleHiddenChanges(ctx context.Context, submoduleRoot string) ([]string, error) {
-	// From the top of its own worktree, --show-cdup prints nothing; from an
-	// empty directory it prints the way up to the superproject's.
-	cdup, err := submoduleGitCommand(ctx, submoduleRoot, nil, "rev-parse", "--show-cdup").Output()
-	if err != nil || strings.TrimSpace(string(cdup)) != "" {
+// Nor does a repository already searched, such as one a symlink at the
+// submodule's path leads back to (git status reports the symlink).
+func submoduleHiddenChanges(ctx context.Context, submoduleRoot string, searched map[string]bool) ([]string, error) {
+	// From the top of its own worktree, --show-cdup prints an empty line; from
+	// an empty directory it prints the way up to the superproject's.
+	out, err := submoduleGitCommand(ctx, submoduleRoot, nil, "rev-parse", "--show-cdup", "--absolute-git-dir").Output()
+	if err != nil {
 		return nil, nil //nolint:nilerr // not checked out: nothing of its own to hide
 	}
-	return hiddenChanges(ctx, submoduleRoot, submoduleGitCommand)
+	cdup, gitDir, _ := strings.Cut(strings.TrimSuffix(string(out), "\n"), "\n")
+	if cdup != "" || searched[gitDir] {
+		return nil, nil
+	}
+	searched[gitDir] = true
+	unshown, err := submoduleStatusHiddenChanges(ctx, submoduleRoot)
+	if err != nil {
+		return nil, err
+	}
+	flagged, err := hiddenChanges(ctx, submoduleRoot, submoduleGitCommand, searched)
+	if err != nil {
+		return nil, err
+	}
+	return append(unshown, flagged...), nil
+}
+
+// submoduleStatusHiddenChanges returns the changes in a checked-out submodule
+// that its own settings keep from the superproject's git status, which asks
+// the submodule's own git status: untracked files its
+// status.showUntrackedFiles hides, and changes in its submodules that their
+// ignore settings there hide. They are returned only when that status shows
+// nothing; otherwise the superproject's git status reports the submodule.
+func submoduleStatusHiddenChanges(ctx context.Context, submoduleRoot string) ([]string, error) {
+	all, err := submoduleStatusPaths(ctx, submoduleRoot, "--untracked-files=all", "--ignore-submodules=none")
+	if err != nil || len(all) == 0 {
+		return nil, err
+	}
+	shown, err := submoduleStatusPaths(ctx, submoduleRoot)
+	if err != nil || len(shown) > 0 {
+		return nil, err
+	}
+	return all, nil
+}
+
+// submoduleStatusPaths returns the paths a submodule's git status, run with
+// args, reports.
+func submoduleStatusPaths(ctx context.Context, submoduleRoot string, args ...string) ([]string, error) {
+	out, err := submoduleGitCommand(ctx, submoduleRoot, nil, append([]string{"--no-optional-locks", "status", "--porcelain=v1", "-z"}, args...)...).Output()
+	if err != nil {
+		return nil, gitCommandError("status", err)
+	}
+	codes := make(map[string]string)
+	paths := ParsePorcelainV1Z(out, codes)
+	for path := range codes {
+		paths = append(paths, path)
+	}
+	return paths, nil
 }
 
 // callerGitCommand is worktreeGitCommand with the caller's own environment,

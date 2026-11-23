@@ -100,18 +100,28 @@ func resolveReviewTrail(cmd *cobra.Command, selector string) (cliReview.TrailPos
 			return errors.New("the reviewed commit is unknown, so it cannot be matched to the trail's head")
 		}
 		// Resolve again for a client whose credentials are fresh after a long
-		// review, but post only to the change announced before it: the
-		// trail's changes may have been linked or unlinked meanwhile.
+		// review, but post only to the change announced before it, still on
+		// the trail announced: the trail's changes may have been linked or
+		// unlinked meanwhile, and a change may have moved to another trail.
 		client, current, err := resolveReviewTrailTarget(cmd, selector)
 		if err != nil {
 			return err
 		}
-		if current.Trail.ID != target.Trail.ID {
+		if current.Trail.ID != target.Trail.ID || trailParentID(current.Trail) != trailParentID(target.Trail) {
 			return fmt.Errorf("--trail %s now resolves to %s, not %s as it did before the review, so the findings were not posted",
 				trailReviewCleanLine(selector), trailReviewCleanLine(trailReviewTargetDisplay(current)), trailReviewCleanLine(trailReviewTargetDisplay(target)))
 		}
 		return post.send(ctx, out, client, current)
 	}, nil
+}
+
+// trailParentID is the ID of the project trail a change belongs to, or ""
+// for a trail that is not a project trail's change.
+func trailParentID(trail api.TrailResource) string {
+	if trail.Parent == nil {
+		return ""
+	}
+	return trail.Parent.ID
 }
 
 // resolveReviewTrailTarget resolves a --trail selector to this clone's change

@@ -47,8 +47,10 @@ names; this avoids a local branch silently shadowing a trail selector.
 whatever the profile's `output` and whatever is checked out, so a review in a
 detached worktree (a CI build whose branch is checked out elsewhere) can post.
 It takes what `entire trail finding add --trail` takes, a project trail number
-or ID or `<repo>/<number>`, or else a branch name, as `--branch` would; a
-positive integer is always a trail number. Only this clone's repository's
+or ID or `<repo>/<number>`, or else a branch name, as `--branch` would. A
+positive integer is always a trail number, and a ULID-shaped value or one
+shaped like `<repo>/<number>` (such as a branch `feature/42`) is always read
+as that selector, so such a branch is selected by its trail number instead. Only this clone's repository's
 changes are considered, since the findings quote this worktree, and a trail
 with several of them in this repository lists them with the `--trail
 <repo>/<number>` command to re-run; the checked-out branch never picks one.
@@ -61,11 +63,15 @@ those flags into a temporary index and compared there by git, so line-ending
 conversion applies as it does for `git status`; a skip-worktree path missing
 from a sparse checkout is no change, and the index read is the one the
 caller's exported `GIT_INDEX_FILE` selects, as for `git status`). A submodule
-so marked counts when it has any change, and each checked-out submodule's own
-index is searched the same way, recursively. This is
-checked before the profile is resolved, and again just before posting: a
+so marked counts when it has any change, and each checked-out submodule is
+searched the same way, recursively, along with the changes its own settings
+(its `status.showUntrackedFiles`, its submodules' `ignore`) keep from
+`git status`. This is
+checked before the review resolves its profile (with `--target`, by the re-run
+in the target worktree, once the parent has resolved its own profile and
+passed the trust gate), and again when the review ends: a
 change made while the reviewers ran, or a HEAD that moved, posts nothing and
-fails the run. When no review profile exists, a
+fails the run, even one that found nothing to report. When no review profile exists, a
 `--trail` run that would use the default one (in a terminal, or with a profile
 named; outside a terminal a bare run still asks for a profile) uses it for that
 run without guided setup and without saving it, so the checkout stays as

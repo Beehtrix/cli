@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/gitrepo"
@@ -144,16 +145,24 @@ func TestHiddenWorktreeChanges_NoneHidden(t *testing.T) {
 }
 
 // A submodule's changes count when the superproject's gitlink is flagged, and
-// so do the edits a checked-out submodule's own index hides. A submodule that
-// is not checked out, or that a sparse checkout left out, has nothing to hide.
+// so do the edits a checked-out submodule's own index hides and the changes
+// its own settings keep from git status, in nested submodules too. A
+// submodule that is not checked out, or that a sparse checkout left out, has
+// nothing to hide.
 // Not parallel: isolates the environment.
 func TestHiddenWorktreeChanges_Submodules(t *testing.T) {
 	gitenv.IsolateRepository(t)
+	inner := t.TempDir()
+	testutil.InitRepo(t, inner)
+	testutil.WriteFile(t, inner, "f.txt", "x")
+	testutil.RunGit(t, inner, "add", "f.txt")
+	testutil.RunGit(t, inner, "commit", "-m", "inner")
 	source := t.TempDir()
 	testutil.InitRepo(t, source)
 	testutil.WriteFile(t, source, "lib.txt", "x")
 	testutil.WriteFile(t, source, "other.txt", "x")
 	testutil.RunGit(t, source, "add", "lib.txt", "other.txt")
+	testutil.RunGit(t, source, "-c", "protocol.file.allow=always", "submodule", "add", inner, "inner")
 	testutil.RunGit(t, source, "commit", "-m", "lib")
 	for _, tt := range []struct {
 		name string
@@ -180,6 +189,24 @@ func TestHiddenWorktreeChanges_Submodules(t *testing.T) {
 			testutil.RunGit(t, sub, "update-index", "--assume-unchanged", "other.txt")
 			testutil.WriteFile(t, sub, "other.txt", "edited")
 		}, []string{"sub/other.txt"}},
+		{"untracked file the submodule's status.showUntrackedFiles hides", func(t *testing.T, dir string) {
+			t.Helper()
+			sub := filepath.Join(dir, "sub")
+			testutil.RunGit(t, sub, "config", "status.showUntrackedFiles", "no")
+			testutil.WriteFile(t, sub, "new.txt", "new")
+		}, []string{"sub/new.txt"}},
+		{"edit in a nested submodule the submodule ignores", func(t *testing.T, dir string) {
+			t.Helper()
+			sub := filepath.Join(dir, "sub")
+			testutil.RunGit(t, sub, "config", "submodule.inner.ignore", "all")
+			testutil.WriteFile(t, filepath.Join(sub, "inner"), "f.txt", "edited")
+		}, []string{"sub/inner"}},
+		{"edit the nested submodule's own index hides", func(t *testing.T, dir string) {
+			t.Helper()
+			nested := filepath.Join(dir, "sub", "inner")
+			testutil.RunGit(t, nested, "update-index", "--assume-unchanged", "f.txt")
+			testutil.WriteFile(t, nested, "f.txt", "edited")
+		}, []string{"sub/inner/f.txt"}},
 		{"submodule not checked out", func(t *testing.T, dir string) {
 			t.Helper()
 			testutil.RunGit(t, dir, "submodule", "deinit", "-q", "-f", "sub")
@@ -199,6 +226,7 @@ func TestHiddenWorktreeChanges_Submodules(t *testing.T) {
 			testutil.InitRepo(t, dir)
 			testutil.RunGit(t, dir, "commit", "--allow-empty", "-m", "init")
 			testutil.RunGit(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", source, "sub")
+			testutil.RunGit(t, dir, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init", "--recursive")
 			testutil.RunGit(t, dir, "commit", "-m", "add a submodule")
 			tt.hide(t, dir)
 			if status := testutil.RunGit(t, dir, "--no-optional-locks", "status", "--porcelain", "--ignore-submodules=none"); status != "" {
@@ -210,5 +238,35 @@ func TestHiddenWorktreeChanges_Submodules(t *testing.T) {
 				t.Fatalf("HiddenWorktreeChanges = %q, %v; want %q", got, err, tt.want)
 			}
 		})
+	}
+}
+
+// A symlink at a submodule's path that leads back to the superproject is not
+// searched again, so the search ends. Not parallel: isolates the environment.
+func TestHiddenWorktreeChanges_SubmoduleSymlinkCycle(t *testing.T) {
+	gitenv.IsolateRepository(t)
+	source := t.TempDir()
+	testutil.InitRepo(t, source)
+	testutil.WriteFile(t, source, "lib.txt", "x")
+	testutil.RunGit(t, source, "add", "lib.txt")
+	testutil.RunGit(t, source, "commit", "-m", "lib")
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	testutil.RunGit(t, dir, "commit", "--allow-empty", "-m", "init")
+	testutil.RunGit(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", source, "sub")
+	testutil.RunGit(t, dir, "commit", "-m", "add a submodule")
+	testutil.RunGit(t, dir, "submodule", "deinit", "-q", "-f", "sub")
+	if err := os.Remove(filepath.Join(dir, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(".", filepath.Join(dir, "sub")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	got, err := gitrepo.HiddenWorktreeChanges(ctx, dir)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("HiddenWorktreeChanges = %q, %v; want none, and an end to the search", got, err)
 	}
 }

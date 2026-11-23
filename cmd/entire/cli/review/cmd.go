@@ -2043,6 +2043,12 @@ func maybePostReviewToTrail(
 		return trailNotPosted(deps, errors.New("the review produced no output"))
 	}
 	if outcome == reportNoOutput || outcome == reportNothingToReport {
+		// A clean --trail run succeeds, which says the reviewed commit is
+		// clean only if the reviewers read nothing else.
+		if err := deps.recheckTrail(ctx, headSHA); err != nil {
+			fmt.Fprintf(notices, "The review found nothing to report, but it did not review the commit alone: %v.\n", err)
+			return trailNotPosted(deps, err)
+		}
 		fmt.Fprintln(out, "Nothing to report, so nothing was posted to the trail.")
 		deps.settleTrail()
 		return nil

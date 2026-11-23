@@ -345,39 +345,50 @@ func checkWorktreeRefusal(t *testing.T, run *trailFlagRun, want string) {
 	}
 }
 
-// A --trail run rechecks the worktree before posting: an edit or a commit
-// made while the reviewers ran means a finding can describe content the
-// reviewed commit does not hold, so nothing is posted and the run fails.
-// Not parallel: changes CWD.
+// A --trail run rechecks the worktree when the review ends: an edit or a
+// commit made while the reviewers ran means a finding can describe content
+// the reviewed commit does not hold, and a clean result can miss what it
+// does, so nothing is posted and the run fails. Not parallel: changes CWD.
 func TestRunReview_TrailFlagRechecksTheWorktreeBeforePosting(t *testing.T) {
+	edited := func(t *testing.T) {
+		t.Helper()
+		testutil.WriteFile(t, ".", "f.txt", "edited while the review ran")
+	}
+	const editedWant = "the worktree gained uncommitted changes (1 paths) while the review ran"
+	clean := []reviewtypes.Event{
+		reviewtypes.Started{},
+		reviewtypes.AssistantText{Text: `{"summary":"No issues","comments":[]}`},
+		reviewtypes.Finished{Success: true},
+	}
 	for _, tt := range []struct {
-		name   string
-		change func(t *testing.T)
-		want   string
+		name    string
+		events  []reviewtypes.Event // nil reports one finding
+		change  func(t *testing.T)
+		want    string
+		because string // what stderr says before want
 	}{
-		{"tracked file edited", func(t *testing.T) {
-			t.Helper()
-			testutil.WriteFile(t, ".", "f.txt", "edited while the review ran")
-		}, "the worktree gained uncommitted changes (1 paths) while the review ran"},
-		{"new commit", func(t *testing.T) {
+		{"tracked file edited", nil, edited, editedWant, "Nothing was posted to the trail: "},
+		{"new commit", nil, func(t *testing.T) {
 			t.Helper()
 			testutil.RunGit(t, ".", "commit", "--allow-empty", "-q", "-m", "during the review")
-		}, "HEAD moved from "},
+		}, "HEAD moved from ", "Nothing was posted to the trail: "},
+		{"tracked file edited during a clean review", clean, edited, editedWant,
+			"The review found nothing to report, but it did not review the commit alone: "},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			setupCmdTestRepo(t)
 			if err := seedReviewConfig(context.Background(), map[string]settings.ReviewConfig{"claude-code": {Prompt: "review"}}); err != nil {
 				t.Fatal(err)
 			}
-			run := runTrailFlagReviewWith(t, &trailFlagRun{duringRun: func() { tt.change(t) }}, nil, nil, "general", "--trail", "42")
+			run := runTrailFlagReviewWith(t, &trailFlagRun{events: tt.events, duringRun: func() { tt.change(t) }}, nil, nil, "general", "--trail", "42")
 			if run.err == nil || !strings.Contains(run.err.Error(), tt.want) {
 				t.Fatalf("err = %v, want %q\n%s", run.err, tt.want, run.errOut)
 			}
 			if run.posted != nil {
 				t.Errorf("posted %+v, want nothing", *run.posted)
 			}
-			if !strings.Contains(run.errOut, "Nothing was posted to the trail: "+tt.want) {
-				t.Errorf("stderr does not say why nothing was posted:\n%s", run.errOut)
+			if !strings.Contains(run.errOut, tt.because+tt.want) {
+				t.Errorf("stderr does not say why the run failed:\n%s", run.errOut)
 			}
 		})
 	}
