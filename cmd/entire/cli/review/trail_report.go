@@ -83,6 +83,36 @@ func trailReportFor(summary reviewtypes.RunSummary, aggregateOutput string) (Tra
 	return report, len(merged) > 0 || len(unstructured) > 0
 }
 
+// trailReportOutcome is what a finished run's report holds for a trail post.
+type trailReportOutcome int
+
+const (
+	// reportToPost holds findings or prose to post.
+	reportToPost trailReportOutcome = iota
+	// reportNothingToReport is a review that found nothing to report.
+	reportNothingToReport
+	// reportNoOutput is a review whose reviewers and judge left no output.
+	reportNoOutput
+	// reportUnreadable is output in which no report could be read.
+	reportUnreadable
+)
+
+// readTrailReport is trailReportFor with the reason a report posts
+// nothing: there is nothing to report, the review left no output, or none
+// of its output could be read.
+func readTrailReport(summary reviewtypes.RunSummary, aggregateOutput string) (TrailReport, trailReportOutcome) {
+	report, post := trailReportFor(summary, aggregateOutput)
+	switch {
+	case !post && strings.TrimSpace(aggregateOutput) == "" && len(usableAgentRuns(summary)) == 0:
+		return report, reportNoOutput
+	case !post:
+		return report, reportNothingToReport
+	case len(report.Comments) == 0 && strings.TrimSpace(report.Prose) == "":
+		return report, reportUnreadable
+	}
+	return report, reportToPost
+}
+
 // contractCoversProse reports whether a valid contract can be posted in place
 // of its prose: the prose reports no finding the comments leave out. The
 // prose normally repeats every comment, so it is posted instead of, not

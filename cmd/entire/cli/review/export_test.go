@@ -15,6 +15,26 @@ func ExposedComposeSynthesisPrompt(summary reviewtypes.RunSummary, perRunPrompt 
 	return composeSynthesisPrompt(summary, synthesisPromptOptions{perRunPrompt: perRunPrompt})
 }
 
+// ExposedSaveReviewRun saves summary as a finished run's manifest, one
+// source per agent run (session "<name>-session"), so package-external
+// tests can read it back through `entire review --findings`.
+func ExposedSaveReviewRun(ctx context.Context, createdAt time.Time, headSHA string, summary reviewtypes.RunSummary, aggregateOutput string) error {
+	manifest := LocalReviewManifest{
+		CreatedAt:   createdAt,
+		StartingSHA: headSHA,
+		Report:      manifestReportFor(summary, aggregateOutput),
+	}
+	for _, run := range summary.AgentRuns {
+		manifest.Sources = append(manifest.Sources, ManifestSource{
+			SessionID: run.Name + "-session",
+			Agent:     run.Name,
+			Label:     run.Name,
+			Output:    agentRunOutput(run),
+		})
+	}
+	return writeLocalReviewManifest(ctx, manifest)
+}
+
 // SinkComposeInputs is the test-facing alias for multiAgentSinkInputs.
 // It lets external tests drive composeMultiAgentSinks with explicit isTTY
 // and canPrompt values without depending on real TTY detection.

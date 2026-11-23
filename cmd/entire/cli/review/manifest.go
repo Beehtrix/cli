@@ -50,6 +50,37 @@ type LocalReviewManifest struct {
 	// TrailFindingsJSON records that the run asked for the trail findings
 	// JSON line, so --findings hides it from the saved output.
 	TrailFindingsJSON bool `json:"trail_findings_json,omitempty"`
+	// Report is the run's report as a trail post reads it, kept so
+	// `entire review --findings <handle> --json` prints the findings the
+	// post would send. nil in a manifest saved before it was kept.
+	Report *ManifestReport `json:"report,omitempty"`
+}
+
+// ManifestReport is a run's report as readTrailReport reads it from the
+// whole run, including reviewers whose session the manifest could not match.
+type ManifestReport struct {
+	Comments []TrailComment `json:"comments"`
+	Prose    string         `json:"prose,omitempty"`
+	// Unreadable says why the run left no report, when it did. A run with
+	// nothing to report has no comments, no prose and no reason.
+	Unreadable string `json:"unreadable,omitempty"`
+}
+
+// manifestReportFor records what a trail post would read from the run.
+func manifestReportFor(summary reviewtypes.RunSummary, aggregateOutput string) *ManifestReport {
+	report, outcome := readTrailReport(summary, aggregateOutput)
+	saved := &ManifestReport{Comments: report.Comments, Prose: report.Prose}
+	switch outcome {
+	case reportNoOutput:
+		saved.Unreadable = "the review produced no output"
+	case reportUnreadable:
+		saved.Unreadable = "the review produced no readable report"
+	case reportToPost, reportNothingToReport:
+	}
+	if saved.Comments == nil {
+		saved.Comments = []TrailComment{}
+	}
+	return saved
 }
 
 type ManifestSource struct {
@@ -73,6 +104,7 @@ func buildLocalReviewManifestFromSummary(
 		CreatedAt:       summary.StartedAt,
 		StartingSHA:     headSHA,
 		AggregateOutput: strings.TrimSpace(aggregateOutput),
+		Report:          manifestReportFor(summary, aggregateOutput),
 	}
 	matched := matchSessionsToRuns(worktreeRoot, headSHA, summary, states)
 	for i, run := range summary.AgentRuns {
