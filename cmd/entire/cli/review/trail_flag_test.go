@@ -194,7 +194,8 @@ func TestRunReview_TrailFlagRejectsModesWithoutAReview(t *testing.T) {
 // resolves the trail or starts a reviewer: an untracked file even when git
 // status hides untracked files, and an edit, deletion or type change of a file
 // git is told to treat as unchanged, compared the way git status would
-// compare it. A skip-worktree file a sparse checkout left out is no edit.
+// compare it, and edits in a submodule whose changes git status ignores. A
+// skip-worktree file a sparse checkout left out is no edit.
 // Not parallel: changes CWD.
 func TestRunReview_TrailFlagRefusesUncommittedChanges(t *testing.T) {
 	for _, tt := range []struct {
@@ -255,6 +256,22 @@ func TestRunReview_TrailFlagRefusesUncommittedChanges(t *testing.T) {
 			testutil.GitAdd(t, ".", "f.txt")
 			testutil.RunGit(t, ".", "update-index", "--assume-unchanged", "f.txt")
 			testutil.WriteFile(t, ".", "f.txt", "edited again")
+		}, "uncommitted changes (1 paths)"},
+		{"edit inside a submodule whose changes git status ignores", func(t *testing.T) {
+			t.Helper()
+			source := t.TempDir()
+			testutil.InitRepo(t, source)
+			testutil.WriteFile(t, source, "lib.txt", "x")
+			testutil.RunGit(t, source, "add", "lib.txt")
+			testutil.RunGit(t, source, "commit", "-m", "lib")
+			testutil.RunGit(t, ".", "-c", "protocol.file.allow=always", "submodule", "add", source, "sub")
+			testutil.RunGit(t, ".", "config", "-f", ".gitmodules", "submodule.sub.ignore", "all")
+			testutil.RunGit(t, ".", "add", ".gitmodules")
+			testutil.RunGit(t, ".", "commit", "-m", "add a submodule")
+			testutil.WriteFile(t, "sub", "lib.txt", "edited")
+			if status := testutil.RunGit(t, ".", "--no-optional-locks", "status", "--porcelain"); status != "" {
+				t.Fatalf("git status reports the submodule edit, so this checks nothing:\n%s", status)
+			}
 		}, "uncommitted changes (1 paths)"},
 		{"skip-worktree file left out of a sparse checkout", func(t *testing.T) {
 			t.Helper()

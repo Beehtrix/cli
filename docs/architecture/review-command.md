@@ -53,7 +53,8 @@ with several of them in this repository lists them with the `--trail
 <repo>/<number>` command to re-run; the checked-out branch never picks one.
 The worktree must have no uncommitted changes, since the reviewers would read
 them but the findings are posted against the reviewed commit: untracked files
-count whatever `status.showUntrackedFiles` says, and so do edits, deletions and
+count whatever `status.showUntrackedFiles` says, changes in a submodule count
+whatever its `ignore` setting says, and so do edits, deletions and
 type changes of files marked assume-unchanged or skip-worktree (copied without
 those flags into a temporary index and compared there by git, so line-ending
 conversion applies as it does for `git status`; a skip-worktree path missing

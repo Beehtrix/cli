@@ -257,8 +257,9 @@ func listFilesChanged(ctx context.Context, repoRoot, baseRef string) ([]string, 
 // and untracked (but not ignored) file, listing files inside untracked
 // directories individually, and separately the paths the uncommitted changes
 // remove: deletions and the origins of renames.
-func listUncommitted(ctx context.Context, repoRoot string) (changed, removed []string, err error) {
-	out, err := runGit(ctx, repoRoot, "--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all")
+func listUncommitted(ctx context.Context, repoRoot string, statusArgs ...string) (changed, removed []string, err error) {
+	args := append([]string{"--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"}, statusArgs...)
+	out, err := runGit(ctx, repoRoot, args...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("git status: %w", err)
 	}
@@ -299,11 +300,12 @@ func listTracked(ctx context.Context, repoRoot string) (tracked, hidden map[stri
 
 // countWorktreeChanges returns how many paths differ between the worktree and
 // HEAD: staged, unstaged and untracked files, whatever
-// status.showUntrackedFiles says, plus the files marked assume-unchanged or
+// status.showUntrackedFiles says, submodules with changes, whatever their
+// ignore setting says, plus the files marked assume-unchanged or
 // skip-worktree that git status does not report, which are also counted in
 // hidden.
 func countWorktreeChanges(ctx context.Context, repoRoot string) (paths, hidden int, err error) {
-	changed, removed, err := listUncommitted(ctx, repoRoot)
+	changed, removed, err := listUncommitted(ctx, repoRoot, "--ignore-submodules=none")
 	if err != nil {
 		return 0, 0, err
 	}
