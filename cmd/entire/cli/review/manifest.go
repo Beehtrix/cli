@@ -50,14 +50,16 @@ type LocalReviewManifest struct {
 	// TrailFindingsJSON records that the run asked for the trail findings
 	// JSON line, so --findings hides it from the saved output.
 	TrailFindingsJSON bool `json:"trail_findings_json,omitempty"`
-	// Report is the run's report as a trail post reads it, kept so
-	// `entire review --findings <handle> --json` prints the findings the
-	// post would send. nil in a manifest saved before it was kept.
+	// Report is the run's report as a trail post reads it (as a local
+	// review gives it, for a run without the trail JSON line), kept so
+	// `entire review --findings <handle> --json` prints its findings. nil
+	// in a manifest saved before it was kept.
 	Report *ManifestReport `json:"report,omitempty"`
 }
 
-// ManifestReport is a run's report as readTrailReport reads it from the
-// whole run, including reviewers whose session the manifest could not match.
+// ManifestReport is a run's report as readTrailReport, or readLocalReport
+// for a run without the trail JSON line, reads it from the whole run,
+// including reviewers whose session the manifest could not match.
 type ManifestReport struct {
 	Comments []TrailComment `json:"comments"`
 	Prose    string         `json:"prose,omitempty"`
@@ -66,13 +68,19 @@ type ManifestReport struct {
 	Unreadable string `json:"unreadable,omitempty"`
 }
 
-// manifestReportFor records what a trail post would read from the run.
-func manifestReportFor(summary reviewtypes.RunSummary, aggregateOutput string) *ManifestReport {
-	report, outcome := readTrailReport(summary, aggregateOutput)
+// manifestReportFor records what a trail post would read from the run, or,
+// for a run that did not ask for the trail JSON line, the report a local
+// review gave (readLocalReport).
+func manifestReportFor(summary reviewtypes.RunSummary, aggregateOutput string, askedForTrailJSON bool) *ManifestReport {
+	read := readTrailReport
+	if !askedForTrailJSON {
+		read = readLocalReport
+	}
+	report, outcome := read(summary, aggregateOutput)
 	saved := &ManifestReport{Comments: report.Comments, Prose: report.Prose}
 	switch outcome {
 	case reportNoOutput:
-		saved.Unreadable = "the review produced no output"
+		saved.Unreadable = "no reviewer finished with output"
 	case reportUnreadable:
 		saved.Unreadable = "the review produced no readable report"
 	case reportToPost, reportNothingToReport:
@@ -97,14 +105,16 @@ func buildLocalReviewManifestFromSummary(
 	summary reviewtypes.RunSummary,
 	states []*session.State,
 	aggregateOutput string,
+	trailFindingsJSON bool,
 ) LocalReviewManifest {
 	manifest := LocalReviewManifest{
-		Version:         localReviewManifestVersion,
-		WorktreePath:    worktreeRoot,
-		CreatedAt:       summary.StartedAt,
-		StartingSHA:     headSHA,
-		AggregateOutput: strings.TrimSpace(aggregateOutput),
-		Report:          manifestReportFor(summary, aggregateOutput),
+		Version:           localReviewManifestVersion,
+		WorktreePath:      worktreeRoot,
+		CreatedAt:         summary.StartedAt,
+		StartingSHA:       headSHA,
+		AggregateOutput:   strings.TrimSpace(aggregateOutput),
+		TrailFindingsJSON: trailFindingsJSON,
+		Report:            manifestReportFor(summary, aggregateOutput, trailFindingsJSON),
 	}
 	matched := matchSessionsToRuns(worktreeRoot, headSHA, summary, states)
 	for i, run := range summary.AgentRuns {
@@ -129,6 +139,7 @@ func localReviewManifestFromCurrentState(
 	headSHA string,
 	summary reviewtypes.RunSummary,
 	aggregateOutput string,
+	trailFindingsJSON bool,
 ) (LocalReviewManifest, []*session.State, error) {
 	store, err := session.NewStateStore(ctx)
 	if err != nil {
@@ -138,7 +149,7 @@ func localReviewManifestFromCurrentState(
 	if err != nil {
 		return LocalReviewManifest{}, nil, fmt.Errorf("list session states: %w", err)
 	}
-	return buildLocalReviewManifestFromSummary(worktreeRoot, headSHA, summary, states, aggregateOutput), states, nil
+	return buildLocalReviewManifestFromSummary(worktreeRoot, headSHA, summary, states, aggregateOutput, trailFindingsJSON), states, nil
 }
 
 // explainEmptyManifest returns a single-line diagnostic explaining why

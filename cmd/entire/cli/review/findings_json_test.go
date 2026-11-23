@@ -53,8 +53,9 @@ func TestReviewFindingsJSON_PrintsWhatATrailPostWouldSend(t *testing.T) {
 }
 
 // A local profile's clean review, which has no trail JSON line to say so,
-// prints an empty list rather than its verdict as a finding, whether a
-// reviewer's verdict or a judge's decides.
+// prints an empty list rather than its verdict, or the exploration
+// narration before it, as findings, whether a reviewer's verdict or a
+// judge's decides.
 func TestReviewFindingsJSON_PrintsNoFindingsForACleanLocalReview(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -66,6 +67,16 @@ func TestReviewFindingsJSON_PrintsNoFindingsForACleanLocalReview(t *testing.T) {
 			runs: []reviewtypes.AgentRun{
 				{Name: "codex", Status: reviewtypes.AgentStatusSucceeded, Buffer: []reviewtypes.Event{reviewtypes.AssistantText{Text: "approve — no actionable findings"}}},
 				{Name: "claude-code", Status: reviewtypes.AgentStatusSucceeded, Buffer: []reviewtypes.Event{reviewtypes.AssistantText{Text: "**Verdict:** approve. The change is small and tested."}}},
+			},
+		},
+		{
+			name: "narration before the verdict",
+			runs: []reviewtypes.AgentRun{
+				{Name: "codex", Status: reviewtypes.AgentStatusSucceeded, Buffer: []reviewtypes.Event{
+					reviewtypes.AssistantText{Text: "I'll check:\n- retry.go\n- main.go"},
+					reviewtypes.ToolCall{Name: "read_file"},
+					reviewtypes.AssistantText{Text: "approve — no actionable findings"},
+				}},
 			},
 		},
 		{

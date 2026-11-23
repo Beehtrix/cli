@@ -113,6 +113,81 @@ func readTrailReport(summary reviewtypes.RunSummary, aggregateOutput string) (Tr
 	return report, reportToPost
 }
 
+// readLocalReport is readTrailReport for a run that did not ask for the
+// trail JSON line, such as a local profile's. Without the line, a trailing
+// JSON block is the reviewer's own text, so the report is prose: the
+// judge's verdict when one ran, otherwise each reviewer's final report
+// (finalReportText). Nothing says such a review is clean, so a report that
+// is a clean verdict (cleanVerdict) is nothing to report, and one
+// reviewer's clean verdict is left out of the others' findings.
+func readLocalReport(summary reviewtypes.RunSummary, aggregateOutput string) (TrailReport, trailReportOutcome) {
+	if verdict := strings.TrimSpace(aggregateOutput); verdict != "" {
+		if cleanVerdict(verdict) {
+			return TrailReport{}, reportNothingToReport
+		}
+		return TrailReport{Prose: verdict}, reportToPost
+	}
+	runs := usableAgentRuns(summary)
+	if len(runs) == 0 {
+		return TrailReport{}, reportNoOutput
+	}
+	var b strings.Builder
+	for _, run := range runs {
+		text := finalReportText(run.Buffer)
+		if cleanVerdict(text) {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("## " + run.Name + "\n\n" + text)
+	}
+	if b.Len() == 0 {
+		return TrailReport{}, reportNothingToReport
+	}
+	return TrailReport{Prose: b.String()}, reportToPost
+}
+
+// finalReportText is a reviewer's report in a run without the trail JSON
+// line: the text after its last tool call, which leaves out exploration
+// narration such as "I'll check:\n- retry.go" written before it. When the
+// earlier text has a severity marker or a feedback verdict, which narration
+// does not, all of the text is the report, so findings written before a last
+// tool call are kept.
+func finalReportText(buf []reviewtypes.Event) string {
+	for i := len(buf) - 1; i >= 0; i-- {
+		if !isTextBoundary(buf, i) {
+			continue
+		}
+		final := joinAssistantText(buf[i+1:])
+		if final == "" {
+			continue
+		}
+		if reportsFindings(joinAssistantText(buf[:i]), false) {
+			break
+		}
+		return final
+	}
+	return joinAssistantText(buf)
+}
+
+// cleanVerdict reports whether a report without the trail JSON line says
+// the change is clean: it opens with an approve verdict, the shape the
+// output format asks a clean review for, and has none of the finding shapes
+// proseReportsFindings looks for ("approve with nits" is one). Anything
+// else, such as a finding written as a plain paragraph, is a finding.
+func cleanVerdict(report string) bool {
+	if proseReportsFindings(report) {
+		return false
+	}
+	first, _, _ := strings.Cut(strings.TrimSpace(report), "\n")
+	lower := strings.ToLower(trimMarkdownEmphasis(first))
+	if after, found := strings.CutPrefix(lower, "verdict"); found {
+		lower = trimMarkdownEmphasis(strings.TrimLeft(after, ":-—– "))
+	}
+	return strings.HasPrefix(lower, "approve")
+}
+
 // contractCoversProse reports whether a valid contract can be posted in place
 // of its prose: the prose reports no finding the comments leave out. The
 // prose normally repeats every comment, so it is posted instead of, not

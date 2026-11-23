@@ -25,7 +25,7 @@ func ExposedSaveReviewRun(ctx context.Context, createdAt time.Time, headSHA stri
 		CreatedAt:         createdAt,
 		StartingSHA:       headSHA,
 		TrailFindingsJSON: askedForTrailJSON,
-		Report:            manifestReportFor(summary, aggregateOutput),
+		Report:            manifestReportFor(summary, aggregateOutput, askedForTrailJSON),
 	}
 	for _, run := range summary.AgentRuns {
 		manifest.Sources = append(manifest.Sources, ManifestSource{

@@ -89,8 +89,10 @@ through `entire review --findings`. A run with nothing to report posts nothing a
 
 `entire review --findings <handle> --json` prints one saved run's findings
 for a script, such as one that posts them with `entire trail finding add`
-where the review could not post. It prints the run's `handle`, `created_at`,
-the reviewed commit as `head_sha`, and `findings`: one object per finding,
+where the review could not post. It prints the run's `handle` (the one the
+completion footer prints, or one that selects only this run when two runs
+started in the same second), `created_at`, the commit checked out for the
+review as `head_sha`, and `findings`: one object per finding,
 the findings a trail post of the run would send, whatever the profile's
 `output` was. Each key is named after the `entire trail finding add` flag
 that posts it: `body`, and when the finding gives them `severity` (high,
@@ -99,13 +101,19 @@ comments map directly; a report without the JSON line is split by top-level
 item, with the severity and location its text gives. The post's cap, the
 profile line it puts before a finding split from prose, and its check of
 each location against the reviewed change are left out: that check reads
-the worktree as the review found it. The run records what a post would read
-from it (the manifest's `report`). A run that did not ask for the JSON line,
-such as a `local` profile's, has no line to say it is clean, so its report
-counts as clean when it has none of the finding shapes the output format asks
-for (a list item, a severity marker, a feedback label or verdict), the rule a
-JSON line with no comments is held to; a trail-mode run's prose counts as
-findings, as posting treats it. A run with nothing to report prints an
+the worktree as the review found it. A review also reads uncommitted
+changes, as a post does, so `head_sha` does not show that a finding's line
+is in that commit. The run records what a post would read from it (the
+manifest's `report`). A run that did not ask for the JSON line, such as a
+`local` profile's, records its report as prose instead, without reading a
+trailing JSON block as the line: the judge's verdict when one ran, otherwise
+each reviewer's text after its last tool call (all of its text when earlier
+text has a severity marker or feedback verdict), leaving out exploration
+narration. Such a report, or one reviewer's part of it, that opens with an
+approve verdict and has none of the finding shapes the output format asks
+for (a list item, a severity marker, a feedback label or verdict) is
+nothing to report; a trail-mode run without its line still counts its prose
+as findings, as posting treats it. A run with nothing to report prints an
 empty list; one that produced no output or no readable report, or that was
 saved before runs kept their report, prints nothing to stdout and exits
 non-zero, saying why on stderr. A handle is required; `entire review

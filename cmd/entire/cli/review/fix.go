@@ -49,7 +49,7 @@ func runReviewFindings(ctx context.Context, cmd *cobra.Command, req reviewFindin
 			return wrapReviewSilentError(silentErr, findErr)
 		}
 		if req.JSON {
-			return printReviewFindingsJSON(cmd, manifest, deps)
+			return printReviewFindingsJSON(cmd, manifest, manifests, deps)
 		}
 		printReviewManifestDetail(cmd.OutOrStdout(), manifest)
 		return nil
@@ -96,7 +96,7 @@ type reviewFindingsJSON struct {
 // trail post of the run would send. A run that left no report, or was saved
 // before its report was kept, prints nothing to stdout and fails, so a
 // script never reads it as a review with nothing to report.
-func printReviewFindingsJSON(cmd *cobra.Command, manifest LocalReviewManifest, deps Deps) error {
+func printReviewFindingsJSON(cmd *cobra.Command, manifest LocalReviewManifest, manifests []LocalReviewManifest, deps Deps) error {
 	findings, err := savedReviewFindings(manifest, deps.TrailFindings)
 	if err != nil {
 		cmd.SilenceUsage = true
@@ -106,7 +106,7 @@ func printReviewFindingsJSON(cmd *cobra.Command, manifest LocalReviewManifest, d
 	enc := json.NewEncoder(cmd.OutOrStdout())
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(reviewFindingsJSON{
-		Handle:    reviewManifestCompletionHandle(manifest),
+		Handle:    reviewManifestUniqueHandle(manifest, manifests),
 		CreatedAt: manifest.CreatedAt,
 		HeadSHA:   manifest.StartingSHA,
 		Findings:  findings,
@@ -126,8 +126,6 @@ func savedReviewFindings(manifest LocalReviewManifest, split func(TrailReport) [
 		return nil, fmt.Errorf("no findings to print: %s", report.Unreadable)
 	case split == nil:
 		return nil, errors.New("--findings --json is not available here")
-	case cleanWithoutTrailJSON(manifest.TrailFindingsJSON, *report):
-		return []Finding{}, nil
 	}
 	findings := split(TrailReport{Comments: report.Comments, Prose: report.Prose})
 	if findings == nil {
@@ -136,14 +134,14 @@ func savedReviewFindings(manifest LocalReviewManifest, split func(TrailReport) [
 	return findings, nil
 }
 
-// cleanWithoutTrailJSON reports whether a run that did not ask for the trail
-// JSON line, such as a local profile's, found nothing: its prose has none of
-// the finding shapes the output format asks for, the rule a JSON line with
-// no comments is held to. Without the line, a clean review is only its
-// verdict, such as "approve". A run that asked for the line had it to say it
-// was clean, so its prose is posted, and printed, as findings.
-func cleanWithoutTrailJSON(askedForTrailJSON bool, report ManifestReport) bool {
-	return !askedForTrailJSON && len(report.Comments) == 0 && !proseReportsFindings(report.Prose)
+// reviewManifestUniqueHandle is the handle the review's completion footer
+// prints for manifest, or, when another saved run shares it (two runs that
+// started in the same second), one that selects only this run.
+func reviewManifestUniqueHandle(manifest LocalReviewManifest, manifests []LocalReviewManifest) string {
+	if handle := reviewManifestCompletionHandle(manifest); reviewManifestHandleCounts(manifests)[handle] == 1 {
+		return handle
+	}
+	return reviewManifestViewHandle(manifest, manifests)
 }
 
 func findReviewManifestByHandle(manifests []LocalReviewManifest, handle string) (LocalReviewManifest, error) {
