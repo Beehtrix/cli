@@ -52,7 +52,11 @@ changes are considered, since the findings quote this worktree, and a trail
 with several of them in this repository lists them with the `--trail
 <repo>/<number>` command to re-run; the checked-out branch never picks one.
 The worktree must have no uncommitted changes, since the reviewers would read
-them but the findings are posted against the reviewed commit. The trail is
+them but the findings are posted against the reviewed commit: untracked files
+count whatever `status.showUntrackedFiles` says, and so do edits to files
+marked assume-unchanged or skip-worktree. This is checked before the profile
+is resolved, so a first run's save of the default profile does not trip it.
+The trust gate's `--show-config` hints leave `--trail` out. The trail is
 resolved before any reviewer runs, so a selector that names no trail fails
 without starting the agents, and the findings are posted only to the change
 announced then, even if the selector resolves to another one afterwards. A

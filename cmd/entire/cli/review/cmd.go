@@ -283,6 +283,7 @@ func NewCommand(deps Deps) *cobra.Command {
 			gateOpts := reviewGateOptions{
 				TrustTarget:    trustTarget,
 				Command:        reviewInvocation(cmd, args),
+				InspectCommand: reviewInspectInvocation(cmd, args),
 				AgentOverride:  agentOverride,
 				ShowConfig:     showConfig,
 				ShowConfigJSON: showConfigJSON,
@@ -1214,10 +1215,6 @@ func withExplicitTrail(cmd *cobra.Command, deps Deps, selector string) (Deps, er
 	if deps.ResolveTrail == nil {
 		return deps, errors.New("--trail is not available in this build")
 	}
-	if err := requireCommittedWorktree(cmd.Context()); err != nil {
-		cmd.SilenceUsage = true
-		return deps, err
-	}
 	post, err := deps.ResolveTrail(cmd, selector)
 	if err != nil {
 		cmd.SilenceUsage = true
@@ -1232,18 +1229,41 @@ func withExplicitTrail(cmd *cobra.Command, deps Deps, selector string) (Deps, er
 
 // requireCommittedWorktree refuses a --trail run in a worktree with
 // uncommitted changes: the reviewers read them, but the findings are posted
-// against the reviewed commit, which does not contain them.
-func requireCommittedWorktree(ctx context.Context) error {
+// against the reviewed commit, which does not contain them. It runs before
+// the review resolves its profile, since a first run saves the default
+// profile to the settings.
+func requireCommittedWorktree(cmd *cobra.Command, trailSelector string) error {
+	if trailSelector == "" {
+		return nil
+	}
+	if err := checkCommittedWorktree(cmd.Context()); err != nil {
+		cmd.SilenceUsage = true
+		return err
+	}
+	return nil
+}
+
+func checkCommittedWorktree(ctx context.Context) error {
 	root, err := paths.WorktreeRoot(ctx)
 	if err != nil {
-		return fmt.Errorf("resolve worktree: %w", err)
+		return fmt.Errorf("not a git repository: %w", err)
 	}
-	uncommitted, err := countUncommitted(ctx, root)
+	// Untracked files count whatever status.showUntrackedFiles says, and so do
+	// edits to files git is told to treat as unchanged.
+	changed, removed, err := listUncommitted(ctx, root)
 	if err != nil {
 		return fmt.Errorf("check for uncommitted changes: %w", err)
 	}
-	if uncommitted > 0 {
-		return fmt.Errorf("--trail posts the findings against the reviewed commit, but this worktree has uncommitted changes (%d paths) that the reviewers would read; commit or stash them, or review a branch with --target", uncommitted)
+	hidden, err := listHiddenEdits(ctx, root)
+	if err != nil {
+		return fmt.Errorf("check for uncommitted changes: %w", err)
+	}
+	if n := len(changed) + len(removed) + len(hidden); n > 0 {
+		marked := ""
+		if len(hidden) > 0 {
+			marked = fmt.Sprintf(", %d of them marked assume-unchanged or skip-worktree", len(hidden))
+		}
+		return fmt.Errorf("--trail posts the findings against the reviewed commit, but this worktree has uncommitted changes (%d paths%s) that the reviewers would read; commit or stash them, or review a branch with --target", n, marked)
 	}
 	return nil
 }
@@ -1256,6 +1276,9 @@ func runReview(ctx context.Context, cmd *cobra.Command, agentOverride, modelOver
 	defer func() { err = result(err) }()
 
 	if err := gateOpts.validate(); err != nil {
+		return err
+	}
+	if err := requireCommittedWorktree(cmd, trailSelector); err != nil {
 		return err
 	}
 	if gateOpts.ShowConfig {

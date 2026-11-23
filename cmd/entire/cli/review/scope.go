@@ -21,6 +21,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/worktreedir"
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
 )
 
 // ScopeStats summarises the scope of a review for the banner.
@@ -289,11 +290,56 @@ func listTracked(ctx context.Context, repoRoot string) (tracked, hidden map[stri
 			continue
 		}
 		tracked[file] = struct{}{}
-		if tag == "S" || tag != strings.ToUpper(tag) {
+		if hiddenIndexTag(tag) {
 			hidden[file] = struct{}{}
 		}
 	}
 	return tracked, hidden, nil
+}
+
+// hiddenIndexTag reports whether a `git ls-files -v` tag marks a path
+// skip-worktree ("S") or assume-unchanged (lowercase).
+func hiddenIndexTag(tag string) bool {
+	return tag == "S" || tag != strings.ToUpper(tag)
+}
+
+// listHiddenEdits returns the regular files marked skip-worktree or
+// assume-unchanged whose worktree contents differ from the index. git status
+// does not report them, but a reviewer reads them. A skip-worktree path that
+// a sparse checkout left out of the worktree is not an edit.
+func listHiddenEdits(ctx context.Context, repoRoot string) ([]string, error) {
+	out, err := runGit(ctx, repoRoot, "ls-files", "-z", "-v", "--stage")
+	if err != nil {
+		return nil, fmt.Errorf("git ls-files: %w", err)
+	}
+	indexed := make(map[string]string)
+	var present []string
+	for _, record := range splitNUL(out) {
+		// "<tag> <mode> <object> <stage>\t<path>"
+		meta, file, ok := strings.Cut(record, "\t")
+		fields := strings.Fields(meta)
+		if !ok || len(fields) != 4 || !hiddenIndexTag(fields[0]) || (fields[1] != "100644" && fields[1] != "100755") {
+			continue
+		}
+		if worktreedir.HashableEntry(repoRoot, file, filemode.Regular) {
+			indexed[file] = fields[2]
+			present = append(present, file)
+		}
+	}
+	if len(present) == 0 {
+		return nil, nil
+	}
+	hashes, err := gitrepo.HashWorktreeFiles(ctx, repoRoot, present)
+	if err != nil {
+		return nil, fmt.Errorf("hash files git treats as unchanged: %w", err)
+	}
+	var edited []string
+	for _, file := range present {
+		if hashes[file].String() != indexed[file] {
+			edited = append(edited, file)
+		}
+	}
+	return edited, nil
 }
 
 func splitNUL(out string) []string {

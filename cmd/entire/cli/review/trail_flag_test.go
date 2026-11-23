@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -185,20 +186,77 @@ func TestRunReview_TrailFlagRejectsModesWithoutAReview(t *testing.T) {
 
 // A --trail review refuses a worktree with uncommitted changes, which the
 // reviewers would read but the reviewed commit does not contain, before it
-// resolves the trail or starts a reviewer. Not parallel: changes CWD.
+// resolves the trail or starts a reviewer: an untracked file even when git
+// status hides untracked files, and an edit to a file git is told to treat as
+// unchanged. A skip-worktree file a sparse checkout left out is no edit.
+// Not parallel: changes CWD.
 func TestRunReview_TrailFlagRefusesUncommittedChanges(t *testing.T) {
-	setupCmdTestRepo(t)
-	if err := seedReviewConfig(context.Background(), map[string]settings.ReviewConfig{"claude-code": {Prompt: "review"}}); err != nil {
-		t.Fatal(err)
+	for _, tt := range []struct {
+		name  string
+		dirty func(t *testing.T)
+		want  string // empty: the review runs and posts
+	}{
+		{"untracked file", func(t *testing.T) {
+			t.Helper()
+			testutil.WriteFile(t, ".", "scratch.txt", "not committed")
+		}, "uncommitted changes (1 paths)"},
+		{"untracked file that git status hides", func(t *testing.T) {
+			t.Helper()
+			testutil.RunGit(t, ".", "config", "status.showUntrackedFiles", "no")
+			testutil.WriteFile(t, ".", "scratch.txt", "not committed")
+		}, "uncommitted changes (1 paths)"},
+		{"edit to an assume-unchanged file", func(t *testing.T) {
+			t.Helper()
+			testutil.RunGit(t, ".", "update-index", "--assume-unchanged", "f.txt")
+			testutil.WriteFile(t, ".", "f.txt", "edited")
+		}, "uncommitted changes (1 paths, 1 of them marked assume-unchanged or skip-worktree)"},
+		{"skip-worktree file left out of a sparse checkout", func(t *testing.T) {
+			t.Helper()
+			testutil.RunGit(t, ".", "update-index", "--skip-worktree", "f.txt")
+			if err := os.Remove("f.txt"); err != nil {
+				t.Fatal(err)
+			}
+		}, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setupCmdTestRepo(t)
+			if err := seedReviewConfig(context.Background(), map[string]settings.ReviewConfig{"claude-code": {Prompt: "review"}}); err != nil {
+				t.Fatal(err)
+			}
+			tt.dirty(t)
+
+			run := runTrailFlagReview(t, nil, nil, "general", "--trail", "42")
+			if tt.want == "" {
+				if run.err != nil || run.posted == nil {
+					t.Fatalf("err = %v, posted %v; want a posted review\n%s", run.err, run.posted != nil, run.errOut)
+				}
+				return
+			}
+			if run.err == nil || !strings.Contains(run.err.Error(), tt.want) {
+				t.Fatalf("err = %v, want %q", run.err, tt.want)
+			}
+			if len(run.resolved) != 0 || run.started {
+				t.Errorf("resolved %v, started %v; want neither", run.resolved, run.started)
+			}
+		})
 	}
-	testutil.WriteFile(t, ".", "scratch.txt", "not committed")
+}
+
+// A first --trail run with no review profile saves the default one to the
+// checkout's tracked settings. That write is Entire's own, so it does not
+// make the worktree count as dirty. Not parallel: changes CWD.
+func TestRunReview_TrailFlagFirstRunSavesTheDefaultProfile(t *testing.T) {
+	setupCmdTestRepo(t)
+	testutil.WriteFile(t, ".", ".entire/settings.json", "{}\n")
+	testutil.GitAdd(t, ".", ".entire/settings.json")
+	testutil.GitCommit(t, ".", "track the settings")
 
 	run := runTrailFlagReview(t, nil, nil, "general", "--trail", "42")
-	if run.err == nil || !strings.Contains(run.err.Error(), "uncommitted changes (1 paths)") {
-		t.Fatalf("err = %v, want the uncommitted-changes refusal", run.err)
+	if run.err != nil || run.posted == nil {
+		t.Fatalf("err = %v, posted %v; want a posted review\n%s\n%s", run.err, run.posted != nil, run.out, run.errOut)
 	}
-	if len(run.resolved) != 0 || run.started {
-		t.Errorf("resolved %v, started %v; want neither", run.resolved, run.started)
+	if !strings.Contains(run.out, "No review profiles found; using default") {
+		t.Errorf("the run did not set up the default profile:\n%s", run.out)
 	}
 }
 
