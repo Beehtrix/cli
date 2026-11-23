@@ -11,6 +11,7 @@ entire review <profile>         # run a profile
 entire review --profile <name>  # same as positional form
 entire review --agent <name>    # run one reviewer from the profile
 entire review --target <ref>    # review a branch/trail in a managed worktree
+entire review --trail <trail>   # post the findings to a named trail
 entire review --findings        # view local findings
 entire review --show-config     # list what the review would run, then exit
 ```
@@ -40,6 +41,27 @@ Findings are attributed to the caller's worktree, so the completion handle
 remains available through `entire review --findings` even after target cleanup.
 Positive integer targets always mean trail numbers rather than numeric branch
 names; this avoids a local branch silently shadowing a trail selector.
+
+`--trail` posts the findings to a named trail instead of the current branch's,
+whatever the profile's `output` and whatever is checked out, so a review in a
+detached worktree (a CI build whose branch is checked out elsewhere) can post.
+It takes what `entire trail finding add --trail` takes, a project trail number
+or ID or `<repo>/<number>`, or else a branch name, as `--branch` would; a
+positive integer is always a trail number. Only this clone's repository's
+changes are considered, since the findings quote this worktree, and a trail
+with several of them in this repository lists them with the `--trail
+<repo>/<number>` command to re-run. The trail is resolved before any reviewer
+runs, so a selector that names no trail fails without starting the agents. A
+finding carries no commit, and the server attaches a review to the trail's
+head, so findings are posted only when the review session the server opens is
+at the reviewed commit; otherwise none are posted. Unlike a profile's `output:
+trail`, which never fails the run, a `--trail` run exits non-zero when its
+findings were not posted (a cancelled run, no readable report, a resolution
+or network error, or a head mismatch); the findings stay available locally
+through `entire review --findings`. A run with nothing to report posts nothing
+and succeeds. `--trail` is rejected with the modes that run no review
+(`--configure`, `--edit`, `--findings`, `--list`, `--agents`, `--models`). With
+`--target`, the flag is passed on to the re-run in the worktree.
 
 ## Profiles
 
@@ -83,7 +105,7 @@ The profile-level `task` is the shared work item. Each `agents` map entry is a w
 
 - Reviewers run the profile task.
 - Multi-reviewer profiles run reviewers concurrently, then run one judge.
-- Results are printed and saved locally; `output: "trail"` also posts findings to the branch trail.
+- Results are printed and saved locally; `output: "trail"` also posts findings to the branch trail, and `--trail` to the named one.
 - In trail mode, reviewers and the judge end their output with a JSON line, `{"summary":...,"comments":[...]}` (`trail_report.go`). The instruction is appended last, after profile and per-run text, and is skipped for a verbatim `prompt` override. Posting reads that line instead of interpreting prose:
   - `"comments":[]` posts nothing, unless the prose has a list item, a severity marker, a feedback label such as `Nits:` or `Findings:`, or a non-approving verdict such as `request changes`, `approve with nits`, or `needs changes` (also when labeled `Verdict:` or `Verdict -`).
   - Comments post as native findings with their severity and location; entries without a body are dropped. When the prose has more severity-marked findings than the line has comments, the line is incomplete and the prose is posted instead, since it normally repeats every comment. When a judge runs, its line alone decides what is posted. Without a judge, each reviewer's report (the last text between tool calls that ends with a valid line) is read separately and the comments are merged; earlier narration cannot contradict it. A reviewer whose report contradicts its line posts that report; one without a valid line posts its whole narrative. Either is posted alongside the other reviewers' structured comments.

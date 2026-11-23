@@ -203,7 +203,7 @@ func runReviewShowConfig(ctx context.Context, cmd *cobra.Command, profileName st
 
 // reviewInvocationFlags are kept when echoing the command in hints; --prompt
 // and the gate's own flags are left out.
-var reviewInvocationFlags = []string{"target", "profile", "agent", reviewFlagModel, "base", "timeout"}
+var reviewInvocationFlags = []string{"target", "profile", "agent", reviewFlagModel, "base", "timeout", "trail"}
 
 const reviewFlagModel = "model"
 

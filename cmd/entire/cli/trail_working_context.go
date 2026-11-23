@@ -398,19 +398,25 @@ func trailChangeListing(item api.ChangeSummary) string {
 // selector. Positional arguments and the flags the user set are kept, so
 // --project, -m, and --json still apply; --trail and --branch are dropped,
 // since the change replaces them and cannot be combined with --branch.
+// Outside the trail tree (`entire review --trail`), positional arguments are
+// not trail selectors, so they are kept as typed and the change is passed
+// back as --trail.
 // project is the trail's <forge>/<project>: a change selector resolves in
 // --project or origin's owner, never --repo's, so a project the user implied
 // through --repo is spelled out.
 func trailChangeRetryCommand(cmd *cobra.Command, selector, change, project string) string {
 	args := slices.Clone(cmd.Flags().Args())
-	replaced := false
-	for i, arg := range args {
-		if !replaced && strings.TrimSpace(arg) == selector {
-			args[i], replaced = change, true
+	inTrailTree := commandInTrailTree(cmd)
+	if inTrailTree {
+		replaced := false
+		for i, arg := range args {
+			if !replaced && strings.TrimSpace(arg) == selector {
+				args[i], replaced = change, true
+			}
 		}
-	}
-	if !replaced {
-		args = append([]string{change}, args...)
+		if !replaced {
+			args = append([]string{change}, args...)
+		}
 	}
 	parts := []string{cmd.CommandPath()}
 	for _, arg := range args {
@@ -435,10 +441,24 @@ func trailChangeRetryCommand(cmd *cobra.Command, selector, change, project strin
 			}
 		}
 	})
+	if !inTrailTree {
+		parts = append(parts, "--"+cmdTrail+"="+shellArg(change))
+	}
 	if !cmd.Flags().Changed("project") && trailRepoFlag(cmd) != "" {
 		parts = append(parts, "--project="+shellArg(project))
 	}
 	return strings.Join(parts, " ")
+}
+
+// commandInTrailTree reports whether cmd is `entire trail` or one of its
+// subcommands, whose positional arguments can be trail selectors.
+func commandInTrailTree(cmd *cobra.Command) bool {
+	for c := cmd; c != nil; c = c.Parent() {
+		if c.Name() == cmdTrail {
+			return true
+		}
+	}
+	return false
 }
 
 func trailForDisplay(work api.TrailResource) api.TrailResource {

@@ -73,7 +73,14 @@ type Deps struct {
 	// package because the data API + auth live there. It prints its own success
 	// line to out. nil when trail delivery is unavailable (e.g. tests), in which
 	// case the run falls back to local output with a notice.
-	PostReviewToTrail func(ctx context.Context, out io.Writer, profileName string, report TrailReport) error
+	PostReviewToTrail TrailPoster
+
+	// ResolveTrail resolves an explicit --trail selector before any reviewer
+	// runs, so a selector that names no trail fails before the agents spend
+	// time on it, and returns the poster for that trail. The poster refuses
+	// to post unless the trail's head is the reviewed commit (report.HeadSHA).
+	// nil when --trail is unavailable (e.g. tests).
+	ResolveTrail func(cmd *cobra.Command, selector string) (TrailPoster, error)
 
 	// ResolveTarget resolves a branch, trail ID, or trail URL to a local branch
 	// and pins its head without checking anything out.
@@ -93,7 +100,15 @@ type Deps struct {
 	// RunInWorktree re-runs the current CLI invocation in worktreeRoot after the
 	// target flags have been removed. nil uses the production subprocess runner.
 	RunInWorktree func(ctx context.Context, worktreeRoot string, args, env []string, stdin io.Reader, stdout, stderr io.Writer) error
+
+	// trailRequired is set for a run whose --trail names the trail: a report
+	// that is not posted fails the run instead of staying local with a notice.
+	trailRequired bool
 }
+
+// TrailPoster posts a run's final report to a trail as findings and prints
+// its own success line to out.
+type TrailPoster func(ctx context.Context, out io.Writer, profileName string, report TrailReport) error
 
 // reviewLongHelp is the `entire review --help` text.
 const reviewLongHelp = `Run a multi-agent review against the current branch or a --target branch:
@@ -144,6 +159,13 @@ Flags:
   --cleanup-worktree
                  remove a newly-created target worktree after a successful
                  review. Interactive runs ask when this flag is omitted.
+  --trail SEL    post the findings to this trail instead of the current
+                 branch's, whatever profile output is set and whatever is
+                 checked out (a detached worktree too). SEL is what
+                 'entire trail finding add --trail' takes, a trail number or
+                 ID or <repo>/<number>, or a branch name. The trail's head
+                 must be the reviewed commit, and the run fails when the
+                 findings are not posted.
   --show-config  list what the review would run (hooks, MCP servers, settings)
                  and exit without checking anything out. Add --json for
                  structured output.
@@ -184,6 +206,7 @@ func NewCommand(deps Deps) *cobra.Command {
 	var trustTarget string
 	var showConfig bool
 	var showConfigJSON bool
+	var trailSelector string
 
 	cmd := &cobra.Command{
 		Use: "review",
@@ -302,7 +325,7 @@ func NewCommand(deps Deps) *cobra.Command {
 			if targetPrompt := takeTargetChildPrompt(); targetPrompt != "" && !cmd.Flags().Changed("prompt") {
 				perRunPrompt = targetPrompt
 			}
-			return runReview(ctx, cmd, agentOverride, modelOverride, baseOverride, profileName, perRunPrompt, reviewTimeout, gateOpts, deps)
+			return runReview(ctx, cmd, agentOverride, modelOverride, baseOverride, profileName, perRunPrompt, trailSelector, reviewTimeout, gateOpts, deps)
 		},
 	}
 	cmd.Flags().BoolVar(&configure, "configure", false, "set up a review profile; shows available agents and accepts --set-* flags for non-interactive config")
@@ -327,6 +350,7 @@ func NewCommand(deps Deps) *cobra.Command {
 	cmd.Flags().StringVar(&target, "target", "", "branch, trail ID, or Entire trail URL to check out in a worktree and review")
 	cmd.Flags().BoolVar(&cleanupWorktree, "cleanup-worktree", false, "remove a newly-created target worktree after a successful review (interactive runs ask when omitted)")
 	registerTrustFlags(cmd, &trustTarget, &showConfig, &showConfigJSON)
+	registerTrailFlag(cmd, &trailSelector)
 	cmd.Flags().DurationVar(&reviewTimeout, "timeout", 0, "optional hard cap per reviewer (default: none — reviewers run until they finish, like a skill invoked directly in a session). When set, it also bounds the consolidating judge; unset, the judge keeps its own 20m default")
 	// The listing modes and the action modes each select a distinct command
 	// behavior; combining them silently runs one and drops the rest, so reject
@@ -1098,8 +1122,65 @@ func unverifiedReviewerConfig(unverified []string, profileName string, profile s
 	return "", false
 }
 
+// reviewModesWithoutARun are the flags that select a mode which runs no
+// review, so it has nothing to post to a --trail.
+var reviewModesWithoutARun = []string{"configure", "edit", "findings", "list", "agents", "models"}
+
+// registerTrailFlag adds --trail and checks it before any mode runs, after
+// the checks already registered.
+func registerTrailFlag(cmd *cobra.Command, selector *string) {
+	cmd.Flags().StringVar(selector, "trail", "", "post the findings to this trail (number, ID, <repo>/<number>, or branch); the run fails if they are not posted")
+	checkGate := cmd.PreRunE
+	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
+		if checkGate != nil {
+			if err := checkGate(cmd, args); err != nil {
+				return err
+			}
+		}
+		return checkTrailFlag(cmd, selector)
+	}
+}
+
+// checkTrailFlag trims --trail's selector and rejects a --trail that has
+// nothing to post: an empty value, or one given with a mode that runs no
+// review.
+func checkTrailFlag(cmd *cobra.Command, selector *string) error {
+	*selector = strings.TrimSpace(*selector)
+	if !cmd.Flags().Changed("trail") {
+		return nil
+	}
+	if *selector == "" {
+		return errors.New("--trail cannot be empty")
+	}
+	for _, mode := range reviewModesWithoutARun {
+		if f := cmd.Flags().Lookup(mode); f != nil && f.Value.String() == "true" {
+			return errors.New("--trail applies to a review run; it cannot be combined with --configure, --edit, --findings, --list, --agents, or --models")
+		}
+	}
+	return nil
+}
+
+// withExplicitTrail resolves --trail before any reviewer runs and returns the
+// deps that post to that trail and fail the run when nothing is posted.
+func withExplicitTrail(cmd *cobra.Command, deps Deps, selector string) (Deps, error) {
+	if deps.ResolveTrail == nil {
+		return deps, errors.New("--trail is not available in this build")
+	}
+	post, err := deps.ResolveTrail(cmd, selector)
+	if err != nil {
+		cmd.SilenceUsage = true
+		if userMessageAlreadyPrinted(err) {
+			return deps, deps.NewSilentError(err)
+		}
+		return deps, fmt.Errorf("--trail %s: %w", sanitizeDisplay(selector), err)
+	}
+	deps.PostReviewToTrail = post
+	deps.trailRequired = true
+	return deps, nil
+}
+
 // runReview executes the main review flow.
-func runReview(ctx context.Context, cmd *cobra.Command, agentOverride, modelOverride, baseOverride, profileOverride, perRunPrompt string, timeout time.Duration, gateOpts reviewGateOptions, deps Deps) error {
+func runReview(ctx context.Context, cmd *cobra.Command, agentOverride, modelOverride, baseOverride, profileOverride, perRunPrompt, trailSelector string, timeout time.Duration, gateOpts reviewGateOptions, deps Deps) error {
 	out := cmd.OutOrStdout()
 	silentErr := deps.NewSilentError
 
@@ -1136,6 +1217,12 @@ func runReview(ctx context.Context, cmd *cobra.Command, agentOverride, modelOver
 	}
 
 	outputMode := profileOutput(profile)
+	if trailSelector != "" {
+		if deps, err = withExplicitTrail(cmd, deps, trailSelector); err != nil {
+			return err
+		}
+		outputMode = ReviewOutputTrail
+	}
 
 	if agentOverride != "" {
 		workerName, cfg, selectErr := selectProfileWorker(profile, agentOverride)
@@ -1342,6 +1429,12 @@ func runSingleAgentPath(
 	// 7. Branch on launchability.
 	reviewer := deps.ReviewerFor(agentName)
 	if reviewer == nil {
+		if deps.trailRequired {
+			// The manual fallback's output is never posted, so --trail could
+			// not keep its promise.
+			cmd.SilenceUsage = true
+			return fmt.Errorf("--trail needs a reviewer that Entire runs, and %s has no review runner", agentName)
+		}
 		// No review runner adapter yet: write marker (with scope-aware prompt) and print guidance.
 		return RunMarkerFallback(ctx, agentName, runCfg, worktreeRoot, out)
 	}
@@ -1369,12 +1462,12 @@ func runSingleAgentPath(
 	summary, waitErr := Run(runCtx, reviewer, runCfg, sinks)
 	printBlockedTools(cmd.ErrOrStderr(), profileName, summary)
 	writePostReviewManifest(ctx, out, worktreeRoot, headSHA, summary, "", runCfg.TrailFindingsJSON)
-	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, findingScope, summary, "")
+	postErr := maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, findingScope, headSHA, summary, "")
 	if waitErr != nil && runCtx.Err() == nil && ctx.Err() == nil {
 		// Non-cancellation error: surface to caller.
 		return fmt.Errorf("review run: %w", waitErr)
 	}
-	return nil
+	return postErr
 }
 
 // detectScope computes the scope base ref for the current repo and prints
@@ -1563,7 +1656,7 @@ func runMultiAgentPath(
 		return multiReviewFailureError(waitErr)
 	}
 	writePostReviewManifest(ctx, out, worktreeRoot, headSHA, summary, aggregateOutput, outputMode == ReviewOutputTrail)
-	maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, findingScope, summary, aggregateOutput)
+	postErr := maybePostReviewToTrail(ctx, out, deps, outputMode, profileName, findingScope, headSHA, summary, aggregateOutput)
 	// The judge produces the review's primary deliverable — the consolidated
 	// verdict. If it was attempted but failed (provider error or timeout), the
 	// run produced no verdict, so exit non-zero instead of reporting success.
@@ -1574,7 +1667,7 @@ func runMultiAgentPath(
 		cmd.SilenceUsage = true
 		return judgeFailureError(masterLabel, synthErr)
 	}
-	return nil
+	return postErr
 }
 
 // judgeFailureError reports a judge (synthesis) failure as the command's error
@@ -1767,41 +1860,68 @@ func reviewTrailScope(ctx context.Context, out io.Writer, outputMode, worktreeRo
 }
 
 // maybePostReviewToTrail delivers the final review output to the branch's trail
-// when the profile selects the "trail" destination. It never fails the run:
-// the review already happened, so a posting error (or a missing hook) is
-// surfaced as a notice and the local output stands.
+// when the profile selects the "trail" destination. By default it never fails
+// the run: the review already happened, so a posting error (or a missing hook)
+// is surfaced as a notice and the local output stands. When --trail named the
+// trail (deps.trailRequired), a report that is not posted also returns an
+// error, so a script can tell a posted review from one kept local. A run with
+// nothing to report posts nothing and succeeds either way.
 func maybePostReviewToTrail(
 	ctx context.Context,
 	out io.Writer,
 	deps Deps,
 	outputMode, profileName string,
 	scope TrailScope,
+	headSHA string,
 	summary reviewtypes.RunSummary,
 	aggregateOutput string,
-) {
-	if outputMode != ReviewOutputTrail || summary.Cancelled {
-		return
+) error {
+	if outputMode != ReviewOutputTrail {
+		return nil
+	}
+	if summary.Cancelled {
+		return trailNotPosted(deps, errReviewCancelled)
 	}
 	report, post := trailReportFor(summary, aggregateOutput)
 	if !post {
 		fmt.Fprintln(out, "Nothing to report, so nothing was posted to the trail.")
-		return
+		return nil
 	}
 	if len(report.Comments) == 0 && strings.TrimSpace(report.Prose) == "" {
 		fmt.Fprintln(out, "The review produced no readable report, so nothing was posted to the trail.")
-		return
+		return trailNotPosted(deps, errors.New("the review produced no readable report"))
 	}
 	if deps.PostReviewToTrail == nil {
 		fmt.Fprintln(out, "Trail output is not available here; the review was kept local.")
-		return
+		return trailNotPosted(deps, errors.New("trail output is not available"))
 	}
 	report.Scope = scope
+	report.HeadSHA = headSHA
 	// On success the hook prints its own confirmation and trail link.
 	if err := deps.PostReviewToTrail(ctx, out, profileName, report); err != nil {
 		if !userMessageAlreadyPrinted(err) {
 			fmt.Fprintf(out, "Could not post the review to the trail: %v\n", err)
 		}
+		return trailNotPosted(deps, err)
 	}
+	return nil
+}
+
+// errReviewCancelled is why a cancelled run posted nothing.
+var errReviewCancelled = errors.New("the review was cancelled")
+
+// trailNotPosted is the run's result when its report was not posted: nil by
+// default, and an error when --trail required the post. The error is printed
+// by the caller; every reason but cancellation was already printed here.
+func trailNotPosted(deps Deps, err error) error {
+	if !deps.trailRequired {
+		return nil
+	}
+	err = fmt.Errorf("review not posted to the trail: %w", err)
+	if errors.Is(err, errReviewCancelled) {
+		return err
+	}
+	return deps.NewSilentError(err)
 }
 
 type alreadyPrintedError interface {
