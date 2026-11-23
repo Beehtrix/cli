@@ -116,6 +116,55 @@ func TestResolveReviewTrailPostsOnlyOnTheReviewedHead(t *testing.T) {
 	}
 }
 
+// The findings go to the change announced before the review, even when the
+// selector resolves to another one by the time they are posted: a trail with
+// several changes here prefers the checked-out branch, which the user may
+// have switched while the reviewers ran.
+// Not parallel: changes CWD and replaces client constructors.
+func TestResolveReviewTrailPostsOnlyToTheAnnouncedChange(t *testing.T) {
+	dir := t.TempDir()
+	testutil.InitRepo(t, dir)
+	testutil.RunGit(t, dir, "remote", "add", "origin", "git@github.com:acme/widget.git")
+	testutil.WriteFile(t, dir, "README.md", "widget")
+	testutil.GitAdd(t, dir, "README.md")
+	testutil.GitCommit(t, dir, "initial")
+	testutil.RunGit(t, dir, "branch", "feature/other")
+	testutil.RunGit(t, dir, "checkout", "-b", "feature/work")
+	t.Chdir(dir)
+	const otherChange = "01ARZ3NDEKTSV4RRFFQ69G5FAY"
+	parent := projectTrailTestResource()
+	parent.Changes = []api.ChangeSummary{
+		{ID: projectTrailTestChange, RepositoryID: "repo-id", Repository: "widget", Number: 7, Title: "Work", Branch: "feature/work"},
+		{ID: otherChange, RepositoryID: "repo-id", Repository: "widget", Number: 8, Title: "Other", Branch: "feature/other"},
+	}
+	setupProjectTrailTest(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/gh/acme/trails/42", projectTrailTestPath:
+			assert.NoError(t, json.NewEncoder(w).Encode(parent))
+		case projectTrailTestPath + "/changes/" + projectTrailTestChange:
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": projectTrailTestChange, "number": 7, "trailId": projectTrailTestID, "repositoryId": "repo-id", "branch": "feature/work", "status": "open"}))
+		case projectTrailTestPath + "/changes/" + otherChange:
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": otherChange, "number": 8, "trailId": projectTrailTestID, "repositoryId": "repo-id", "branch": "feature/other", "status": "open"}))
+		default:
+			t.Errorf("unexpected project request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	})
+	setupWorkingRepoClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("must not post: %s %s", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	})
+
+	var out bytes.Buffer
+	post, err := resolveReviewTrail(reviewTrailTestCommand(&out), "42")
+	require.NoError(t, err)
+	require.Contains(t, out.String(), "feature/work")
+	testutil.RunGit(t, dir, "checkout", "feature/other")
+	err = post(context.Background(), &out, "general", cliReview.TrailReport{Prose: "a finding", HeadSHA: reviewTrailTestHead})
+	require.ErrorContains(t, err, "--trail 42 now resolves to")
+	require.ErrorContains(t, err, "so the findings were not posted")
+}
+
 // A branch with no trail fails at once, before any reviewer would run.
 // Not parallel: changes CWD and replaces client constructors.
 func TestResolveReviewTrailRejectsABranchWithoutATrail(t *testing.T) {

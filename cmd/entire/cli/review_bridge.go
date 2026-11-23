@@ -98,11 +98,19 @@ func resolveReviewTrail(cmd *cobra.Command, selector string) (cliReview.TrailPos
 		if post.headSHA = strings.TrimSpace(report.HeadSHA); post.headSHA == "" {
 			return errors.New("the reviewed commit is unknown, so it cannot be matched to the trail's head")
 		}
-		client, target, err := resolveReviewTrailTarget(cmd, selector)
+		// Resolve again for a client whose credentials are fresh after a long
+		// review, but post only to the change announced before it: with
+		// several changes in this repository, the trail resolves through the
+		// checked-out branch, which may have changed meanwhile.
+		client, current, err := resolveReviewTrailTarget(cmd, selector)
 		if err != nil {
 			return err
 		}
-		return post.send(ctx, out, client, target)
+		if current.Trail.ID != target.Trail.ID {
+			return fmt.Errorf("--trail %s now resolves to %s, not %s as it did before the review, so the findings were not posted",
+				trailReviewCleanLine(selector), trailReviewCleanLine(trailReviewTargetDisplay(current)), trailReviewCleanLine(trailReviewTargetDisplay(target)))
+		}
+		return post.send(ctx, out, client, current)
 	}, nil
 }
 
