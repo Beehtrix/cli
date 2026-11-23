@@ -1209,6 +1209,17 @@ func checkTrailFlag(cmd *cobra.Command, selector *string) error {
 	return nil
 }
 
+// reviewOutputFor returns where the run's findings go and the deps that send
+// them there: the profile's output, or the --trail resolved before any
+// reviewer runs.
+func reviewOutputFor(cmd *cobra.Command, profile settings.ReviewProfileConfig, trailSelector string, deps Deps) (string, Deps, error) {
+	if trailSelector == "" {
+		return profileOutput(profile), deps, nil
+	}
+	deps, err := withExplicitTrail(cmd, deps, trailSelector)
+	return ReviewOutputTrail, deps, err
+}
+
 // withExplicitTrail resolves --trail before any reviewer runs and returns the
 // deps that post to that trail.
 func withExplicitTrail(cmd *cobra.Command, deps Deps, selector string) (Deps, error) {
@@ -1248,20 +1259,14 @@ func checkCommittedWorktree(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("not a git repository: %w", err)
 	}
-	// Untracked files count whatever status.showUntrackedFiles says, and so do
-	// edits to files git is told to treat as unchanged.
-	changed, removed, err := listUncommitted(ctx, root)
+	n, hidden, err := countWorktreeChanges(ctx, root)
 	if err != nil {
 		return fmt.Errorf("check for uncommitted changes: %w", err)
 	}
-	hidden, err := listHiddenEdits(ctx, root)
-	if err != nil {
-		return fmt.Errorf("check for uncommitted changes: %w", err)
-	}
-	if n := len(changed) + len(removed) + len(hidden); n > 0 {
+	if n > 0 {
 		marked := ""
-		if len(hidden) > 0 {
-			marked = fmt.Sprintf(", %d of them marked assume-unchanged or skip-worktree", len(hidden))
+		if hidden > 0 {
+			marked = fmt.Sprintf(", %d of them marked assume-unchanged or skip-worktree", hidden)
 		}
 		return fmt.Errorf("--trail posts the findings against the reviewed commit, but this worktree has uncommitted changes (%d paths%s) that the reviewers would read; commit or stash them, or review a branch with --target", n, marked)
 	}
@@ -1310,12 +1315,9 @@ func runReview(ctx context.Context, cmd *cobra.Command, agentOverride, modelOver
 		}
 	}
 
-	outputMode := profileOutput(profile)
-	if trailSelector != "" {
-		if deps, err = withExplicitTrail(cmd, deps, trailSelector); err != nil {
-			return err
-		}
-		outputMode = ReviewOutputTrail
+	outputMode, deps, err := reviewOutputFor(cmd, profile, trailSelector, deps)
+	if err != nil {
+		return err
 	}
 
 	if agentOverride != "" {

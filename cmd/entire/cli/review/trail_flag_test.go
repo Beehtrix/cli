@@ -187,8 +187,9 @@ func TestRunReview_TrailFlagRejectsModesWithoutAReview(t *testing.T) {
 // A --trail review refuses a worktree with uncommitted changes, which the
 // reviewers would read but the reviewed commit does not contain, before it
 // resolves the trail or starts a reviewer: an untracked file even when git
-// status hides untracked files, and an edit to a file git is told to treat as
-// unchanged. A skip-worktree file a sparse checkout left out is no edit.
+// status hides untracked files, and an edit, deletion or type change of a file
+// git is told to treat as unchanged, compared the way git status would
+// compare it. A skip-worktree file a sparse checkout left out is no edit.
 // Not parallel: changes CWD.
 func TestRunReview_TrailFlagRefusesUncommittedChanges(t *testing.T) {
 	for _, tt := range []struct {
@@ -210,6 +211,46 @@ func TestRunReview_TrailFlagRefusesUncommittedChanges(t *testing.T) {
 			testutil.RunGit(t, ".", "update-index", "--assume-unchanged", "f.txt")
 			testutil.WriteFile(t, ".", "f.txt", "edited")
 		}, "uncommitted changes (1 paths, 1 of them marked assume-unchanged or skip-worktree)"},
+		{"deleted assume-unchanged file", func(t *testing.T) {
+			t.Helper()
+			testutil.RunGit(t, ".", "update-index", "--assume-unchanged", "f.txt")
+			if err := os.Remove("f.txt"); err != nil {
+				t.Fatal(err)
+			}
+		}, "uncommitted changes (1 paths, 1 of them marked assume-unchanged or skip-worktree)"},
+		{"assume-unchanged file replaced by a symlink", func(t *testing.T) {
+			t.Helper()
+			testutil.RunGit(t, ".", "update-index", "--assume-unchanged", "f.txt")
+			if err := os.Remove("f.txt"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("elsewhere.txt", "f.txt"); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+		}, "uncommitted changes (1 paths, 1 of them marked assume-unchanged or skip-worktree)"},
+		{"assume-unchanged file committed with CRLF under text=auto", func(t *testing.T) {
+			t.Helper()
+			// The blob keeps its CRLF, so hashing the file with today's
+			// attributes would not give the committed object.
+			testutil.RunGit(t, ".", "config", "core.autocrlf", "false")
+			testutil.WriteFile(t, ".", "crlf.txt", "a\r\nb\r\n")
+			testutil.RunGit(t, ".", "add", "crlf.txt")
+			testutil.RunGit(t, ".", "commit", "-m", "a CRLF file")
+			if blob := testutil.RunGit(t, ".", "cat-file", "-p", "HEAD:crlf.txt"); !strings.Contains(blob, "\r") {
+				t.Fatalf("committed blob %q lost its CRLF", blob)
+			}
+			testutil.WriteFile(t, ".", ".gitattributes", "* text=auto\n")
+			testutil.RunGit(t, ".", "add", ".gitattributes")
+			testutil.RunGit(t, ".", "commit", "-m", "normalize line endings")
+			testutil.RunGit(t, ".", "update-index", "--assume-unchanged", "crlf.txt")
+		}, ""},
+		{"staged and edited assume-unchanged file", func(t *testing.T) {
+			t.Helper()
+			testutil.WriteFile(t, ".", "f.txt", "staged")
+			testutil.GitAdd(t, ".", "f.txt")
+			testutil.RunGit(t, ".", "update-index", "--assume-unchanged", "f.txt")
+			testutil.WriteFile(t, ".", "f.txt", "edited again")
+		}, "uncommitted changes (1 paths)"},
 		{"skip-worktree file left out of a sparse checkout", func(t *testing.T) {
 			t.Helper()
 			testutil.RunGit(t, ".", "update-index", "--skip-worktree", "f.txt")
@@ -225,20 +266,27 @@ func TestRunReview_TrailFlagRefusesUncommittedChanges(t *testing.T) {
 			}
 			tt.dirty(t)
 
-			run := runTrailFlagReview(t, nil, nil, "general", "--trail", "42")
-			if tt.want == "" {
-				if run.err != nil || run.posted == nil {
-					t.Fatalf("err = %v, posted %v; want a posted review\n%s", run.err, run.posted != nil, run.errOut)
-				}
-				return
-			}
-			if run.err == nil || !strings.Contains(run.err.Error(), tt.want) {
-				t.Fatalf("err = %v, want %q", run.err, tt.want)
-			}
-			if len(run.resolved) != 0 || run.started {
-				t.Errorf("resolved %v, started %v; want neither", run.resolved, run.started)
-			}
+			checkWorktreeRefusal(t, runTrailFlagReview(t, nil, nil, "general", "--trail", "42"), tt.want)
 		})
+	}
+}
+
+// checkWorktreeRefusal checks that run was refused with want before it
+// resolved the trail or started a reviewer, or with want empty, that it
+// posted.
+func checkWorktreeRefusal(t *testing.T, run *trailFlagRun, want string) {
+	t.Helper()
+	if want == "" {
+		if run.err != nil || run.posted == nil {
+			t.Fatalf("err = %v, posted %v; want a posted review\n%s", run.err, run.posted != nil, run.errOut)
+		}
+		return
+	}
+	if run.err == nil || !strings.Contains(run.err.Error(), want) {
+		t.Fatalf("err = %v, want %q", run.err, want)
+	}
+	if len(run.resolved) != 0 || run.started {
+		t.Errorf("resolved %v, started %v; want neither", run.resolved, run.started)
 	}
 }
 

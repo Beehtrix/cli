@@ -13,6 +13,10 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -21,7 +25,6 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/worktreedir"
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
 )
 
 // ScopeStats summarises the scope of a review for the banner.
@@ -303,43 +306,129 @@ func hiddenIndexTag(tag string) bool {
 	return tag == "S" || tag != strings.ToUpper(tag)
 }
 
-// listHiddenEdits returns the regular files marked skip-worktree or
-// assume-unchanged whose worktree contents differ from the index. git status
-// does not report them, but a reviewer reads them. A skip-worktree path that
-// a sparse checkout left out of the worktree is not an edit.
+// countWorktreeChanges returns how many paths differ between the worktree and
+// HEAD: staged, unstaged and untracked files, whatever
+// status.showUntrackedFiles says, plus the files marked assume-unchanged or
+// skip-worktree that git status does not report, which are also counted in
+// hidden.
+func countWorktreeChanges(ctx context.Context, repoRoot string) (paths, hidden int, err error) {
+	changed, removed, err := listUncommitted(ctx, repoRoot)
+	if err != nil {
+		return 0, 0, err
+	}
+	edited, err := listHiddenEdits(ctx, repoRoot)
+	if err != nil {
+		return 0, 0, err
+	}
+	seen := make(map[string]bool)
+	for _, file := range slices.Concat(changed, removed) {
+		seen[file] = true
+	}
+	for _, file := range edited {
+		if !seen[file] {
+			seen[file] = true
+			hidden++
+		}
+	}
+	return len(seen), hidden, nil
+}
+
+// listHiddenEdits returns the tracked files marked skip-worktree or
+// assume-unchanged whose worktree copy differs from the index: edited,
+// deleted, or replaced by another kind of entry. git status does not report
+// them, but a reviewer reads the worktree. A skip-worktree path missing from
+// the worktree is a sparse checkout's omission, not an edit.
 func listHiddenEdits(ctx context.Context, repoRoot string) ([]string, error) {
 	out, err := runGit(ctx, repoRoot, "ls-files", "-z", "-v", "--stage")
 	if err != nil {
 		return nil, fmt.Errorf("git ls-files: %w", err)
 	}
-	indexed := make(map[string]string)
-	var present []string
+	var entries strings.Builder
+	sparse := make(map[string]bool)
 	for _, record := range splitNUL(out) {
 		// "<tag> <mode> <object> <stage>\t<path>"
-		meta, file, ok := strings.Cut(record, "\t")
+		tag, entry, _ := strings.Cut(record, " ")
+		meta, file, ok := strings.Cut(entry, "\t")
 		fields := strings.Fields(meta)
-		if !ok || len(fields) != 4 || !hiddenIndexTag(fields[0]) || (fields[1] != "100644" && fields[1] != "100755") {
+		if !ok || len(fields) != 3 || fields[2] != "0" || !hiddenIndexTag(tag) || !worktreeEntryMode(fields[0]) {
 			continue
 		}
-		if worktreedir.HashableEntry(repoRoot, file, filemode.Regular) {
-			indexed[file] = fields[2]
-			present = append(present, file)
-		}
+		sparse[file] = strings.EqualFold(tag, "S")
+		entries.WriteString(entry)
+		entries.WriteByte(0)
 	}
-	if len(present) == 0 {
+	if len(sparse) == 0 {
 		return nil, nil
 	}
-	hashes, err := gitrepo.HashWorktreeFiles(ctx, repoRoot, present)
+	changes, err := diffFilesWithoutFlags(ctx, repoRoot, entries.String())
 	if err != nil {
-		return nil, fmt.Errorf("hash files git treats as unchanged: %w", err)
+		return nil, fmt.Errorf("compare files git treats as unchanged: %w", err)
 	}
 	var edited []string
-	for _, file := range present {
-		if hashes[file].String() != indexed[file] {
+	for file, status := range changes {
+		if status != "D" || !sparse[file] {
 			edited = append(edited, file)
 		}
 	}
 	return edited, nil
+}
+
+// worktreeEntryMode reports whether an index mode is a file or symlink, the
+// entries a worktree holds for this repository (not a submodule's gitlink).
+func worktreeEntryMode(mode string) bool {
+	return mode == "100644" || mode == "100755" || mode == "120000"
+}
+
+// diffFilesWithoutFlags copies entries (NUL-terminated `git ls-files --stage`
+// records) into a temporary index, where they carry no assume-unchanged or
+// skip-worktree flag, and returns git diff-files' status for each one whose
+// worktree copy differs. git compares them itself, so clean filters and
+// line-ending conversion apply as they do for git status. The real index is
+// not touched.
+func diffFilesWithoutFlags(ctx context.Context, repoRoot, entries string) (map[string]string, error) {
+	dir, err := os.MkdirTemp("", "entire-review-index-")
+	if err != nil {
+		return nil, fmt.Errorf("create a temporary index: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	index, err := filepath.Abs(filepath.Join(dir, "index"))
+	if err != nil {
+		return nil, fmt.Errorf("create a temporary index: %w", err)
+	}
+	git := func(stdin string, args ...string) (string, error) {
+		// A split index would leave a shared index file in the repository,
+		// and fsmonitor could start its daemon for a throwaway index.
+		cmd := exec.CommandContext(ctx, "git", append([]string{"-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"}, args...)...)
+		cmd.Dir = repoRoot
+		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+index)
+		cmd.Stdin = strings.NewReader(stdin)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("git %s: %w (stderr: %s)", strings.Join(args[:2], " "), err, strings.TrimSpace(stderr.String()))
+		}
+		return string(out), nil
+	}
+	if _, err := git(entries, "update-index", "-z", "--index-info"); err != nil {
+		return nil, err
+	}
+	// The copied entries have no stat data: refreshing compares each one's
+	// contents and records the stat of those that match.
+	if _, err := git("", "update-index", "-q", "--refresh"); err != nil {
+		return nil, err
+	}
+	out, err := git("", "diff-files", "-z", "--name-status")
+	if err != nil {
+		return nil, err
+	}
+	// "<status>\0<path>\0" per entry.
+	records := splitNUL(out)
+	changes := make(map[string]string, len(records)/2)
+	for i := 0; i+1 < len(records); i += 2 {
+		changes[records[i+1]] = records[i]
+	}
+	return changes, nil
 }
 
 func splitNUL(out string) []string {
