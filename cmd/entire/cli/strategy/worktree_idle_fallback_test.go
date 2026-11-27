@@ -152,6 +152,42 @@ func TestCommitLinking_FallbackKeepsTheOwnerOfAnExistingTarget(t *testing.T) {
 	assert.Empty(t, sessions, "with no existing target, the idle owner is a new link and is dropped")
 }
 
+// The same owner, with a recent session in a third worktree: the candidates
+// span two worktrees, so the fallback judges them by recency before the idle
+// check runs. The owner of the existing target counts as recent there and,
+// with the recent session in another worktree, decides: post-commit condenses
+// the amend's work into the checkpoint its trailer names rather than linking
+// the other worktree's session or declining. Without an existing target, the
+// recent session is linked as before.
+func TestCommitLinking_OwnerOfAnExistingTargetDecidesAcrossWorktrees(t *testing.T) {
+	mainDir, linkedDir := twoWorktrees(t)
+	ctx := context.Background()
+	s := &ManualCommitStrategy{}
+	dayAgo := time.Now().Add(-24 * time.Hour)
+	recent := time.Now().Add(-time.Minute)
+	target := id.MustCheckpointID("a1b2c3d4e5f6")
+	saveSiblingSession(t, s, mainDir, "owner", session.PhaseIdle, &dayAgo)
+	owner, err := s.loadSessionState(ctx, "owner")
+	require.NoError(t, err)
+	owner.LastCheckpointID = target
+	require.NoError(t, s.saveSessionState(ctx, owner))
+	otherDir := filepath.Join(filepath.Dir(linkedDir), "other")
+	createSessionMatchWorktree(t, mainDir, otherDir, "other")
+	t.Cleanup(func() { removeSessionMatchWorktree(mainDir, otherDir) })
+	saveSiblingSession(t, s, otherDir, "recent", session.PhaseIdle, &recent)
+
+	t.Chdir(linkedDir)
+	clearSessionMatchCaches()
+	sessions, err := s.findSessionsForCommitLinking(withPreexistingTarget(ctx, target), linkedDir)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"owner"}, linkedSessionIDs(sessions))
+
+	clearSessionMatchCaches()
+	sessions, err = s.findSessionsForCommitLinking(ctx, linkedDir)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"recent"}, linkedSessionIDs(sessions), "with no existing target, the recent session is linked")
+}
+
 // The `checkpoint list --pending` preview lists the sessions a commit here
 // would link: from a worktree with no session of its own, a sibling session
 // idle beyond the window has pending work but is left out, as commit linking
